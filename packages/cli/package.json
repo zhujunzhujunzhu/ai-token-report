@@ -1,0 +1,34 @@
+{
+  "name": "@ai-token-report/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "命令行入口：统计 / 上报 / 起本地服务",
+  "bin": {
+    "dsh-token": "src/cli.ts"
+  },
+  "main": "src/cli.ts",
+  "types": "src/cli.ts",
+  "exports": {
+    ".": "./src/cli.ts",
+    "./report": "./src/report.ts",
+    "./deliver": "./src/deliver.ts",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "start": "bun run src/cli.ts",
+    "web": "bun run src/cli.ts --web",
+    "report": "bun run src/cli.ts report",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@ai-token-report/core": "workspace:*",
+    "@ai-token-report/server": "workspace:*",
+    "@ai-token-report/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.7.2"
+  }
+}
