@@ -1,0 +1,25 @@
+{
+  "name": "@ai-token-report/web-portal",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "部门看板页面：看全部门人员用量，数据来自服务端的 /api/v1/stats/*",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc --noEmit"
+  },
+  "dependencies": {
+    "@ai-token-report/shared": "workspace:*",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^22.10.2",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7",
+    "vue-tsc": "^2.2.0"
+  }
+}
