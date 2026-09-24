@@ -1,0 +1,11 @@
+# token-report 插件包自带的挂载声明（dsh.bundle.patch 指向本文件）。
+#
+# 格式说明（照抄 @deepseek-ai/dsh-base 的写法，别自创）：
+#   顶层是 YAML 数组；数组里的条目形如 `- insert:` + 缩进的插件行。
+#   行内的 `name` 必须是包名本身 —— loader 拿这个字符串去 import。
+#
+# 本文件只负责把插件插进 profile 树；具体配置留给用户的 cordis.patch.yml
+# 按 id 覆盖（patch 的 config 是整体替换，不是深合并）。
+- insert:
+    - id: token-report
+      name: '@ai-token-report/dsh-plugin'
