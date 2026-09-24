@@ -1,0 +1,11 @@
+[install]
+# 精确锁定依赖版本，避免不同机器装出不同版本导致的口径漂移
+exact = true
+
+[install.cache]
+# 缓存目录留在项目内，便于离线环境与 CI 复用
+dir = ".bun-cache"
+
+[run]
+# 允许 bun run 直接执行 package.json 里的脚本（默认已开启）
+bun = true

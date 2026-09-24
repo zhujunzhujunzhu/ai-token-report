@@ -1,0 +1,34 @@
+{
+  "name": "ai-token-report",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH token 用量统计平台：CLI + 本地页面 + 部门看板 + DSH 插件",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "bun": ">=1.1.0",
+    "node": ">=22"
+  },
+  "scripts": {
+    "stats": "bun run --filter '@ai-token-report/cli' start",
+    "report": "bun run --filter '@ai-token-report/cli' report",
+    "web": "bun run --filter '@ai-token-report/cli' web",
+    
+    "dev:local": "bun run --filter '@ai-token-report/web-local' dev",
+    "dev:portal": "bun run --filter '@ai-token-report/web-portal' dev",
+    "build:local": "bun run --filter '@ai-token-report/web-local' build",
+    "build:portal": "bun run --filter '@ai-token-report/web-portal' build",
+    "build": "bun run build:local && bun run build:portal",
+
+    "server": "bun run --filter '@ai-token-report/server' start",
+    "typecheck": "bun run --filter '*' typecheck",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}

@@ -1,0 +1,19 @@
+node_modules/
+dist/
+lib/
+.bun-cache/
+*.log
+
+# SQLite 数据库与增量水位线属于运行时数据，不入库
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.jsonl
+
+# 本地身份署名文件（方案 A），含个人信息，绝不提交
+token-report-user.json
+
+.env
+.env.local
+.DS_Store
