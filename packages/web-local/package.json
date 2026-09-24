@@ -1,0 +1,27 @@
+{
+  "name": "@ai-token-report/web-local",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "本地统计页面：只看本机，数据来自本地服务的 /api/local/*",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc --noEmit",
+    "verify": "bun run verify/verify-data.ts && bun run verify/verify-render.ts",
+    "verify:layout": "bun run verify/verify-layout.ts"
+  },
+  "dependencies": {
+    "@ai-token-report/shared": "workspace:*",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^22.10.2",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7",
+    "vue-tsc": "^2.2.0"
+  }
+}
