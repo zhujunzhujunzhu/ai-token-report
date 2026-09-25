@@ -23,7 +23,7 @@ defineProps<{
       </span>
     </header>
 
-    <MetricChartCard :series="card.chart" :ticks="card.ticks" />
+    <MetricChartCard :series="card.chart" :ticks="card.ticks" :title="card.title" />
   </section>
 </template>
 

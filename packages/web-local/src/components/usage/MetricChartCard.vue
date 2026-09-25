@@ -5,19 +5,20 @@
  * 用原生 SVG 绘制，坐标采用「按数值直接换算像素」的方式，
  * 因此不需要引入任何图表库。
  */
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 
 import type { ChartSeries } from '@/types/usage'
 
 const props = withDefaults(
   defineProps<{
     series: ChartSeries
+    title?: string
     /** 绘图区高度（px），不含坐标轴文字 */
     plotHeight?: number
     /** Y 轴刻度文案，自下而上 */
     ticks: string[]
   }>(),
-  { plotHeight: 200 },
+  { plotHeight: 200, title: '数值' },
 )
 
 /**
@@ -29,6 +30,36 @@ const VIEW_WIDTH = 480
 const PAD_X = 6
 
 const count = computed(() => props.series.labels.length)
+const activeIndex = ref<number | null>(null)
+const tooltip = computed(() => {
+  const index = activeIndex.value
+  if (index === null || index >= count.value) return null
+  const items = props.series.kind === 'stackedBar'
+    ? props.series.layers.map((layer) => ({ name: layer.name, value: layer.values[index] ?? 0 }))
+    : [{ name: props.title, value: props.series.values[index] ?? 0 }]
+  return { label: props.series.labels[index], items, left: centerX(index) / VIEW_WIDTH * 100 }
+})
+
+/** 整个时间槽都可命中，零值和很矮的柱子也能查看。 */
+function inspectPoint(event: PointerEvent): void {
+  if (!count.value) return
+  const bounds = (event.currentTarget as SVGSVGElement).getBoundingClientRect()
+  if (!bounds.width) return
+  const x = (event.clientX - bounds.left) / bounds.width * VIEW_WIDTH
+  activeIndex.value = Math.max(0, Math.min(count.value - 1, Math.floor((x - PAD_X) / slot.value)))
+}
+
+function inspectKey(event: KeyboardEvent): void {
+  if (event.key === 'Escape') activeIndex.value = null
+  if (!count.value || !['ArrowLeft', 'ArrowRight'].includes(event.key)) return
+  event.preventDefault()
+  const next = (activeIndex.value ?? (event.key === 'ArrowRight' ? -1 : count.value))
+    + (event.key === 'ArrowRight' ? 1 : -1)
+  activeIndex.value = Math.max(0, Math.min(count.value - 1, next))
+}
+
+// 仅时间槽变化时清除提示；常规轮询更新数值时保留当前悬浮位置。
+watch(() => props.series.labels.join('\u0000'), () => { activeIndex.value = null })
 
 /** 绘图区逻辑宽度 */
 const plotWidth = computed(() => VIEW_WIDTH - PAD_X * 2)
@@ -252,6 +283,13 @@ const visibleXLabels = computed(() => {
             :height="plotHeight"
             preserveAspectRatio="none"
             role="img"
+            :aria-label="`${title}趋势，使用左右方向键查看数值`"
+            tabindex="0"
+            @pointermove="inspectPoint"
+            @pointerleave="activeIndex = null"
+            @focus="activeIndex = count ? 0 : null"
+            @blur="activeIndex = null"
+            @keydown="inspectKey"
           >
             <!-- 面积图 -->
             <template v-if="series.kind === 'area'">
@@ -294,7 +332,31 @@ const visibleXLabels = computed(() => {
                 rx="3"
               />
             </template>
+            <line
+              v-if="activeIndex !== null"
+              :x1="centerX(activeIndex)"
+              :x2="centerX(activeIndex)"
+              y1="0"
+              :y2="plotHeight"
+              stroke="#64748b"
+              stroke-dasharray="4 4"
+              vector-effect="non-scaling-stroke"
+              pointer-events="none"
+            />
           </svg>
+        </div>
+        <div
+          v-if="tooltip"
+          class="metric-chart__tooltip"
+          :class="{ 'metric-chart__tooltip--right': tooltip.left > 50 }"
+          :style="{ left: `${tooltip.left}%` }"
+          role="status"
+        >
+          <strong>{{ tooltip.label }}</strong>
+          <div v-for="item in tooltip.items" :key="item.name" class="metric-chart__tooltip-row">
+            <span>{{ item.name }}</span>
+            <b>{{ item.value.toLocaleString('zh-CN') }}</b>
+          </div>
         </div>
       </div>
     </div>
@@ -365,6 +427,33 @@ const visibleXLabels = computed(() => {
 .metric-chart__svg {
   display: block;
   width: 100%;
+}
+
+.metric-chart__tooltip {
+  position: absolute;
+  top: 8px;
+  z-index: 2;
+  padding: 10px 12px;
+  max-width: 100%;
+  border: 1px solid var(--c-border, #e8eaed);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--c-text-primary);
+  box-shadow: 0 4px 16px #00000014;
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.metric-chart__tooltip--right {
+  transform: translateX(-100%);
+}
+
+.metric-chart__tooltip-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 6px;
+  font-variant-numeric: tabular-nums;
 }
 
 /* X 轴刻度与绘图区左边缘对齐：向左让出 Y 轴宽度 + 间隙 */
