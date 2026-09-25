@@ -235,6 +235,34 @@ describe('★ TTL 缓存 + 在途合并（面板常驻，不能每个周期重�
     expect(first).toEqual({ period: 'today', error: '会话目录不存在' })
     expect(second).toEqual(first)
   })
+
+  test('★ 代次没变也不许让缓存永不失效（库外变化只能靠 TTL 兜住）', async () => {
+    // 别的 DSH 实例 / CLI `dsh-token` 写进来的用量**不会**动本进程的代次，
+    // 所以「代次相同 ⇒ 直接复用缓存」是一个会静默出错的捷径：
+    // 兜底全量轮询会永远返回同一份旧载荷，而页面看起来一切正常。
+    let calls = 0
+    let clock = 1_000
+    let gen = 3
+    const provider = createUiStatsProvider({
+      run: async () => {
+        calls++
+        return sampleResult()
+      },
+      now: () => clock,
+      ttlMs: 30_000,
+      generation: () => gen,
+    })
+
+    await provider.get('today')
+    clock += 20_000 // TTL 内：缓存生效
+    await provider.get('today')
+    expect(calls).toBe(1)
+
+    clock += 20_000 // 超过 TTL，代次仍未变
+    await provider.get('today')
+    expect(calls).toBe(2)
+    expect(gen).toBe(3)
+  })
 })
 
 describe('Fetch 处理器', () => {
@@ -245,6 +273,8 @@ describe('Fetch 处理器', () => {
         seen.push({ period, refresh: force === true })
         return toUiPayload(sampleResult(), period)
       },
+      // 代次恒为 0：本用例不带 `gen` 参数，必须**不能**被当成探针命中
+      generation: () => 0,
     })
 
     await fetchStats(new Request(`http://127.0.0.1${UI_STATS_PATH}?period=month&refresh=1`))
@@ -256,6 +286,100 @@ describe('Fetch 处理器', () => {
       { period: 'today', refresh: false },
       { period: 'today', refresh: false },
     ])
+  })
+
+  test('★ 不带 gen 参数的普通取数不会被误判成探针（`Number(null)` 就是 0）', async () => {
+    let calls = 0
+    const fetchStats = makeStatsFetch(createUiStatsProvider({
+      run: async () => {
+        calls++
+        return sampleResult()
+      },
+      generation: () => 0,
+    }))
+
+    const res = await fetchStats(new Request(`http://127.0.0.1${UI_STATS_PATH}?period=today`))
+    expect(res.status).toBe(200)
+    expect(calls).toBe(1)
+  })
+
+  test('★ 代次探针：代次没变回 204 且一个字节都不回（不查库、不序列化）', async () => {
+    let calls = 0
+    let gen = 7
+    const fetchStats = makeStatsFetch(createUiStatsProvider({
+      run: async () => {
+        calls++
+        return sampleResult()
+      },
+      generation: () => gen,
+    }))
+
+    const same = await fetchStats(new Request(`http://127.0.0.1${UI_STATS_PATH}?period=today&gen=7`))
+    expect(same.status).toBe(204)
+    expect(same.headers.get('cache-control')).toBe('no-store')
+    expect(await same.text()).toBe('')
+    expect(calls).toBe(0)
+
+    // 有新采集 → 代次变了 → 正常返回载荷（并带上新代次）
+    gen = 8
+    const changed = await fetchStats(new Request(`http://127.0.0.1${UI_STATS_PATH}?period=today&gen=7`))
+    expect(changed.status).toBe(200)
+    expect(calls).toBe(1)
+    expect(((await changed.json()) as UiPayload).gen).toBe(8)
+  })
+
+  test('代次探针不认识垃圾值：不来回 204（宁可多回一次载荷）', async () => {
+    let calls = 0
+    const fetchStats = makeStatsFetch(createUiStatsProvider({
+      run: async () => {
+        calls++
+        return sampleResult()
+      },
+      generation: () => 0,
+      ttlMs: 0, // 关掉缓存，否则后三次会被 TTL 命中，看不出「有没有走 204 捷径」
+    }))
+    for (const raw of ['', 'abc', 'NaN', '1.5']) {
+      const res = await fetchStats(new Request(`http://127.0.0.1${UI_STATS_PATH}?gen=${raw}`))
+      expect(res.status).toBe(200)
+    }
+    expect(calls).toBe(4)
+  })
+
+  test('refresh=1 压过探针（用户点了「刷新」就必须真查一次）', async () => {
+    let calls = 0
+    const fetchStats = makeStatsFetch(createUiStatsProvider({
+      run: async () => {
+        calls++
+        return sampleResult()
+      },
+      generation: () => 5,
+    }))
+    const res = await fetchStats(new Request(`http://127.0.0.1${UI_STATS_PATH}?period=today&gen=5&refresh=1`))
+    expect(res.status).toBe(200)
+    expect(calls).toBe(1)
+  })
+
+  test('载荷带上当前代次（浏览器半靠它做探针）', async () => {
+    const provider = createUiStatsProvider({ run: async () => sampleResult(), generation: () => 42 })
+    expect(provider.generation()).toBe(42)
+    const body = (await provider.get('today')) as UiPayload
+    expect(body.gen).toBe(42)
+  })
+
+  test('★ 载荷带的是**开查前**的代次（查询期间的新采集必须还能被探针发现）', async () => {
+    // 若改成「查完再读代次」，查询期间采集到的那一笔会被盖上「已包含」的章，
+    // 而那次 ingest 很可能还没看到它 —— 探针随后一直 204，这一笔要等兜底才补上。
+    let gen = 5
+    const provider = createUiStatsProvider({
+      run: async () => {
+        gen = 6 // 查询进行中来了一条新采集
+        return sampleResult()
+      },
+      generation: () => gen,
+    })
+    const body = (await provider.get('today')) as UiPayload
+    expect(body.gen).toBe(5)
+    expect(provider.generation()).toBe(6) // ★ 失配 ⇒ 浏览器半下一轮会再取一次
   })
 
   test('响应是 200 + JSON，且带 no-store（面板自己管缓存）', async () => {
@@ -367,6 +491,19 @@ describe('★ 路由安装：拿不到 connection 必须安静跳过', () => {
     const hosts = fakeHost({ connection: undefined })
     expect(installUiRoute(hosts.ctx, stats)).toBe('pending')
     expect(hosts.injected).toEqual([['connection']])
+  })
+
+  test('★ 代次来源要透传到取数器上（接错线不会报错，只会表现为「数字再也不动」）', async () => {
+    const registered: unknown[] = []
+    const hosts = fakeHost({ connection: fakeConnection(registered) })
+    expect(installUiRoute(hosts.ctx, stats, { generation: () => 11 })).toBe('registered')
+
+    const route = (registered as { path: string; fetch: (r: Request) => Promise<Response> }[])
+      .find((r) => r.path === UI_STATS_PATH)!
+    // 手上就是第 11 代 → 204，零查询
+    expect((await route.fetch(new Request(`http://127.0.0.1${UI_STATS_PATH}?period=today&gen=11`))).status).toBe(204)
+    // 代次对不上 → 照常返回载荷（这里的会话目录不存在，会被翻成 200 + error 体，不影响本断言）
+    expect((await route.fetch(new Request(`http://127.0.0.1${UI_STATS_PATH}?period=today&gen=10`))).status).toBe(200)
   })
 
   test('延迟出现的 connection 最终会注册，且只注册一次（重复路径会抛错）', () => {

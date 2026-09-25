@@ -79,7 +79,7 @@ export function seriesFor(period: UiPeriod): 'day' | 'hour' {
  *
  * 明细不能截断，否则浏览器翻页后无法看到后面的会话。
  */
-export function toUiPayload(result: UsageResult, period: UiPeriod): UiPayload {
+export function toUiPayload(result: UsageResult, period: UiPeriod, gen = 0): UiPayload {
   const groups = result.groups.map((group) => ({
     by: group.by,
     rows: group.rows.map(
@@ -131,6 +131,8 @@ export function toUiPayload(result: UsageResult, period: UiPeriod): UiPayload {
     sessions: result.sessions,
     elapsedMs: result.elapsedMs,
     scannedAt: result.scannedAt,
+    // ★ 代次如实带出去：浏览器半靠它做「没变就别取数」的探针（见 protocol.ts）
+    gen,
   }
 }
 
@@ -143,15 +145,27 @@ export interface UiStatsProvider {
    * @param force - 绕过缓存（用户点了「刷新」）。仍然会与在途请求合并。
    */
   get(period: UiPeriod, force?: boolean, dateRange?: UiDateRange): Promise<UiResponse>
+
+  /**
+   * ★ 数据代次：宿主每次**采集到**新的计费记录就加一。
+   *
+   * 浏览器半用「我手上是第 N 代」问一句（`?gen=N`），代次没变就一个字节都不用回。
+   * 它与缓存是两个独立的东西：
+   *   - 缓存省的是**同一次数据**被重复查询；
+   *   - 代次省的是**根本没有新数据**时的整轮往返（含载荷序列化与页面重渲染）。
+   */
+  generation(): number
 }
 
 /**
- * 造一个带「TTL 缓存 + 在途合并」的取数器。
+ * 造一个带「TTL 缓存 + 在途合并 + 代次探针」的取数器。
  *
- * 两件事各解决一个真实问题：
+ * 三件事各解决一个真实问题：
  * - **TTL 缓存**：面板轮询不该等于「每轮扫一遍日志」。
  * - **在途合并**：两个面板（输入框上方的条 + 标题栏的徽章）同时挂载时
  *   会各发一次请求，而扫描是 CPU 密集型 —— 合并后只扫一次。
+ * - **代次探针**：`generation()` 没变就回 `204`（见 `makeStatsFetch`），
+ *   于是浏览器半可以高频问「有没有新数」而**几乎不花钱**。
  *
  * ⚠️ 失败也进缓存：反正是同一个周期的同一次失败，
  *   不缓存只会让坏掉的环境被反复重扫（那才是最坏的情况）。
@@ -169,14 +183,31 @@ export function createUiStatsProvider(options: {
   /** 注入时钟，便于单测断言 TTL。 */
   now?: () => number
   ttlMs?: number
+  /**
+   * 数据代次的来源（缺省恒为 0 = 不提供探针）。
+   *
+   * 🚨 只允许**纯内存读**：它每次探针都会被调用一次（默认 3 秒一次），
+   *   在这里扫日志/读文件等于把省下来的开销又加回去。
+   *   组合根传入的是上报器的 `enqueued` 计数 —— 一次属性读。
+   */
+  generation?: () => number
 }): UiStatsProvider {
   const now = options.now ?? (() => Date.now())
   const ttlMs = options.ttlMs ?? DEFAULT_TTL_MS
+  const generation = options.generation ?? (() => 0)
 
+  /** 缓存项。⚠️ 刻意**不**用「代次相同」当命中条件 —— 见下面 `get()` 的注释。 */
   const cache = new Map<string, { at: number; body: UiResponse }>()
   const inflight = new Map<string, Promise<UiResponse>>()
 
   const load = async (period: UiPeriod, dateRange?: UiDateRange): Promise<UiResponse> => {
+    // ★ 代次必须在**开查之前**取。
+    //
+    //   反过来（查完再读）会漏数：查询期间刚好采集到一条记录时，载荷会带上
+    //   「已经包含它」的新代次，而那次 ingest 很可能还没看到这条日志 ——
+    //   浏览器半随后探针会一直拿到 204，这一笔要等到下一次采集或 120 秒兜底才补上。
+    //   开查前取则相反：代次偏旧 → 探针立刻失配 → 多取一次，数字只会晚不会丢。
+    const genAtStart = generation()
     try {
       const result = await options.run({
         ...(period === 'custom' ? dateRange : { period }),
@@ -184,7 +215,7 @@ export function createUiStatsProvider(options: {
         top: Number.MAX_SAFE_INTEGER,
         series: period === 'custom' && dateRange?.since === dateRange?.until ? 'hour' : seriesFor(period),
       })
-      return toUiPayload(result, period)
+      return toUiPayload(result, period, genAtStart)
     } catch (err) {
       // ★ 扫描失败不抛给浏览器：面板要能就地显示「为什么没数」
       const body: UiErrorPayload = {
@@ -196,12 +227,22 @@ export function createUiStatsProvider(options: {
   }
 
   return {
+    generation,
+
     async get(period, force = false, dateRange) {
       if (period === 'custom' && !validDateRange(dateRange)) {
         return { period, error: '请选择有效的开始和结束日期，开始日期不能晚于结束日期' }
       }
       const key = period === 'custom' ? `${period}:${dateRange!.since}:${dateRange!.until}` : period
       const hit = cache.get(key)
+      // 🚨 命中条件**只有 TTL 一条**。
+      //
+      //   曾想顺手加一条「代次没变就直接复用」——那是错的，而且错得很隐蔽：
+      //   代次只反映**本进程**采集到的用量，而库里的数还可能被别的 DSH 实例、
+      //   被 CLI `dsh-token` 改动。一旦让它短路掉 TTL，
+      //   「代次很久没动」就等于「缓存永不失效」——
+      //   兜底全量轮询会永远返回同一份旧载荷，而页面看起来一切正常。
+      //   代次只用来回答探针（`?gen=N` → 204），不参与缓存判定。
       if (!force && hit !== undefined && now() - hit.at < ttlMs) return hit.body
 
       const running = inflight.get(key)
@@ -232,6 +273,17 @@ function jsonResponse(body: unknown): Response {
 }
 
 /**
+ * 「没有新数据」的回应：**状态码 204，零字节载荷**。
+ *
+ * ★ 为什么不是 `200 + {unchanged:true}`：那仍要走一次 JSON 序列化与解析，
+ *   而这条路径的意义正是「高频、几乎不花钱」。204 天然无 body，
+ *   浏览器半看到它就知道「手上那份载荷还是最新的」，连状态都不用改。
+ */
+function unchangedResponse(): Response {
+  return new Response(null, { status: 204, headers: { 'cache-control': 'no-store' } })
+}
+
+/**
  * 把「界面呈现配置」包成一条 Fetch 路由处理器。
  *
  * ★ 这是宿主半**唯一需要主动告诉**浏览器半的部署事实。DSH 的客户端插件条目
@@ -252,12 +304,29 @@ export function makeConfigFetch(position: UiPosition): (request: Request) => Pro
  * 查询参数：
  * - `period` —— 具名周期，不合法回落到默认值。
  * - `refresh=1` —— 绕过宿主缓存（面板上的「刷新」按钮）。
+ * - `gen=N` —— **代次探针**：调用方说「我手上是第 N 代」。
+ *   宿主发现当前还是第 N 代就回 `204`（一个字节都不回，不查库、不序列化）；
+ *   代次变了才正常返回新载荷。
+ *
+ * ⚠️ 探针**不做鉴权之外的新判断**（period 是否一样之类）：代次是全局单调计数，
+ *   任何新采集都会让它变；调用方只在「手上这份载荷就是当前显示的那份」时才发探针，
+ *   代次相同即意味着「这份载荷不需要重取」。
  */
 export function makeStatsFetch(provider: UiStatsProvider): (request: Request) => Promise<Response> {
   return async (request) => {
     const url = new URL(request.url)
     const period = coercePeriod(url.searchParams.get('period'))
     const force = url.searchParams.get('refresh') === '1'
+
+    // ⚠️ 必须区分「没传 gen」与「gen=0」，也要拒绝空串：
+    //   `Number(null)` 和 `Number('')` 都是 0 —— 少一个判断会让
+    //   **所有普通取数**（以及 `?gen=` 这种残缺参数）都被当成代次 0 的探针而回 204。
+    const rawGen = url.searchParams.get('gen')
+    const probeGen = rawGen === null || rawGen.trim() === '' ? undefined : Number(rawGen)
+    if (!force && probeGen !== undefined && Number.isInteger(probeGen) && probeGen === provider.generation()) {
+      return unchangedResponse()
+    }
+
     return jsonResponse(await provider.get(period, force, period === 'custom' ? {
       since: url.searchParams.get('since') ?? '', until: url.searchParams.get('until') ?? '',
     } : undefined))
@@ -317,6 +386,14 @@ export function installUiRoute(
      * 两边不会各跑各的。
      */
     position?: UiPosition
+    /**
+     * 数据代次来源（见 `createUiStatsProvider`）。
+     *
+     * 组合根（`apply()`）传入上报器的 `enqueued` 计数：本进程每采集到一条计费记录，
+     * 面板的数据就变了 —— 这正是浏览器半探针想问的那个问题。
+     * 不传则恒为 0，浏览器半退化为「按兜底周期全量取数」（= 改动前的行为）。
+     */
+    generation?: () => number
   } = {},
 ): UiRouteInstall {
   const provider = createUiStatsProvider({
@@ -324,6 +401,7 @@ export function installUiRoute(
     //   所以面板上的数与终端、与 Agent 报的数必然一致。
     run: (query) => queryUsage(stats, query),
     ...(options.ttlMs !== undefined ? { ttlMs: options.ttlMs } : {}),
+    ...(options.generation !== undefined ? { generation: options.generation } : {}),
   })
   const fetchStats = makeStatsFetch(provider)
   const position = options.position ?? UI_DEFAULT_POSITION

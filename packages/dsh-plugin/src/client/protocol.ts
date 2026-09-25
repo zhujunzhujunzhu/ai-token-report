@@ -174,6 +174,18 @@ export interface UiPayload {
   sessions: number
   elapsedMs: number
   scannedAt: number
+  /**
+   * ★ 数据代次：宿主每次**采集到**新的计费记录就加一。
+   *
+   * 浏览器半拿着上一次载荷里的 `gen` 做**轻量探针**
+   * （`GET …?period=today&gen=N`），宿主发现代次没变就回 `204`——
+   * 于是「3 秒看一眼有没有新数」这件事不再等于「3 秒扫一次日志」。
+   *
+   * ⚠️ 刻意是**可选**的：老宿主（或中间层）不带这个字段时，
+   *   浏览器半必须退回「按兜底周期全量取数」，
+   *   而不是把 `undefined` 当成一个合法代次（那会永远探测成功、数字再也不动）。
+   */
+  gen?: number
 }
 
 /**
@@ -299,6 +311,9 @@ export function readUiResponse(value: unknown): { ok: true; payload: UiPayload }
   }
 
   const degradedReason = raw['degradedReason']
+  // ★ 代次只认有限数字；缺字段/脏值时**整个字段不带**，
+  //   让浏览器半能区分「宿主说自己没变过（0）」与「宿主根本不认识这个协议」。
+  const gen = raw['gen']
 
   return {
     ok: true,
@@ -326,6 +341,7 @@ export function readUiResponse(value: unknown): { ok: true; payload: UiPayload }
       sessions: count(raw['sessions']),
       elapsedMs: count(raw['elapsedMs']),
       scannedAt: count(raw['scannedAt']),
+      ...(typeof gen === 'number' && Number.isFinite(gen) ? { gen } : {}),
     },
   }
 }

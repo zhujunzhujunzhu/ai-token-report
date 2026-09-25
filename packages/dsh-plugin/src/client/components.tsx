@@ -132,6 +132,14 @@ export function UsageDetail(props: { state: UsageState; store: UsageStore; onClo
   useEffect(() => setPage((previous) => Math.min(previous, pageCount)), [pageCount])
   const [trendMetric, setTrendMetric] = useState<'total' | 'calls' | 'cacheHitRate'>('total')
   const data = state.data
+  /**
+   * ★ 只把**首次加载**算作「挡住使用者」，后台刷新不算。
+   *
+   * 之前是 `loading || refreshing`，于是每次轮询一发起就把周期页签、日期选择器、
+   * 刷新按钮全部 `disabled` —— 面板每隔几秒「抽一下」，刷新按钮还会把点击吞掉。
+   * 后台刷新期间本来就可以继续操作：新的请求会按序号覆盖旧的（见 store.ts）。
+   */
+  const blocked = state.loading
   const busy = state.loading || state.refreshing
 
   const head = createElement(
@@ -147,13 +155,13 @@ export function UsageDetail(props: { state: UsageState; store: UsageStore; onClo
         props.onClose ? createElement('button', { type: 'button', className: 'atr-btn atr-close', onClick: props.onClose, 'aria-label': '关闭用量详情' }, '×') : null)),
     !settings ? createElement('div', { className: 'atr-filter-bar' },
     createElement(PeriodTabs, {
-      period: state.period, onPick: store.setPeriod, disabled: busy,
+      period: state.period, onPick: store.setPeriod, disabled: blocked,
     }),
-    createElement(DateRangePicker, { range: state.dateRange, active: state.period === 'custom', disabled: busy, onApply: store.setCustomRange }),
+    createElement(DateRangePicker, { range: state.dateRange, active: state.period === 'custom', disabled: blocked, onApply: store.setCustomRange }),
     createElement('div', { className: 'atr-filter-actions' },
     createElement(
       'button',
-      { type: 'button', className: 'atr-btn atr-icon-btn atr-refresh', onClick: store.refresh, disabled: busy, title: busy ? '正在刷新' : '刷新用量', 'aria-label': '刷新用量', 'aria-busy': busy },
+      { type: 'button', className: 'atr-btn atr-icon-btn atr-refresh', onClick: store.refresh, disabled: blocked, title: busy ? '正在刷新' : '刷新用量', 'aria-label': '刷新用量', 'aria-busy': busy },
       createElement('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
         createElement('path', { d: 'M20 7v5h-5M4 17v-5h5M6.1 6.1A8 8 0 0 1 19.5 9M4.5 15a8 8 0 0 0 13.4 2.9' })),
     ),

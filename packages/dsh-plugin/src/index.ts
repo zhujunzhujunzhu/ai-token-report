@@ -530,6 +530,18 @@ export function apply(
     status.uiRoute = installUiRoute(ctx, statsContext, {
       // ★ 位置只能这样交给页面：客户端插件条目拿不到插件 config
       position: config.ui.position,
+      // ★ 数据代次 = 本进程已采集的计费记录数。
+      //
+      //   面板上的数字来自本机日志的聚合，而「本进程又采到用量」正是它变化的主因；
+      //   浏览器半拿这个计数做探针（`?gen=N`），代次没变就一个字节都不回 ——
+      //   于是它可以 3 秒看一次而几乎不花钱（见 client/store.ts）。
+      //
+      //   ⚠️ 这里必须是**纯内存读**：探针默认 3 秒一次，任何 IO 都等于把
+      //     省下来的开销又加回去。`enqueued` 只是读一个计数器。
+      //   ⚠️ 上报未启用（未署名 / 没 appKey）时没有后端，代次恒为 0，
+      //      此时浏览器半退回「按兜底周期全量取数」—— 与改动前一致，
+      //      不会退化成「永远不刷新」。
+      generation: () => backend?.reporterStats.enqueued ?? 0,
       settingsFetch: createSettingsHandler(config, {
         locked: !!rawConfig.user,
       }),

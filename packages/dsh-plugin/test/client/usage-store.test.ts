@@ -9,7 +9,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import { UI_STATS_PATH, readUiResponse } from '../../src/client/protocol.js'
-import { createUsageStore, describeFetchFailure, type UsageStoreDeps } from '../../src/client/store.js'
+import { createUsageStore, describeFetchFailure, type UsageStoreDeps, type VisibilitySource } from '../../src/client/store.js'
 
 /** 一份合法的响应体。 */
 function payloadBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -17,6 +17,8 @@ function payloadBody(overrides: Record<string, unknown> = {}): Record<string, un
     period: 'today',
     rangeLabel: '今天',
     source: 'scan',
+    // 数据代次：浏览器半拿它做探针。真宿主每个载荷都会带上。
+    gen: 1,
     totals: {
       total: 2_392_609_771,
       input: 70_379_895,
@@ -331,6 +333,185 @@ describe('★ 轮询生命周期：卸载后不该还在解码日志', () => {
   })
 })
 
+/** 可手动切换的假可见性来源（后台标签页 / 切回前台）。 */
+function fakeVisibility(hidden: boolean): { source: VisibilitySource; set(hidden: boolean): void } {
+  let current = hidden
+  const listeners = new Set<() => void>()
+  return {
+    source: {
+      isHidden: () => current,
+      subscribe(listener) {
+        listeners.add(listener)
+        return () => listeners.delete(listener)
+      },
+    },
+    set(next) {
+      current = next
+      for (const listener of listeners) listener()
+    },
+  }
+}
+
+/**
+ * ★ 刷新模型：3 秒探针 + 120 秒兜底 + 后台暂停。
+ *
+ * 这一组守的是「既不让面板每 3 秒重扫一次日志，又不让它看起来死了」——
+ * 两个极端都是事故：前者卡住 agent，后者让人以为数据没在动。
+ */
+describe('★ 刷新模型：代次探针 / 兜底全量 / 后台暂停', () => {
+  /** 假宿主：代次与手上那份一样就回 204，否则返回带新代次的载荷。 */
+  function hostWithGen(initial: { gen: number; total: number }) {
+    const host = { ...initial }
+    const urls: string[] = []
+    const impl: UsageStoreDeps['fetch'] = async (input) => {
+      urls.push(input)
+      const asked = new URL(`http://x${input}`).searchParams.get('gen')
+      if (asked !== null && Number(asked) === host.gen) {
+        return { ok: true, status: 204, json: async () => { throw new SyntaxError('204 没有 body') } }
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => payloadBody({
+          gen: host.gen,
+          totals: { total: host.total, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, calls: 1 },
+        }),
+      }
+    }
+    return { host, urls, impl }
+  }
+
+  test('★ 代次没变 → 204 不产生任何新快照（否则每 3 秒白重渲染一次）', async () => {
+    const { urls, impl } = hostWithGen({ gen: 1, total: 100 })
+    const store = createUsageStore({ fetch: impl, intervalMs: 5, fullIntervalMs: 10_000_000, now: () => 1_000 })
+
+    let renders = 0
+    const unsubscribe = store.subscribe(() => { renders++ })
+    await settle()
+    const rendersAfterLoad = renders
+
+    await Bun.sleep(30) // 若干个 tick
+    const probes = urls.slice(1) // urls[0] 是首次全量取数
+    expect(probes.length).toBeGreaterThan(0)
+    expect(probes.every((u) => u.includes('gen=1'))).toBe(true) // 探针带上了手上的代次
+    expect(probes.every((u) => !u.includes('refresh=1'))).toBe(true) // 探针不是「刷新」
+    expect(renders).toBe(rendersAfterLoad) // ★ 零重渲染
+    expect(store.getSnapshot().refreshing).toBe(false) // ★ 也不该闪「正在更新」
+    unsubscribe()
+    store.dispose()
+  })
+
+  test('★ 代次变了 → 新载荷被采纳，随后又回到 204（不会反复取）', async () => {
+    const { host, urls, impl } = hostWithGen({ gen: 1, total: 100 })
+    const store = createUsageStore({ fetch: impl, intervalMs: 5, fullIntervalMs: 10_000_000, now: () => 1_000 })
+    const unsubscribe = store.subscribe(() => {})
+    await settle()
+    expect(store.getSnapshot().data?.totals.total).toBe(100)
+
+    host.gen = 2
+    host.total = 200
+    await Bun.sleep(30)
+    expect(store.getSnapshot().data?.totals.total).toBe(200)
+    expect(store.getSnapshot().data?.gen).toBe(2)
+
+    const afterUpdate = urls.length
+    await Bun.sleep(30)
+    // 后续探针都带 gen=2 并拿到 204：不再有新的**载荷**请求，但探针本身照发
+    expect(urls.slice(afterUpdate).every((u) => u.includes('gen=2'))).toBe(true)
+    unsubscribe()
+    store.dispose()
+  })
+
+  test('★ 后台标签页一个请求都不发，切回前台立刻补一次全量', async () => {
+    const vis = fakeVisibility(true)
+    const { urls, impl } = hostWithGen({ gen: 1, total: 100 })
+    const store = createUsageStore({
+      fetch: impl, intervalMs: 5, fullIntervalMs: 10_000_000, now: () => 1_000, visibility: vis.source,
+    })
+    const unsubscribe = store.subscribe(() => {})
+    await settle()
+    // 挂载时的首次取数照常发生：面板就在眼前，可见性还没被问过
+    const afterMount = urls.length
+    expect(afterMount).toBe(1)
+
+    await Bun.sleep(30)
+    expect(urls.length).toBe(afterMount) // 后台什么都不做
+
+    vis.set(false)
+    await settle()
+    // ★ 回前台立刻补一次**全量**取数（随后 intervalMs=5 的探针会紧随其后）
+    expect(urls.length).toBeGreaterThan(afterMount)
+    expect(urls[afterMount]).not.toContain('gen=')
+    unsubscribe()
+    store.dispose()
+  })
+
+  test('★ 兜底：到了全量周期就真查一次（代次没变也一样）', async () => {
+    const { urls, impl } = hostWithGen({ gen: 1, total: 100 })
+    let clock = 1_000
+    const store = createUsageStore({
+      fetch: impl, intervalMs: 5, fullIntervalMs: 50, now: () => clock,
+    })
+    const unsubscribe = store.subscribe(() => {})
+    await settle()
+
+    clock += 100 // 走完一个兜底周期
+    await Bun.sleep(20)
+    const fullLoads = urls.filter((u) => !u.includes('gen='))
+    expect(fullLoads.length).toBe(2) // 首次 + 兜底
+    unsubscribe()
+    store.dispose()
+  })
+
+  test('★ 载荷没有 gen（老宿主）→ 退回兜底周期，绝不 3 秒一次全量', async () => {
+    const body = payloadBody()
+    delete body['gen']
+    const urls: string[] = []
+    const store = createUsageStore({
+      fetch: async (input) => {
+        urls.push(input)
+        return { ok: true, status: 200, json: async () => body }
+      },
+      intervalMs: 5,
+      fullIntervalMs: 10_000_000,
+      now: () => 1_000,
+    })
+    const unsubscribe = store.subscribe(() => {})
+    await settle()
+    await Bun.sleep(30)
+    expect(urls.length).toBe(1) // 一个探针都没发
+    unsubscribe()
+    store.dispose()
+  })
+
+  test('探针失败静默：后台检查坏了也不该把面板变红', async () => {
+    let first = true
+    const urls: string[] = []
+    const store = createUsageStore({
+      fetch: async (input) => {
+        urls.push(input)
+        if (first) {
+          first = false
+          return { ok: true, status: 200, json: async () => payloadBody() }
+        }
+        return { ok: false, status: 500, json: async () => undefined }
+      },
+      intervalMs: 5,
+      fullIntervalMs: 10_000_000,
+      now: () => 1_000,
+    })
+    const unsubscribe = store.subscribe(() => {})
+    await settle()
+    await Bun.sleep(30)
+    expect(urls.length).toBeGreaterThan(1)
+    const state = store.getSnapshot()
+    expect(state.error).toBeUndefined() // 探针失败不冒泡
+    expect(state.data?.totals.total).toBe(2_392_609_771) // 也没有把已有数字擦掉
+    unsubscribe()
+    store.dispose()
+  })
+})
+
 describe('readUiResponse：不可信输入的边界', () => {
   test('缺 totals 一律判失败（宁可报格式错，也不要渲染成一片 0）', () => {
     const result = readUiResponse({ period: 'today', rangeLabel: '今天' })
@@ -372,6 +553,23 @@ describe('readUiResponse：不可信输入的边界', () => {
     const result = readUiResponse(payloadBody({ source: 'wat' }))
     expect(result.ok).toBe(true)
     if (result.ok) expect(result.payload.source).toBe('none')
+  })
+
+  test('★ gen：认数字，缺字段/脏值就当没有（浏览器半据此决定要不要发探针）', () => {
+    const ok = readUiResponse(payloadBody({ gen: 7 }))
+    expect(ok.ok && ok.payload.gen).toBe(7)
+
+    // 0 是**合法**代次（进程刚起来、还没采集到任何用量），不能与「没有」混为一谈
+    const zero = readUiResponse(payloadBody({ gen: 0 }))
+    expect(zero.ok && zero.payload.gen).toBe(0)
+
+    const missing = payloadBody()
+    delete missing['gen']
+    const none = readUiResponse(missing)
+    expect(none.ok && none.payload.gen).toBeUndefined()
+
+    const dirty = readUiResponse(payloadBody({ gen: 'nan' }))
+    expect(dirty.ok && dirty.payload.gen).toBeUndefined()
   })
 
   test('ok 载荷原样还原四个 token 列', () => {
