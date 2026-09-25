@@ -12,6 +12,8 @@ export function DateRangePicker(props: { range?: UiDateRange; active: boolean; d
   const [open, setOpen] = useState(false)
   const [draft, setDraft] = useState<DateRange>()
   const [months, setMonths] = useState(2)
+  const [leftMonth, setLeftMonth] = useState(new Date())
+  const [rightMonth, setRightMonth] = useState(new Date())
   const root = useRef<HTMLDivElement>(null)
   const trigger = useRef<HTMLButtonElement>(null)
   const id = useId()
@@ -39,6 +41,12 @@ export function DateRangePicker(props: { range?: UiDateRange; active: boolean; d
       onClick={() => {
         if (open) { close(); return }
         setDraft(props.range ? { from: parseDay(props.range.since), to: parseDay(props.range.until) } : undefined)
+        const start = props.range ? parseDay(props.range.since) : new Date()
+        const end = props.range ? parseDay(props.range.until) : start
+        setLeftMonth(new Date(start.getFullYear(), start.getMonth(), 1))
+        setRightMonth(end.getFullYear() === start.getFullYear() && end.getMonth() === start.getMonth()
+          ? new Date(start.getFullYear(), start.getMonth() + 1, 1)
+          : new Date(end.getFullYear(), end.getMonth(), 1))
         setOpen(true)
       }}>
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
@@ -53,13 +61,16 @@ export function DateRangePicker(props: { range?: UiDateRange; active: boolean; d
         <span aria-hidden="true">→</span>
         <div><span>结束日期</span><strong>{draft?.to ? dayKey(draft.to) : '请选择'}</strong></div>
       </div>
-      <div className="atr-calendar"><DayPicker mode="range" selected={draft} onSelect={setDraft}
+      {/* 两栏只共享选区，独立维护浏览月份，避免下拉年份和翻页互相牵动。 */}
+      <div className="atr-calendar">{Array.from({ length: months }, (_, index) => <DayPicker key={index}
+        mode="range" selected={draft} onSelect={setDraft}
         resetOnSelect required locale={zhCN} weekStartsOn={1} classNames={classNames}
-        numberOfMonths={months} defaultMonth={draft?.from ?? new Date()} autoFocus
+        month={index === 0 ? leftMonth : rightMonth} onMonthChange={index === 0 ? setLeftMonth : setRightMonth}
+        autoFocus={index === 0} aria-label={index === 0 ? '左侧日历' : '右侧日历'}
         captionLayout="dropdown" startMonth={new Date(2000, 0)} endMonth={new Date(new Date().getFullYear() + 1, 11)}
         fixedWeeks showOutsideDays
         labels={{ labelNext: () => '下个月', labelPrevious: () => '上个月', labelMonthDropdown: () => '月份', labelYearDropdown: () => '年份' }}
-      /></div>
+      />)}</div>
       <div className="atr-calendar-footer"><span>按本地时区，包含起止两天</span><div>
         <button type="button" className="atr-btn" onClick={close}>取消</button>
         <button type="button" className="atr-btn atr-primary" disabled={!validDateRange(range) || props.disabled}
