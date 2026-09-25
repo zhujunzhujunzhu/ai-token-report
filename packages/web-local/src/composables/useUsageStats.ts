@@ -21,7 +21,7 @@
  * 前端再算一遍必然会在跨天、跨时区时与服务端错开。
  */
 
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 
 import { fetchBreakdown, fetchOverview, fetchSeries, refreshCache } from '@/api/stats'
 import {
@@ -57,6 +57,8 @@ export function useUsageStats() {
   const rows = ref<LocalBreakdownRow[]>([])
 
   let requestSeq = 0
+  let pending = false
+  let refreshTimer: ReturnType<typeof setInterval> | undefined
 
   /**
    * 拉取一轮数据。
@@ -64,10 +66,15 @@ export function useUsageStats() {
    * 用递增的 `requestSeq` 丢弃过期响应：快速切换筛选时，
    * 先发的请求可能后到，直接写入会让页面回退到旧的筛选结果。
    */
-  async function load(): Promise<void> {
+  async function load(background = false): Promise<void> {
+    if (background && (pending || document.hidden)) return
     const seq = ++requestSeq
-    loading.value = true
-    error.value = null
+    pending = true
+    // 定时更新保留当前图表和表格，避免频繁闪回加载占位。
+    if (!background) {
+      loading.value = true
+      error.value = null
+    }
 
     const filter = { period: timeRange.value }
 
@@ -79,6 +86,7 @@ export function useUsageStats() {
 
     // 已经有更新的请求发出去了，这轮结果作废
     if (seq !== requestSeq) return
+    pending = false
 
     // 三个请求任一失败都提示 —— 部分成功还照常渲染会让人以为「数据就是少了」
     const failure = [overview, series, breakdown].find((r) => !r.ok)
@@ -89,6 +97,7 @@ export function useUsageStats() {
     }
 
     if (overview.ok && series.ok && breakdown.ok) {
+      error.value = null
       rows.value = breakdown.data.rows
       summary.value = buildUsageSummary(
         overview.data,
@@ -156,6 +165,13 @@ export function useUsageStats() {
 
   onMounted(() => {
     void load()
+    refreshTimer = setInterval(() => { void load(true) }, 3_000)
+  })
+
+  onUnmounted(() => {
+    clearInterval(refreshTimer)
+    // 卸载后不再应用尚未返回的响应。
+    requestSeq += 1
   })
 
   return {
