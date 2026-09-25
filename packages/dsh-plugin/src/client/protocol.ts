@@ -34,6 +34,56 @@ export const UI_STATS_PATH = '/api/tokenReport.stats'
 export const UI_SETTINGS_PATH = '/api/tokenReport.settings'
 
 /**
+ * 界面呈现配置的取数地址。
+ *
+ * ★ 为什么需要**单独一条**路由：DSH 的客户端插件条目**拿不到**插件的
+ *   `config`（`WebBootEntry` 只有 id/url/rev/inject/immediately/external，
+ *   壳层组装条目时也只传 `name`），所以部署 YAML 里的 `config.ui` 到不了页面。
+ *   位置这种「挂载前就要知道」的事实只能由宿主半经 HTTP 送过去。
+ *
+ * ⚠️ 必须挂在 `/api` 下（与 stats 同款）—— 那层前缀由 `dsh-client-connection`
+ *   加了 Host/Origin 栅栏与浏览器鉴权，裸挂等于把本机信息公开给能访问端口的人。
+ */
+export const UI_CONFIG_PATH = '/api/tokenReport.config'
+
+/**
+ * 用量面板的落点。
+ *
+ * - `dock` —— 输入框上方的用量条（**默认**，0.3.0 起只挂这一个）
+ * - `header` —— 会话标题栏右侧的胶囊（右上角）
+ * - `both` —— 两个都挂（**等价于 0.2.0 的外观**，老用户的兼容开关）
+ */
+export const UI_POSITIONS = ['dock', 'header', 'both'] as const
+
+export type UiPosition = (typeof UI_POSITIONS)[number]
+
+/**
+ * ★ 默认值只在这里定义一次。
+ *
+ * ⚠️ 不要把它抄到 `config.ts` 的 `DEFAULTS` 里：宿主半与浏览器半都必须认同
+ *   一个默认值 —— 浏览器半在**取不到配置**（404 / 超时 / 旧宿主）时用的就是它，
+ *   两边一旦各写一份，就会出现「配置路由打不通时面板跑到了另一个位置」。
+ */
+export const UI_DEFAULT_POSITION: UiPosition = 'dock'
+
+/** 配置通道的响应体。刻意只有位置一项：这是展示面，不是数据面。 */
+export interface UiConfigPayload {
+  position: UiPosition
+}
+
+/**
+ * 严格认值：**只认精确的 id，不认识就返回 `undefined`**。
+ *
+ * 返回 `undefined` 而不是回退默认值，是为了让调用方能区分
+ * 「没配」与「配错了」——后者要告警（宿主半）或回退（浏览器半）。
+ */
+export function parseUiPosition(value: unknown): UiPosition | undefined {
+  return typeof value === 'string' && (UI_POSITIONS as readonly string[]).includes(value)
+    ? (value as UiPosition)
+    : undefined
+}
+
+/**
  * 面板上可切换的周期。
  *
  * `id` 必须是 `core/range.ts` 的 `resolveRange()` 认得的具名周期 ——
@@ -166,6 +216,21 @@ function text(value: unknown, fallback: string): string {
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : undefined
+}
+
+/**
+ * 从不可信载荷里读出位置。
+ *
+ * ★ 与 `readUiResponse` 同一套思路：逐字段重建而不是 `as` 一转了事。
+ *   这里的**任何异常都必须回退默认值**，绝不抛错 —— 位置是展示面的事，
+ *   而「读配置时抛错」会让面板整个不挂载，那是最坏的结果。
+ *
+ * 失败路径（旧宿主 404、SPA 兜底 HTML、中间层塞了别的东西）一律得到
+ * `UI_DEFAULT_POSITION`，即与浏览器半不请求配置时的行为完全一致。
+ */
+export function readUiConfig(value: unknown): UiPosition {
+  const raw = record(value)
+  return (raw === undefined ? undefined : parseUiPosition(raw['position'])) ?? UI_DEFAULT_POSITION
 }
 
 function coerceSource(value: unknown): UiSource {

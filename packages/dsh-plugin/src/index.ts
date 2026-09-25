@@ -479,10 +479,13 @@ export function apply(
   rawConfig: RawConfig = {},
   deps: ApplyDeps = {},
 ): { status: PluginStatus; backend: TokenReportBackend | null } {
-  const config = resolveConfig(withSavedConnection(rawConfig))
+  const merged = withSavedConnection(rawConfig)
+  const config = resolveConfig(merged)
 
-  // 配置问题要在启动时说清楚，但**不能**因此让 DSH 起不来
-  for (const problem of validateConfig(config)) {
+  // 配置问题要在启动时说清楚，但**不能**因此让 DSH 起不来。
+  // ⚠️ 必须把 raw 一起传进去：`EffectiveConfig` 里的非法值已经被抹平，
+  //   光看它分不出「没配」与「配错了」（见 validateConfig 的注释）。
+  for (const problem of validateConfig(config, merged)) {
     ctx.logger.warn(`token-report: ${problem}`)
   }
 
@@ -525,6 +528,8 @@ export function apply(
   //   宿主没有 `connection`（headless / 非 web profile）时安静跳过。
   if (config.features.ui) {
     status.uiRoute = installUiRoute(ctx, statsContext, {
+      // ★ 位置只能这样交给页面：客户端插件条目拿不到插件 config
+      position: config.ui.position,
       settingsFetch: createSettingsHandler(config, {
         locked: !!rawConfig.user,
       }),
@@ -783,19 +788,27 @@ export {
   installUiRoute,
   createUiStatsProvider,
   makeStatsFetch,
+  makeConfigFetch,
   seriesFor,
   toUiPayload,
   type UiHostContext,
   type UiStatsProvider,
 } from './ui-bridge.js'
 export {
+  UI_CONFIG_PATH,
   UI_STATS_PATH,
   UI_SETTINGS_PATH,
   UI_PERIODS,
+  UI_POSITIONS,
+  UI_DEFAULT_POSITION,
   coercePeriod,
+  parseUiPosition,
+  readUiConfig,
   readUiResponse,
+  type UiConfigPayload,
   type UiPayload,
   type UiPeriod,
+  type UiPosition,
   type UiRouteInstall,
 } from './client/protocol.js'
 export { isSigned } from '@ai-token-report/shared'

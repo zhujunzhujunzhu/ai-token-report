@@ -121,12 +121,23 @@ check(
 
 // ── ③ 宿主半与浏览器半的路由路径必须一致 ────────────────────────────────
 console.log('\n── 双半一致性 ──')
-const host = (await import(join(pkgDir, 'lib', 'index.js'))) as { UI_STATS_PATH?: string }
+const host = (await import(join(pkgDir, 'lib', 'index.js'))) as {
+  UI_STATS_PATH?: string
+  UI_CONFIG_PATH?: string
+  UI_DEFAULT_POSITION?: string
+}
 check('宿主半导出了 UI_STATS_PATH', typeof host.UI_STATS_PATH === 'string', String(host.UI_STATS_PATH))
 check(
-  '★ 浏览器半里的路由字面量与宿主半一致（不一致 = 面板永远 404）',
+  '★ 浏览器半里的取数字面量与宿主半一致（不一致 = 面板永远 404）',
   typeof host.UI_STATS_PATH === 'string' && code.includes(JSON.stringify(host.UI_STATS_PATH)),
   `宿主 = ${String(host.UI_STATS_PATH)}`,
+)
+// ★ 位置通道同理：两边各写一个字面量，面板会静默地停在默认位置上
+check('宿主半导出了 UI_CONFIG_PATH', typeof host.UI_CONFIG_PATH === 'string', String(host.UI_CONFIG_PATH))
+check(
+  '★ 浏览器半里的配置路由字面量与宿主半一致（不一致 = 位置配置永远不生效）',
+  typeof host.UI_CONFIG_PATH === 'string' && code.includes(JSON.stringify(host.UI_CONFIG_PATH)),
+  `宿主 = ${String(host.UI_CONFIG_PATH)}`,
 )
 
 // ── ④ 真的执行一遍 ──────────────────────────────────────────────────────
@@ -183,7 +194,12 @@ const mod = entry?.factory((spec: string) => {
   if (spec === 'react-dom') return ReactDOM
   if (spec === 'react/jsx-runtime') return JSXRuntime
   return {}
-}) as { apply?: unknown; inject?: unknown } | undefined
+}) as {
+  apply?: unknown
+  inject?: unknown
+  DOCK_SLOT?: string
+  HEADER_SLOT?: string
+} | undefined
 
 check('factory 返回了模块对象', mod !== undefined)
 check('导出 apply()', typeof mod?.apply === 'function')
@@ -195,6 +211,14 @@ check(
 )
 check('require 只用了模块表内的模块', requiredButMissing.length === 0, requiredButMissing.join(', '))
 
+// slot 名字写错是**静默失效**（`slots.inject()` 永不回调），所以产物本身也要钉住这两个字面量
+check(
+  '★ 产物导出的两个 slot 名与 DSH 的 SlotMap 声明逐字相符',
+  mod?.DOCK_SLOT === 'conversation.input.dock' &&
+    mod?.HEADER_SLOT === 'conversation.session.header.utilities',
+  `${String(mod?.DOCK_SLOT)} / ${String(mod?.HEADER_SLOT)}`,
+)
+
 // ── ⑤ 装配（假客户端 ctx）──────────────────────────────────────────────
 console.log('\n── apply()（假客户端 ctx）──')
 
@@ -205,58 +229,121 @@ interface Recorded {
   face: () => Record<string, unknown>
 }
 
-const recorded: Recorded[] = []
-const fakeSlots = {
-  inject(_name: string, callback: () => unknown) {
-    callback()
-    return () => {}
-  },
-  register(options: { name: string; order?: number; id?: string; inject?: () => Record<string, unknown> }, _component: unknown) {
-    recorded.push({
-      slot: options.name,
-      ...(options.order !== undefined ? { order: options.order } : {}),
-      ...(options.id !== undefined ? { id: options.id } : {}),
-      face: options.inject ?? (() => ({})),
-    })
-    return () => {}
-  },
+function fakeSlots(recorded: Recorded[]): unknown {
+  return {
+    inject(_name: string, callback: () => unknown) {
+      callback()
+      return () => {}
+    },
+    register(
+      options: { name: string; order?: number; id?: string; inject?: () => Record<string, unknown> },
+      _component: unknown,
+    ) {
+      recorded.push({
+        slot: options.name,
+        ...(options.order !== undefined ? { order: options.order } : {}),
+        ...(options.id !== undefined ? { id: options.id } : {}),
+        face: options.inject ?? (() => ({})),
+      })
+      return () => {}
+    },
+  }
 }
 
-try {
-  ;(mod?.apply as (ctx: unknown) => void)({ slots: fakeSlots })
-} catch (err) {
-  check('apply() 不抛错', false, err instanceof Error ? err.stack : String(err))
+/**
+ * 假配置通道：位置来自宿主半的 `GET /api/tokenReport.config`。
+ *
+ * ★ 这一步必须**注入** fetch：产物里的 `apply()` 拿不到插件 config
+ *   （DSH 的客户端条目只带 name），位置只能问这条路由。
+ *   不注入就会去请求一个相对 URL，验的就成了「网络失败时的回退」。
+ */
+function configFetch(position: string | 'fail', urls: string[] = []) {
+  return async (input: string): Promise<{ ok: boolean; status: number; json(): Promise<unknown> }> => {
+    urls.push(input)
+    if (position === 'fail') throw new Error('Failed to fetch')
+    return { ok: true, status: 200, json: async () => ({ position }) }
+  }
 }
 
-check(
-  '注册到 conversation.input.dock（输入框上方的用量条）',
-  recorded.some((r) => r.slot === 'conversation.input.dock'),
-  recorded.map((r) => r.slot).join(', '),
-)
-check(
-  '注册到 conversation.session.header.utilities（标题栏徽章）',
-  recorded.some((r) => r.slot === 'conversation.session.header.utilities'),
-  recorded.map((r) => r.slot).join(', '),
-)
-check('两端都带格子 id', recorded.every((r) => r.id === 'token-report'))
+/** 用给定位置装配一次，返回注册结果、告警与 config 被请求到的地址。 */
+async function mount(position: string | 'fail'): Promise<{
+  recorded: Recorded[]
+  warnings: string[]
+  urls: string[]
+}> {
+  const recorded: Recorded[] = []
+  const warnings: string[] = []
+  const urls: string[] = []
+  try {
+    await (mod?.apply as (ctx: unknown, deps: unknown) => Promise<void>)(
+      { slots: fakeSlots(recorded), logger: { info: () => {}, warn: (m: string) => warnings.push(m) } },
+      { fetch: configFetch(position, urls) },
+    )
+  } catch (err) {
+    check('apply() 不抛错', false, err instanceof Error ? err.stack : String(err))
+  }
+  return { recorded, warnings, urls }
+}
 
-const stores = recorded.map((r) => r.face()['usage'])
+const slotsOf = (recorded: Recorded[]): string => recorded.map((r) => r.slot).join(', ')
+
+// ① 默认位置：宿主说 dock 就只挂用量条
+const dock = await mount('dock')
+check(
+  '★ 位置 = dock：只注册 conversation.input.dock（0.3.0 起的默认）',
+  dock.recorded.length === 1 && dock.recorded[0]?.slot === 'conversation.input.dock',
+  slotsOf(dock.recorded),
+)
+check(
+  '取位置的地址就是宿主半声明的那条路由',
+  dock.urls.length === 1 && dock.urls[0] === host.UI_CONFIG_PATH,
+  dock.urls.join(', '),
+)
+check('两个挂载点都带格子 id', dock.recorded.every((r) => r.id === 'token-report'))
+
+// ② 右上角：只挂标题栏胶囊
+const header = await mount('header')
+check(
+  '位置 = header：只注册 conversation.session.header.utilities（右上角）',
+  header.recorded.length === 1 && header.recorded[0]?.slot === 'conversation.session.header.utilities',
+  slotsOf(header.recorded),
+)
+
+// ③ 兼容外观：两个都挂，且共用同一个 store
+const both = await mount('both')
+check(
+  '位置 = both：两个挂载点都注册（等价于 0.2.0 的外观）',
+  both.recorded.length === 2 &&
+    both.recorded[0]?.slot === 'conversation.input.dock' &&
+    both.recorded[1]?.slot === 'conversation.session.header.utilities',
+  slotsOf(both.recorded),
+)
+const stores = both.recorded.map((r) => r.face()['usage'])
 check(
   '★ 两个面板共用同一个 store（取数只做一次）',
   stores.length === 2 && stores[0] === stores[1] && stores[0] !== undefined,
 )
 
-// 样式注入 + 幂等
+// ④ 取不到位置也要照常挂载 —— 这是最难排查的一类故障
+const failed = await mount('fail')
+check(
+  '★ 取位置失败（旧宿主 / 网络）→ 回退默认位置，但面板照常挂载',
+  failed.recorded.length === 1 && failed.recorded[0]?.slot === 'conversation.input.dock',
+  slotsOf(failed.recorded),
+)
+check(
+  '回退时打一条能指着动作的 warn',
+  failed.warnings.some((w) => w.includes('读取面板位置失败')),
+  failed.warnings.join(' | '),
+)
+
+// ⑤ 样式注入 + 幂等（HMR 会重新执行工厂函数）
 check('插入了 <style> 标签', styles.length === 1, `实际 ${styles.length} 个`)
 check(
   '样式里用的是 DSH 主题变量（不是写死的颜色）',
   styles[0]?.textContent.includes('--dsw-alias-') === true,
 )
-try {
-  ;(mod?.apply as (ctx: unknown) => void)({ slots: fakeSlots })
-} catch {
-  /* 第二次装配的重复注册由真框架按 priority 处理，这里只看样式 */
-}
+await mount('dock')
 check('重复装配不重复插样式（HMR 会重新执行工厂）', styles.length === 1, `实际 ${styles.length} 个`)
 
 console.log('\n' + '='.repeat(72))

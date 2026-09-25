@@ -14,11 +14,12 @@
 
 import { describe, expect, test } from 'bun:test'
 
-import { UI_STATS_PATH, type UiPayload, type UiResponse } from '../src/client/protocol.js'
+import { UI_CONFIG_PATH, UI_DEFAULT_POSITION, UI_STATS_PATH, type UiConfigPayload, type UiPayload, type UiResponse } from '../src/client/protocol.js'
 import {
   coercePeriod,
   createUiStatsProvider,
   installUiRoute,
+  makeConfigFetch,
   makeStatsFetch,
   seriesFor,
   toUiPayload,
@@ -268,6 +269,20 @@ describe('Fetch 处理器', () => {
   })
 })
 
+describe('配置通道（位置只能这样到页面）', () => {
+  test('回的就是那个位置，且带 no-store', async () => {
+    const res = await makeConfigFetch('header')(new Request(`http://127.0.0.1${UI_CONFIG_PATH}`))
+    expect(res.status).toBe(200)
+    expect(res.headers.get('cache-control')).toBe('no-store')
+    expect((await res.json()) as UiConfigPayload).toEqual({ position: 'header' })
+  })
+
+  test('★ 载荷里只有 position：这是展示面，不是数据面', async () => {
+    const body = (await (await makeConfigFetch('both')(new Request(`http://127.0.0.1${UI_CONFIG_PATH}`))).json()) as Record<string, unknown>
+    expect(Object.keys(body)).toEqual(['position'])
+  })
+})
+
 describe('★ 路由安装：拿不到 connection 必须安静跳过', () => {
   const stats = { config: {} as never, sessionsRoot: '/tmp/sessions', dbPath: '/tmp/db.sqlite' }
 
@@ -310,19 +325,42 @@ describe('★ 路由安装：拿不到 connection 必须安静跳过', () => {
     return { ctx, logs, injected }
   }
 
-  test('有 connection → 注册到 /api/tokenReport.stats 的 GET，并记一条 info', () => {
+  test('有 connection → 注册 stats 与 config 两条路由，并记一条 info', async () => {
     const registered: unknown[] = []
     const hosts = fakeHost({ connection: fakeConnection(registered) })
     expect(installUiRoute(hosts.ctx, stats)).toBe('registered')
-    expect(registered.length).toBe(1)
-    const route = registered[0] as { path: string; methods: string[]; requestBody: string }
-    expect(route.path).toBe(UI_STATS_PATH)
+    // 两条：取数（stats）+ 面板位置（config）。位置**不能**塞进 stats 载荷 ——
+    // 那个载荷首次返回要等冷建库，面板会先在错的位置出现再跳一下。
+    expect(registered.length).toBe(2)
+    const byPath = new Map((registered as { path: string }[]).map((r) => [r.path, r]))
+    const route = byPath.get(UI_STATS_PATH) as { path: string; methods: string[]; requestBody: string }
+    expect(route).toBeDefined()
     // ★ 必须挂在 /api 下：那层前缀由 dsh-client-connection 加了鉴权栅栏，
     //   裸挂在别的路径上等于把本机用量公开给能访问该端口的人。
     expect(route.path.startsWith('/api/')).toBe(true)
     expect(route.methods).toEqual(['GET'])
     expect(route.requestBody).toBe('buffered')
     expect(hosts.logs.some((l) => l.includes('UI 用量面板数据通道已挂载'))).toBe(true)
+
+    const configRoute = byPath.get(UI_CONFIG_PATH) as { path: string; methods: string[]; fetch: (r: Request) => Promise<Response> }
+    expect(configRoute).toBeDefined()
+    expect(configRoute.path.startsWith('/api/')).toBe(true)
+    expect(configRoute.methods).toEqual(['GET'])
+    // 缺省位置与浏览器半的回退值是**同一个常量**，两边不会各跑各的
+    const body = (await (await configRoute.fetch(new Request(`http://127.0.0.1${UI_CONFIG_PATH}`))).json()) as UiConfigPayload
+    expect(body.position).toBe(UI_DEFAULT_POSITION)
+  })
+
+  test('配了位置就照配的答，并在启动日志里说出来（排障第一现场）', async () => {
+    const registered: unknown[] = []
+    const hosts = fakeHost({ connection: fakeConnection(registered) })
+    expect(installUiRoute(hosts.ctx, stats, { position: 'both' })).toBe('registered')
+    const configRoute = (registered as { path: string; fetch: (r: Request) => Promise<Response> }[])
+      .find((r) => r.path === UI_CONFIG_PATH)
+    expect(configRoute).toBeDefined()
+    const body = (await (await configRoute!.fetch(new Request(`http://127.0.0.1${UI_CONFIG_PATH}`))).json()) as UiConfigPayload
+    expect(body.position).toBe('both')
+    expect(hosts.logs.some((l) => l.includes('面板位置：both'))).toBe(true)
   })
 
   test('没有 connection 但宿主可注入 → pending，且挂上了等待', () => {
@@ -351,7 +389,8 @@ describe('★ 路由安装：拿不到 connection 必须安静跳过', () => {
     const ready = { ...base, get: () => fakeConnection(registered) } as unknown as UiHostContext
     injectCb?.(ready)
     injectCb?.(ready) // 回调再来一次也不能重复注册
-    expect(registered.length).toBe(1)
+    // stats + config 各一条；重复注册同一条路径会让 webServer 直接抛错
+    expect(registered.length).toBe(2)
   })
 
   test('headless（没有 inject，也没有 connection）→ unavailable，且不抛错', () => {

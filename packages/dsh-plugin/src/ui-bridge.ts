@@ -37,16 +37,20 @@
 
 import { queryUsage, type StatsContext, type UsageQuery, type UsageResult } from './stats.js'
 import {
+  UI_CONFIG_PATH,
+  UI_DEFAULT_POSITION,
   UI_STATS_PATH,
   UI_SETTINGS_PATH,
   UI_SERIES_POINTS,
   coercePeriod,
   validDateRange,
+  type UiConfigPayload,
   type UiDateRange,
   type UiErrorPayload,
   type UiGroupRow,
   type UiPayload,
   type UiPeriod,
+  type UiPosition,
   type UiResponse,
   type UiRouteInstall,
   type UiSeriesPoint,
@@ -220,11 +224,26 @@ export function createUiStatsProvider(options: {
 }
 
 /** 响应统一带上 `no-store`：面板自己管缓存，中间层别插一脚。 */
-function jsonResponse(body: UiResponse): Response {
+function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), {
     status: 200,
     headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
   })
+}
+
+/**
+ * 把「界面呈现配置」包成一条 Fetch 路由处理器。
+ *
+ * ★ 这是宿主半**唯一需要主动告诉**浏览器半的部署事实。DSH 的客户端插件条目
+ *   拿不到插件的 `config`（`WebBootEntry` 里没有 config 字段，壳层组装条目时
+ *   只传 `name`），所以 `config.ui.position` 到不了页面，只能走这条 HTTP。
+ *
+ * 它不查库、不读文件 —— 响应就是一个常量对象，因此**不会给面板启动加任何延迟**。
+ * 把位置塞进 `/api/tokenReport.stats` 是行不通的：那个载荷首次返回要等冷建库
+ * （可能十几秒），面板会先在错的位置出现、再跳一下。
+ */
+export function makeConfigFetch(position: UiPosition): (request: Request) => Promise<Response> {
+  return async () => jsonResponse({ position } satisfies UiConfigPayload)
 }
 
 /**
@@ -288,7 +307,17 @@ export interface UiHostContext {
 export function installUiRoute(
   ctx: UiHostContext,
   stats: StatsContext,
-  options: { ttlMs?: number; settingsFetch?: (request: Request) => Promise<Response> } = {},
+  options: {
+    ttlMs?: number
+    settingsFetch?: (request: Request) => Promise<Response>
+    /**
+     * 面板落点，随 `/api/tokenReport.config` 交给浏览器半。
+     *
+     * 缺省用 `UI_DEFAULT_POSITION` —— 与浏览器半在取不到配置时的回退值**同一个常量**，
+     * 两边不会各跑各的。
+     */
+    position?: UiPosition
+  } = {},
 ): UiRouteInstall {
   const provider = createUiStatsProvider({
     // ★ 与 CLI `dsh-token` / `token_usage` 工具调用的是**同一个函数**，
@@ -297,6 +326,8 @@ export function installUiRoute(
     ...(options.ttlMs !== undefined ? { ttlMs: options.ttlMs } : {}),
   })
   const fetchStats = makeStatsFetch(provider)
+  const position = options.position ?? UI_DEFAULT_POSITION
+  const fetchConfig = makeConfigFetch(position)
 
   // 只会真正注册一次：ctx.inject 的回调在依赖出现时机上可能被调用多次，
   // 而 webServer/connection 的路由表对重复路径是**直接抛错**的。
@@ -315,12 +346,19 @@ export function installUiRoute(
         requestBody: 'buffered',
         fetch: fetchStats,
       })
+      // ★ 位置必须走这条独立路由：客户端插件条目拿不到插件 config（见文件头注释）
+      const disposeConfig = connection.fetch.register({
+        path: UI_CONFIG_PATH, methods: ['GET'], requestBody: 'buffered', fetch: fetchConfig,
+      })
       const disposeSettings = options.settingsFetch ? connection.fetch.register({
         path: UI_SETTINGS_PATH, methods: ['GET', 'POST'], requestBody: 'buffered', fetch: options.settingsFetch,
       }) : undefined
-      host.logger.info(`token-report: UI 用量面板数据通道已挂载 → GET ${UI_STATS_PATH}`)
+      host.logger.info(
+        `token-report: UI 用量面板数据通道已挂载 → GET ${UI_STATS_PATH}（面板位置：${position}）`,
+      )
       return () => {
         void dispose()
+        void disposeConfig()
         void disposeSettings?.()
       }
     })

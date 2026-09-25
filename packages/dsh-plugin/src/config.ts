@@ -24,6 +24,12 @@
  */
 
 import { isSigned, type Identity } from '@ai-token-report/shared'
+import {
+  parseUiPosition,
+  UI_DEFAULT_POSITION,
+  UI_POSITIONS,
+  type UiPosition,
+} from './client/protocol.js'
 
 /** 生效配置（所有可选字段都已填好默认值）。 */
 export interface EffectiveConfig {
@@ -83,6 +89,21 @@ export interface EffectiveConfig {
    * 默认开启。运行时驱动由 core/db 选择，库不可用时降级直扫并显示原因。
    */
   localDb: boolean
+  /**
+   * 界面**呈现**配置 —— 只影响长什么样，不影响上报 / 工具 / 服务。
+   *
+   * 与 `features.ui` 分开：`features` 管「装不装配」，这里管「装配到哪里」。
+   * 关掉 `features.ui` 时整块都被忽略。
+   */
+  ui: {
+    /**
+     * 用量面板的落点（`dock` / `header` / `both`）。
+     *
+     * ⚠️ 这一项**必须经 HTTP 送到浏览器半**才能生效：DSH 的客户端插件条目
+     *   拿不到插件 `config`（见 `client/protocol.ts` 的 `UI_CONFIG_PATH` 注释）。
+     */
+    position: UiPosition
+  }
   /** 固定身份（IT 统一部署场景）。留空则读本机身份文件。 */
   user?: { name: string; token: string; dept?: string }
   /** DSH home，一般不需要手动指定。 */
@@ -95,6 +116,13 @@ export const DEFAULT_ENDPOINT = 'http://127.0.0.1:8787/api/v1/token-usage'
 /** 默认插件名。 */
 export const DEFAULT_NAME = 'dsh-token-report'
 
+/**
+ * 代码默认值。
+ *
+ * ⚠️ `ui.position` 的默认值**不在这里**，而在 `client/protocol.ts` 的
+ *   `UI_DEFAULT_POSITION` —— 浏览器半在取不到配置时用的也是那一个常量。
+ *   抄一份到这里就会有两个默认值，配置通道打不通时两边会各跑各的。
+ */
 export const DEFAULTS = {
   batch: {
     maxRecords: 50,
@@ -145,6 +173,7 @@ export const ENV = {
   outboxDir: 'DSH_TOKEN_REPORT_OUTBOX_DIR',
   outboxMaxBytes: 'DSH_TOKEN_REPORT_OUTBOX_MAX_BYTES',
   localDb: 'DSH_TOKEN_REPORT_LOCAL_DB',
+  uiPosition: 'DSH_TOKEN_REPORT_UI_POSITION',
   userName: 'DSH_TOKEN_REPORT_USER_NAME',
   userToken: 'DSH_TOKEN_REPORT_USER_TOKEN',
   dept: 'DSH_TOKEN_REPORT_DEPT',
@@ -172,6 +201,10 @@ export interface RawConfig {
     ui?: boolean
   }
   localDb?: boolean
+  ui?: {
+    /** 面板落点。**字符串**而不是联合类型：YAML 里写错是常态，要能收下再回退。 */
+    position?: string
+  }
   user?: { name?: string; token?: string; dept?: string }
   dshHome?: string
 }
@@ -179,6 +212,17 @@ export interface RawConfig {
 /** 正数校验：非法值**回退默认**而不是抛错 —— 一个写错的数字不该让整个 DSH 起不来。 */
 function positive(v: number | undefined, fallback: number): number {
   return v !== undefined && Number.isFinite(v) && v > 0 ? v : fallback
+}
+
+/**
+ * 「位置」这一项到底写了什么（config > 环境变量），**还没收窄**。
+ *
+ * 抽成函数是为了让 `resolveConfig` 与 `validateConfig` 用**同一个**取值口径：
+ * 两处各写一遍的话，就会出现「解析读的是环境变量、告警读的是 config」这种鬼事。
+ * 空白字符串仍然按「没配」处理（与其它字段一致）。
+ */
+function rawUiPosition(raw: RawConfig): string | undefined {
+  return raw.ui?.position?.trim() || envString(ENV.uiPosition)
 }
 
 /**
@@ -232,6 +276,11 @@ export function resolveConfig(raw: RawConfig = {}): EffectiveConfig {
     },
     // ⚠️ 默认 false：宿主是 Node 时 `bun:sqlite` 不存在，开了会直接起不来
     localDb: raw.localDb ?? envBool(ENV.localDb) ?? true,
+    ui: {
+      // 位置写错**回退默认值**而不是抛错；告警在 validateConfig 里（写错的配置
+      // 既不该让 DSH 起不来，也绝不该让面板消失）
+      position: parseUiPosition(rawUiPosition(raw)) ?? UI_DEFAULT_POSITION,
+    },
     ...(user ? { user } : {}),
     ...(raw.dshHome ? { dshHome: raw.dshHome } : {}),
   }
@@ -258,8 +307,13 @@ export function claimedUserId(config: EffectiveConfig, identity: Identity | null
  *
  * 刻意返回清单而不是抛错：上报没配好不该让 DSH 起不来，
  * 但一定要在启动时把「缺什么、去哪儿配」讲清楚。
+ *
+ * @param config - 已归一化的生效配置。
+ * @param raw - 原始 config。**可选的第二参数**，只有需要报「写了但写错了」的项
+ *   （目前是 `ui.position`）时才用得上 —— 归一化已经把非法值抹平了，
+ *   光看 `EffectiveConfig` 分不出「没配」与「配错了」。
  */
-export function validateConfig(config: EffectiveConfig): string[] {
+export function validateConfig(config: EffectiveConfig, raw: RawConfig = {}): string[] {
   const problems: string[] = []
   if (!config.appKey) {
     problems.push(
@@ -269,6 +323,15 @@ export function validateConfig(config: EffectiveConfig): string[] {
   }
   if (!/^https?:\/\//i.test(config.endpoint)) {
     problems.push(`endpoint 必须是 http(s) 地址，当前为 "${config.endpoint}"`)
+  }
+  // 位置写错不影响任何功能，但界面会出现在「另一个地方」——必须说出来，
+  // 否则用户只会看到「我配了 header，徽章没出现，用量条还在」。
+  const rawPosition = rawUiPosition(raw)
+  if (rawPosition !== undefined && parseUiPosition(rawPosition) === undefined) {
+    problems.push(
+      `ui.position 写了不认识的值 "${rawPosition}" —— 已回退为 ${UI_DEFAULT_POSITION}。` +
+        ` 可选值：${UI_POSITIONS.join(' / ')}`,
+    )
   }
   return problems
 }

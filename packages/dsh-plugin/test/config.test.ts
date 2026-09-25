@@ -164,6 +164,55 @@ describe('配置自检', () => {
   })
 })
 
+describe('★ 界面位置（ui.position）', () => {
+  test('默认 dock —— 0.3.0 起面板默认只出现在输入框上方', () => {
+    expect(resolveConfig({}).ui.position).toBe('dock')
+  })
+
+  test('三种取值都认', () => {
+    for (const position of ['dock', 'header', 'both'] as const) {
+      expect(resolveConfig({ ui: { position } }).ui.position).toBe(position)
+    }
+  })
+
+  test('config 覆盖环境变量', () => {
+    setEnv(ENV.uiPosition, 'header')
+    expect(resolveConfig({ ui: { position: 'both' } }).ui.position).toBe('both')
+  })
+
+  test('环境变量覆盖默认值', () => {
+    setEnv(ENV.uiPosition, 'header')
+    expect(resolveConfig({}).ui.position).toBe('header')
+  })
+
+  test('★ 写错的值回退默认值：既不让 DSH 起不来，也不让面板消失', () => {
+    for (const bad of ['right', 'up', 'DOCK', 'dock,header', '  ', '上方']) {
+      // 空白串按「没配」处理，其余按「配错了」处理 —— 两条路都落到默认值
+      expect(resolveConfig({ ui: { position: bad } }).ui.position).toBe('dock')
+      setEnv(ENV.uiPosition, bad)
+      expect(resolveConfig({}).ui.position).toBe('dock')
+    }
+  })
+
+  test('● config 里写了非法值时 validateConfig 要指出来，并列出可选值', () => {
+    // appKey 配齐，这样清单里只剩「位置写错」这一条
+    const raw = { appKey: 'k', ui: { position: 'right' } }
+    const problems = validateConfig(resolveConfig(raw), raw)
+    expect(problems.length).toBe(1)
+    expect(problems[0]).toContain('right')
+    expect(problems[0]).toContain('dock / header / both')
+  })
+
+  test('环境变量里写了非法值同样要指出来', () => {
+    setEnv(ENV.uiPosition, '右上角')
+    expect(validateConfig(resolveConfig({}), {}).some((p) => p.includes('右上角'))).toBe(true)
+  })
+
+  test('没配位置时没有任何告警（默认值不是「问题」）', () => {
+    expect(validateConfig(resolveConfig({ appKey: 'k' }), { appKey: 'k' })).toEqual([])
+  })
+})
+
 describe('包含对话内容这件事没有开关', () => {
   test('★ 配置与类型里都不存在能把内容带出去的字段', () => {
     const c = resolveConfig({}) as unknown as Record<string, unknown>
