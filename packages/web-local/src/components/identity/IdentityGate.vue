@@ -30,18 +30,23 @@ const props = withDefaults(
     hint?: string | null
     /** 是否允许跳过（只看本机统计，不上报） */
     allowSkip?: boolean
+    /** 配置页复用校验流程，取消时保留原署名。 */
+    settings?: boolean
+    initialName?: string
+    initialDept?: string | null
   }>(),
-  { hint: null, allowSkip: true },
+  { hint: null, allowSkip: true, settings: false, initialName: '', initialDept: null },
 )
 
 const emit = defineEmits<{
   /** 署名完成（skip 时 name 为空串） */
   (e: 'signed', payload: { name: string; dept?: string }): void
+  (e: 'cancel'): void
 }>()
 
-const name = ref('')
+const name = ref(props.initialName)
 const token = ref('')
-const dept = ref('')
+const dept = ref(props.initialDept ?? '')
 const submitting = ref(false)
 const error = ref<string | null>(null)
 
@@ -93,9 +98,12 @@ function onSkip(): void {
   <div class="signin">
     <div class="signin__card">
       <header class="signin__head">
-        <h1 class="signin__title">署名后开始统计</h1>
+        <h1 class="signin__title">{{ props.settings ? '配置' : '署名后开始统计' }}</h1>
         <p class="signin__sub">
-          首次使用需要填写你的姓名与管理员发放的 token，用于把用量归属到部门统计。
+          设置管理员发放的 Key，用于验证身份并将用量归属到部门统计。
+        </p>
+        <p v-if="props.settings && props.initialName" class="signin__hint">
+          当前已配置：{{ props.initialName }}。更新 Key 时请重新输入，已保存的 Key 不会回显。
         </p>
       </header>
 
@@ -113,16 +121,16 @@ function onSkip(): void {
         </label>
 
         <label class="field">
-          <span class="field__label">Token<em class="field__req">必填</em></span>
+          <span class="field__label">Key<em class="field__req">必填</em></span>
           <input
             v-model="token"
             class="field__input"
             type="password"
-            placeholder="管理员发放的 token"
+            placeholder="请输入管理员发放的 Key"
             autocomplete="off"
             maxlength="256"
           />
-          <span class="field__help">token 是身份凭证，提交时会向部门服务端校验</span>
+          <span class="field__help">Key 是身份凭证，保存前会向部门服务端校验</span>
         </label>
 
         <label class="field">
@@ -141,27 +149,27 @@ function onSkip(): void {
 
         <div class="signin__actions">
           <UiButton variant="primary" :disabled="!canSubmit" @click="onSubmit">
-            {{ submitting ? '校验中…' : '保存并开始统计' }}
+            {{ submitting ? '校验中…' : props.settings ? '验证并保存' : '保存并开始统计' }}
           </UiButton>
           <button
-            v-if="props.allowSkip"
+            v-if="props.allowSkip || props.settings"
             type="button"
             class="signin__skip"
             :disabled="submitting"
-            @click="onSkip"
+            @click="props.settings ? emit('cancel') : onSkip()"
           >
-            暂不填写，只看本机统计
+            {{ props.settings ? '返回我的用量' : '暂不填写，只看本机统计' }}
           </button>
         </div>
       </form>
 
       <footer class="signin__foot">
         <div class="notice">
-          <strong class="notice__title">未填写前不会做任何事</strong>
+          <strong class="notice__title">数据与隐私</strong>
           <ul class="notice__list">
-            <li>不采集、也不向任何服务端发送数据</li>
+            <li>未配置身份时不采集，也不向服务端上报数据</li>
             <li>只看 token 数值与模型名，<b>不采集对话内容</b></li>
-            <li>姓名与 token 保存在本机，随时可清除</li>
+            <li>姓名与 Key 保存在本机</li>
           </ul>
         </div>
         <p v-if="props.hint" class="signin__hint">{{ props.hint }}</p>

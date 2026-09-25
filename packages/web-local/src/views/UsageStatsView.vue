@@ -10,6 +10,9 @@ import UsageDetailTable from '@/components/usage/UsageDetailTable.vue'
 import UsageFilterBar from '@/components/usage/UsageFilterBar.vue'
 import UsageMetricGrid from '@/components/usage/UsageMetricGrid.vue'
 import { useUsageStats } from '@/composables/useUsageStats'
+import UiButton from '@/components/ui/UiButton.vue'
+
+defineEmits<{ (e: 'configure'): void }>()
 
 const {
   loading,
@@ -36,13 +39,7 @@ function totalOfRows(): number {
   <div class="usage-page">
     <header class="usage-page__header">
       <h1>我的用量</h1>
-      <p>
-        直接读取本机会话日志，展示计费总量、缓存命中率与调用次数明细。
-        不经过任何服务端，也不采集对话内容。
-      </p>
-      <p class="usage-page__freshness">
-        数据 {{ summary.freshness }}
-      </p>
+      <UiButton @click="$emit('configure')">配置</UiButton>
     </header>
 
     <UsageFilterBar
@@ -101,22 +98,18 @@ function totalOfRows(): number {
   gap: 20px;
 }
 
+.usage-page__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
 .usage-page__header h1 {
   margin: 0 0 6px;
   font-size: 20px;
   font-weight: 600;
   letter-spacing: -0.01em;
-}
-
-.usage-page__header p {
-  margin: 0;
-  font-size: 13px;
-  color: var(--c-text-tertiary);
-}
-
-.usage-page__freshness {
-  margin-top: 6px !important;
-  font-size: 12px !important;
 }
 
 .usage-page__error {

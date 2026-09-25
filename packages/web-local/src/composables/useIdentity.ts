@@ -9,7 +9,7 @@
  *    ├─ GET /api/local/identity
  *    │     │
  *    │     ├─ signed=true  → 直接进统计页
- *    │     └─ signed=false → 显示引导页
+ *    │     └─ signed=false → 直接看本机统计，主动点击署名才显示引导页
  *    │            │
  *    │            ├─ 提交署名 → 服务端校验 token → 通过则进统计页
  *    │            └─ 跳过     → 进统计页，但**不采集也不上报**
@@ -40,8 +40,8 @@ export type GateState =
 export function useIdentity() {
   const state = ref<GateState>({ kind: 'loading' })
 
-  /** 用户本次会话是否已跳过署名（不持久化，下次打开还会问） */
-  let skippedThisSession = false
+  /** 默认直接查看本机统计，署名仅在用户主动打开时展示。 */
+  let skippedThisSession = true
 
   async function load(): Promise<void> {
     const res = await fetchIdentity()

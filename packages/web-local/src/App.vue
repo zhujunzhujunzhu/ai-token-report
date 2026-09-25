@@ -7,7 +7,7 @@
  * 状态分派见 `useIdentity.ts`。这里只做展示，
  * 业务逻辑都在 composable 里，便于单独测试。
  */
-import { computed } from 'vue'
+import { ref } from 'vue'
 
 import IdentityGate from '@/components/identity/IdentityGate.vue'
 import UiButton from '@/components/ui/UiButton.vue'
@@ -16,14 +16,12 @@ import UsageStatsView from '@/views/UsageStatsView.vue'
 
 const { state, onSigned, refresh } = useIdentity()
 
-/** 顶部提示条文案。未署名时必须明确告知「不上报」。 */
-const banner = computed(() => {
-  if (state.value.kind === 'ready') return `已署名：${state.value.name}`
-  if (state.value.kind === 'skipped') return '未署名 —— 当前不会采集也不会向服务端上报'
-  return null
-})
+const configuring = ref(false)
 
-const bannerTone = computed(() => (state.value.kind === 'ready' ? 'ok' : 'warn'))
+function saveSettings(payload: { name: string; dept?: string }): void {
+  onSigned(payload)
+  configuring.value = false
+}
 </script>
 
 <template>
@@ -46,13 +44,15 @@ const bannerTone = computed(() => (state.value.kind === 'ready' ? 'ok' : 'warn')
 
   <!-- 已署名 / 已跳过：统计页 -->
   <div v-else class="shell">
-    <div class="shell__banner" :class="`shell__banner--${bannerTone}`">
-      <span>{{ banner }}</span>
-      <button v-if="state.kind === 'skipped'" type="button" class="shell__link" @click="refresh">
-        现在去署名
-      </button>
-    </div>
-    <UsageStatsView />
+    <IdentityGate
+      v-if="configuring"
+      settings
+      :initial-name="state.kind === 'ready' ? state.name : ''"
+      :initial-dept="state.kind === 'ready' ? state.dept : null"
+      @signed="saveSettings"
+      @cancel="configuring = false"
+    />
+    <UsageStatsView v-show="!configuring" @configure="configuring = true" />
   </div>
 </template>
 
@@ -98,32 +98,4 @@ const bannerTone = computed(() => (state.value.kind === 'ready' ? 'ok' : 'warn')
   color: var(--c-text-secondary, #6b7280);
 }
 
-.shell__banner {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 8px 24px;
-  font-size: 12px;
-  border-bottom: 1px solid var(--c-border, #e8eaed);
-}
-
-.shell__banner--ok {
-  color: #067647;
-  background-color: #ecfdf3;
-}
-
-.shell__banner--warn {
-  color: #b54708;
-  background-color: #fffaeb;
-}
-
-.shell__link {
-  padding: 0;
-  font-size: 12px;
-  color: inherit;
-  background: none;
-  border: none;
-  text-decoration: underline;
-  text-underline-offset: 3px;
-}
 </style>
