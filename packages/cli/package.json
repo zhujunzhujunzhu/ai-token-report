@@ -19,6 +19,8 @@
     "start": "bun run src/cli.ts",
     "web": "bun run src/cli.ts --web",
     "report": "bun run src/cli.ts report",
+    "build:npm": "bun run scripts/build-npm.ts",
+    "verify:npm": "bun run verify/verify-npm-package.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "bun test"
   },

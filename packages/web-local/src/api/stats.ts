@@ -3,7 +3,7 @@
  *
  * ★ 这些接口由本地服务提供，数据来自**本地 SQLite 增量库**
  *   （由会话日志增量派生，库不可用时服务端自动降级直扫日志）。
- *   页面上的数字与 `dsh-token-stats --period X` 完全一致
+ *   页面上的数字与 `dsh-token-report --period X` 完全一致
  *   （同一数据源、同一套口径公式）。
  *
  * 时间窗用 `period` 具名周期（`today` / `week` / `last7d` / …），

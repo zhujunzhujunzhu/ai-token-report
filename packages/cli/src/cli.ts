@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * dsh-token-stats —— DSH token 用量统计 CLI。
+ * dsh-token-report —— DSH token 用量统计 CLI。
  *
  * 数据源：`$DSH_HOME/sessions/**\/session*.jsonl.zstd` 中的 `assistant/message` 事件。
  * 只有该事件的 `data.usage` 是 provider 真实上报的计费级数据。
@@ -47,12 +47,12 @@ import { openStats, resetDb } from '@ai-token-report/core/db'
 import { derive, emptyDiagnostics, type UsageRecord } from '@ai-token-report/core'
 
 const HELP = `
-dsh-token-stats —— DSH token 用量统计
+dsh-token-report —— DSH token 用量统计
 
 用法:
-  dsh-token-stats [选项]
-  dsh-token-stats web [选项]          起本地页面（内嵌服务 + 自动开浏览器）
-  dsh-token-stats report [选项]      增量上报（每 10 分钟由计划任务调用）
+  dsh-token-report [选项]
+  dsh-token-report web [选项]          起本地页面（内嵌服务 + 自动开浏览器）
+  dsh-token-report report [选项]      增量上报（每 10 分钟由计划任务调用）
 
 ── 统计（默认）──────────────────────────────────────────
 数据维度:
@@ -99,7 +99,7 @@ dsh-token-stats —— DSH token 用量统计
 
   首次启动会全量建库（约 15 秒，需解析历史日志），之后都是毫秒级。
 
-  服务对象是「我自己」：页面上看到的数与你执行 dsh-token-stats --period X
+  服务对象是「我自己」：页面上看到的数与你执行 dsh-token-report --period X
   完全一致 —— 两者走同一个数据源与同一套口径公式。
 
   --port <n>       监听端口 (默认 8787，被占用自动 +1)
@@ -128,22 +128,22 @@ dsh-token-stats —— DSH token 用量统计
   -h, --help       显示帮助
 
 示例:
-  dsh-token-stats --period today                # 今天
-  dsh-token-stats --period week --series day    # 本周 + 每日趋势
-  dsh-token-stats --provider dashscope --period month   # 数字集团本月
-  dsh-token-stats --by provider --cross         # 全量按厂商
-  dsh-token-stats --list-providers              # 先摸清有哪些厂商
-  dsh-token-stats --format csv --out report.csv
-  dsh-token-stats --period today --no-db        # 直扫日志（与库结果对照）
+  dsh-token-report --period today                # 今天
+  dsh-token-report --period week --series day    # 本周 + 每日趋势
+  dsh-token-report --provider dashscope --period month   # 数字集团本月
+  dsh-token-report --by provider --cross         # 全量按厂商
+  dsh-token-report --list-providers              # 先摸清有哪些厂商
+  dsh-token-report --format csv --out report.csv
+  dsh-token-report --period today --no-db        # 直扫日志（与库结果对照）
 
-  dsh-token-stats web                           # 本地页面（推荐入口）
-  dsh-token-stats web --no-open --port 8899     # 指定端口、不开浏览器
+  dsh-token-report web                           # 本地页面（推荐入口）
+  dsh-token-report web --no-open --port 8899     # 指定端口、不开浏览器
 
-  dsh-token-stats report --dry-run              # 看这一轮会发什么
-  dsh-token-stats report --no-save --dry-run    # 只看不改
-  dsh-token-stats report --out-file out.jsonl   # 落本地文件演练
-  dsh-token-stats report --endpoint https://portal/api/v1/token-usage --token $env:DSH_REPORT_TOKEN
-  dsh-token-stats report --reset                # 清空水位线
+  dsh-token-report report --dry-run              # 看这一轮会发什么
+  dsh-token-report report --no-save --dry-run    # 只看不改
+  dsh-token-report report --out-file out.jsonl   # 落本地文件演练
+  dsh-token-report report --endpoint https://portal/api/v1/token-usage --token $env:DSH_REPORT_TOKEN
+  dsh-token-report report --reset                # 清空水位线
 `
 
 interface CliOptions {
@@ -249,7 +249,7 @@ function parseArgs(argv: string[]): CliOptions | null {
   let byExplicit = false
 
   // 子命令：第一个非 flag 的 token 若是 `report` / `web`，后续按该子命令解析。
-  // 保持 `dsh-token-stats [选项]` 的既有用法完全不变。
+  // 保持 `dsh-token-report [选项]` 的既有用法完全不变。
   // 同时兼容 `--web` 这种历史写法（package.json 的 web 脚本就是这么调的）。
   if (argv[0] === 'report') {
     opts.command = 'report'
@@ -966,13 +966,29 @@ async function runWebCommand(opts: CliOptions, paths: ResolvedPaths): Promise<nu
   return 0
 }
 
-/** 候选的 web-local 构建产物目录（相对本文件与仓库根各算一份）。 */
+/**
+ * 候选的 web-local 构建产物目录。
+ *
+ * 需要同时覆盖两种布局，因为同一份代码有两种跑法：
+ *
+ * | 场景 | 本文件位置 | 页面资源位置 |
+ * |---|---|---|
+ * | 仓库内（源码/开发） | `packages/cli/src/cli.ts` | `packages/web-local/dist` |
+ * | **npm 安装后**（发布形态） | `<pkg>/cli.js` | `<pkg>/web-local` |
+ *
+ * ★ 发布形态把页面资源**内嵌在包里**（`build-npm.ts` 会把
+ *   `packages/web-local/dist` 整个拷进产物目录）。这样 `npm i -g` 之后
+ *   `dsh-token-report web` 不需要用户再去 clone 仓库构建前端 ——
+ *   否则「本地页面」这个子命令对 npm 用户就是不可用的。
+ */
 function candidateDistDirs(): string[] {
   const here = dirname(fileURLToPath(import.meta.url))
   return [
-    // packages/cli/src/ → packages/web-local/dist
+    // npm 包内：<pkg>/cli.js → <pkg>/web-local
+    resolve(here, 'web-local'),
+    // 仓库内：packages/cli/src/ → packages/web-local/dist
     resolve(here, '..', '..', 'web-local', 'dist'),
-    // 以 cwd 为仓库根时
+    // 以 cwd 为仓库根时（手工在仓库根执行）
     resolve(process.cwd(), 'packages', 'web-local', 'dist'),
   ]
 }
@@ -1042,7 +1058,7 @@ async function runReportCommand(opts: CliOptions, sessionsRoot: string): Promise
     return 0
   }
 
-  // 身份三级回退（PLAN.md §9 方案 A）：显式参数 > 环境变量。
+  // 身份三级回退（docs/插件方案.md §9 方案 A）：显式参数 > 环境变量。
   // 第三级（~/.dsh/token-report-user.json）留给安装脚本，此处只做前两级。
   const userId = r.userId ?? process.env['DSH_REPORT_USER_ID']
   const userName = r.userName ?? process.env['DSH_REPORT_USER_NAME']

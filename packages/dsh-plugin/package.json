@@ -35,6 +35,8 @@
     "build:client": "bun run build-client.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
     "test": "bun test",
+    "build:npm": "bun run scripts/build-npm.ts",
+    "verify:npm": "bun run verify/verify-npm-package.ts",
     "verify": "bun run verify/verify-plugin.ts"
   },
   "dependencies": {

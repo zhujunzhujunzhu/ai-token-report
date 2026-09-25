@@ -22,6 +22,22 @@
     "build:portal": "bun run --filter '@ai-token-report/web-portal' build",
     "build": "bun run build:local && bun run build:portal",
 
+    "build:npm:cli": "bun run --filter '@ai-token-report/web-local' build && bun run --filter '@ai-token-report/cli' build:npm",
+    "build:npm:plugin": "bun run --filter '@ai-token-report/dsh-plugin' build:npm",
+    "build:npm": "bun run build:npm:cli && bun run build:npm:plugin",
+
+    "verify:npm:cli": "bun run --filter '@ai-token-report/cli' verify:npm",
+    "verify:npm:plugin": "bun run --filter '@ai-token-report/dsh-plugin' verify:npm",
+    "verify:npm": "bun run verify:npm:cli && bun run verify:npm:plugin",
+
+    "publish:cli:dry": "bun publish --cwd packages/cli/dist --dry-run",
+    "publish:cli:next": "bun publish --cwd packages/cli/dist --tag next",
+    "publish:cli": "bun publish --cwd packages/cli/dist",
+    "publish:plugin:dry": "bun publish --cwd packages/dsh-plugin/dist --dry-run",
+    "publish:plugin:next": "bun publish --cwd packages/dsh-plugin/dist --tag next",
+    "publish:plugin": "bun publish --cwd packages/dsh-plugin/dist",
+    "publish:dry": "bun run publish:cli:dry && bun run publish:plugin:dry",
+
     "server": "bun run --filter '@ai-token-report/server' start",
     "typecheck": "bun run --filter '*' typecheck",
     "test": "bun test"
