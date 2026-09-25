@@ -8,11 +8,18 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "typecheck": "vue-tsc --noEmit"
+    "typecheck": "vue-tsc --noEmit",
+    "verify": "bun run verify/verify-render.ts && bun run verify/verify-charts.ts",
+    "verify:charts": "bun run verify/verify-charts.ts"
   },
   "dependencies": {
     "@ai-token-report/shared": "workspace:*",
-    "vue": "^3.5.13"
+    "@element-plus/icons-vue": "2.3.2",
+    "chart.js": "4",
+    "element-plus": "2.14.6",
+    "pinia": "4.0.3",
+    "vue": "^3.5.13",
+    "vue-router": "4.6.4"
   },
   "devDependencies": {
     "@types/bun": "latest",

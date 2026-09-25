@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="部门用量看板">
+  <!--
+    看板图标：三根高低不同的柱 + 一条基线，对应「按用量排行」这个核心视图。
+    用 SVG 而不是 ico/png：一个纯文本文件就能进仓库，且任意尺寸都清晰。
+  -->
+  <rect width="32" height="32" rx="7" fill="#0c70f3" />
+  <g fill="#ffffff">
+    <rect x="7" y="17" width="4.5" height="9" rx="1.5" />
+    <rect x="13.75" y="11" width="4.5" height="15" rx="1.5" />
+    <rect x="20.5" y="7" width="4.5" height="19" rx="1.5" />
+  </g>
+</svg>
