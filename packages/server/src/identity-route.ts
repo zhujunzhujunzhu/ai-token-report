@@ -117,7 +117,7 @@ export class IdentityRoute {
       // 网络失败 → 不落盘。宁可让用户重试，也不存一个永不被承认的凭证。
       return {
         ok: false,
-        reason: `无法连接部门服务端校验 token：${msg(err)}。请稍后重试。`,
+        reason: `无法连接部门服务端校验 token：${msg(err, this.#timeoutMs)}。请稍后重试。`,
       }
     }
 
@@ -195,9 +195,11 @@ export class IdentityRoute {
   }
 }
 
-function msg(err: unknown): string {
+function msg(err: unknown, timeoutMs: number): string {
   if (err instanceof Error && err.name === 'AbortError') {
-    return `请求超时（${8}s）`
+    // ⚠️ 用真实的超时值：写死成 8s 会在 `verifyTimeoutMs` 被改过之后
+    //    对用户说一个错的时间，而这类文案正是排障时被直接引用的东西。
+    return `请求超时（${Math.round(timeoutMs / 1000)}s）`
   }
   return err instanceof Error ? err.message : String(err)
 }
