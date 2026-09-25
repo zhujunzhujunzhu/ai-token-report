@@ -25,9 +25,49 @@
  * 会让「验证一下 token」这个无害动作产生审计噪音。
  */
 
-import type { VerifyTokenResponse } from '@ai-token-report/shared'
+import { ROLE_MEMBER, type UserRole, type VerifyTokenResponse } from '@ai-token-report/shared'
 
 import type { CredentialStore } from './credentials.js'
+
+/**
+ * 上报方向的两句失败文案。
+ *
+ * ★ 与看板方向**刻意不同**：看板没 token 时要说「去看板填 token」，
+ *   而上报没 token 时要说「上报请求缺少 Authorization 头」——
+ *   后者是给运维看的（插件/CLI 配错了），把两者的文案统一
+ *   等于把排障方向带偏。文案本身是**线上契约**（前端直接展示）。
+ */
+export const INGEST_AUTH_MESSAGES = {
+  unregistered: '服务端尚未配置任何凭证，无法归属上报数据',
+  missingToken: '上报请求缺少 Authorization 头',
+}
+
+/** 看板方向的两句失败文案（同上，刻意的措辞差异）。 */
+export const VIEWER_AUTH_MESSAGES = {
+  unregistered: '服务端尚未配置任何凭证，部门看板暂无数据可看，请让管理员先发放 token',
+  missingToken: '部门看板需要身份 token：请在页面顶部填入管理员发放的 token',
+}
+
+/**
+ * 凭证表的校验结果 → 查看者身份。
+ *
+ * ★ **角色缺省 = member 只在这里写一次**。重构前它在 `verifyToken` 与
+ *   `resolveIdentity` 各写了一遍（`role ?? ROLE_MEMBER`）——
+ *   两处里只要有一处写成 `?? 'admin'`，「服务端少返回一个字段」
+ *   就变成「人人可发 token」。这类默认值必须只有一个落点。
+ */
+function viewerFrom(verified: { name?: string; role?: UserRole; dept?: string }): {
+  name: string
+  role: UserRole
+  dept?: string
+} {
+  return {
+    name: verified.name!,
+    // ★ 角色只可能来自凭证表；缺省（老客户端/字段改名）一律按普通成员处理
+    role: verified.role ?? ROLE_MEMBER,
+    ...(verified.dept ? { dept: verified.dept } : {}),
+  }
+}
 
 /** 从 Authorization 头里取出裸 token。 */
 export function tokenFromHeader(header: string | null | undefined): string | null {
@@ -87,8 +127,8 @@ export function verifyToken(
   return {
     ok: true,
     registered: true,
-    name: result.name,
-    ...(result.dept ? { dept: result.dept } : {}),
+    // ★ name 只来自凭证表（store.verify 的返回值），绝不回显客户端输入
+    ...viewerFrom(result),
   }
 }
 
@@ -102,18 +142,56 @@ export function verifyToken(
 export function resolveIngestIdentity(
   store: CredentialStore,
   authorization: string | null | undefined,
-): { ok: true; name: string; dept?: string } | { ok: false; reason: string; registered: boolean } {
+): IdentityResolution {
+  return resolveIdentity(store, authorization, INGEST_AUTH_MESSAGES)
+}
+
+/**
+ * 从看板请求中解析出**查看者身份**（`/api/v1/stats/*`）。
+ *
+ * ★ 与 `resolveIngestIdentity` 是**同一套可信边界**（token → 凭证表 → 姓名 + 角色），
+ *   只是失败文案不同：看板没有 token 时要说「去看板填 token」，
+ *   而不是「上报请求缺少 Authorization 头」—— 后者会把运维引到错误的方向。
+ *
+ * ⚠️ **角色由凭证表决定**（`role` 列，见 `credentials.ts`），
+ *   而**不是**由姓名白名单决定 —— 姓名是可以随便改的显示值。
+ *   数据范围上：任何有效 token 都能查看**全部门**（部门看板是组内公开的用量页），
+ *   角色只决定「能不能进管理页发 token」（见 `admin-route.ts`）。
+ */
+export function resolveViewerIdentity(
+  store: CredentialStore,
+  authorization: string | null | undefined,
+): IdentityResolution {
+  return resolveIdentity(store, authorization, VIEWER_AUTH_MESSAGES)
+}
+
+/** 身份解析结果。失败时 `registered` 区分「没配凭证」与「token 不对」。 */
+export type IdentityResolution =
+  | { ok: true; name: string; dept?: string; role: UserRole }
+  | { ok: false; reason: string; registered: boolean }
+
+/**
+ * 身份解析的**唯一实现**。
+ *
+ * 上报（写）、看板（读）、人员管理（管理）三处共用它，只把两句失败文案
+ * 作为参数传进来 —— 若各写一份，「token 有效性判定」就有两个实现，
+ * 而其中一个松一点的那个不会报错，只会让不该进来的人进来。
+ *
+ * 对外可直接使用；`http/auth.ts` 的 `authorize()` 在它的结果上
+ * 加「401/503/403 怎么回」这一层（那一层也只该有一处）。
+ */
+export function resolveIdentity(
+  store: CredentialStore,
+  authorization: string | null | undefined,
+  messages: { unregistered: string; missingToken: string },
+): IdentityResolution {
   const token = tokenFromHeader(authorization)
 
   if (!store.registered) {
-    return {
-      ok: false,
-      registered: false,
-      reason: '服务端尚未配置任何凭证，无法归属上报数据',
-    }
+    return { ok: false, registered: false, reason: messages.unregistered }
   }
   if (!token) {
-    return { ok: false, registered: true, reason: '上报请求缺少 Authorization 头' }
+    return { ok: false, registered: true, reason: messages.missingToken }
   }
 
   const r = store.verify(token)
@@ -121,5 +199,5 @@ export function resolveIngestIdentity(
     return { ok: false, registered: true, reason: r.reason ?? 'token 无效' }
   }
 
-  return { ok: true, name: r.name!, ...(r.dept ? { dept: r.dept } : {}) }
+  return { ok: true, ...viewerFrom(r) }
 }

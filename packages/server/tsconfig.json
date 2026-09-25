@@ -12,6 +12,7 @@
     "types": ["bun"],
     "paths": {
       "@ai-token-report/shared": ["../shared/src/index.ts"],
+      "@ai-token-report/shared/schemas": ["../shared/src/schemas.ts"],
       "@ai-token-report/core": ["../core/src/index.ts"],
       "@ai-token-report/core/db": ["../core/src/db/index.ts"]
     }

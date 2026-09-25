@@ -17,7 +17,9 @@
   },
   "dependencies": {
     "@ai-token-report/core": "workspace:*",
-    "@ai-token-report/shared": "workspace:*"
+    "@ai-token-report/shared": "workspace:*",
+    "@noble/hashes": "2.4.0",
+    "rate-limiter-flexible": "11.2.1"
   },
   "devDependencies": {
     "@types/bun": "latest",
