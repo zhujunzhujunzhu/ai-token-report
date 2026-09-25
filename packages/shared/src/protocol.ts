@@ -109,22 +109,50 @@ export type GroupBy = 'provider' | 'model' | 'provider-model' | 'user' | 'projec
 /** 时间分桶粒度。 */
 export type Bucket = 'day' | 'hour'
 
+/**
+ * 未归属（没有署名）的归属键。
+ *
+ * ★ 这个常量是**唯一的**「未归属」表述：库里未归属的行 `user_id IS NULL`，
+ *   而所有对外展示（分组键、筛选值）一律用这个字符串。
+ *   `server/src/stats-route.ts` 与 `core/db/query.ts` 都从它取值 ——
+ *   两边各写一个字面量的话，「筛选 unknown 得到 0 行」这种分叉迟早出现。
+ */
+export const UNATTRIBUTED_USER = 'unknown' as const
+
 /** 查询的公共筛选条件。所有 stats 接口共用。 */
 export interface StatsQuery {
   /** epoch 毫秒；缺省表示不限 */
   from?: number
   to?: number
+  /**
+   * 具名周期（`today` / `week` / `last7d` / …），与 CLI 的 `--period` 完全同义。
+   *
+   * ★ **由服务端解析**（`core/range.ts` 的 `resolveRange`），前端不做任何日期换算：
+   *   让浏览器自己算「本月从哪一天开始」等于把时区口径复制到第二个地方，
+   *   跨天、跨时区时页面与命令行必然对不上。
+   *   显式的 `from` / `to` 优先于它。
+   */
+  period?: string
   /** 子串匹配，与 CLI 的 `--provider` 行为一致 */
   provider?: string
   model?: string
-  /** 按署名过滤，用于「只看某人」 */
+  /**
+   * 按署名过滤，用于「只看某人」。**精确匹配**（不是子串）：
+   * 子串匹配会把「张三」和「张三丰」混成一个。
+   *
+   * 特殊值 {@link UNATTRIBUTED_USER} 表示只看未归属的数据。
+   */
   userId?: string
 }
 
 /** 顶部指标卡片。 */
 export interface OverviewResponse {
-  /** 当前筛选范围的实际起止（服务端可能因无数据而收缩） */
-  range: { from: number | null; to: number | null }
+  /**
+   * 当前筛选范围的实际起止（服务端可能因无数据而收缩）。
+   * `label` 是服务端解析出的**人话口径**（如「最近 7 天（自然日）」），
+   * 页面直接展示，不在前端重算。
+   */
+  range: { from: number | null; to: number | null; label: string }
   /** 计费总量 */
   totalTokens: number
   inputTokens: number
@@ -140,8 +168,10 @@ export interface OverviewResponse {
   /** 平均每次调用 token 数 */
   avgTokensPerCall: number
   /**
-   * 未归属占比 0~1（`userId === 'unknown'`）。
+   * 未归属占比 0~1（`userId === 'unknown'` 的调用数 / 总调用数）。
    * 用于监控采集覆盖率，防止「数据悄悄少了」这种最难排查的故障。
+   *
+   * ★ 公式在 `metrics.ts` 的 `unattributedRate()`，服务端调用它而不是就地做除法。
    */
   unattributedRate: number
 }
@@ -438,7 +468,159 @@ export interface VerifyTokenResponse {
   /** 该 token 对应的姓名（由服务端决定，客户端不可覆盖）。 */
   name?: string
   dept?: string
+  /**
+   * 该 token 的角色。服务端**始终**返回它，页面据此决定是否显示管理页。
+   *
+   * 🚨 消费方（页面/插件）在字段缺失时必须按 {@link ROLE_MEMBER} 处理，
+   *   绝不能默认成管理员 —— 那会让一个老服务端或一次字段改名
+   *   直接变成「人人可发 token」。
+   */
+  role?: UserRole
   /** 服务端是否已配置任何凭证。 */
   registered?: boolean
   reason?: string
+}
+
+// ─────────────────────────────────────────────────────────────
+// 人员管理与 token 发放：管理页 → 服务端（/api/v1/admin/members*）
+// ─────────────────────────────────────────────────────────────
+//
+// ★ 这一组接口是**唯一会写凭证文件的通路**。凭证文件此前只由管理员手工维护，
+//   现在管理页可以签发/重置/吊销 token，因此多出三条硬约束：
+//
+//   1. **只有管理员能调用**（`role === 'admin'`）：403 而不是静默返回空列表，
+//      否则页面会把「你没权限」渲染成「部门里没有人」。
+//   2. **最后一个管理员不可删除 / 不可降级**：否则一次误操作会让
+//      *所有人都失去发放 token 的能力*，且只能靠改文件恢复。
+//   3. **文件解析失败时拒绝写入**：覆盖一份读不懂的凭证文件 = 静默吊销全员，
+//      与「上报库绝不自动重建」是同一类事故（见 AGENTS.md）。
+
+/**
+ * 角色。
+ *
+ * ⚠️ 这是**权限的唯一来源**：不要用姓名硬编码白名单
+ *   （ARCHITECTURE.md §5.3 早已写死这条），姓名是可以随便改的显示值。
+ */
+export type UserRole = 'admin' | 'member'
+
+/** 管理员：可看全部门看板，并可在管理页发放 / 重置 / 吊销 token。 */
+export const ROLE_ADMIN: UserRole = 'admin'
+/** 普通成员：可看全部门看板，看不到管理页。 */
+export const ROLE_MEMBER: UserRole = 'member'
+
+/** 判断一个任意值是否是合法角色。 */
+export function isUserRole(value: unknown): value is UserRole {
+  return value === ROLE_ADMIN || value === ROLE_MEMBER
+}
+
+/** 凭证来源。`env` 表示由 `ATR_ADMIN_TOKEN` 注入，管理页不能改它。 */
+export type CredentialSource = 'file' | 'env'
+
+/** 管理页里的一行人员。 */
+export interface AdminMember {
+  /** 后台账号；旧凭证未设置时为空。不返回密码或哈希。 */
+  username?: string | null
+  login_enabled?: boolean
+  /**
+   * 身份 token。
+   *
+   * ★ 这里**刻意返回明文**：管理页的用途就是「把 token 发给本人」与
+   *   「补发时把原值再发一次」。能打开这个页面的人本来就能读到
+   *   `credentials.json`（文件本身就是明文，理由见 credentials.ts）。
+   *   而本地页的 `GET /api/local/identity` 依然**绝不回传 token**。
+   */
+  token: string
+  name: string
+  dept: string | null
+  role: UserRole
+  /** token 发放时刻（epoch ms）。手工写进文件的凭证没有这个字段 → null。 */
+  createdAt: number | null
+  source: CredentialSource
+}
+
+/** `GET /api/v1/admin/members` —— 人员列表 + 凭证文件状态。 */
+export interface AdminMembersResponse {
+  members: AdminMember[]
+  /** 凭证文件的绝对路径（管理员要知道自己在维护哪个文件）。 */
+  credentialsPath: string
+  /** 当前是否可写入（解析失败或目录不可写时为 false）。 */
+  writable: boolean
+  /** 不可写的原因，可直接展示给管理员。 */
+  writeBlockedReason: string | null
+}
+
+/**
+ * 签发一个 token（`POST /api/v1/admin/members`）。
+ *
+ * 姓名是**归属的唯一键**：同名会让看板把两个人并成一个人，
+ * 因此服务端会拒绝重名（见 `member-admin.ts`）。
+ */
+export interface AdminIssueMemberRequest {
+  name: string
+  dept?: string
+  /** 缺省为 {@link ROLE_MEMBER}。 */
+  role?: UserRole
+}
+
+/** 修改一个已有人员（`POST /api/v1/admin/members/update`）。token 不变。 */
+export interface AdminUpdateMemberRequest {
+  /** 定位用：要改的那个人当前持有的 token。 */
+  token: string
+  name?: string
+  /** 传空串表示清除部门。 */
+  dept?: string
+  role?: UserRole
+}
+
+/** 重置 token / 吊销（`.../rotate`、`.../revoke`）。 */
+export interface AdminMemberTokenRequest {
+  token: string
+}
+
+/** 管理员为已有成员开通或重置后台登录，独立于上报 Token。 */
+export interface AdminLoginAccountRequest {
+  token: string
+  username: string
+  password: string
+}
+
+/** 后台认证的公开身份，不含上报 Token。 */
+export interface PortalViewer {
+  name: string
+  username: string
+  dept?: string
+  role: UserRole
+}
+
+export interface PortalLoginRequest {
+  username: string
+  password: string
+  captcha_id: string
+  captcha: string
+}
+
+export interface PortalSessionResponse {
+  ok: boolean
+  viewer?: PortalViewer
+  reason?: string
+}
+
+export interface PortalCaptchaResponse {
+  captcha_id: string
+  image: string
+  expires_in: number
+}
+
+/**
+ * 签发 / 修改 / 重置 / 吊销的结果。
+ *
+ * ⚠️ 与 `/api/v1/identity/verify` 一样用 `200 + ok:false` 表达业务失败
+ *   （重名、最后一个管理员不能删……），而**鉴权失败仍是 401/403/503**：
+ *   这两类错误对使用者是完全不同的动作（改输入 vs 换 token）。
+ */
+export interface AdminMemberResponse {
+  ok: boolean
+  reason?: string
+  /** 本次操作涉及的人员（含**新签发的 token**，供管理员复制转发）。 */
+  member?: AdminMember
 }

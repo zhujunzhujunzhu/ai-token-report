@@ -16,6 +16,7 @@ import {
   computeTotal,
   deriveMetrics,
   emptyUsage,
+  unattributedRate,
   verifyIdentity,
   type TokenUsage,
 } from '../src/metrics.js'
@@ -146,5 +147,21 @@ describe('派生指标', () => {
 
   test('calls 为 0 时 avg 为 0 而不是 NaN', () => {
     expect(deriveMetrics(emptyUsage(), 0).avgTokensPerCall).toBe(0)
+  })
+})
+
+describe('未归属占比（部门看板的覆盖率监控）', () => {
+  test('未归属调用 / 总调用', () => {
+    // 100 次调用里 3 次没署名 → 3%
+    expect(unattributedRate(3, 100)).toBeCloseTo(0.03, 6)
+  })
+
+  test('无调用时返回 0 而不是 NaN', () => {
+    // NaN 会让「未归属占比」卡片显示成 NaN%，比 0 更糟
+    expect(unattributedRate(0, 0)).toBe(0)
+  })
+
+  test('全部未署名时为 1', () => {
+    expect(unattributedRate(7, 7)).toBe(1)
   })
 })

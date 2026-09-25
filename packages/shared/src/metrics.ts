@@ -89,6 +89,25 @@ export function cacheLeverage(u: Pick<TokenUsage, 'input' | 'cacheRead'>): numbe
   return u.input === 0 ? 0 : u.cacheRead / u.input
 }
 
+/**
+ * 未归属占比 —— 采集覆盖率的反向指标（部门看板专用）。
+ *
+ * ```
+ * unattributedRate = 未归属调用数 / 总调用数
+ * ```
+ *
+ * 为什么它必须在共享口径里：这个数字唯一的作用就是回答
+ * 「看板上的数是不是少了」。若某一端自己算一遍（哪怕只是换个分母），
+ * 它就会变成第二个口径 —— 而且因为它**不会报错**，
+ * 只会让「覆盖率 98%」和「覆盖率 60%」两个页面同时存在。
+ *
+ * 无调用时返回 0 而非 NaN（与 `cacheHitRate` 同一条约定：
+ * NaN 会让前端图表出现空点）。
+ */
+export function unattributedRate(unattributedCalls: number, totalCalls: number): number {
+  return totalCalls === 0 ? 0 : unattributedCalls / totalCalls
+}
+
 /** 合并多条用量（累加）。禁止在采集端做任何「合并口径」的加工。 */
 export function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
   return {
