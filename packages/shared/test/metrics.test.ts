@@ -4,7 +4,7 @@
  * ★ 这些断言不是「测试代码覆盖率」，而是**把实测结论钉死**。
  *   任何人未来改动 metrics.ts 的公式，这里会立刻失败。
  *
- * 基准数字全部来自 `TOKEN-STATS-DESIGN.md` §2 对 156 个真实会话的实测。
+ * 基准数字全部来自 `docs/口径实测结论.md` §2 对 156 个真实会话的实测。
  */
 
 import { describe, expect, test } from 'bun:test'
@@ -20,7 +20,7 @@ import {
   type TokenUsage,
 } from '../src/metrics.js'
 
-/** 实测样本：单条 assistant/message（TOKEN-STATS-DESIGN.md §1.3） */
+/** 实测样本：单条 assistant/message（docs/口径实测结论.md §1.3） */
 const SAMPLE: TokenUsage = {
   input: 7772,
   output: 186,
@@ -30,7 +30,7 @@ const SAMPLE: TokenUsage = {
   total: 8982,
 }
 
-/** 实测样本：dashscope 全量汇总（TOKEN-STATS-DESIGN.md §2.2） */
+/** 实测样本：dashscope 全量汇总（docs/口径实测结论.md §2.2） */
 const DASHSCOPE_TOTAL: TokenUsage = {
   input: 11_561_323,
   output: 1_815_109,

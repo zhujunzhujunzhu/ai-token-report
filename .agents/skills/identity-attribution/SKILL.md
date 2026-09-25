@@ -59,7 +59,7 @@ DSH 原生**故意匿名**：`~/.dsh/.anonymous-user-id` 是 `crypto.randomUUID(
 > **为什么不按 `unknown` 兜底上报？** 因为那是**未授权的数据采集**。
 > 宁可数据缺失（看板上能看到「有 N 人未署名」），也不要偷偷采集。
 >
-> ⚠️ `PLAN.md` §9 里「以 `unknown` 上报并打 warning」是**已废弃的旧方案**，
+> ⚠️ `docs/插件方案.md` §9 里「以 `unknown` 上报并打 warning」是**已废弃的旧方案**，
 > 不要照它实现。
 
 ## 身份文件

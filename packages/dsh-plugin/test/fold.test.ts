@@ -22,7 +22,7 @@ const IDENTITY: FoldIdentity = {
 }
 
 /**
- * 一条真实的计费事件（字段取自 `docs/PLAN.md` §2.1 的实测样本）。
+ * 一条真实的计费事件（字段取自 `docs/插件方案.md` §2.1 的实测样本）。
  *
  * 刻意用实测样本而不是编造的数字：它带着「cacheRead 1024 远大于 input 7772」之外
  * 更重要的性质 —— `totalTokens` 与四项之和不符时该怎么处理。

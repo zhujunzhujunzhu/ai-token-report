@@ -3,8 +3,8 @@
 DSH token 用量统计平台。四种形态：**命令行 / 本地页面 / 部门看板 / DSH 插件**。
 
 > 📖 **先读 [`ARCHITECTURE.md`](./ARCHITECTURE.md)** —— 整体结构与职责划分。
-> 口径细节见 [`TOKEN-STATS-DESIGN.md`](./TOKEN-STATS-DESIGN.md)，
-> 插件方案见 [`PLAN.md`](./PLAN.md)。
+> 口径细节见 [`docs/口径实测结论.md`](./docs/口径实测结论.md)，
+> 插件方案见 [`docs/插件方案.md`](./docs/插件方案.md)。
 
 ---
 

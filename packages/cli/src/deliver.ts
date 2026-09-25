@@ -8,14 +8,14 @@
  *   （内层指数退避 + 外层周期）导致的长尾卡顿。
  * - **超时必须显式设置**。计划任务每 10 分钟拉起一次进程，调用方（任务计划程序）
  *   会把它当成前台进程；没有超时的 fetch 可能挂到天荒地老，把下一轮挤掉。
- * - **鉴权只是 Bearer**。内网 + HTTPS 起步足够；PLAN.md §10.3 提到要区分机器时
+ * - **鉴权只是 Bearer**。内网 + HTTPS 起步足够；docs/插件方案.md §10.3 提到要区分机器时
  *   再演进为「每台一个 token，服务端绑定 user_id」。
  */
 
 import type { DeliverOutcome, Deliverer } from './report.js'
 import { emptyCounts, mergeCounts, type UsageRecord } from '@ai-token-report/core'
 
-/** 上报 DTO —— 与 PLAN.md §3.3 的字段口径一致。 */
+/** 上报 DTO —— 与 docs/插件方案.md §3.3 的字段口径一致。 */
 export interface TokenUsagePayload {
   /** 上报协议版本，便于后台演进。 */
   schemaVersion: 1
@@ -28,7 +28,7 @@ export interface TokenUsagePayload {
     dept?: string
   }
   generatedAt: string
-  /** 扁平化的线上记录（下划线字段，对齐 PLAN.md §10.4 的表结构）。 */
+  /** 扁平化的线上记录（下划线字段，对齐 docs/插件方案.md §10.4 的表结构）。 */
   records: Record<string, unknown>[]
 }
 
@@ -93,7 +93,7 @@ export function createHttpDeliverer(options: HttpDeliverOptions): Deliverer {
         ...(options.dept ? { dept: options.dept } : {}),
       },
       generatedAt: new Date().toISOString(),
-      // 线上结构用下划线字段（对齐 PLAN.md §10.4 的表结构）
+      // 线上结构用下划线字段（对齐 docs/插件方案.md §10.4 的表结构）
       records: records.map(toWireRecord),
     }
 

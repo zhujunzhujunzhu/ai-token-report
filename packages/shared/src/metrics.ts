@@ -1,7 +1,7 @@
 /**
  * 指标口径 —— 全平台唯一的计算公式来源。
  *
- * ★ 这些公式不是随便写的，全部来自 `TOKEN-STATS-DESIGN.md` §2
+ * ★ 这些公式不是随便写的，全部来自 `docs/口径实测结论.md` §2
  *   对 156 个真实会话（9,845 条 usage 样本）的实测结论。
  *
  * 任何地方要算这些指标，**必须调用这里**，不要各自重写。
@@ -70,7 +70,7 @@ export function verifyIdentity(u: TokenUsage): boolean {
  * cacheRead / (cacheRead + input)
  * ```
  *
- * 实测约 94%~95%（`TOKEN-STATS-DESIGN.md` 两次取样分别是 94.3% 与 95.1%，
+ * 实测约 94%~95%（`docs/口径实测结论.md` 两次取样分别是 94.3% 与 95.1%，
  * 差异来自取样时点不同）。这个数字越高越好：命中缓存的部分单价远低于未命中输入。
  * 分母用 `cacheRead + input` 而非 `input`，因为 input 只是「未命中」那部分。
  */
