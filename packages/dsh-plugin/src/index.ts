@@ -19,7 +19,7 @@
  *
  * ## 挂载点：一个 `SessionTelemetryBackend`
  *
- * 复用 DSH 已有的捕获链路，不自建事件监听与 token 计量（见 `docs/PLAN.md` §1）：
+ * 复用 DSH 已有的捕获链路，不自建事件监听与 token 计量（见 `docs/插件方案.md` §1）：
  *
  * ```
  * session/event (同步热路径)
@@ -65,6 +65,9 @@ import {
 import { foldRecord, type FoldIdentity } from './fold.js'
 import { IdentityResolver, type IdentityState } from './identity.js'
 import { Reporter, type ReporterStats } from './reporter.js'
+import { createSettingsHandler, withSavedConnection } from './settings.js'
+import { installUiRoute, type UiHostContext } from './ui-bridge.js'
+import type { UiRouteInstall } from './client/protocol.js'
 import {
   formatUsage,
   queryUsage,
@@ -97,6 +100,14 @@ export interface PluginStatus {
   toolsRegistered: boolean
   /** 服务是否注册成功。 */
   serviceRegistered: boolean
+  /**
+   * UI 数据通道（`/api/tokenReport.stats`）的落点。
+   *
+   * 由**宿主能力**决定（有没有 `connection` 服务），不是配置或身份决定的，
+   * 所以不参与 `evaluateStatus()` 的判定，只在 `apply()` 里填。
+   * `undefined` 表示 `features.ui` 被关掉了。
+   */
+  uiRoute?: UiRouteInstall
 }
 
 /**
@@ -468,7 +479,7 @@ export function apply(
   rawConfig: RawConfig = {},
   deps: ApplyDeps = {},
 ): { status: PluginStatus; backend: TokenReportBackend | null } {
-  const config = resolveConfig(rawConfig)
+  const config = resolveConfig(withSavedConnection(rawConfig))
 
   // 配置问题要在启动时说清楚，但**不能**因此让 DSH 起不来
   for (const problem of validateConfig(config)) {
@@ -507,6 +518,25 @@ export function apply(
     status.serviceRegistered = registerService(ctx, config, statsContext)
   }
 
+  // ── ④ UI 数据通道（浏览器半的取数口）──────────────────────────────
+  //
+  // ★ 与工具/服务一样是**纯本地读取**，所以不受 `reportingEnabled` 影响：
+  //   没署名、没 appKey 的同事照样能在界面上看自己的用量。
+  //   宿主没有 `connection`（headless / 非 web profile）时安静跳过。
+  if (config.features.ui) {
+    status.uiRoute = installUiRoute(ctx, statsContext, {
+      settingsFetch: createSettingsHandler(config, {
+        locked: !!rawConfig.user,
+      }),
+    })
+    if (status.uiRoute === 'unavailable') {
+      ctx.logger.info(
+        'token-report: 宿主不提供 connection 服务（非 web profile），界面用量面板不可用；' +
+          '上报与 token_usage 工具不受影响。',
+      )
+    }
+  }
+
   return { status, backend }
 }
 
@@ -535,7 +565,7 @@ function buildResolver(config: EffectiveConfig): IdentityResolver {
 }
 
 /** `apply()` 需要的宿主能力：后端能力 + cordis 的服务注册表。 */
-export interface ApplyContext extends BackendContext {
+export interface ApplyContext extends BackendContext, UiHostContext {
   /** cordis 的服务注册表。 */
   reflect: { provide(name: string, value: unknown): void }
 }
@@ -749,4 +779,23 @@ export { foldRecord, toWireRecord, toTokenUsage, type BillingRecord, type FoldId
 export { Outbox, type OutboxStats } from './outbox.js'
 export { Reporter, resolveOutboxDir, type ReporterStats } from './reporter.js'
 export { queryUsage, formatUsage, TOOL_DIMENSIONS, type UsageQuery, type UsageResult } from './stats.js'
+export {
+  installUiRoute,
+  createUiStatsProvider,
+  makeStatsFetch,
+  seriesFor,
+  toUiPayload,
+  type UiHostContext,
+  type UiStatsProvider,
+} from './ui-bridge.js'
+export {
+  UI_STATS_PATH,
+  UI_SETTINGS_PATH,
+  UI_PERIODS,
+  coercePeriod,
+  readUiResponse,
+  type UiPayload,
+  type UiPeriod,
+  type UiRouteInstall,
+} from './client/protocol.js'
 export { isSigned } from '@ai-token-report/shared'

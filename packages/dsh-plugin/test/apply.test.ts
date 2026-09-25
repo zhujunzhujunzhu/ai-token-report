@@ -450,11 +450,11 @@ describe('配置问题只告警，不让 DSH 起不来', () => {
     expect(logs.some((l) => l.message.includes('http(s)'))).toBe(true)
   })
 
-  test('打开 localDb 时给出运行时限制的告警', () => {
+  test('打开 localDb 不再错误警告 Bun 专属限制', () => {
     signIdentity()
     const { ctx, logs } = fakeCtx()
     apply(ctx, { appKey: 'k', dshHome: home, localDb: true }, {})
-    expect(logs.some((l) => l.message.includes('bun:sqlite'))).toBe(true)
+    expect(logs.some((l) => l.message.includes('bun:sqlite'))).toBe(false)
   })
 })
 

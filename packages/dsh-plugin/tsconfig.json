@@ -10,10 +10,13 @@
     "skipLibCheck": true,
     "noEmit": true,
     "types": ["bun"],
+    "jsx": "react-jsx",
     "paths": {
       "@ai-token-report/shared": ["../shared/src/index.ts"],
+      "@ai-token-report/core/db": ["../core/src/db/index.ts"],
       "@ai-token-report/core": ["../core/src/index.ts"]
     }
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "exclude": ["src/client/**", "test/client/**"]
 }

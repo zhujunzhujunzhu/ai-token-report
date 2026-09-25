@@ -3,11 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "DSH 插件：以 SessionTelemetryBackend 实时上报 token 用量",
+  "description": "DSH 插件：实时上报 token 用量 + 在 DSH 界面里直接看本机用量",
   "main": "lib/index.js",
   "exports": {
     ".": {
       "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
     },
     "./package.json": "./package.json"
   },
@@ -18,18 +21,28 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
     }
   },
   "scripts": {
-    "build": "bun build src/index.ts --target=node --format=esm --outfile=lib/index.js --external '@deepseek-ai/*'",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "bun run build:host && bun run build:client",
+    "build:host": "bun build src/index.ts --target=node --format=esm --outfile=lib/index.js --external '@deepseek-ai/*'",
+    "build:client": "bun run build-client.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
     "test": "bun test",
     "verify": "bun run verify/verify-plugin.ts"
   },
   "dependencies": {
     "@ai-token-report/core": "workspace:*",
     "@ai-token-report/shared": "workspace:*",
-    "@deepseek-ai/schemastery": "^3.18.2"
+    "@deepseek-ai/schemastery": "^3.18.2",
+    "chart.js": "4",
+    "react-day-picker": "9"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
@@ -38,11 +51,19 @@
     "@deepseek-ai/dsh-session-telemetry": "^0.1.5-rc.1"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/dsh-agent": { "optional": true },
-    "@deepseek-ai/dsh-session": { "optional": true }
+    "@deepseek-ai/dsh-agent": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-session": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/bun": "latest",
+    "@types/react": "18.3.12",
+    "@types/react-dom": "18.3.1",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
     "typescript": "^5.7.2"
   }
 }

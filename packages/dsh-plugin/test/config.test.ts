@@ -55,10 +55,15 @@ describe('默认值', () => {
     expect(c.outbox.maxBytes).toBe(DEFAULTS.outbox.maxBytes)
   })
 
-  test('★ 功能开关默认全开，但 localDb 默认关（宿主是 Node 时 bun:sqlite 不存在）', () => {
+  test('功能开关与 SQLite 查询默认开启', () => {
     const c = resolveConfig({})
-    expect(c.features).toEqual({ reporting: true, tools: true, service: true })
-    expect(c.localDb).toBe(false)
+    expect(c.features).toEqual({ reporting: true, tools: true, service: true, ui: true })
+    expect(c.localDb).toBe(true)
+  })
+
+  test('features.ui 可以单独关掉界面面板，其余功能不受影响', () => {
+    const c = resolveConfig({ features: { ui: false } })
+    expect(c.features).toEqual({ reporting: true, tools: true, service: true, ui: false })
   })
 })
 
@@ -149,9 +154,9 @@ describe('配置自检', () => {
     expect(problems.some((p) => p.includes('http(s)'))).toBe(true)
   })
 
-  test('打开 localDb 时会警告宿主运行时限制', () => {
+  test('打开 localDb 不再产生过时的 Bun 专属警告', () => {
     const problems = validateConfig(resolveConfig({ appKey: 'k', localDb: true }))
-    expect(problems.some((p) => p.includes('bun:sqlite'))).toBe(true)
+    expect(problems).toEqual([])
   })
 
   test('配齐之后没有任何问题', () => {

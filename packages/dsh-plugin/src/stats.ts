@@ -18,7 +18,7 @@
  *
  * ## 两条数据源，且**如实标注**
  *
- * 1. `local-db`：本机 SQLite 增量库（`core/db`）—— 快，但**依赖宿主是 Bun**。
+ * 1. `local-db`：本机 SQLite 增量库（`core/db`）—— 增量更新，支持 Bun 与 Node。
  * 2. `scan`：直接扫会话日志（`core/scanner`）—— 慢，但任何运行时都能跑。
  *
  * `source` 字段会如实带出去。**不允许**在降级时假装数据来自库：
@@ -28,12 +28,8 @@
 import {
   aggregate,
   resolveRange,
-  scanAll,
-  timeSeries,
-  totalOf,
   type GroupDimension,
   type TokenCounts,
-  type UsageRecord,
 } from '@ai-token-report/core'
 import {
   cacheHitRate,
@@ -42,6 +38,8 @@ import {
   maskName,
   type UsageMetrics,
 } from '@ai-token-report/shared'
+
+import { openStats } from '@ai-token-report/core/db'
 
 import type { EffectiveConfig } from './config.js'
 
@@ -63,6 +61,9 @@ export const TOOL_DIMENSIONS: GroupDimension[] = [
 export interface UsageQuery {
   /** 具名周期，与 CLI `--period` 完全同义（today / last7d / month / 中文别名…）。 */
   period?: string
+  /** 显式起止时间；纯日期包含结束当天。 */
+  since?: string
+  until?: string
   /** 分组维度，默认 provider-model。 */
   by?: GroupDimension[]
   /** 只显示前 N 行。 */
@@ -123,82 +124,6 @@ export interface StatsContext {
   dbPath: string
 }
 
-/**
- * 本地库查询的**动态**入口。
- *
- * ## 为什么这里要绕这么多弯（🚨 改这段前先读懂）
- *
- * `core/db` 依赖 **`bun:sqlite`** —— 那是 Bun 专有的内建模块，
- * 而 **DSH 宿主跑在 Node 上**。所以：
- *
- * - **顶层 `import` 不行**：Node 加载插件时就会 `ERR_UNKNOWN_BUILTIN_MODULE`，
- *   整个插件（连同上报）直接挂掉。
- * - **`await import('@ai-token-report/core/db')` 也不行**：打包器（bun build）
- *   会**静态识别**这个字面量说明符并把 `bun:sqlite` 提到产物的顶层 import，
- *   等于绕了一圈又回到「加载即失败」。
- *
- * 解决办法是让说明符在**构建期不可静态分析**：用变量拼出来，
- * 打包器就只能原样保留成运行时的动态 import。Node 真正执行到这行时
- * （只有 `localDb: true` 才会走到）才会失败，而失败被 catch 成降级。
- *
- * ★ 这正是「库是派生物，不是真值」的落点：它坏了不该拖垮别的功能。
- */
-async function importDbModule(): Promise<{
-  openStats: (opts: {
-    sessionsRoot: string
-    dbPath: string
-    period?: string
-    providers?: string[]
-    models?: string[]
-  }) => Promise<DbStatsSession>
-}> {
-  const specifier = ['@ai-token-report', 'core', 'db'].join('/')
-  return (await import(/* @vite-ignore */ specifier)) as Awaited<ReturnType<typeof importDbModule>>
-}
-
-/** `core/db` 的 `StatsSession` 里我们真正用到的那几个成员。 */
-interface DbStatsSession {
-  records(): UsageRecord[]
-  source: string
-  degradedReason?: string
-  close(): void
-}
-
-async function tryOpenStats(
-  ctx: StatsContext,
-  query: UsageQuery,
-): Promise<{ records: UsageRecord[]; source: StatsSource; degradedReason?: string } | null> {
-  if (!ctx.config.localDb) return null
-  try {
-    const mod = await importDbModule()
-    const session = await mod.openStats({
-      sessionsRoot: ctx.sessionsRoot,
-      dbPath: ctx.dbPath,
-      ...(query.period ? { period: query.period } : {}),
-      ...(query.provider ? { providers: [query.provider] } : {}),
-      ...(query.model ? { models: [query.model] } : {}),
-    })
-    try {
-      // 物化记录后统一交给 `aggregate` / `timeSeries` —— 与直扫路径**同一套聚合**，
-      // 因此两条路径的结果必然一致（`verify-db-parity.ts` 就是断言这一点）
-      return {
-        records: session.records(),
-        source: session.source === 'sql' ? 'local-db' : 'scan',
-        ...(session.degradedReason ? { degradedReason: session.degradedReason } : {}),
-      }
-    } finally {
-      session.close()
-    }
-  } catch (err) {
-    // 库加载失败（Node 宿主没有 bun:sqlite / SQLITE_CORRUPT …）→ 降级直扫
-    return {
-      records: [],
-      source: 'scan',
-      degradedReason: `本地库不可用（${err instanceof Error ? err.message : String(err)}），已降级为直扫日志`,
-    }
-  }
-}
-
 /** 把分组结果转成输出行（派生指标交给 `shared`）。 */
 function toRows(rows: ReturnType<typeof aggregate>): UsageGroupRow[] {
   return rows.map((r) => ({
@@ -220,80 +145,90 @@ function toRows(rows: ReturnType<typeof aggregate>): UsageGroupRow[] {
  *
  * 不抛错（除参数非法外）：任何内部失败都降级为「直扫日志」并把原因带出去。
  */
-export async function queryUsage(ctx: StatsContext, query: UsageQuery = {}): Promise<UsageResult> {
+// 同一个库的增量写入串行执行，避免多个周期/工具同时打开连接互相等写锁。
+const pendingQueries = new Map<string, Promise<unknown>>()
+export function queryUsage(ctx: StatsContext, query: UsageQuery = {}): Promise<UsageResult> {
+  const previous = pendingQueries.get(ctx.dbPath) ?? Promise.resolve()
+  const task = previous.catch(() => {}).then(() => executeQuery(ctx, query))
+  pendingQueries.set(ctx.dbPath, task)
+  void task.finally(() => {
+    if (pendingQueries.get(ctx.dbPath) === task) pendingQueries.delete(ctx.dbPath)
+  }).catch(() => {})
+  return task
+}
+
+async function executeQuery(ctx: StatsContext, query: UsageQuery): Promise<UsageResult> {
   const t0 = Date.now()
 
   // 时间窗解析复用 `core/range.ts` —— 保证「工具说的今天」与「CLI 说的今天」是同一段
-  const range = resolveRange(query.period ? { period: query.period } : {})
+  const range = resolveRange({ period: query.period, since: query.since, until: query.until })
 
-  let degradedReason: string | undefined
-  let source: StatsSource = 'scan'
-  let records: UsageRecord[]
+  // 驱动选择集中在 core/db/driver.ts，构建时内联 core，运行时才加载 SQLite。
+  const session = await openStats({
+    sessionsRoot: ctx.sessionsRoot,
+    dbPath: ctx.dbPath,
+    forceScan: !ctx.config.localDb,
+    ...(range.sinceMs !== undefined ? { sinceMs: range.sinceMs } : {}),
+    ...(range.untilMs !== undefined ? { untilMs: range.untilMs } : {}),
+    ...(query.provider ? { providers: [query.provider] } : {}),
+    ...(query.model ? { models: [query.model] } : {}),
+  })
+  try {
+    const source: StatsSource = session.source === 'sql' ? 'local-db'
+      : session.diagnostics?.filesScanned === 0 ? 'none' : 'scan'
+    const degradedReason = session.degradedReason
+    const totals = session.totals()
+    const dims = query.by && query.by.length > 0 ? query.by : (['provider-model'] as GroupDimension[])
+    const top = query.top && query.top > 0 ? query.top : 30
 
-  const fromDb = await tryOpenStats(ctx, query)
-  if (fromDb && fromDb.source === 'local-db') {
-    records = fromDb.records
-    source = 'local-db'
-  } else {
-    degradedReason = fromDb?.degradedReason
-    const scanned = await scanAll(ctx.sessionsRoot, {
-      ...(query.provider ? { providers: [query.provider] } : {}),
-      ...(query.model ? { models: [query.model] } : {}),
-      ...(range.sinceMs !== undefined ? { sinceMs: range.sinceMs } : {}),
-      ...(range.untilMs !== undefined ? { untilMs: range.untilMs } : {}),
-    })
-    records = scanned.records
-    source = records.length === 0 && scanned.diagnostics.filesScanned === 0 ? 'none' : 'scan'
-  }
-
-  const totals = totalOf(records)
-  const dims = query.by && query.by.length > 0 ? query.by : (['provider-model'] as GroupDimension[])
-  const top = query.top && query.top > 0 ? query.top : 30
-
-  const groups = dims.map((dim) => ({
-    by: dim,
-    rows: toRows(aggregate(records, dim)).slice(0, top),
-  }))
-
-  const result: UsageResult = {
-    source,
-    ...(degradedReason ? { degradedReason } : {}),
-    rangeLabel: range.label,
-    range: {
-      since: range.sinceMs ?? null,
-      until: range.untilMs ?? null,
-    },
-    totals,
-    metrics: deriveMetrics(
-      {
-        input: totals.input,
-        output: totals.output,
-        cacheRead: totals.cacheRead,
-        cacheWrite: totals.cacheWrite,
-        reasoning: totals.reasoning,
-        total: totals.total,
-      },
-      totals.calls,
-    ),
-    groups,
-    sessions: new Set(records.map((r) => r.sessionId)).size,
-    elapsedMs: Date.now() - t0,
-    scannedAt: Date.now(),
-  }
-
-  if (query.series) {
-    result.series = timeSeries(records, query.series, false).map((p) => ({
-      bucket: p.bucket,
-      total: p.counts.total,
-      input: p.counts.input,
-      output: p.counts.output,
-      cacheRead: p.counts.cacheRead,
-      calls: p.counts.calls,
-      cacheHitRate: cacheHitRate(p.counts),
+    const groups = dims.map((dim) => ({
+      by: dim,
+      rows: toRows(session.groups(dim)).slice(0, top),
     }))
-  }
 
-  return result
+    const result: UsageResult = {
+      source,
+      ...(degradedReason ? { degradedReason } : {}),
+      rangeLabel: range.label,
+      range: {
+        since: range.sinceMs ?? null,
+        until: range.untilMs ?? null,
+      },
+      totals,
+      metrics: deriveMetrics(
+        {
+          input: totals.input,
+          output: totals.output,
+          cacheRead: totals.cacheRead,
+          cacheWrite: totals.cacheWrite,
+          reasoning: totals.reasoning,
+          total: totals.total,
+        },
+        totals.calls,
+      ),
+      groups,
+      sessions: session.sessions,
+      elapsedMs: Date.now() - t0,
+      scannedAt: session.scannedAt,
+    }
+
+    if (query.series) {
+      result.series = session.series(query.series, false).map((p) => ({
+        bucket: p.bucket,
+        total: p.counts.total,
+        input: p.counts.input,
+        output: p.counts.output,
+        cacheRead: p.counts.cacheRead,
+        calls: p.counts.calls,
+        cacheHitRate: cacheHitRate(p.counts),
+      }))
+    }
+
+    result.elapsedMs = Date.now() - t0
+    return result
+  } finally {
+    session.close()
+  }
 }
 
 /** 缓存杠杆（单独导出，便于调用方不直接碰 shared 的签名）。 */

@@ -1,16 +1,18 @@
 # `@ai-token-report/dsh-plugin` —— DSH token 上报插件
 
 装在 DSH 里，**无人值守地**把本机产生的计费级 token 用量实时上报到部门服务端，
-同时给同事一个「问一句就能看到自己用量」的工具。
+同时给同事一个「问一句就能看到自己用量」的工具，以及一块**在 DSH 界面里
+一直看得见**的用量面板。
 
 ```
 ① 实时上报   SessionTelemetryBackend.emit(record)    ← 会话进行中，秒级
 ② 统计工具   token_usage / token_usage_diagnostics   ← Agent 可调用
 ③ 统计服务   ctx.tokenReport                        ← 其它插件可调用
+④ 界面面板   输入框上方的用量条 + 标题栏徽章          ← 人直接看
 ```
 
-三种形态与 CLI `dsh-token`、本地页面走**同一套聚合与同一套口径**，
-所以「工具报的数」与「页面上的数」必然一致。
+四种形态与 CLI `dsh-token`、本地页面走**同一套聚合与同一套口径**，
+所以「工具报的数」「面板上的数」「终端里的数」必然一致。
 
 ---
 
@@ -43,8 +45,9 @@
       reporting: true               # 关掉即完全不上报
       tools: true                   # 注册 token_usage 工具
       service: true                 # 注册 ctx.tokenReport
+      ui: true                      # 在 DSH 界面里显示用量面板（只影响显示）
 
-    localDb: false                  # ⚠️ 见 §5「本地库」
+    localDb: true                   # 默认增量 SQLite，见 §5
 
     # ── 身份（选填）─────────────────────────────────────────────
     # 留空则读 $DSH_HOME/token-report/identity.json（员工自己在本地页填的那份）
@@ -96,8 +99,8 @@
 | `batch.timeoutMillis` | `15000` |
 | `outbox.enabled` | `true` |
 | `outbox.maxBytes` | `33554432`（32 MB） |
-| `features.*` | 全 `true` |
-| `localDb` | `false` |
+| `features.*` | 全 `true`（含 `ui`） |
+| `localDb` | `true` |
 
 ---
 
@@ -118,13 +121,25 @@
 ```bash
 bun install
 bun run --filter '@ai-token-report/dsh-plugin' build
-# → packages/dsh-plugin/lib/index.js（约 66 KB）
+# → packages/dsh-plugin/lib/index.js   宿主半（约 75 KB，Node 侧）
+#    packages/dsh-plugin/lib/client.js  浏览器半（约 26 KB，包在 __ModuleLoader__ 信封里）
 #
 # ⚠️ 构建**不能**加 --external '@ai-token-report/*'：
 #   本仓 workspace 包的 main 指向 src/index.ts（Bun 能直接吃，Node 不能），
 #   把它们 external 出去会让 DSH（跑在 Node 上）加载即失败。
 #   打包产物里只保留 @deepseek-ai/* 为 external。
 ```
+
+浏览器半由 `build-client.ts` 单独构建，它做两件 `bun build` 一行命令做不到的事：
+
+1. **包 `__ModuleLoader__` 信封** —— DSH 前端只认
+   `window.__ModuleLoader__.load({ id, factory })` 这种形状，工厂函数的返回值
+   才是模块导出。用 CLI 的 `--banner/--footer` 拼那段带引号、花括号与换行的
+   banner 太容易在 Windows 上被 shell 转义搞坏。
+2. **平台模块纯度校验** —— DSH 前端只预置**固定 9 个**模块，浏览器半的
+   `require()` 命中不了就在物化阶段抛错。最阴的一种是 JSX 走了**开发版**转换
+   （`react/jsx-dev-runtime`）：产物看着完全正常，运行时必炸。
+   构建脚本会逐个断言 `require` 的说明符都在表内，**越界直接让构建失败**。
 
 ### 2.3 放进 DSH profile
 
@@ -181,6 +196,10 @@ New-Item -ItemType Junction `
   -Target "D:\Coding\ai-token-report\packages\dsh-plugin"
 ```
 
+> ★ 这一步同时决定**界面面板会不会出现**：DSH 的客户端模块扫描会在同一个
+> 解析范围里找每个插件条目的 `package.json`，读它的 `dsh.client` 声明与
+> `exports["./client"]`。解析不到包 = 宿主半没有、浏览器半也没有。
+
 **④ 🚨 必须关掉官方 OTel telemetry 后端**（与 token-report 互斥）：
 
 ```yaml
@@ -215,6 +234,20 @@ dsh --profile web --no-open
 启动成功会打印 `dsh web: http://127.0.0.1:<port>/?token=...`。
 插件启用时还会在 `$DSH_HOME/token-report/` 下**创建 `outbox/` 目录** ——
 这是「后端真的构造了」最直接的证据（未启用时不会建）。
+
+装对了的话，**界面上会直接看到用量面板**：
+
+- 输入框上方多一条 `TOKEN 用量 …` 的条（点「详情」直接打开弹框）；
+- 会话标题栏右侧多一个 `● 2.39B 97.0%` 的胶囊（点开是浮层）。
+
+启动日志里还有一句 `UI 用量面板数据通道已挂载 → GET /api/tokenReport.stats`。
+没有这句、界面也没面板时，按下面顺序看：
+
+| 日志/现象 | 原因 |
+|---|---|
+| `宿主不提供 connection 服务（非 web profile）` | 用的是 headless profile —— 预期行为，web profile 才有界面 |
+| 什么都不打印，界面也没面板 | 包不在 profile 的解析范围内，或 `features.ui: false` |
+| 数据通道那句有，但界面没面板 | 浏览器半没被加载 —— 查 `dsh.client` 声明与 `lib/client.js` 是否存在 |
 
 没看到启用时，日志会说明**为什么没启用**以及**怎么配** ——
 不会只留一句「没启用」让人卡住。
@@ -322,23 +355,102 @@ svc.signed()                                            // → 身份是否就�
 返回值是**某一刻的快照**而不是活会话 —— 调用方不持有 SQLite 连接，
 也就不可能忘记 `close()`。
 
+### 4.3 界面面板（人直接看）
+
+装在 DSH 的 Web 界面里，**常驻可见**，不需要问 Agent、也不需要开另一个页面。
+
+| 挂载点 | slot | 长什么样 |
+|---|---|---|
+| 输入框上方的用量条 | `conversation.input.dock` | 一行摘要：`TOKEN 用量 · 今天 · 2.39B tokens · 命中率 97.0% · 16,437 次调用`，右侧「详情」打开居中弹框 |
+| 会话标题栏右侧的徽章 | `conversation.session.header.utilities` | 一个紧凑胶囊 `● 2.39B 97.0%`，点开是居中浮层（Esc 关闭） |
+
+两个挂载点用的是**同一份状态**（`store.ts` 里那个 store），所以数字永远一致，
+而且取数只做一次 —— 这点很重要，见下面的「为什么有缓存」。
+
+详情里有：周期切换（今天 / 昨天 / 本周 / 最近 7 天 / 本月 / 近 30 天 / 今年 / 自定义）、
+**四个 token 列分列**的统计格、派生指标（命中率 / 平均每次调用）、
+迷你趋势柱、按 `provider-model` 的排行，以及脚注里的
+**数据来源 / 耗时 / 统计时刻 / 降级原因**。
+
+#### 数据怎么走到页面里
+
+```
+浏览器半  fetch('/api/tokenReport.stats?period=today')     ← 同源，自带宿主会话 cookie
+              ↓  DSH 的 /api 前缀先做 Host/Origin 栅栏 + 浏览器鉴权
+宿主半    ctx.connection.fetch.register(...)  精确 Fetch 路由
+              ↓
+          queryUsage()   ← 与 CLI `dsh-token`、`token_usage` 工具**同一个函数**
+```
+
+**为什么复用 `/api` 而不自己 `ctx.webServer.register`**：
+DSH 的 web 服务器**不做任何鉴权**（`dsh-host-webserver` 的文档明写
+「No server-wide TLS, authentication, or origin policy」）。本仓的约定是
+「服务端默认只监听 127.0.0.1」，但监听地址可配置 —— 一旦有人绑到 `0.0.0.0`，
+一条裸的用量路由就是**向整个内网公开本机用量**。挂在 `/api` 下等于免费拿到
+那两道栅栏，所以这不是「多绕一层」，而是「不要把已经有的锁拆掉」。
+
+宿主不提供 `connection` 时（headless / 非 web profile）**安静跳过**，
+面板不出现，但上报、工具、服务都不受影响。启动日志会说明这一点。
+
+#### 详情与配置
+
+打开详情弹框后，可切换周期、查看 Token/调用数/命中率趋势，并按模型、服务商、项目、会话查看明细。
+自定义范围使用 React DayPicker 中文双月日历（窄屏单月），选择开始与结束日期后点击「应用范围」，按 DSH 宿主本地时区包含起止两天；刷新保留所选日期。
+趋势图使用 Chart.js：Token / 调用数用柱状图，命中率用折线面积图，提供坐标轴、悬浮精确值与可展开的数据表。图表只展示宿主计算结果，关闭弹框即释放画布。
+两个组件库都按需内联进浏览器产物并生产压缩，React 继续复用 DSH 实例；不依赖 CDN，也不增加宿主运行时依赖。日历样式统一加 `atr-` 前缀，避免影响宿主或其他插件。
+点击明细行展开四项 token 与会话数；明细每页展示 10 行，超过一页时显示翻页与总条数，切换分组或时间范围回到第一页。明细保留全部数据，短周期趋势保留最多 31 点，今年和自定义范围保留完整序列。
+切换时间时保留已有内容与范围标签，结果返回后整体更新；图表复用实例，弹框保持稳定高度。底部不再展示数据来源、耗时与读取时间，仅在查询失败或降级时提示原因。
+
+「配置」页填写姓名、身份 Key、完整上报地址与可选的独立 appKey。
+保存前向该地址对应的 `/api/v1/identity/verify` 校验身份，姓名与部门只认服务端返回值。
+未署名时仍可看本机统计，但不采集、不上报；已保存的 Key 不回显。
+署名与本地 Web 共用 `$DSH_HOME/token-report/identity.json`，
+连接保存到同目录的 `plugin-connection.json`（原子写入、0600）。
+用户保存的连接优先于部署默认连接；配置了固定 `user` 时页面只读。
+
+**保存后重启 DSH 生效**：当前上报器仍绑定启动时的身份与连接，页面会明确提示。
+
+#### 缓存与轮询
+
+默认走 SQLite 增量查询；每次先检查日志变化，未变化文件跳过解压。
+浏览器每 120 秒刷新，宿主缓存 30 秒并合并同周期并发请求；
+不同周期和工具查询对同一库串行执行，避免增量写入互相等待写锁。
+手动刷新绕过响应缓存，但仍走增量 SQLite，不会强制全量重扫。
+脚注显示实际数据来源、耗时和统计时刻；库不可用时明确显示直扫与降级原因。
+
+#### 面板的失败模式（都是刻意不静默的）
+
+| 现象 | 原因 | 面板会显示 |
+|---|---|---|
+| 面板完全不出现 | 浏览器半没被加载：`dsh.client` 声明缺了 `exports["./client"]`，或包不在 profile 的 `node_modules` 里 | 什么都不显示（这一类只能查 DSH 启动日志） |
+| 面板完全不出现 | slot 名字与 DSH 声明不一致 | 什么都不显示 —— 所以名字被单测钉住了（`test/client/mounting.test.ts`） |
+| 面板在，显示 404 | 宿主没有 `connection`（非 web profile）或 `features.ui: false` | `宿主未提供用量数据通道（… 返回 404）…` |
+| 面板在，显示 401 | 页面不是从带 token 的 DSH 地址打开的 | `未通过宿主鉴权（HTTP 401）…` |
+| 面板在，显示格式错 | 返回的是 SPA 兜底的 HTML，或宿主版本不匹配 | `响应不是合法 JSON` / `响应格式不认识（缺少 totals）` |
+
+★ 最后三条都带**具体动作指向**，不是统一一句「加载失败」——
+「会话目录不在」和「路由没装上」的处置完全不同，混在一起只能靠猜。
+
 ---
 
 ## 5. 两条数据源，且如实标注
 
 | `source` | 路径 | 特点 |
 |---|---|---|
-| `local-db` | 本机 SQLite 增量库（`@ai-token-report/core/db`） | 快（热态 ~50ms），**但依赖宿主是 Bun** |
+| `local-db` | 本机 SQLite 增量库（`@ai-token-report/core/db`） | 增量更新；Bun 使用 bun:sqlite，Node 使用 node:sqlite |
 | `scan` | 直接扫会话日志（`@ai-token-report/core`） | 慢（冷态 10~13s），但任何运行时都能跑 |
 | `none` | 没找到任何会话日志 | —— |
 
 `source` 与 `degradedReason` 都会**如实带在结果里**。不允许在降级时假装数据来自库 ——
 「这次为什么慢了 30 倍」必须能从输出里直接看出来。
 
-> ⚠️ **`localDb` 默认 `false`**：`core/db` 依赖 `bun:sqlite`，而 DSH 宿主跑在
-> **Node** 上，加载它会直接抛错。代码里用的是**动态 `import()`**，
-> 所以即使误开也只是「库查询降级为直扫」，不会把整个插件（连同上报）拖垮。
-> 只有确认宿主是 Bun 时才应打开。
+> `localDb` 默认 `true`。core/db 随插件内联打包，只有 SQLite 内建驱动在运行时加载。
+> `localDb: false` 用于排障对照；库不可用时由 `openStats()` 扫描一次并返回降级原因，
+> 插件不会再扫第二遍，也不会把全量记录取回后重算 SQL 已能完成的聚合。
+>
+> 产物验证：`bun run packages/dsh-plugin/verify/verify-sql.ts`。
+> 如果 `bun run` 的 PATH 把 `node` 指向 Bun shim，请通过 `ATR_NODE_BIN` 指定真实 node.exe。
+> 验证覆盖 Node SQL、直扫逐字段一致、热态、追加记录和降级。
 
 ---
 
@@ -394,19 +506,20 @@ inflight-<ts>-<pid>-<seq>.jsonl   ← 已发出但还没收到响应
 ## 8. 开发与验证
 
 ```bash
-bun test packages/dsh-plugin            # 109 个用例（fold / config / outbox / reporter / apply / identity）
+bun test packages/dsh-plugin            # 180 个用例（fold / config / outbox / reporter / apply / identity / 界面）
 bun run --filter '@ai-token-report/dsh-plugin' typecheck
 bun run --filter '@ai-token-report/dsh-plugin' build
 ```
 
-四层验证脚本，**从内到外逐层接近真实**：
+五层验证脚本，**从内到外逐层接近真实**：
 
 | 脚本 | 层次 | 断言数 | 验证什么 |
 |---|---|---|---|
-| `bun test packages/dsh-plugin` | 单元 | 109 | 折叠口径 / 配置优先级 / outbox 崩溃不丢 / 热路径只入队 |
+| `bun test packages/dsh-plugin` | 单元 | 180 | 折叠口径 / 配置优先级 / outbox 崩溃不丢 / 热路径只入队 / **界面：格式、取数状态机、挂载点、离屏渲染** |
 | `verify/verify-plugin.ts` | 端到端冒烟 | 55 | **真 HTTP 往返** + 真扫日志 + 崩溃恢复（假 ctx） |
 | `verify/verify-cordis-load.ts` | 真实框架装载 | 10 | 打包产物挂进**真 cordis Context**，含 `inject` 形状 |
 | `verify/verify-resolution.ts` | **宿主语义** | 9 | 用 **Node**（不是 Bun）解析并加载打包产物 |
+| `verify/verify-client-bundle.ts` | **浏览器半产物** | 25 | 真跑 `lib/client.js`：信封形状 / **平台模块纯度** / 双半路由一致 / slot 注册 |
 | `verify/diagnose-boot.ts` | 排障工具 | — | profile 里哪个包 import 就炸，展开完整 cause 链 |
 
 另有三个辅助脚本：
@@ -416,6 +529,21 @@ bun run packages/dsh-plugin/verify/probe-activation.ts      # apply() 到底有�
 bun run packages/dsh-plugin/verify/e2e-receiver.ts 18787    # 起一个真实接收端，供真实 DSH 会话验证
 bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败并展开 cause
 ```
+
+### 为什么「界面」也要有产物层的验证
+
+`bun test` 跑的是 `src/client/**` 的**源码**，证明的是代码逻辑对；
+但装进 DSH 的是**打包产物**，中间隔着 `bun build` + 一层 `__ModuleLoader__` 信封。
+`verify-client-bundle.ts` 补的就是这段，它抓的是只有产物上才会出现的三类问题：
+
+1. **信封没包对**（`id` 写错 / 没包 `factory`）→ DSH 报
+   `loaded without registering "<pkg>" via __ModuleLoader__.load`，而且只在浏览器里。
+2. **引用了模块表里没有的模块**（最典型：JSX 走了开发版转换）→ 物化阶段抛错。
+3. **`dsh.client` 声明与产物对不上** → DSH **启动直接失败**
+   （`ClientPackageCompositionError`），不是「面板不出现」。
+
+它还断言了**宿主半与浏览器半对路由路径的看法一致** —— 两边各写一个字面量
+是这类双半插件最容易长出来的静默 bug（面板永远 404）。
 
 ### 为什么必须跑「真实装载」这两层
 
@@ -494,6 +622,21 @@ bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败
 | `src/reporter.ts` | 内存队列 → 批量 → HTTP（热路径只入队） |
 | `src/stats.ts` | 统计查询与渲染（**不实现任何公式**） |
 | `src/identity.ts` | 身份解析（复用 core 的存储，与本地页共用同一份文件） |
+| `src/ui-bridge.ts` | 宿主侧 UI 数据通道：`/api/tokenReport.stats` + TTL 缓存 + 并发合并 |
+| `src/client/protocol.ts` | ★ **双半唯一契约**：载荷类型、周期、响应解析（零依赖，两边都能 import） |
+| `src/client/store.ts` | 浏览器侧取数状态机（`fetch`/时钟可注入，因此可单测） |
+| `src/client/format.ts` | 纯展示格式（不是口径公式，见文件头注释） |
+| `src/client/components.tsx` | 两个挂载点的 React 组件 |
+| `src/client/styles.ts` | `<style>` 注入（全部用 `--dsw-alias-*` 主题变量） |
+| `src/client/index.ts` | 浏览器半入口：`apply()` + 两个 slot 注册 |
+| `build-client.ts` | 浏览器半构建：`__ModuleLoader__` 信封 + **平台模块纯度校验** |
+
+> ⚠️ **双环境的 tsconfig**：`tsconfig.json` 管宿主半（`lib: ES2022`，无 DOM），
+> `tsconfig.client.json` 管浏览器半与它的测试（`lib` 含 DOM）。
+> 拆开是为了**不让宿主半看见 `document`、也不让浏览器半看见 `node:*`** ——
+> 合并成一个 tsconfig 会让「浏览器半里 import 了 node 内建」在类型层面合法，
+> 而那种错误只有到了用户浏览器里才会炸。`package.json` 的 `typecheck`
+> 两个都会跑。
 
 ### 三个「只有真实装载才能发现」的坑（都真实踩过）
 
@@ -530,6 +673,12 @@ bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败
 | `$DSH_HOME/token-report/outbox` 目录不存在 | 上报后端从未构造（未署名 / 没 appKey / `features.reporting: false`） | 看启动日志给的原因；这是**预期行为**不是故障 |
 | 工具报的数比看板少 | 正常 —— 看板是服务端累计，工具只看本机日志 | 用 `period` 对齐时间窗 |
 | 统计很慢（10s+） | 走了直扫路径 | 确认 `localDb` 与宿主运行时；`source` 字段会如实标注 |
+| 界面没有用量面板 | 用的不是 web profile，或 `features.ui: false`，或浏览器半没被加载 | 见 §2.4 的三行对照表；启动日志会说明「数据通道已挂载」还是「宿主不提供 connection」 |
+| 面板显示「返回 404」 | 宿主没有 `connection` 服务，或路由没注册上 | 看启动日志有无 `UI 用量面板数据通道已挂载`；headless 下是预期行为 |
+| 面板显示「未通过宿主鉴权（401）」 | 页面不是从带 `?token=` 的 DSH 地址打开的 | 用 `dsh web` 打印的那个完整地址重开页面 |
+| 面板显示「响应格式不认识（缺少 totals）」 | 宿主半与浏览器半版本不一致（升级后没重启 DSH） | 重启 DSH；两边都由同一个 `lib/` 提供，重启即可对齐 |
+| 面板数字长时间不动 | 轮询间隔就是 120s（见 §4.3 的实测依据） | 点「刷新」立刻取新值 |
+| DSH 启动报 `client bundle not found` | 改了插件但没重新构建浏览器半 | `bun run --filter '@ai-token-report/dsh-plugin' build` |
 
 ### 9.3 宿主环境（本机实测踩到）
 
@@ -568,5 +717,5 @@ bun run packages/dsh-plugin/verify/diagnose-boot.ts web   # 逐个包试 import�
 | 身份署名与归属 | `.agents/skills/identity-attribution/SKILL.md` |
 | 会话日志解析 | `.agents/skills/dsh-session-log-parsing/SKILL.md` |
 | 工程约定 | `.agents/skills/repo-conventions/SKILL.md` |
-| 插件方案（历史） | `docs/PLAN.md` |
+| 插件方案（历史） | `docs/插件方案.md` |
 

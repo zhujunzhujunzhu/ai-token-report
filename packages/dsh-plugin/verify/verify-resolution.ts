@@ -1,3 +1,4 @@
+import { cleanChildEnv, resolveNodeBin } from '../../core/verify/lib/runtime.js'
 /**
  * 解析验证：模拟 DSH 宿主（**Node**，不是 Bun）加载插件时的模块解析。
  *
@@ -20,6 +21,7 @@
 
 import { createRequire } from 'node:module'
 import { existsSync, readFileSync } from 'node:fs'
+import { pathToFileURL } from 'node:url'
 import { dirname, join, resolve } from 'node:path'
 
 let failures = 0
@@ -99,10 +101,11 @@ console.log('\n── Node 真实加载打包产物 ──')
 try {
   // 注意：这里用 Node 而不是 Bun 来跑，才真正验证宿主语义
   const { spawnSync } = await import('node:child_process')
-  const script = `import(${JSON.stringify(libPath)}).then(m => { console.log(JSON.stringify({ name: m.default?.name, hasApply: typeof m.default?.apply === 'function', hasRunTool: typeof m.queryUsage === 'function' })) }).catch(e => { console.error('LOAD_FAIL: ' + e.message); process.exit(1) })`
-  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+  const script = `import(${JSON.stringify(pathToFileURL(libPath).href)}).then(m => { console.log(JSON.stringify({ name: m.default?.name, hasApply: typeof m.default?.apply === 'function', hasRunTool: typeof m.queryUsage === 'function' })) }).catch(e => { console.error('LOAD_FAIL: ' + e.message); process.exit(1) })`
+  const r = spawnSync(resolveNodeBin() ?? 'node', ['--input-type=module', '-e', script], {
     encoding: 'utf8',
     cwd: pluginDir,
+    env: cleanChildEnv(),
     timeout: 30_000,
     // ⚠️ 不能用管道捕获 —— 受限沙箱下 pipe stdio 会 EPERM
     stdio: ['ignore', 'pipe', 'pipe'],

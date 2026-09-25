@@ -68,12 +68,19 @@ export interface EffectiveConfig {
     tools: boolean
     /** 注册 `ctx.tokenReport` 服务，供其它插件取数。 */
     service: boolean
+    /**
+     * 在 DSH 界面里显示用量面板（浏览器半 + `/api/tokenReport.stats` 路由）。
+     *
+     * 关掉它只影响**显示**：上报、工具、服务都不受影响。
+     * 宿主不提供 `connection` 服务时（headless profile）会自动跳过，
+     * 不需要为此改配置。
+     */
+    ui: boolean
   }
   /**
    * 本机上是否启用本地 SQLite 库查询。
    *
-   * ⚠️ 默认 `false`：`core/db` 依赖 `bun:sqlite`，而 DSH 宿主跑在 **Node** 上，
-   *   加载它会直接抛错。只有确认宿主是 Bun 时才应打开。
+   * 默认开启。运行时驱动由 core/db 选择，库不可用时降级直扫并显示原因。
    */
   localDb: boolean
   /** 固定身份（IT 统一部署场景）。留空则读本机身份文件。 */
@@ -162,6 +169,7 @@ export interface RawConfig {
     reporting?: boolean
     tools?: boolean
     service?: boolean
+    ui?: boolean
   }
   localDb?: boolean
   user?: { name?: string; token?: string; dept?: string }
@@ -220,9 +228,10 @@ export function resolveConfig(raw: RawConfig = {}): EffectiveConfig {
       reporting: raw.features?.reporting ?? true,
       tools: raw.features?.tools ?? true,
       service: raw.features?.service ?? true,
+      ui: raw.features?.ui ?? true,
     },
     // ⚠️ 默认 false：宿主是 Node 时 `bun:sqlite` 不存在，开了会直接起不来
-    localDb: raw.localDb ?? envBool(ENV.localDb) ?? false,
+    localDb: raw.localDb ?? envBool(ENV.localDb) ?? true,
     ...(user ? { user } : {}),
     ...(raw.dshHome ? { dshHome: raw.dshHome } : {}),
   }
@@ -260,12 +269,6 @@ export function validateConfig(config: EffectiveConfig): string[] {
   }
   if (!/^https?:\/\//i.test(config.endpoint)) {
     problems.push(`endpoint 必须是 http(s) 地址，当前为 "${config.endpoint}"`)
-  }
-  if (config.localDb) {
-    problems.push(
-      'localDb = true —— 本地库查询依赖 bun:sqlite，宿主不是 Bun 时会加载失败。\n' +
-        '  仅在确认宿主为 Bun 时打开；否则保持默认值 false。',
-    )
   }
   return problems
 }
