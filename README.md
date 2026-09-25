@@ -20,17 +20,29 @@ bun run stats -- --period today
 bun run build:local   # 首次需先构建前端产物
 bun run web
 
-# ③ 独立部署部门服务端 —— ✅ 已可用
+# ③ 独立部署部门服务端（含部门看板页面）—— ✅ 已可用
+bun run build:portal  # 首次需先构建看板前端产物
 bun run server
+
+# ④ 增量上报到部门服务端（由计划任务每 10 分钟调用）—— ✅ 已可用
+bun run report -- --endpoint http://<服务端>:8787/api/v1/token-usage --token <管理员发的 token>
 ```
 
-> **实现进度**：`stats`（终端统计）、`web`（本地页面）与 `server` 已可用。
-> 以下尚未实现：
->
-> - `bun run report`（增量上报，待 S3 上报接口）
-> - `packages/web-portal` 部门看板页面（待 S8；当前是骨架占位）
->
+> **实现进度**：`stats`（终端统计）、`web`（本地页面）、`server`（上报接收 +
+> **部门看板**）与 `report`（CLI 上报）均已可用。
+> 四种形态（CLI / 本地页面 / 部门看板 / DSH 插件）全部落地，
 > 详见 [`ARCHITECTURE.md`](./ARCHITECTURE.md) §8 阶段表。
+>
+> **部门看板**：`bun run server` 起服务后打开 `http://<服务端>:8787/`
+> （页面由服务端静态托管，构建产物在 `packages/web-portal/dist`），
+> 在页面上填入管理员发放的身份 token 即可看到本部门的人员排行、
+> 部门趋势、模型分布、用量明细与采集覆盖率诊断。
+> 筛选栏支持**时间窗**（今天 / 上周 / 本月 / 最近 90 天…或自定义起止时间）、
+> **人员多选**与厂商 / 模型。
+>
+> **人员管理**：管理员登录后右上多一个「人员管理」页签 ——
+> 在页面上**发放 / 重置 / 吊销** token（姓名、部门、角色），
+> 不必再手工改凭证文件。
 
 ## 目录
 
@@ -39,9 +51,9 @@ bun run server
 | `packages/shared` | **契约单一真源**：上报 DTO、查询响应、口径公式 |
 | `packages/core` | **统计内核**：解码 / 扫描 / 聚合 / 时间范围 / 水位线 / 身份存储 |
 | `packages/cli` | 命令行入口：`stats` / `report` / `--web` |
-| `packages/server` | 后端：上报接收 + 本地直查 + 部门统计 + 静态托管 |
+| `packages/server` | 后端：上报接收 + 本地直查 + 部门统计 + **人员管理（凭证读写）** + 静态托管 |
 | `packages/web-local` | **本地页面**：只看本机，数据来自 `/api/local/*` |
-| `packages/web-portal` | **部门看板**：看全员，数据来自 `/api/v1/stats/*` |
+| `packages/web-portal` | **部门看板 + 人员管理页**：看全员，数据来自 `/api/v1/stats/*` 与 `/api/v1/admin/members*`（需身份 token） |
 | `packages/dsh-plugin` | **DSH 插件**：实时上报 |
 
 ## 三条铁律
@@ -65,13 +77,30 @@ bun run server
 
 ### 管理员准备凭证
 
-在服务端的 `<dshHome>/token-report/credentials.json` 里登记：
+在服务端的 `<dshHome>/token-report/credentials.json` 里登记**第一个管理员**：
 
-```json
-[ { "token": "atr-zhangsan-9f3c", "name": "张三", "dept": "研发一部" } ]
+```jsonc
+[ { "token": "atr-boss-9f3c", "name": "李经理", "role": "admin" },
+  { "token": "atr-zhangsan-9f3c", "name": "张三", "dept": "研发一部" } ]
 ```
 
-然后把 token 发给对应员工。
+也可以完全不碰文件，用环境变量起服务（该 token 不会写进文件）：
+
+```bash
+ATR_ADMIN_TOKEN=atr-boss-9f3c ATR_ADMIN_NAME=李经理 bun run server
+```
+
+之后**都在页面上发放**：管理员登录 →「人员管理」→ 填姓名 / 部门 / 角色 →
+「生成并发放 token」，把新 token 复制给本人（本地页与插件填的是同一个）。
+同一个页面还能**重置 token**（旧 token 立即失效）与**吊销**（本人此后无法上报与看看板）。
+
+两条与权限有关的约定：
+
+- **角色只有两个**：`member`（缺省，可看全部门看板）与 `admin`（额外可进人员管理页）。
+  **不要用姓名白名单判断管理员** —— 姓名是可以随便改的显示值。
+- **最后一个管理员不可删除、不可降级**：否则没人能再发放 token，只能改文件恢复。
+  凭证文件**读不懂时服务端拒绝一切写入**（不拿空表覆盖唯一真值），
+  此时管理页会显示「不可写」与原因。
 
 ## 环境要求
 

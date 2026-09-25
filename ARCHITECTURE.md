@@ -43,7 +43,7 @@
 | `dsh-token-stats/` | 完整 CLI：zstd 解码、扫描、聚合、增量上报、HTTP 投递 | ✅ 已拆成 `core` + `cli`，原目录已删 |
 | `frontend/` | Vue 3 统计页 UI（卡片 / 图表 / 明细表 / 筛选） | ✅ 已改造为 `web-local` 并接真数据，原目录已删 |
 | `dsh-session-inspector/` | 会话探针插件，可在工具调用处打断点 | ✅ 与本项目主线无关，已移除 |
-| 服务端 | —— | ⚠️ 骨架已就位，ingest 接口待 S3 |
+| 服务端 | —— | ✅ 上报接收（S3）、本地直查（S4）、部门查询（S7）均已落地 |
 | DSH 插件 | —— | ✅ 身份解析、上报后端、工具/服务、**界面用量面板**均已落地（S9，见 `packages/dsh-plugin/README.md`） |
 
 ### 1.1 三个必须修的裂缝
@@ -112,22 +112,23 @@ ai-token-report/
 │  │   ├─ src/views/           #   现有统计页（复用）
 │  │   └─ vite.config.ts
 │  │
-│  ├─ web-portal/              # ★ ② 部门看板页面（新建）
-│  │   ├─ src/api/portal.ts    #   调服务端的 /api/v1/stats/*
+│  ├─ web-portal/              # ★ ② 部门看板页面（S8，已落地）
+│  │   ├─ src/api/portal.ts    #   调服务端的 /api/v1/stats/*（带 Bearer token）
+│  │   ├─ src/composables/     #   usePortalSession（门禁）/ usePortalDashboard（取数编排）
 │  │   ├─ src/views/
-│  │   │   ├─ DeptOverview.vue #     部门总览
-│  │   │   ├─ UserRanking.vue  #     ★ 人员排行（核心诉求）
-│  │   │   ├─ UserDetail.vue   #     单人下钻
-│  │   │   └─ Diagnostics.vue  #     采集覆盖率 / 未归属监控
-│  │   └─ vite.config.ts
+│  │   │   └─ DashboardView.vue#     总览 + 趋势 + 人员排行 + 分布 + 明细 + 诊断
+│  │   ├─ src/components/      #   RankingTable / TrendChart / RecordsTable / DiagnosticsPanel …
+│  │   └─ vite.config.ts       #   5198；开发期把 /api 代理到 8787（DSH_PORTAL_API 可改）
 │  │
-│  ├─ server/                  # ★ ② 服务端
-│  │   ├─ src/index.ts         #   createServer()（Bun.serve）
+│  ├─ server/                  # ★ ② 服务端（一个 server 两副面孔，见 index.ts 顶部表）
+│  │   ├─ src/index.ts         #   createServer() + 路由分派（Bun.serve / node:http 二选一）
+│  │   ├─ src/ingest-route.ts  #   POST /api/v1/token-usage  ← 插件 & CLI（S3，已落地）
+│  │   ├─ src/stats-route.ts   #   GET  /api/v1/stats/*      ← 部门页（S7，已落地）
 │  │   ├─ src/local-api.ts     #   /api/local/*  ← 本地页专用（本地增量库）
-│  │   ├─ src/routes/
-│  │   │   ├─ ingest.ts        #   POST /api/v1/token-usage  ← 插件 & CLI
-│  │   │   └─ stats.ts         #   GET  /api/v1/stats/*      ← 部门页
-│  │   └─ src/static.ts        #   托管两个 web 的构建产物
+│  │   ├─ src/credentials.ts   #   凭证表：身份判定的唯一权威来源
+│  │   ├─ src/verify-route.ts  #   POST /api/v1/identity/verify + 上报归属/看板身份解析
+│  │   ├─ src/identity-route.ts#   /api/local/identity  ← 引导页读写
+│  │   └─ src/serve-node.ts    #   node:http 适配器（★ 必须动态 import node:http）
 │  │
 │  └─ dsh-plugin/              # ★ ③ DSH 插件（docs/插件方案.md §3）
 │      ├─ src/index.ts         #   SessionTelemetryBackend 实现 + apply() 装配
@@ -144,8 +145,10 @@ ai-token-report/
 
 > `dsh-session-inspector/` 曾是独立 DSH 插件，与本项目无耦合，**现已移除**。
 >
-> **尚未落地**：`tools/`、`packages/web-portal/src/views/`。
-> （`packages/core/src/db/` 已在 S10 落地，见 §3.1。）
+> **尚未落地**：`tools/`（计划任务注册，S10）。
+> （`packages/core/src/db/` 已在 S10 落地，见 §3.1；
+> `packages/server/src/stats-route.ts` 与 `packages/web-portal/` 已在 S7/S8 落地，
+> 见 §5.3 与 §6。）
 >
 > 已落地但计划里未单列的：`packages/server/src/local-api.ts` —— `/api/local/*`
 > 的直查实现（进程内 mtime 缓存 + 参数解析），S4 的实际产物。
@@ -407,17 +410,57 @@ $DSH_HOME/token-report/identity.json
 服务端启动前放置 `<dshHome>/token-report/credentials.json`：
 
 ```jsonc
-// 推荐：一 token 一人
-[ { "token": "atr-zhangsan-9f3c", "name": "张三", "dept": "研发一部" } ]
+// 推荐：一 token 一人；role 缺省是 member
+[ { "token": "atr-zhangsan-9f3c", "name": "张三", "dept": "研发一部" },
+  { "token": "atr-boss-9f3c",     "name": "李经理", "role": "admin" } ]
 
-// 或简写
+// 或简写（该格式下所有人都是普通成员）
 { "张三": "atr-zhangsan-9f3c" }
 ```
 
 > 凭证文件损坏时服务端**照常启动**（空表 + 告警），
 > 不会因为一份文件写错就让已署名的员工全部失效。
+> 但从那一刻起**管理页拒绝一切写入** —— 覆盖一份读不懂的文件 =
+> 静默吊销全员（AGENTS.md「凭证文件是唯一真值」）。
 
-### 4.5.6 提示文案的三条原则
+### 4.5.6 人员管理与 token 发放（管理页）
+
+手工维护一个文件在人数增长后迅速变得不划算（入职手写一行、泄露手工改一行、
+查「谁还没发」人肉比对）。因此服务端提供了一组**管理员专用**接口，
+看板上多一个「人员管理」页签：
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| GET | `/api/v1/admin/members` | 人员列表 + 凭证文件状态（路径 / 是否可写） |
+| POST | `/api/v1/admin/members` | **签发 token** |
+| POST | `/api/v1/admin/members/update` | 改姓名 / 部门 / 角色（token 不变） |
+| POST | `/api/v1/admin/members/rotate` | 重置 token（旧 token 立即失效） |
+| POST | `/api/v1/admin/members/revoke` | 吊销 |
+
+★ **`role` 是权限的唯一来源**（`admin` / `member`，缺省 `member`）：
+
+- `member`：可看全部门看板（部门看板是组内公开的用量页），看不到管理页
+- `admin`：额外可进入管理页发放 / 重置 / 吊销 token
+
+**绝不要用姓名白名单判断管理员** —— 姓名是可以随时改的显示值。
+
+三条实现上的硬约束（`packages/server/src/member-admin.ts`）：
+
+| 约束 | 不这么做会怎样 |
+|---|---|
+| **先落盘、再整体替换内存镜像** | 反过来会出现「页面上 token 能用、重启后消失」 |
+| **文件读不懂时拒绝一切写入** | 按内存空表覆盖 = 静默吊销全员 |
+| **最后一个管理员不可删 / 不可降级** | 一次误操作后所有人都无法再发放 token |
+
+另外两条与身份可信边界同源：
+
+- **签发即刻生效**：`CredentialStore` 全进程只有一个实例（上报 / 看板 / 管理共享），
+  否则员工拿到 token 后要等服务端重启才能上报，而管理员这边一切正常
+- **冷启动兜底 `ATR_ADMIN_TOKEN`**：凭证文件为空（全新部署）或只读（编排系统挂载）时，
+  没有它就没有任何人能进管理页 —— 而管理页的第一件事就是发放第一个 token。
+  该凭证**不落文件**（部署秘密不该被复制到磁盘的另一处）
+
+### 4.5.7 提示文案的三条原则
 
 未署名时的提示写了什么，直接决定这个功能会不会被接受：
 
@@ -427,6 +470,25 @@ $DSH_HOME/token-report/identity.json
    后者用户做什么都没用，混为一谈会让人反复重试
 
 ---
+
+### 4.5.8 部门后台的账号登录
+
+部门后台现在以 **用户名 + 密码 + 图形验证码** 登录；CLI / 插件仍使用上报 Token。
+账号与同一个人员凭证绑定，在 `credentials.json` 增加可选 `username` / `passwordHash`，
+既有 Token 不自动成为密码。新增账号或重置密码由人员管理页完成，仍先落盘再替换内存镜像。
+
+- `server/src/auth/password.ts`：`@noble/hashes` scrypt，随机盐，密码不明文落盘。
+- `auth/captcha.ts`：PNG 位图，服务端保存答案，绑定浏览器、2 分钟有效且只能使用一次。
+- `auth/portal-auth.ts`：进程内会话与限流。会话 8 小时过期，权限每次从凭证表重读。
+- `app.ts`：`/api/v1/auth/{captcha,login,session,logout}`；后台可使用 HttpOnly Cookie，
+  原 Bearer API 契约保留。POST Cookie 操作校验同源及自定义请求头。
+- `POST /api/v1/admin/members/login`：管理员设置 username / password，响应不含密码或哈希。
+
+首次部署在原 `ATR_ADMIN_TOKEN` 基础上增加 `ATR_ADMIN_USERNAME` / `ATR_ADMIN_PASSWORD`；
+环境变量账号不落文件。HTTPS 反向代理需配置 `ATR_PORTAL_ORIGIN`。
+密码或账号变更、Token 重置或吊销会使旧会话失效；服务重启后需要重新登录。
+当前会话、验证码与限流均为单进程存储。页面拆分、迁移与部署步骤见
+[部门前端重构方案](docs/部门前端重构方案.md)。
 
 ## 5. 接口契约
 
@@ -510,17 +572,103 @@ Content-Type: application/json
 > 身份在 `client` 对象内而非记录内、响应必须如实返回三个计数
 > （缺失时 CLI 会回退成「全部接受」—— 不报错，但统计会失真）。
 
+实现落在 `packages/server/src/ingest-route.ts`。四条容易搞错、且已在
+`test/ingest.test.ts` 里锁死的语义：
+
+| 语义 | 做法 | 不这么做会怎样 |
+|---|---|---|
+| **鉴权失败回 401/503，不是 `200 + ok:false`** | ★ 与 §5.1.1 的 `/identity/verify` **刻意相反** | 客户端把 2xx 当成「已投递」并清掉 `pending`，那批用量**静默消失** |
+| **归属取 token 查凭证表** | ★ `client.userName` 一律忽略，只用于排查 | 改一下本地配置就能以他人名义上报 |
+| **`event_id` 主键幂等** | `INSERT OR IGNORE`，冲突破主键即跳过 | 插件与 CLI 同时上报会重复计费 |
+| **单行拒收不牵连整批** | 坏行计入 `rejected`，好行照常入库 | 一条脏数据让整批 10 分钟的增量被反复重投 |
+
+> 归属的三列（`user_id` / `user_name` / `dept`）与四项 token 同表存储
+> （`usage_event`，schema 版本 3），**本机库同一份 schema 但三列为 NULL**
+> —— 本机数据只有我一个人，归属只对上报道意义。
+
+#### 🚨 上报库（`portal.sqlite`）绝不自动重建
+
+本地库是**日志的派生物**，所以它「版本不符就重建」（§3.1）；
+**上报库不是** —— 客户端投递成功后就清掉了自己的 `pending` / outbox，
+**服务端是唯一副本**。因此 `openPortalDb()` 在 schema 版本不符时**抛错**，
+而不是沿用 `openDatabaseForIngest()` 的「丢了重建」。一旦搞反，
+一次 schema 升级就会把全部门的历史用量静默清空，且无从恢复。
+
+库路径默认 `<dsh-home>/token-report/portal.sqlite`，与本地库
+`usage.sqlite` **必须分开**：混用会让全员数据与本机数据互相污染，
+而库里没有「数据来源」列，事后拆不开。
+
+#### 上报库可选 MySQL（本机库**不行**）
+
+部门服务端可以把上报库放到 MySQL：`--mysql <url>` 或环境变量 `ATR_MYSQL_URL`
+（见 `packages/core/src/db/portal-db.ts`）。**本机库 `usage.sqlite` 恒为 SQLite** ——
+员工机器上跑 CLI 不需要任何数据库服务，这条边界由**类型**保证：
+本地路径的函数只收同步 SQLite `Database`，MySQL 侧只有异步 `PortalStore`。
+
+设计要点（细节与实测坑见 `docs/mysql上报库.md`）：
+
+- **一份 SQL，两种后端**：`query.ts` 的构建器产出 `$name` 参数，MySQL 侧由
+  `toPositional()` 翻成 `?`；四处语法差异（含 `||` 在 MySQL 是**逻辑或**这种
+  「不报错只出错」的坑）全部收在 `dialect.ts`。
+- **异步只在 portal 一侧**：MySQL 驱动只有异步 API，所以上报库门面统一异步；
+  本机库路径保持同步（`bun run stats` 的终端表格就是产品本身）。
+- **MySQL 的 `close()` 是空操作**：连接来自进程内共享池，每请求关池会重新握手。
+- **Node 上不支持 MySQL**（明确报错并指路）：npm 版 CLI 只跑本机库，
+  为一条用不到的通路引 `mysql2` 会进发布产物。
+- 验收：`bun run packages/server/verify/verify-mysql-portal.ts`（53 项）断言
+  两种后端在**同一批数据**下每个接口的响应体**逐位一致**。
+
 ### 5.3 服务端查询（部门页用）
 
 | 接口 | 用途 |
 |---|---|
-| `GET /api/v1/stats/overview?from&to&provider&user` | 部门总览卡片 |
+| `GET /api/v1/stats/overview?period&from&to&provider&model&user` | 部门总览卡片 |
 | `GET /api/v1/stats/series?bucket=day\|hour` | 部门趋势 |
-| `GET /api/v1/stats/breakdown?by=user\|model\|provider\|cwd` | **★ 人员排行** |
-| `GET /api/v1/stats/records?limit&offset` | 明细（分页） |
-| `GET /api/v1/stats/diagnostics` | 覆盖率 / 未归属 / 机器在线 |
+| `GET /api/v1/stats/breakdown?by=user\|model\|provider\|provider-model\|project\|day\|hour` | **★ 人员排行** |
+| `GET /api/v1/stats/records?limit&offset` | 明细（分页，最新在前） |
+| `GET /api/v1/stats/diagnostics` | 覆盖率 / 未归属 / 数据边界 / 最近落库 |
+
+**页面上的筛选**（`web-portal`）：
+
+| 筛选 | 传什么 | 为什么 |
+|---|---|---|
+| **时间窗** | 具名周期 `period`（`today` / `上周` / `最近 90 天` …） | 由服务端 `core/range.ts` 解析，**前端不做日期换算** |
+| **自定义区间** | `from` / `to`（epoch 毫秒） | 那本来就是使用者选定的两个绝对时刻，不是口径；结束时刻按「含该分钟」处理 |
+| **人员** | `user=张三,李四`（**多人可多选**，逗号分隔） | 归属筛选是**精确匹配**；`unknown` 表示未署名 |
+| **厂商 / 模型** | `provider` / `model` | **子串**匹配（与 CLI 同义），与人名规则刻意不同 |
+
+> ⚠️ 人员下拉的候选来自**不含人员筛选**的同窗口 `breakdown?by=user`：
+> 若从已筛选的结果里取候选，选中一个人之后下拉会塌缩成一个选项（自锁定），
+> 使用者再也加不回别人，而页面看起来像「其余人都没数据」。
 
 **响应结构在 `packages/shared/src/protocol.ts` 定义，前后端共用** —— 防漂移的关键。
+
+实现落在 `packages/server/src/stats-route.ts`（数据层在 `core/db/portal.ts`）。
+五条容易搞错的语义：
+
+| 语义 | 做法 | 不这么做会怎样 |
+|---|---|---|
+| **鉴权失败回 401/503，不是 `200 + ok:false`** | ★ 与 §5.1.1 的 `/identity/verify` **刻意相反**，理由同 §5.2 | 响应体里装的是**数据**，回 2xx 会让前端把「token 不对」渲染成「这段时间没人用」—— 一个 0 值空看板 |
+| **只读上报库，一个字节都不写** | `openPortalStats()` → `openPortalDb()` | 写坏唯一副本；schema 版本不符时还会触发「重建」 |
+| **没有降级路径** | 库打不开 → `500` + 具体原因 | 上报库没有可重扫的真值，拿空数据冒充「今天没人用」比报错危险 |
+| **未归属统一成 `unknown`** | SQL `COALESCE(user_id,'unknown')`，筛选值同值 | 那批数据会被 `GROUP BY` 丢进 NULL，「有多少人没署名」永远浮不上来 |
+| **时间窗由服务端解析** | 页面只传 `period`，服务端调 `core/range.ts` | 前端自己算「本月从哪天开始」= 时区口径的第二份实现 |
+
+> ⚠️ **角色列已落地**（`role: admin | member`，见 §4.5.6）：任何有效 token 都能查看
+> **全部门**看板（部门看板是「组内公开」的用量页），而**只有管理员**能进人员管理页
+> 发放 / 重置 / 吊销 token。鉴权失败分 401 / **403** / 503 三者，
+> 绝不能用姓名硬编码白名单判断管理员。
+>
+> ⚠️ 诊断里的 `identityViolations` **恒为 0 且是结构性的**：上报库不存
+> `total_tokens` 列（铁律 2），总量一律由四项相加得出，所以恒等式不可能不成立。
+> 页面文案必须说清这一点，否则它就是个「看起来很健康」的假信号。
+
+数据链路：
+
+```
+CLI / 插件 ──POST /api/v1/token-usage──► portal.sqlite ──只读──► /api/v1/stats/* ──► 看板页
+                （归属取 Bearer token 查凭证表）        （openPortalStats）
+```
 
 ---
 
@@ -530,15 +678,30 @@ Content-Type: application/json
 |---|---|---|
 | 使用者 | 我自己 | 管理者 / 全组 |
 | 数据范围 | 本机 | 全员 |
-| 数据源 | `/api/local/*`（本地增量库） | `/api/v1/stats/*`（读库） |
-| 鉴权 | 无（仅 127.0.0.1） | Bearer token |
-| 部署 | CLI 内置，随命令启动 | 独立部署 |
-| 核心视图 | **首次署名引导** / 我的用量 / 我的项目分布 | **人员排行** / 部门趋势 / 模型分布 / 单人下钻 / 采集诊断 |
+| 数据源 | `/api/local/*`（本地增量库） | `/api/v1/stats/*`（只读上报库） |
+| 鉴权 | 无（仅 127.0.0.1） | **Bearer token**：页面顶部填一次，存 localStorage，可点「退出」清除 |
+| 部署 | CLI 内置，随命令启动 | 独立部署（`bun run server` 托管 `packages/web-portal/dist`） |
+| 核心视图 | **首次署名引导** / 我的用量 / 我的项目分布 | **人员排行** / 部门趋势 / 模型分布 / 单人下钻 / 用量明细 / 采集诊断 |
+| 管理视图 | ❌ 无（本机数据只有我自己） | ★ **人员管理**（仅 `role=admin` 可见）：发放 / 重置 / 吊销 token |
+| 筛选 | 时间窗 / 厂商 / 模型 | 时间窗（**含自定义区间**）/ **人员（多选）** / 厂商 / 模型 |
 | 金额 | ❌ **不展示**（已确认，无单价来源） | ❌ **不展示**（已确认） |
-| 特色指标 | 我的缓存命中率、我的项目消耗 | **未署名占比**、**掉了哪些机器** |
+| 特色指标 | 我的缓存命中率、我的项目消耗 | **未署名占比**、**是谁没署名**、**给谁发了 token** |
 
-两者共享 `shared` 的类型与 `web-local/src/components` 里的 UI 组件（图表卡片等），
-但**构建产物、路由、部署方式完全独立**。
+两者共享 `shared` 的类型与视觉规范（`styles/base.css` 的设计令牌同源），
+但**构建产物、路由、部署方式完全独立** —— 样式文件刻意各存一份，
+不为几个 CSS 变量把两个应用绑成同一个构建单元。
+
+> **看板的 token 门禁**：`web-portal` 未登录时只渲染门禁页，**一个统计请求都不发**
+> （发了必然 401）。校验走 `/api/v1/identity/verify`（`200 + ok:false` 语义），
+> 因此页面能区分「token 填错了」与「管理员还没配凭证」——
+> 后者用户做什么都没用，提示必须不同。
+> token 失效（401/503）时立刻退回门禁页，**不能只挂一条红字**：
+> 页面上还留着上一轮的数据，使用者会以为「这是最新的，只是有个警告」。
+>
+> **管理页签的显示只由 `role` 决定，而它来自服务端**（`/api/v1/identity/verify`
+> 的 `role` 字段，见 §4.5.6）。前端隐藏入口是排版，不是权限：
+> 非管理员直接打 `/api/v1/admin/members*` 会拿到 **403**。
+> 权限判断只写在前端 = 没有权限。
 
 ---
 
@@ -553,10 +716,27 @@ Content-Type: application/json
 4. ☐ **「数字集团 token」口径**：只算 `dashscope`，还是员工全部流量？
    （`docs/口径实测结论.md` §4.1，差 2.36 亿 vs 10 亿+）—— **仍需拍板**
 5. ☐ **部门页开放范围**：仅 127.0.0.1？还是内网全组可访问（需鉴权）？
+   ✅ 已定：**监听地址仍默认 127.0.0.1，对全组开放用 `--host 0.0.0.0`；
+   所有 `/api/v1/stats/*` 与页面数据都要求身份 token**（见 §5.3 与 §6）。
 6. ☐ **凭证发放方式**：管理员手工编辑 `credentials.json`，还是加一个签发页面/命令？
+   ✅ 已定并实现：**两者都有**。手工维护只用于铺开第一个管理员
+   （写 `"role": "admin"`，或用 `ATR_ADMIN_TOKEN` 兜底）；
+   之后一律在**人员管理页**发放 / 重置 / 吊销（§4.5.6）。
+   权限用**凭证角色列**，不用姓名白名单。
 7. ✅ **迁移期旧目录如何处理？** 已确认并执行：`dsh-token-stats/`、`frontend/`、
    `p0-verify/`、`dsh-session-inspector/` 全部删除；`.bun-cache/`、`node_modules/` 一并清理。
    `dsh-token-stats/` 的代码先迁入 `packages/core` + `packages/cli` 并验证后才删。
+8. ☐ **server 层要不要库化（引入第三方 Web 框架）？**
+   现状：`packages/server` **零第三方运行时依赖**，但 HTTP 层是手写的 ——
+   路由分发是 185 行顺序 `if` 链（`server/src/index.ts:390-574`）、
+   `registered ? 401 : 503` 写了 3 遍（`ingest-route.ts:109` / `stats-route.ts:119` /
+   `admin-route.ts:173`）、错误信封 `{ ok:false, reason }` 手写约 31 处、
+   请求日志 / CORS / `Content-Type` 校验 / 压缩**全缺**、静态托管 52 行无 ETag。
+   另有一段 **843 行没人调用的孤儿子系统**（`password` / `captcha` / `png` / `dot-font`）。
+   **建议**：引入 `hono` + `@hono/node-server`（均 MIT、**0 依赖**）接管
+   「HTTP 机械动作」，业务护栏（401/403/503 三分、上报非 2xx、凭证唯一真值…）
+   留在自持代码里 —— 完整事实、选型逐项判定与分阶段方案见
+   **`docs/server架构重构方案.md`（S12 系列）**。
 
 ---
 
@@ -567,17 +747,33 @@ Content-Type: application/json
 | **S0** | 整体梳理 + 目录骨架 + shared 契约 | 本文 + 骨架 | ✅ 完成 |
 | **S0.5** | **身份署名全链路**（契约 / 存储 / 校验 / 引导页 / 插件） | **可署名的本地服务** | ✅ 完成 |
 | **S1** | 抽 `core`（迁移 CLI 逻辑，行为不变） | 可复用内核 | ✅ 完成 |
-| **S3** | `server`：ingest 接口 + SQLite 幂等落库 | ④ 能打通 | |
+| **S3** | `server`：ingest 接口 + SQLite 幂等落库 | ④ 能打通 | ✅ 完成 |
 | **S4** | `server`：`/api/local/*` 统计直查 | ① 数据就绪 | ✅ 完成 |
 | **S5** | `web-local`：删 mock，接本地 API | **本地页面可用** | ✅ 完成 |
 | **S6** | `cli --web`：内嵌 server + 开浏览器 | **`dsh-token --web` 兑现** | ✅ 完成 |
-| **S7** | `server`：`/api/v1/stats/*` 查询接口 | 部门数据就绪 | |
-| **S8** | `web-portal`：部门看板（人员排行等） | **部门页面可用** | |
+| **S7** | `server`：`/api/v1/stats/*` 查询接口 | 部门数据就绪 | ✅ 完成 |
+| **S8** | `web-portal`：部门看板（人员排行等） | **部门页面可用** | ✅ 完成 |
 | **S9** | `dsh-plugin`：backend + 队列 + outbox + 全局配置 + 工具/服务 | **③ 插件上报** | ✅ 完成 |
 | **S9.5** | `dsh-plugin`：浏览器半（`conversation.input.dock` 用量条 + 标题栏徽章）+ `/api/tokenReport.stats` | **④ 界面里直接看用量** | ✅ 完成 |
+| **S11** | `server` + `web-portal`：**角色与人员管理**（权限列 / 签发重置吊销 / 管理员页签）+ 看板的**人员多选与自定义时间段**筛选 | **可运营：自己发 token** | ✅ 完成 |
+| **S12** | `server`：**库化重构**（补分发面契约测试 ✅ → Hono 路由 ✅ → 中间件收编 ✅ → 孤儿模块裁定：删除 ✅ → 静态托管升级 ☐ → 可选 schema 化 ☐） | 更薄、更可运维的 server 层 | 🟡 S12.0~S12.2 + S12.4 完成，S12.3 / S12.5 待做（`docs/server架构重构方案.md`） |
 | **S10** | 计划任务 + 凭证铺开 + 合规确认 | 可运营 | |
 
 > **S0.5 已完成**：署名链路（含真实 HTTP 端到端验证 27 项）已可用。
+>
+> **S3 已完成**：`POST /api/v1/token-usage` 已落地（`server/src/ingest-route.ts`）——
+> 鉴权（Bearer → 凭证表）、逐行校验、`event_id` 幂等落库、如实返回
+> `accepted / duplicates / rejected`，归属写进 `usage_event` 的
+> `user_id / user_name / dept` 三列（schema 版本 3）。
+> 两条端到端验证：
+>
+> ```bash
+> bun run packages/server/test/e2e-ingest.ts        # 真实 HTTP 打上报接口（35 项）
+> bun run packages/cli/verify/verify-report-ingest.ts  # 真 CLI report → 真服务端 → 库（28 项）
+> ```
+>
+> 关键取舍见 §5.2：**鉴权失败必须是非 2xx**、**归属只信服务端**、
+> **上报库绝不自动重建**。
 >
 > **S9 已完成**：`dsh-plugin` 的上报后端已落地 ——
 > `SessionTelemetryBackend` + 内存队列 + 磁盘 outbox（两态 + 启动重放）+ 全局配置
@@ -637,6 +833,41 @@ Content-Type: application/json
 > 3. `bun:sqlite` 的 prepared statement **必须 `finalize()`**，
 >    否则 `db.close()` 不释放文件句柄，`--reset-db` 会永远报
 >    `EBUSY: resource busy or locked`，且错误信息完全不提 prepared statement。
+
+> **S7 / S8 已完成**：`server` 的 `/api/v1/stats/*` 与 `web-portal` 部门看板
+> 一并落地 —— 页面由服务端静态托管（`bun run server` 会探测
+> `packages/web-portal/dist`），带上身份 token 即可看到人员排行、部门趋势、
+> 模型分布、用量明细、单人下钻与采集诊断。
+>
+> 实现要点与五条易错语义见 §5.3；门禁与两个页面的分工见 §6。
+> 三条验证入口：
+>
+> ```bash
+> bun test packages/server/test/stats-api.test.ts   # 接口 + 鉴权 + 口径（26 项）
+> bun test packages/core/test/portal.test.ts        # 查询层 + 人员排行（16 项）
+> bun run --filter '@ai-token-report/web-portal' verify   # SSR 真执行组件树（25 项）
+> ```
+>
+> 关键取舍：**看板只读上报库、没有降级路径**（上报库没有可重扫的真值）；
+> **鉴权失败回 401/503 而不是 200 + ok:false**（响应体里装的是数据）；
+> **未归属必须成组出现在人员排行里**（否则覆盖率缺口永远浮不上来）。
+
+> **S11 已完成**：角色与人员管理落地 —— 凭证表多一列 `role`（缺省 `member`），
+> 看板上多一个**仅管理员可见**的「人员管理」页签，可以在页面上
+> 签发 / 重置 / 吊销 token；看板的筛选栏也补齐了**人员多选**与**自定义时间段**。
+>
+> 三条验证入口：
+>
+> ```bash
+> bun test packages/server/test/member-admin.test.ts   # 权限 / 护栏 / 落盘（34 项）
+> bun run packages/server/test/e2e-admin.ts            # 真 HTTP 全链路（53 项）
+> bun run --filter '@ai-token-report/web-portal' verify # SSR 真执行组件树（含管理页断言）
+> ```
+>
+> 关键取舍：**`role` 是权限的唯一来源**（不用姓名白名单）；
+> **签发即刻生效**（三条路由共享同一个 `CredentialStore` 实例）；
+> **凭证文件读不懂时拒绝一切写入**（不拿空表覆盖唯一真值）；
+> **最后一个管理员不可删 / 不可降级**（否则没人能再发 token）。
 
 > **两个交付节点**：
 > - **S6** → `dsh-token --web` 一条命令看到自己的真实统计（本地闭环）
