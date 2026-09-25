@@ -51,7 +51,6 @@ import { fileURLToPath } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const pkgRoot = resolve(here, '..')
-const repoRoot = resolve(pkgRoot, '..', '..')
 const libDir = join(pkgRoot, 'lib')
 const distDir = join(pkgRoot, 'dist')
 
@@ -159,7 +158,7 @@ const manifest = {
     './client': { default: './client.js' },
     './package.json': './package.json',
   },
-  files: ['index.js', 'client.js', 'cordis.patch.yml', 'README.md'],
+  files: ['index.js', 'client.js', 'cordis.patch.yml', 'README.md', 'README.offline.md', 'screenshots'],
   // ★ 这两段是「能被 DSH 认成插件」的全部声明：bundle 决定配置树里有这一行，
   //   client 决定浏览器半挂到哪个平台、依赖哪个第一方客户端包。
   dsh: {
@@ -203,13 +202,25 @@ const manifest = {
 }
 await writeFile(join(distDir, 'package.json'), JSON.stringify(manifest, null, 2) + '\n', 'utf8')
 
-// ── 8. 带上 README（npm 页面正文就是它）─────────────────────────────────
-const readme = join(pkgRoot, 'README.md')
-const rootReadme = join(repoRoot, 'README.md')
-const readmeSource = existsSync(readme) ? readme : existsSync(rootReadme) ? rootReadme : null
-if (readmeSource) {
-  await cp(readmeSource, join(distDir, 'README.md'))
+// ── 8. 从同一份文档生成网页与离线版，截图随包发布，不依赖源码先推送 ──────
+// npm 的 Markdown 清洗器可能过滤 data: URL，因此首页使用固定版本 CDN，
+// 单文件离线版才内嵌 Base64。源文件仍用相对路径，便于仓内预览与审查。
+const readmeSource = await Bun.file(join(pkgRoot, 'README.md')).text()
+const publicReadme = readmeSource.split('<!-- DEVELOPMENT-DOCS -->')[0]!.trim()
+const screenshotDir = join(distDir, 'screenshots')
+await mkdir(screenshotDir, { recursive: true })
+let onlineReadme = publicReadme
+let offlineReadme = publicReadme
+for (const match of publicReadme.matchAll(/!\[([^\]]*)\]\(docs\/screenshots\/([a-z0-9-]+\.png)\)/g)) {
+  const [markdown, alt, filename] = match
+  const source = join(pkgRoot, 'docs', 'screenshots', filename!)
+  const bytes = Buffer.from(await Bun.file(source).arrayBuffer())
+  await cp(source, join(screenshotDir, filename!))
+  onlineReadme = onlineReadme.replace(markdown, `![${alt}](https://cdn.jsdelivr.net/npm/${PUBLISH_NAME}@${VERSION}/screenshots/${filename})`)
+  offlineReadme = offlineReadme.replace(markdown, `![${alt}](data:image/png;base64,${bytes.toString('base64')})`)
 }
+await writeFile(join(distDir, 'README.md'), onlineReadme + `\n\n单文件离线版（截图以 Base64 内嵌）：[README.offline.md](https://cdn.jsdelivr.net/npm/${PUBLISH_NAME}@${VERSION}/README.offline.md)。\n`, 'utf8')
+await writeFile(join(distDir, 'README.offline.md'), offlineReadme + '\n', 'utf8')
 
 // ── 9. 报告产物 ─────────────────────────────────────────────────────────
 const hostSize = (await Bun.file(join(distDir, 'index.js')).arrayBuffer()).byteLength

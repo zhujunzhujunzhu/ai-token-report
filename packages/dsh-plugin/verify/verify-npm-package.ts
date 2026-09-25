@@ -94,6 +94,18 @@ const manifest = JSON.parse(manifestRaw) as {
 }
 
 check('包名是发布名', manifest.name === 'dsh-plugin-token-report', manifest.name)
+const sourceManifest = await Bun.file(join(pkgRoot, 'package.json')).json()
+check('发布版本与源码清单一致', manifest.version === sourceManifest.version, manifest.version)
+const readme = await Bun.file(join(distDir, 'README.md')).text()
+const offlineReadme = await Bun.file(join(distDir, 'README.offline.md')).text()
+check('发布文档不包含仓内开发章节', !readme.includes('<!-- DEVELOPMENT-DOCS -->') && !readme.includes('## 开发与部署参考'))
+const screenshots = [...offlineReadme.matchAll(/!\[([^\]]*)\]\(data:image\/png;base64,([A-Za-z0-9+/=]+)\)/g)]
+check('离线 README 包含两张真实截图', screenshots.length === 2)
+for (const [index, filename] of ['usage-overview.png', 'date-range.png'].entries()) {
+  const bytes = Buffer.from(await Bun.file(join(distDir, 'screenshots', filename)).arrayBuffer())
+  check(`截图 ${filename} 的 Base64 与随包文件一致`, Buffer.from(screenshots[index]?.[2] ?? '', 'base64').equals(bytes))
+  check(`网页截图 ${filename} 使用当前版本链接`, readme.includes(`https://cdn.jsdelivr.net/npm/${manifest.name}@${manifest.version}/screenshots/${filename}`))
+}
 check('license 已填', manifest.license === 'MIT', String(manifest.license))
 check(
   '没有 `dependencies`（workspace 包必须已内联）',

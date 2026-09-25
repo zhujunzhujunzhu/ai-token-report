@@ -1,4 +1,160 @@
-# `@ai-token-report/dsh-plugin` —— DSH token 上报插件
+# dsh-plugin-token-report
+
+在 DeepSeek Harness（DSH）里直接查看本机 token 用量：输入框摘要、趋势图、模型排行和自定义日期范围；需要团队汇总时，再配置身份与上报连接。
+
+**当前版本：0.3.0** · npm 包名：`dsh-plugin-token-report` · 仓内开发包名：`@ai-token-report/dsh-plugin`
+
+## 实际使用截图
+
+以下截图来自 2026-09-25 本机运行的 DSH Web 与真实会话日志，仅截取插件区域。数值是该机器当时的用量，不是模拟数据，也不代表性能基准。
+
+### 用量概览与模型明细
+
+点击输入框上方 `TOKEN 用量` 条里的「详情」，即可查看计费总量、未缓存输入、输出、缓存读、缓存命中率、调用数和会话数。趋势支持切换 Token 总量、调用数与命中率，明细支持模型、服务商、项目和会话分组，点击行可展开，超过 10 行可翻页。
+
+![真实 DSH 插件用量概览](docs/screenshots/usage-overview.png)
+
+### 自定义日期范围
+
+除了今天、昨天、本周、最近 7 天、本月、近 30 天和今年，还可以通过双月日历选择开始与结束日期。范围按本地时区计算，包含起止两天，点击「应用范围」后更新统计。
+
+![真实 DSH 插件日期选择](docs/screenshots/date-range.png)
+
+## 安装 0.3.0
+
+需要已经安装 DSH，并使用与插件兼容的宿主模块（`@deepseek-ai/cordis ^4.0.2`、`@deepseek-ai/dsh-session-telemetry ^0.1.5-rc.1`）。Node.js 要求 **22.15.0 或更新版本**。
+
+```bash
+dsh plugin --profile web add dsh-plugin-token-report@0.3.0
+```
+
+在 `~/.dsh/profiles/web/package.json` 的 `dsh.profile.bundles` 数组中加入 `dsh-plugin-token-report`，保留已有条目。依赖安装与 bundle 声明都需要具备；已经存在的条目不要重复添加。例如：
+
+```json
+{
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "dsh-plugin-token-report"
+      ]
+    }
+  }
+}
+```
+
+在该 profile 的 `cordis.patch.yml` 中合并以下条目：
+
+```yaml
+# 同一时间只能有一个 sessionTelemetry 后端。
+- id: session-telemetry-otel
+  disabled: true
+```
+
+随后重启 DSH，用终端打印的完整地址打开浏览器：
+
+```bash
+dsh --profile web --no-open
+```
+
+选择工作区后，输入框上方会出现用量条（**0.3.0 起这是默认位置**）。想让面板改到会话标题栏右上角、或两个位置都要，见上方「调整面板位置」。安装后无需单独启动本地统计网页。
+
+> `dsh plugin` 内部调用宿主自己的包管理器。上面的安装命令用于 DSH profile；本仓开发、构建与发布使用 Bun。
+
+## 第一次使用
+
+1. 打开「详情」，选择需要查看的周期。首次建立索引可能需要十几秒，后续只增量读取变化的日志。
+2. 切换趋势指标或明细分组查看用量来源。图表下方「查看图表数据」提供精确值。
+3. 手动点击刷新即可读取最新数据；页面每 **3 秒**问一次「有没有新数」（没有就零成本），
+   有新采集时按宿主缓存节奏（最多 30 秒）自动更新；切回前台标签页会立刻取一次。
+
+**仅查看本机统计不需要署名。未署名时，插件不采集上报事件，也不上报。** 页面读取的是 DSH 已有的本机会话日志。
+
+### 调整面板位置
+
+面板默认出现在**输入框上方**。想让它出现在**会话标题栏右上角**、或两个位置都要，在 profile 的 `cordis.patch.yml` 里给插件加一段 `ui`：
+
+```yaml
+- id: token-report
+  config:
+    ui:
+      position: dock      # dock(默认，输入框上方) | header(右上角) | both(两处都要)
+```
+
+| 取值 | 效果 |
+|---|---|
+| `dock` | 只显示输入框上方的用量条（默认） |
+| `header` | 只显示标题栏右上角的胶囊；点开就是同一个详情面板 |
+| `both` | 两处都显示 —— 与 0.2.0 的外观一致 |
+
+改完**刷新页面**即可生效（位置在页面加载时确定）。三种取值共用同一个详情面板，数字口径完全一致。
+也可以不改 YAML，用环境变量 `DSH_TOKEN_REPORT_UI_POSITION` 临时覆盖。
+
+**写错的值不会让面板消失**：只认上面三个值，其它一律回退 `dock`，并在 DSH 启动日志里告警。
+
+### 开启团队上报
+
+在详情面板右上角点击齿轮「配置」，填写管理员提供的姓名、身份 Key 和完整上报地址，例如 `https://portal.example.com/api/v1/token-usage`。如果团队使用独立 appKey，也可以一并填写；留空使用本次身份 Key。
+
+点击「验证并保存」后，插件先向对应服务端校验身份，姓名与部门以服务端返回值为准。**保存后重启 DSH**，新的署名与连接才会用于上报。已保存的 Key 不回显。
+
+身份与连接保存在 `$DSH_HOME/token-report/` 下；默认 DSH_HOME 为 `~/.dsh`。插件与本地 Web 共用身份文件。部署侧固定了身份时，页面会提示配置由管理员管理。
+
+### 让 Agent 查询
+
+可以在 DSH 会话里要求：
+
+```text
+调用 token_usage，查看我今天的 token 用量，按模型分组。
+调用 token_usage，查看最近 7 天的用量，按天显示趋势。
+调用 token_usage_diagnostics，检查上报是否成功、是否有待发送数据。
+```
+
+工具注册需要宿主提供对应能力并启用 `features.tools`。查询工具只读本机日志，本身不产生上报。
+
+## 0.3.0 功能说明
+
+| 能力 | 使用方式 |
+|---|---|
+| 界面统计 | 用量条与标题栏入口（挂哪几个由 `ui.position` 决定，默认只挂输入框上方），共用详情面板 |
+| 时间分析 | 预设周期、双月日历、自定义范围、趋势切换 |
+| 明细分析 | 模型 / 服务商 / 项目 / 会话分组，展开与分页 |
+| 本地增量查询 | SQLite 增量索引；库不可用时自动回退日志扫描并提示 |
+| 身份配置 | 面板内验证署名与上报连接，重启后生效 |
+| 实时上报 | 异步批量发送、磁盘 outbox、失败保留、重启重放 |
+| Agent 与插件集成 | `token_usage`、`token_usage_diagnostics`、`ctx.tokenReport` |
+
+只展示 token 数，不展示金额。只采集用量相关字段（包含模型名、工作目录、轮次等），不采集对话内容。上报失败不会阻塞 DSH 的会话循环；服务端按事件 ID 去重。
+
+## 升级与常见问题
+
+从旧版升级时，重新运行指定版本的安装命令，然后重启 DSH。若此前通过源码包 `@ai-token-report/dsh-plugin` 安装，请先把旧 bundle 与旧插件挂载条目替换成发布包，避免两个实例同时注册服务。
+
+> **0.2.0 → 0.3.0 的行为变更（唯一一处）**：用量面板的默认位置改成
+> `ui.position: dock` —— 默认**只出现输入框上方那条用量条**，
+> 会话标题栏右侧的胶囊不再默认出现。要保留 0.2.0 的外观（两处都有），
+> 在插件 `config` 里加 `ui: { position: both }`。
+> 位置配错（写了别的值）不会让面板消失：一律回退 `dock` 并在启动日志里告警。
+
+| 现象 | 处理 |
+|---|---|
+| `sessionTelemetry` 已注册 | 确认官方 OTel 后端已禁用，且没有重复挂载插件 |
+| 没有用量入口 | 确认安装在 `web` profile、bundle 数组包含发布包名，并已重启；`features.ui` 不能关闭 |
+| 401 / 未通过宿主鉴权 | 使用本次 DSH 启动时打印的完整地址重新打开 |
+| 首次统计较慢 | 等待首次索引完成；如显示降级，检查 SQLite 权限与宿主 Node 版本 |
+| 团队看板没有数据 | 验证并保存身份与连接后重启，再调用 `token_usage_diagnostics` 查看原因 |
+| 修改配置后仍使用旧身份 | 当前进程仍绑定启动时配置，需要重启 DSH |
+
+源码与开发文档见 [GitHub 仓库](https://github.com/zhujunzhujunzhu/ai-token-report/tree/main/packages/dsh-plugin)。
+
+<!-- DEVELOPMENT-DOCS -->
+
+---
+
+## 开发与部署参考（仓内包）
+
+以下章节针对源码直挂与二次开发，示例里的 `@ai-token-report/dsh-plugin` 是仓内包名。通过 npm 安装时使用上方的 `dsh-plugin-token-report` 安装步骤。
 
 装在 DSH 里，**无人值守地**把本机产生的计费级 token 用量实时上报到部门服务端，
 同时给同事一个「问一句就能看到自己用量」的工具，以及一块**在 DSH 界面里
@@ -47,6 +203,11 @@
       service: true                 # 注册 ctx.tokenReport
       ui: true                      # 在 DSH 界面里显示用量面板（只影响显示）
 
+    # ── 界面呈现（只影响面板挂在哪，不影响上报 / 工具 / 服务）──────
+    ui:
+      position: dock                # dock(默认，输入框上方) | header(标题栏右上角) | both(两处都要)
+                                    # ★ 0.2.0 的外观 = both
+
     localDb: true                   # 默认增量 SQLite，见 §5
 
     # ── 身份（选填）─────────────────────────────────────────────
@@ -77,6 +238,7 @@
 | `DSH_TOKEN_REPORT_OUTBOX_DIR` | `outbox.dir` |
 | `DSH_TOKEN_REPORT_OUTBOX_MAX_BYTES` | `outbox.maxBytes` |
 | `DSH_TOKEN_REPORT_LOCAL_DB` | `localDb` |
+| `DSH_TOKEN_REPORT_UI_POSITION` | `ui.position`（`dock` / `header` / `both`） |
 | `DSH_TOKEN_REPORT_USER_NAME` | `user.name` |
 | `DSH_TOKEN_REPORT_USER_TOKEN` | `user.token` |
 | `DSH_TOKEN_REPORT_DEPT` | `user.dept` |
@@ -85,6 +247,9 @@
 > 两者是不同的部署面，混用会让「我改了变量为什么没生效」变成谜题。
 
 **写错的数字不会让 DSH 起不来**：非正数一律回退默认值并告警。
+**写错的位置同样不会**：`ui.position` 只认 `dock` / `header` / `both`，其它值一律
+回退 `dock` 并在启动日志里说明「写了什么、可选哪些」—— 配错位置既不会让 DSH 起不来，
+也不会让面板消失。
 半份身份（只填了名字没填 token）视为「这一级没配」，回退下一级 ——
 半份身份比没有更危险，它会让判定误以为已署名却带着空凭证发请求。
 
@@ -100,6 +265,7 @@
 | `outbox.enabled` | `true` |
 | `outbox.maxBytes` | `33554432`（32 MB） |
 | `features.*` | 全 `true`（含 `ui`） |
+| `ui.position` | `dock`（输入框上方的用量条） |
 | `localDb` | `true` |
 
 ---
@@ -235,12 +401,14 @@ dsh --profile web --no-open
 插件启用时还会在 `$DSH_HOME/token-report/` 下**创建 `outbox/` 目录** ——
 这是「后端真的构造了」最直接的证据（未启用时不会建）。
 
-装对了的话，**界面上会直接看到用量面板**：
+装对了的话，**界面上会直接看到用量面板**。挂哪几个由 `ui.position` 决定，
+默认（`dock`）只有第一条：
 
 - 输入框上方多一条 `TOKEN 用量 …` 的条（点「详情」直接打开弹框）；
-- 会话标题栏右侧多一个 `● 2.39B 97.0%` 的胶囊（点开是浮层）。
+- 会话标题栏右侧多一个 `● 2.39B 97.0%` 的胶囊（点开是浮层）—— **需要 `ui.position: both` 或 `header`**。
 
-启动日志里还有一句 `UI 用量面板数据通道已挂载 → GET /api/tokenReport.stats`。
+启动日志里还有一句 `UI 用量面板数据通道已挂载 → GET /api/tokenReport.stats（面板位置：dock）`
+—— 括号里就是这次真正生效的位置，位置配了没生效时先看它。
 没有这句、界面也没面板时，按下面顺序看：
 
 | 日志/现象 | 原因 |
@@ -359,13 +527,16 @@ svc.signed()                                            // → 身份是否就�
 
 装在 DSH 的 Web 界面里，**常驻可见**，不需要问 Agent、也不需要开另一个页面。
 
-| 挂载点 | slot | 长什么样 |
-|---|---|---|
-| 输入框上方的用量条 | `conversation.input.dock` | 一行摘要：`TOKEN 用量 · 今天 · 2.39B tokens · 命中率 97.0% · 16,437 次调用`，右侧「详情」打开居中弹框 |
-| 会话标题栏右侧的徽章 | `conversation.session.header.utilities` | 一个紧凑胶囊 `● 2.39B 97.0%`，点开是居中浮层（Esc 关闭） |
+| 挂载点 | slot | 长什么样 | 什么时候挂 |
+|---|---|---|---|
+| 输入框上方的用量条 | `conversation.input.dock` | 一行摘要：`TOKEN 用量 · 今天 · 2.39B tokens · 命中率 97.0% · 16,437 次调用`，右侧「详情」打开居中弹框 | `ui.position: dock`（默认）/ `both` |
+| 会话标题栏右侧的徽章 | `conversation.session.header.utilities` | 一个紧凑胶囊 `● 2.39B 97.0%`，点开是居中浮层（Esc 关闭） | `ui.position: header` / `both` |
+
+挂哪几个由 `ui.position` 决定，**默认只挂输入框上方那一条**；`both` 才是 0.2.0 的外观。
+位置在**页面加载时定下来**（slot 注册是一次性的），所以改完配置要刷新页面。
 
 两个挂载点用的是**同一份状态**（`store.ts` 里那个 store），所以数字永远一致，
-而且取数只做一次 —— 这点很重要，见下面的「为什么有缓存」。
+而且取数只做一次 —— 这点很重要，见下面的「缓存与轮询」。
 
 详情里有：周期切换（今天 / 昨天 / 本周 / 最近 7 天 / 本月 / 近 30 天 / 今年 / 自定义）、
 **四个 token 列分列**的统计格、派生指标（命中率 / 平均每次调用）、
@@ -375,12 +546,27 @@ svc.signed()                                            // → 身份是否就�
 #### 数据怎么走到页面里
 
 ```
+浏览器半  fetch('/api/tokenReport.config')                 ← 挂载前先问「面板放哪」
+              ↓  同源；DSH 的 /api 前缀先做 Host/Origin 栅栏 + 浏览器鉴权
+宿主半    installUiRoute 注册的常量路由（不查库、不读文件）→ { position }
+              ↓  ★ 取不到（旧宿主 404 / 超时）就按默认位置挂载，面板照常出现
+
 浏览器半  fetch('/api/tokenReport.stats?period=today')     ← 同源，自带宿主会话 cookie
               ↓  DSH 的 /api 前缀先做 Host/Origin 栅栏 + 浏览器鉴权
 宿主半    ctx.connection.fetch.register(...)  精确 Fetch 路由
               ↓
           queryUsage()   ← 与 CLI `dsh-token`、`token_usage` 工具**同一个函数**
+
+浏览器半  fetch('/api/tokenReport.stats?period=today&gen=N')  ← 之后每 3 秒一次的**探针**
+              ↓  宿主发现还是第 N 代 → 204（零载荷、不查库）；变了才回载荷
 ```
+
+**为什么位置要单独走一条 HTTP**：DSH 的客户端插件条目**拿不到**插件的 `config`
+（`__DSH_BOOT__` 的条目里只有 id / url / inject 这些字段，壳层组装条目时也只传包名），
+所以部署 YAML 里的 `config.ui.position` 到不了页面。位置又必须在**注册之前**知道
+（注册是一次性的，挂错了再改就等于先挂错地方），因此它不能塞进
+`/api/tokenReport.stats` 那个载荷 —— 那个载荷首次返回要等冷建库，可能十几秒，
+面板会先在错的位置出现再跳一下。
 
 **为什么复用 `/api` 而不自己 `ctx.webServer.register`**：
 DSH 的 web 服务器**不做任何鉴权**（`dsh-host-webserver` 的文档明写
@@ -413,10 +599,26 @@ DSH 的 web 服务器**不做任何鉴权**（`dsh-host-webserver` 的文档明�
 #### 缓存与轮询
 
 默认走 SQLite 增量查询；每次先检查日志变化，未变化文件跳过解压。
-浏览器每 120 秒刷新，宿主缓存 30 秒并合并同周期并发请求；
 不同周期和工具查询对同一库串行执行，避免增量写入互相等待写锁。
 手动刷新绕过响应缓存，但仍走增量 SQLite，不会强制全量重扫。
 脚注显示实际数据来源、耗时和统计时刻；库不可用时明确显示直扫与降级原因。
+
+刷新分三层，**代次探针是为了让「看一眼有没有新数」不再等于「扫一遍日志」**：
+
+| 机制 | 周期 | 代价 |
+|---|---|---|
+| 代次探针（`?gen=N`） | 3 秒 | 宿主只比一个整数；没变就回 `204`，零载荷、零查询、页面零重渲染 |
+| 兜底全量取数 | 120 秒 | 真查一次，兜住**库外**的变化（别的 DSH 实例、CLI `dsh-token`） |
+| 用户动作 | 立即 | 切周期 / 改区间 / 点刷新 / **从后台切回前台**；后台标签页完全不取数 |
+
+代次由宿主的上报器计数（本进程每采集到一条计费记录 +1），因此**上报未启用时它恒为 0**，
+此时面板退回「每 120 秒全量取数」——与探针引入前一致，不会变成永不刷新。
+
+新鲜度的上限是**宿主响应缓存（30 秒）**，不是 3 秒：这是刻意的 ——
+热态查询要先做一次增量 ingest（实测 25~100ms，积压变更时 2.7s，
+降级直扫时 3.3s，见 §4.3），而宿主与 agent 是**同一个进程**，
+每 3 秒真查一次等于把同步 zstd 解码塞进 agent loop。
+实测（真 HTTP 往返）：空闲时 20 次探针 = 20 × `204`、0 字节、0 次查询、平均 0.1ms。
 
 #### 面板的失败模式（都是刻意不静默的）
 
@@ -506,7 +708,7 @@ inflight-<ts>-<pid>-<seq>.jsonl   ← 已发出但还没收到响应
 ## 8. 开发与验证
 
 ```bash
-bun test packages/dsh-plugin            # 180 个用例（fold / config / outbox / reporter / apply / identity / 界面）
+bun test packages/dsh-plugin            # 214 个用例（fold / config / outbox / reporter / apply / identity / 界面）
 bun run --filter '@ai-token-report/dsh-plugin' typecheck
 bun run --filter '@ai-token-report/dsh-plugin' build
 ```
@@ -515,11 +717,11 @@ bun run --filter '@ai-token-report/dsh-plugin' build
 
 | 脚本 | 层次 | 断言数 | 验证什么 |
 |---|---|---|---|
-| `bun test packages/dsh-plugin` | 单元 | 180 | 折叠口径 / 配置优先级 / outbox 崩溃不丢 / 热路径只入队 / **界面：格式、取数状态机、挂载点、离屏渲染** |
+| `bun test packages/dsh-plugin` | 单元 | 214 | 折叠口径 / 配置优先级 / **面板位置** / outbox 崩溃不丢 / 热路径只入队 / **界面：格式、取数状态机、挂载点、离屏渲染** |
 | `verify/verify-plugin.ts` | 端到端冒烟 | 55 | **真 HTTP 往返** + 真扫日志 + 崩溃恢复（假 ctx） |
 | `verify/verify-cordis-load.ts` | 真实框架装载 | 10 | 打包产物挂进**真 cordis Context**，含 `inject` 形状 |
 | `verify/verify-resolution.ts` | **宿主语义** | 9 | 用 **Node**（不是 Bun）解析并加载打包产物 |
-| `verify/verify-client-bundle.ts` | **浏览器半产物** | 25 | 真跑 `lib/client.js`：信封形状 / **平台模块纯度** / 双半路由一致 / slot 注册 |
+| `verify/verify-client-bundle.ts` | **浏览器半产物** | 32 | 真跑 `lib/client.js`：信封形状 / **平台模块纯度** / 双半路由一致 / **三种位置各注册哪些 slot** / slot 注册 |
 | `verify/diagnose-boot.ts` | 排障工具 | — | profile 里哪个包 import 就炸，展开完整 cause 链 |
 
 另有三个辅助脚本：
@@ -622,13 +824,13 @@ bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败
 | `src/reporter.ts` | 内存队列 → 批量 → HTTP（热路径只入队） |
 | `src/stats.ts` | 统计查询与渲染（**不实现任何公式**） |
 | `src/identity.ts` | 身份解析（复用 core 的存储，与本地页共用同一份文件） |
-| `src/ui-bridge.ts` | 宿主侧 UI 数据通道：`/api/tokenReport.stats` + TTL 缓存 + 并发合并 |
-| `src/client/protocol.ts` | ★ **双半唯一契约**：载荷类型、周期、响应解析（零依赖，两边都能 import） |
+| `src/ui-bridge.ts` | 宿主侧 UI 数据通道：`/api/tokenReport.stats` + `/api/tokenReport.config`（面板位置）+ TTL 缓存 + 并发合并 |
+| `src/client/protocol.ts` | ★ **双半唯一契约**：载荷类型、周期、**面板位置枚举与配置解析**、响应解析（零依赖，两边都能 import） |
 | `src/client/store.ts` | 浏览器侧取数状态机（`fetch`/时钟可注入，因此可单测） |
 | `src/client/format.ts` | 纯展示格式（不是口径公式，见文件头注释） |
 | `src/client/components.tsx` | 两个挂载点的 React 组件 |
 | `src/client/styles.ts` | `<style>` 注入（全部用 `--dsw-alias-*` 主题变量） |
-| `src/client/index.ts` | 浏览器半入口：`apply()` + 两个 slot 注册 |
+| `src/client/index.ts` | 浏览器半入口：`apply()` + 取面板位置（取不到回退默认并照常挂载）+ 按位置注册 slot |
 | `build-client.ts` | 浏览器半构建：`__ModuleLoader__` 信封 + **平台模块纯度校验** |
 
 > ⚠️ **双环境的 tsconfig**：`tsconfig.json` 管宿主半（`lib: ES2022`，无 DOM），
@@ -674,10 +876,14 @@ bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败
 | 工具报的数比看板少 | 正常 —— 看板是服务端累计，工具只看本机日志 | 用 `period` 对齐时间窗 |
 | 统计很慢（10s+） | 走了直扫路径 | 确认 `localDb` 与宿主运行时；`source` 字段会如实标注 |
 | 界面没有用量面板 | 用的不是 web profile，或 `features.ui: false`，或浏览器半没被加载 | 见 §2.4 的三行对照表；启动日志会说明「数据通道已挂载」还是「宿主不提供 connection」 |
+| **升级后标题栏徽章不见了** | **预期行为**：0.3.0 起 `ui.position` 默认 `dock`，只挂输入框上方那条 | 要徽章就配 `ui.position: both`（= 0.2.0 的外观）或 `header` |
+| 配了 `ui.position` 但界面没变 | 值写错了（已回退 `dock`），或页面没刷新（位置在页面加载时定下来） | 看启动日志里 `ui.position` 的 warn 与「面板位置：」那句，然后**刷新页面** |
+| 面板位置忽然回到默认 | 读位置那条路由没通（旧宿主 → 404、中间层超时） | 浏览器控制台会有一条 `读取面板位置失败（…）`；面板**照常出现**，只是位置是默认的 |
 | 面板显示「返回 404」 | 宿主没有 `connection` 服务，或路由没注册上 | 看启动日志有无 `UI 用量面板数据通道已挂载`；headless 下是预期行为 |
 | 面板显示「未通过宿主鉴权（401）」 | 页面不是从带 `?token=` 的 DSH 地址打开的 | 用 `dsh web` 打印的那个完整地址重开页面 |
 | 面板显示「响应格式不认识（缺少 totals）」 | 宿主半与浏览器半版本不一致（升级后没重启 DSH） | 重启 DSH；两边都由同一个 `lib/` 提供，重启即可对齐 |
-| 面板数字长时间不动 | 轮询间隔就是 120s（见 §4.3 的实测依据） | 点「刷新」立刻取新值 |
+| 面板数字长时间不动 | 没在干活时数据本来就不变；代次探针每 3 秒问一次，有新采集才会重新取数（真查受宿主 30 秒缓存限制） | 点「刷新」绕过缓存立刻取新值；切回前台标签页也会立刻取一次 |
+| 面板数字 30 秒才跳一次 | **预期行为**：探针采样是 3 秒，但真查询受宿主 30 秒缓存限制（见 §4.3 的实测依据） | 点「刷新」立刻取新值 |
 | DSH 启动报 `client bundle not found` | 改了插件但没重新构建浏览器半 | `bun run --filter '@ai-token-report/dsh-plugin' build` |
 
 ### 9.3 宿主环境（本机实测踩到）
