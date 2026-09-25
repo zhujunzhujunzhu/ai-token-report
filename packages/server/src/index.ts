@@ -20,14 +20,31 @@
  *
  * 默认 8787，被占用时自动 +1 重试（最多 10 次）。这让「再开一个」
  * 不会因为端口冲突直接失败，也让多实例调试变得容易。
+ *
+ * ## ★ 运行时无关：Bun 与 Node 都能起
+ *
+ * 请求处理器（{@link createHandler}）**本来就写成 Web 标准的**
+ * （入参 `Request`、返回 `Response`），所以 Bun 专有的只有最外面那层 server。
+ * {@link tryListen} 按运行期二选一：
+ *
+ * | 运行时 | 实现 | 端口占用的表现 |
+ * |---|---|---|
+ * | Bun | `Bun.serve` | **同步抛错** |
+ * | Node | `node:http`（`serve-node.ts` 桥接） | **异步 reject** |
+ *
+ * 两者的差异被 `tryListen` 收敛成同一个 async 形状，重试循环只有一份。
+ * 🚨 静态资源一律用 `node:fs/promises` 读取，**不要用 `Bun.file()`** ——
+ *   那是 Bun 专有的，会让 npm 发布出去、跑在 Node 上的 CLI 直接崩。
  */
 
 import { resolvePaths } from '@ai-token-report/core'
+import { readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { CredentialStore } from './credentials.js'
 import { IdentityRoute } from './identity-route.js'
 import { CoreStatsProvider, LocalStatsRouter } from './local-api.js'
+import { serveWithNodeHttp, type ServeHandle } from './serve-node.js'
 import { verifyToken } from './verify-route.js'
 
 export const SERVER_VERSION = '0.1.0'
@@ -136,39 +153,72 @@ export async function createServer(options: ServerOptions = {}): Promise<ServerH
     ...(options.staticDir ? { staticDir: options.staticDir } : {}),
   })
 
-  const { server, port, shifted } = serveWithPortRetry(host, requestedPort, handler)
+  const { handle, port, shifted } = await serveWithPortRetry(host, requestedPort, handler)
 
   return {
     url: `http://${host}:${port}`,
     port,
     host,
     portShifted: shifted,
-    async stop() {
-      await server.stop(true)
-    },
+    stop: () => handle.stop(),
   }
 }
 
+/** 是否跑在 Bun 上。决定用 `Bun.serve` 还是 `node:http`。 */
+function isBunRuntime(): boolean {
+  return typeof (globalThis as { Bun?: unknown }).Bun !== 'undefined'
+}
+
+/**
+ * 在指定端口起服务；端口被占用时抛出（由调用方重试）。
+ *
+ * ★ 两个运行时的差异**只收敛在这里**：Bun 的 `Bun.serve` 端口占用是
+ *   **同步抛错**，而 `node:http` 是 **异步 reject**。把它包成 async 之后，
+ *   上面的重试循环对两者就是同一套写法。
+ */
+async function tryListen(
+  host: string,
+  port: number,
+  handler: (req: Request) => Response | Promise<Response>,
+): Promise<ServeHandle> {
+  if (isBunRuntime()) {
+    const server = Bun.serve({
+      hostname: host,
+      port,
+      fetch: handler,
+      // 见 IDLE_TIMEOUT_SECONDS 的注释：不设这个值，冷扫描必被掐断
+      idleTimeout: IDLE_TIMEOUT_SECONDS,
+    })
+    return {
+      port,
+      stop: async () => {
+        await server.stop(true)
+      },
+    }
+  }
+
+  // Node 运行时：请求处理器本身是 Web 标准的，这里只换最外面那层 server。
+  return serveWithNodeHttp({
+    host,
+    port,
+    idleTimeoutSeconds: IDLE_TIMEOUT_SECONDS,
+    handler,
+  })
+}
+
 /** 依次尝试端口，直到绑定成功。 */
-function serveWithPortRetry(
+async function serveWithPortRetry(
   host: string,
   startPort: number,
   handler: (req: Request) => Response | Promise<Response>,
-): { server: ReturnType<typeof Bun.serve>; port: number; shifted: boolean } {
+): Promise<{ handle: ServeHandle; port: number; shifted: boolean }> {
   let lastErr: unknown
 
   for (let i = 0; i < MAX_PORT_ATTEMPTS; i++) {
     const port = startPort + i
     try {
-      // Bun.serve 在端口被占用时会抛错，据此重试
-      const server = Bun.serve({
-        hostname: host,
-        port,
-        fetch: handler,
-        // 见 IDLE_TIMEOUT_SECONDS 的注释：不设这个值，冷扫描必被掐断
-        idleTimeout: IDLE_TIMEOUT_SECONDS,
-      })
-      return { server, port, shifted: i > 0 }
+      const handle = await tryListen(host, port, handler)
+      return { handle, port, shifted: i > 0 }
     } catch (err) {
       lastErr = err
       // 只有「端口占用」才重试；其他错误（如权限）应立即失败
@@ -300,9 +350,9 @@ function createHandler(deps: HandlerDeps): (req: Request) => Promise<Response> {
         if (served) return served
         // 未命中文件 → 回落到 index.html，交给前端路由
         if (indexHtml) {
-          const file = Bun.file(indexHtml)
-          if (await file.exists()) {
-            return new Response(file, {
+          const html = await readFileOrNull(indexHtml)
+          if (html) {
+            return new Response(html, {
               headers: { 'Content-Type': 'text/html; charset=utf-8' },
             })
           }
@@ -315,6 +365,22 @@ function createHandler(deps: HandlerDeps): (req: Request) => Promise<Response> {
       // 前端拿到结构化错误才能展示有意义的信息。
       return json({ ok: false, reason: `服务内部错误: ${msg(err)}` }, 500)
     }
+  }
+}
+
+/**
+ * 读取一个文件；不存在或不是普通文件时返回 null。
+ *
+ * ★ 用 `node:fs/promises` 而不是 `Bun.file()`：后者是 Bun 专有的，
+ *   而本服务要同时跑在 Bun 与 Node 上（npm 发布的 CLI 就是这么用的）。
+ */
+async function readFileOrNull(path: string): Promise<Buffer | null> {
+  try {
+    const info = await stat(path)
+    if (!info.isFile()) return null
+    return await readFile(path)
+  } catch {
+    return null
   }
 }
 
@@ -334,10 +400,10 @@ async function serveStatic(dir: string, pathname: string): Promise<Response | nu
   const rel = decoded.replace(/^\/+/, '')
   if (!rel || rel.includes('..')) return null
 
-  const file = Bun.file(join(dir, rel))
-  if (!(await file.exists())) return null
+  const data = await readFileOrNull(join(dir, rel))
+  if (!data) return null
 
-  return new Response(file, { headers: { 'Content-Type': contentTypeOf(rel) } })
+  return new Response(data, { headers: { 'Content-Type': contentTypeOf(rel) } })
 }
 
 function contentTypeOf(path: string): string {

@@ -1,0 +1,163 @@
+/**
+ * `node:http` 服务适配器 —— 让部门服务端与本地页面服务**不依赖 `Bun.serve`**。
+ *
+ * ## 为什么需要一个适配器而不是重写一套路由
+ *
+ * `index.ts` 里的请求处理器**本来就写成 Web 标准的**
+ * （入参 `Request`、返回 `Response`），Bun 专有的只有最外面那层
+ * `Bun.serve({ fetch: handler })`。所以这里只做「把 Node 的
+ * `IncomingMessage`/`ServerResponse` 翻译成 `Request`/`Response`」，
+ * **路由、鉴权、口径一行都不用动**，两条运行时也就天然共享同一套逻辑。
+ *
+ * ★ 这是刻意的取舍：若为 Node 另写一套路由，就会存在第二个「什么路径返回什么」
+ *   的实现，而它与 Bun 那套必然随时间漂移 —— 这类分叉不会报错，
+ *   只会让某个端点在某个运行时上悄悄返回不一样的东西。
+ *
+ * ## 为什么把请求体整个读进内存
+ *
+ * 本服务的请求体都是小 JSON（署名、token 校验），几百字节量级；
+ * 而提交 `ReadableStream` 作为 `Request` 的 body 需要额外处理 Node 的
+ * `duplex: 'half'` 约束，容易在边界上出错。用内存换确定性是划算的。
+ * ⚠️ 如果将来要支持大文件上传，这里必须改成流式，不能沿用现在的写法。
+ */
+
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+
+/** 一个已启动的 HTTP 服务（两个运行时的公共形状）。 */
+export interface ServeHandle {
+  /** 实际监听的端口（可能因占用而后移）。 */
+  port: number
+  /** 优雅停机。 */
+  stop(): Promise<void>
+}
+
+/** 请求处理器：与 `Bun.serve` 的 `fetch` 完全同形。 */
+export type RequestHandler = (req: Request) => Response | Promise<Response>
+
+/** 在指定端口上监听；端口被占用时抛出的错误交给调用方识别。 */
+function listen(server: ReturnType<typeof createServer>, host: string, port: number): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const onError = (err: unknown): void => {
+      server.removeListener('listening', onListening)
+      reject(err)
+    }
+    const onListening = (): void => {
+      server.removeListener('error', onError)
+      resolve()
+    }
+    server.once('error', onError)
+    server.once('listening', onListening)
+    server.listen(port, host)
+  })
+}
+
+/** 关闭一个已启动的服务并等它真的关完。 */
+function closeServer(server: ReturnType<typeof createServer>): Promise<void> {
+  return new Promise<void>((resolve) => {
+    server.close(() => resolve())
+    // keep-alive 连接会让 close() 一直不回调，这里主动断开空闲连接。
+    // ⚠️ 不要用 closeAllConnections()：它会掐断正在返回的响应。
+    server.closeIdleConnections?.()
+  })
+}
+
+/**
+ * 用 `node:http` 起一个服务。
+ *
+ * 端口占用重试由调用方（`index.ts` 的 `serveWithPortRetry`）统一负责，
+ * 因为 Bun 那一侧是同步抛错、Node 这一侧是异步 reject ——
+ * 把差异收敛在那一个函数里，比让两边各自实现一遍重试更不容易出错。
+ */
+export async function serveWithNodeHttp(options: {
+  host: string
+  port: number
+  /** 请求超时（秒）。与 `Bun.serve` 的 `idleTimeout` 对齐语义。 */
+  idleTimeoutSeconds: number
+  handler: RequestHandler
+}): Promise<ServeHandle> {
+  const { host, port, handler } = options
+
+  const server = createServer((req, res) => {
+    void handleNodeRequest(req, res, handler, host, port)
+  })
+
+  /**
+   * ⚠️ 必须显式设置，理由与 `Bun.serve` 的 `idleTimeout` 完全相同：
+   *   首次冷建库要约 15 秒，超时太短会让客户端看到 `ECONNRESET`
+   *   而**服务端一条日志都没有**。
+   *   Node 的 `requestTimeout` 默认是 300 秒（够用），但显式写出来
+   *   才能让「这里有意放长」这件事被下一个改代码的人看见。
+   */
+  server.requestTimeout = options.idleTimeoutSeconds * 1000
+  server.headersTimeout = options.idleTimeoutSeconds * 1000
+
+  await listen(server, host, port)
+
+  return {
+    port,
+    stop: () => closeServer(server),
+  }
+}
+
+/** 把 Node 的请求/响应翻译成 Web 标准的 `Request`/`Response`。 */
+async function handleNodeRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  handler: RequestHandler,
+  host: string,
+  port: number,
+): Promise<void> {
+  try {
+    const method = req.method ?? 'GET'
+
+    // 把请求体读完再构造 Request（见文件头「为什么把请求体整个读进内存」）
+    const chunks: Buffer[] = []
+    for await (const chunk of req) {
+      chunks.push(chunk as Buffer)
+    }
+    const hasBody = chunks.length > 0 && method !== 'GET' && method !== 'HEAD'
+
+    // 用 Host 头拼绝对 URL，这样 `new URL(req.url)` 在处理器里拿到的主机名
+    // 与客户端请求的一致（回调地址、日志排障都要靠它）。
+    const hostHeader = req.headers.host ?? `${host}:${port}`
+    const url = `http://${hostHeader}${req.url ?? '/'}`
+
+    const headers = new Headers()
+    for (const [key, value] of Object.entries(req.headers)) {
+      if (value === undefined) continue
+      if (Array.isArray(value)) for (const v of value) headers.append(key, v)
+      else headers.set(key, value)
+    }
+
+    const request = new Request(url, {
+      method,
+      headers,
+      ...(hasBody ? { body: Buffer.concat(chunks) } : {}),
+    })
+
+    const response = await handler(request)
+
+    const outHeaders: Record<string, string> = {}
+    response.headers.forEach((value, key) => {
+      outHeaders[key] = value
+    })
+
+    // 两个运行时的 Response 都支持 arrayBuffer()，用它统一取值，
+    // 避免依赖 Node 特有的 Readable.fromWeb 桥接。
+    const body = Buffer.from(await response.arrayBuffer())
+    res.writeHead(response.status, outHeaders)
+    res.end(body)
+  } catch (err) {
+    // 兜底：任何未捕获异常都返回 JSON 而不是让连接挂断 ——
+    // 与 `index.ts` 处理器内的兜底保持同一策略，前端才能拿到结构化错误。
+    if (!res.headersSent) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' })
+    }
+    res.end(
+      JSON.stringify({
+        ok: false,
+        reason: `服务内部错误: ${err instanceof Error ? err.message : String(err)}`,
+      }),
+    )
+  }
+}
