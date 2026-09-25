@@ -13,7 +13,8 @@
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "verify:drivers": "bun run verify/run-driver-parity.ts"
   },
   "dependencies": {
     "@ai-token-report/shared": "workspace:*"

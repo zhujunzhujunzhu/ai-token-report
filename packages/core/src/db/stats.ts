@@ -47,7 +47,7 @@
  * ```
  */
 
-import type { Database } from 'bun:sqlite'
+import type { Database } from './driver.js'
 import { rmSync } from 'node:fs'
 
 import { aggregate, timeSeries, totalOf, type GroupDimension, type GroupRow } from '../aggregate.js'

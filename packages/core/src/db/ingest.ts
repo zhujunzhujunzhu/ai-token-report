@@ -27,7 +27,7 @@
  * 这是「宁可重扫，不可漏扫」的落点 —— 与 `report` 子命令的崩溃安全策略同源。
  */
 
-import type { Database } from 'bun:sqlite'
+import type { Database } from './driver.js'
 
 import { scanIncremental, type ScanOptions } from '../scanner.js'
 import type { ScanDiagnostics, UsageRecord } from '../types.js'
@@ -187,7 +187,7 @@ export async function ingest(options: IngestOptions): Promise<IngestResult> {
         insertedTotal: countEvents(db),
         diagnostics: scan.diagnostics,
       })
-    })()
+    })
 
     // ⚠️ 必须 finalize 全部 prepared statement。
     //   bun:sqlite 里未 finalize 的语句会让 `db.close()` **不释放文件句柄**，
@@ -416,7 +416,7 @@ export function insertRecords(db: Database, records: UsageRecord[]): {
       if (res.changes > 0) inserted++
       else duplicates++
     }
-  })()
+  })
   // ⚠️ 必须 finalize：未 finalize 的 prepared statement 会让
   //   `db.close()` **不释放文件句柄**，之后 `rmSync` 该库文件会抛
   //   `EBUSY: resource busy or locked`（Windows 与 Linux 都会）。

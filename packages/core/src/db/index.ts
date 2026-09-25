@@ -3,6 +3,7 @@
  *
  * | 文件 | 职责 |
  * |---|---|
+ * | `driver.ts` | ★ 驱动适配：Bun → `bun:sqlite`，Node → `node:sqlite`（只抹平调用方式，不碰 SQL） |
  * | `schema.ts` | 表结构（4 个独立列 + `event_id` 主键）与 PRAGMA |
  * | `ingest.ts` | 增量入库：复用 `scanIncremental`，数据与水印同事务 |
  * | `query.ts` | 查询：**只做原始列求和，不写任何公式** |
@@ -12,6 +13,7 @@
  *   见 `stats.ts` 与 `schema.ts` 的模块注释。
  */
 
+export * from './driver.js'
 export * from './schema.js'
 export * from './ingest.js'
 export * from './query.js'

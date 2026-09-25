@@ -38,7 +38,7 @@
  * 那条链路的投递目标在远端，语义不同，不要混用。
  */
 
-import { Database } from 'bun:sqlite'
+import { createSqliteDatabase, type Database } from './driver.js'
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 
@@ -175,7 +175,9 @@ export function openDb(dbPath: string): Database {
   //   这里主动建目录，与 `state.ts` 的 `saveState()` 行为保持一致。
   mkdirSync(dirname(dbPath), { recursive: true })
 
-  const db = new Database(dbPath, { create: true })
+  // ★ 驱动由 `driver.ts` 按运行期挑：Bun → `bun:sqlite`，Node → `node:sqlite`。
+  //   本文件与上层看不到这个差异，SQL 与 PRAGMA 完全一致。
+  const db = createSqliteDatabase(dbPath)
 
   db.exec('PRAGMA journal_mode = WAL')
   db.exec('PRAGMA synchronous = NORMAL')

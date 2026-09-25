@@ -1,6 +1,8 @@
 node_modules/
 dist/
 lib/
+!packages/core/verify/lib/
+!packages/core/verify/lib/runtime.ts
 .bun-cache/
 *.log
 
@@ -17,3 +19,4 @@ token-report-user.json
 .env
 .env.local
 .DS_Store
+.dsh

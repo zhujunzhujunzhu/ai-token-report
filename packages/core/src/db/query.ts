@@ -25,7 +25,9 @@
  * 这条规则必须只有一份实现，否则两条路径的项目名会对不上）。
  */
 
-import type { Database, SQLQueryBindings } from 'bun:sqlite'
+// 驱动类型来自适配层（Bun → bun:sqlite / Node → node:sqlite）。
+// 🚨 这里**只换类型来源**，SQL 文本与口径公式一个字都不动。
+import type { Database, SQLQueryBindings } from './driver.js'
 
 // ★ 时间键与项目名一律复用 aggregate.ts 的实现 ——
 //   这两条规则（toDayKey / toHourKey / projectName）必须只有一份实现，
