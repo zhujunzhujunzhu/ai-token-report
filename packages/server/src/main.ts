@@ -14,6 +14,9 @@
  */
 
 import { resolvePaths } from '@ai-token-report/core'
+import { existsSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { createServer, DEFAULT_PORT } from './index.js'
 
@@ -22,6 +25,8 @@ interface Args {
   host: string
   dshHome?: string
   dbPath?: string
+  /** 上报库改用 MySQL 的连接串（也可用环境变量 `ATR_MYSQL_URL`）。 */
+  mysqlUrl?: string
   credentialsPath?: string
   staticDir?: string
   portalUrl?: string
@@ -60,6 +65,12 @@ function parseArgs(argv: string[]): Args | null {
         args.dbPath = take(i, a)
         i++
         break
+      case '--mysql':
+        // ★ 两者只该有一个：都给了也不报错，`openPortalStore()` 的语义是
+        //   「有 mysqlUrl 就用它」，`--db` 退化成不被使用的退路。
+        args.mysqlUrl = take(i, a)
+        i++
+        break
       case '--credentials':
         args.credentialsPath = take(i, a)
         i++
@@ -89,16 +100,31 @@ ai-token-report 部门服务端
   --port <n>          监听端口 (默认 ${DEFAULT_PORT}，被占用自动 +1)
   --host <addr>       监听地址 (默认 127.0.0.1，对全组开放用 0.0.0.0)
   --dsh-home <p>      DSH home (默认 $DSH_HOME 或 ~/.dsh)
-  --db <p>            SQLite 文件路径
+  --db <p>            上报库路径 (默认 <dsh-home>/token-report/portal.sqlite)
+  --mysql <url>       上报库改用 MySQL，如 mysql://user:pass@host:3306/ai_token_report
+                      (也可用环境变量 ATR_MYSQL_URL；⚠️ 仅 Bun 上可用。
+                       本机库 usage.sqlite 不受影响，永远是 SQLite)
   --credentials <p>   凭证文件路径
-  --static <p>        前端构建产物目录
+  --static <p>        部门看板前端构建产物目录 (默认 packages/web-portal/dist)
   --portal <url>      部门服务端自身地址 (本地模式用)
   -h, --help          显示帮助
 
 凭证文件格式 (credentials.json):
-  [ { "token": "atr-zhangsan-9f3c", "name": "张三", "dept": "研发一部" } ]
+  [ { "token": "atr-zhangsan-9f3c", "name": "张三", "dept": "研发一部" },
+    { "token": "atr-admin-0001",     "name": "李经理", "role": "admin" } ]
   或
   { "张三": "atr-zhangsan-9f3c" }
+
+  role 缺省为 member（可看全部门看板）；admin 额外可以进入看板上的
+  「人员管理」页签发 / 重置 / 吊销 token。手工维护只需第一个管理员，
+  之后都在页面上发放。
+
+冷启动兜底:
+  配置 ATR_ADMIN_TOKEN、ATR_ADMIN_USERNAME、ATR_ADMIN_PASSWORD（12～128 位）。
+  ATR_ADMIN_NAME 可选。使用用户名 + 密码 + 图形验证码进入管理页。
+  部署账号不写入凭证文件；已有 Token 不自动成为登录密码。
+  HTTPS 反向代理请配置 ATR_PORTAL_ORIGIN=https://你的域名。
+  详见 docs/部门前端重构方案.md。
 `
 
 async function main(): Promise<number> {
@@ -117,13 +143,20 @@ async function main(): Promise<number> {
 
   const paths = resolvePaths(args.dshHome)
 
+  // 看板前端产物：显式 --static 优先，否则按仓库布局探测。
+  // ⚠️ 探测不到时**不把不存在的目录传给服务**（否则每个页面请求都会去读一个
+  //   不存在的 index.html 再回落到 JSON 404，排障时看不出是「没构建」），
+  //   而是明确提示跑哪条命令。
+  const staticDir = args.staticDir ?? resolvePortalDist()
+
   const handle = await createServer({
     port: args.port,
     host: args.host,
     ...(args.dshHome ? { dshHome: args.dshHome } : {}),
     ...(args.dbPath ? { dbPath: args.dbPath } : {}),
+    ...(args.mysqlUrl ? { mysqlUrl: args.mysqlUrl } : {}),
     ...(args.credentialsPath ? { credentialsPath: args.credentialsPath } : {}),
-    ...(args.staticDir ? { staticDir: args.staticDir } : {}),
+    ...(staticDir ? { staticDir } : {}),
     ...(args.portalUrl ? { portalUrl: args.portalUrl } : {}),
     enableLocalApi: false,
   })
@@ -134,7 +167,30 @@ async function main(): Promise<number> {
     out.push(`  ⚠ 端口 ${args.port} 被占用，已改用 ${handle.port}`)
   }
   out.push(`  DSH home  ${paths.dshHome}`)
-  out.push(`  凭证文件  ${args.credentialsPath ?? `${paths.dshHome}/token-report/credentials.json`}`)
+  out.push(`  凭证文件  ${handle.credentialsPath}`)
+  out.push(`  已发凭证  ${handle.credentialCount} 人（其中管理员 ${handle.adminCount} 人）`)
+  // 上报库必须打印出来：它是全员数据的唯一副本，出问题时管理员要知道去备份哪个库。
+  // ★ 用 handle 里的描述而不是自己拼路径：配了 MySQL 时它要打印「库名 @ 主机:端口」，
+  //   而且**必须脱敏**（`ATR_MYSQL_URL` 里带密码，启动日志经常被贴进工单）。
+  out.push(`  上报库    ${handle.portalTargetLabel}`)
+  out.push(`  上报接口  POST ${handle.url}/api/v1/token-usage`)
+  if (staticDir) {
+    out.push(`  部门看板  ${handle.url}/  （资源 ${staticDir}）`)
+    out.push(`  人员管理  ${handle.url}/ →「人员管理」页（需管理员登录账号）`)
+  } else {
+    out.push(`  ⚠ 未找到部门看板构建产物，仅提供 API。先执行: bun run build:portal`)
+  }
+  // ★ 没有人是管理员时必须在启动时说清：管理页谁都进不去，
+  //   而管理页的第一件事恰恰是「发放第一个 token」—— 不说就是个死锁。
+  if (handle.adminCount === 0) {
+    out.push('')
+    out.push('  ⚠ 当前没有任何管理员，人员管理页无法进入。二选一：')
+    out.push(`     1) 在 ${handle.credentialsPath} 里给某人加 "role": "admin" 后重启`)
+    out.push('     2) 用环境变量起服务：ATR_ADMIN_TOKEN=<自定token> bun run start')
+  }
+  if (!args.dbPath && !args.dshHome && !args.mysqlUrl && !process.env.ATR_MYSQL_URL) {
+    out.push(`  ⚠ 上报库默认落在 DSH home 下；生产部署建议用 --db 指到独立数据盘，或用 --mysql。`)
+  }
   if (args.host !== '127.0.0.1') {
     out.push(`  ⚠ 正在监听 ${args.host}，内网可访问。请确认凭证已配置且已发放给员工。`)
   }
@@ -164,3 +220,28 @@ main()
     process.stderr.write(`未处理的错误: ${err instanceof Error ? err.stack : String(err)}\n`)
     process.exitCode = 1
   })
+
+/**
+ * 探测部门看板前端的构建产物目录。
+ *
+ * 候选路径与 CLI 找 `web-local` 产物的做法一致（见 `packages/cli/src/cli.ts`
+ * 的 `resolveWebLocalDist`）：**开发形态**从源码目录往上找，
+ * **发布形态**则可能被拷进包目录旁边。这里只覆盖本仓开发形态 ——
+ * 部门服务端目前只从仓库里起（`bun run server`），未随 npm 包发布。
+ *
+ * 返回 null 表示尚未构建（调用方给出明确提示，而不是拿空目录去托管）。
+ */
+function resolvePortalDist(): string | undefined {
+  // 源码目录 = packages/server/src。用 fileURLToPath 而不是 Bun 专有的
+  // `import.meta.dir`：本文件虽然由 bun 启动，但服务端整体要能跑在 Node 上
+  // （见 index.ts 的运行时无关说明），少一处 Bun 专有 API 就少一个坑。
+  const here = fileURLToPath(new URL('.', import.meta.url))
+  const candidates = [
+    resolve(here, '..', '..', 'web-portal', 'dist'),
+    resolve(process.cwd(), 'packages', 'web-portal', 'dist'),
+  ]
+  for (const dir of candidates) {
+    if (existsSync(resolve(dir, 'index.html'))) return dir
+  }
+  return undefined
+}

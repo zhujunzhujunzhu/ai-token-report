@@ -1,83 +1,56 @@
 /**
- * `@ai-token-report/server` —— 后端服务实现。
+ * `@ai-token-report/server` —— 后端服务的**组装入口**。
  *
- * ## 一个 server，两副面孔
+ * ## 这个文件现在只做三件事
  *
- * | 路径 | 使用者 | 数据源 | 鉴权 |
- * |---|---|---|---|
- * | `/api/local/identity` | 本地页面引导页 | 身份文件 | 无（仅 127.0.0.1） |
- * | `/api/local/stats/*` | 本地页面（`dsh-token --web`） | **本地 SQLite 增量库**（降级直扫日志） | 无（仅 127.0.0.1） |
- * | `/api/local/refresh` | 本地页面「刷新」按钮 | 触发下一次增量 ingest | 无（仅 127.0.0.1） |
- * | `/api/v1/identity/verify` | 本地服务代用户校验 | 凭证表 | Bearer |
- * | `/api/v1/token-usage` | 插件 & CLI 上报 | 写入 SQLite | Bearer |
- * | `/api/v1/stats/*` | 部门看板页面 | 读 SQLite | Bearer |
+ * 1. 把选项（`ServerOptions`）变成一条完整的依赖链：凭证表 → 四条路由 → 应用
+ * 2. 起监听（两个运行时二选一，见 `runtime/listen.ts`）
+ * 3. 回报启动横幅需要的那点元信息
  *
- * ★ **`/api/local/*` 用的是「本地自己的库」**（`$DSH_HOME/token-report/usage.sqlite`），
- *   与部门服务端的库（`dbPath`）是两个不同的文件，不要混淆。
- *   本地库只装本机数据，因此仍然「断网可用、服务端挂掉不影响看自己的数据」。
- *
- * ## 端口占用
- *
- * 默认 8787，被占用时自动 +1 重试（最多 10 次）。这让「再开一个」
- * 不会因为端口冲突直接失败，也让多实例调试变得容易。
+ * 「什么路径返回什么」在 `app.ts`；鉴权裁决在 `http/auth.ts`；
+ * 上报 / 看板 / 管理 / 本地查的业务与护栏在各自的 `*-route.ts`。
+ * **本文件里不该再出现任何 `if (path === ...)`** —— 重构前它有 185 行这样的分支。
  *
  * ## ★ 运行时无关：Bun 与 Node 都能起
  *
- * 请求处理器（{@link createHandler}）**本来就写成 Web 标准的**
+ * 请求处理器（{@link createHandlerFor} 返回的 `handler`）是 Web 标准的
  * （入参 `Request`、返回 `Response`），所以 Bun 专有的只有最外面那层 server。
- * {@link tryListen} 按运行期二选一：
+ * npm 发布出去的那份 CLI 靠的就是这条性质跑在 Node 上。
  *
- * | 运行时 | 实现 | 端口占用的表现 |
- * |---|---|---|
- * | Bun | `Bun.serve` | **同步抛错** |
- * | Node | `node:http`（`serve-node.ts` 桥接） | **异步 reject** |
+ * 🚨 **静态资源一律走 `node:fs/promises`，绝不用 `Bun.file()`**。
  *
- * 两者的差异被 `tryListen` 收敛成同一个 async 形状，重试循环只有一份。
- * 🚨 静态资源一律用 `node:fs/promises` 读取，**不要用 `Bun.file()`** ——
- *   那是 Bun 专有的，会让 npm 发布出去、跑在 Node 上的 CLI 直接崩。
+ * ## 端口占用
+ *
+ * 默认 8787，被占用时自动 +1 重试（最多 10 次，见 `runtime/listen.ts`）。
+ * 这让「再开一个」不会因为端口冲突直接失败，也让多实例调试变得容易。
+ * ⚠️ 但部署时应当用 `--port` 固定端口：静默自增会让反代指向一个没人听的端口，
+ *   而启动日志里那行「已改用 8788」很容易被忽略。
  */
 
 import { resolvePaths } from '@ai-token-report/core'
-import { readFile, stat } from 'node:fs/promises'
+import { describePortalTarget, portalDbFileName, resolvePortalTarget } from '@ai-token-report/core/db'
 import { join } from 'node:path'
 
-import { CredentialStore } from './credentials.js'
+import { AdminRoute } from './admin-route.js'
+import { createApp } from './app.js'
+import { hashPassword, normalizeUsername, usernameError } from './auth/password.js'
+import type { CredentialStore } from './credentials.js'
 import { IdentityRoute } from './identity-route.js'
+import { IngestRoute } from './ingest-route.js'
 import { CoreStatsProvider, LocalStatsRouter } from './local-api.js'
-import { serveWithNodeHttp, type ServeHandle } from './serve-node.js'
-import { verifyToken } from './verify-route.js'
+import { envAdminFrom, loadMembers } from './member-admin.js'
+import { serveWithPortRetry, type RequestHandler } from './runtime/listen.js'
+import { StatsRoute } from './stats-route.js'
 
-export const SERVER_VERSION = '0.1.0'
-
-/** 默认端口。 */
-export const DEFAULT_PORT = 8787
-/** 端口被占用时的最大重试次数。 */
-const MAX_PORT_ATTEMPTS = 10
-
-/**
- * `Bun.serve` 的空闲超时（秒）。
- *
- * ⚠️ **必须显式设置，否则默认值是 10 秒**。
- *
- * 历史背景：早期本地页**直扫日志**，冷扫描要 10~13 秒（185 文件 / 61 MB），
- * 默认 10 秒会直接掐断连接 —— 客户端看到 `ECONNRESET`，
- * 而**服务端一条日志都没有**，表现为「本地页偶尔连不上」这种
- * 极难复现、极难定位的故障。
- *
- * 现在数据源换成了本地 SQLite 增量库，热态查询只要 20ms 左右，
- * 这个超时已经不再是正确性瓶颈。但**仍然必须设大**，因为还有两个
- * 真实的长请求场景：
- *
- * 1. **首次冷启动建库**：库不存在时要全量解析历史日志，实测约 15 秒
- * 2. **`--reset-db` 之后的第一请求**：同上
- *
- * 设为 120 秒：给冷建库留一个数量级的余量。扫描期间连接是活跃的
- * （请求尚未返回），所以真正被这个值兜住的是「客户端已断开但任务还在跑」，
- * 那种情况等久一点只是浪费一个协程，远好过误杀一个正常的长请求。
- */
-const IDLE_TIMEOUT_SECONDS = 120
+export { DEFAULT_PORT, IDLE_TIMEOUT_SECONDS } from './runtime/listen.js'
+export { SERVER_VERSION } from './app.js'
 
 export interface ServerOptions {
+  /** 后台公开源（HTTPS 反向代理时用于同源校验与 Secure Cookie）。 */
+  portalOrigin?: string
+  /** 首次部署的后台登录账号；需要同时配置 adminToken，密码不落盘。 */
+  adminUsername?: string
+  adminPassword?: string
   /** 监听端口。默认 8787；被占用时自动 +1。 */
   port?: number
   /**
@@ -89,10 +62,49 @@ export interface ServerOptions {
   host?: string
   /** DSH home，用于本地日志扫描与身份文件。 */
   dshHome?: string
-  /** SQLite 文件路径。仅上报与部门统计需要。 */
+  /**
+   * **上报库**（服务端）的 SQLite 文件路径。
+   *
+   * 默认 `<dshHome>/token-report/portal.sqlite`。
+   * ⚠️ 与本地库 `usage.sqlite` 是两个不同的文件 —— 混用会让全员数据与本机数据
+   * 相互污染且无法事后拆开（见 `core/db` 的 `portalDbFileName()`）。
+   *
+   * 🚨 这个库是全员上报数据的**唯一副本**，因此 schema 版本不符时
+   * `openPortalDb()` 会抛错而**不会**像本地库那样自动重建。
+   */
   dbPath?: string
+  /**
+   * **上报库改用 MySQL**（可选）。设置后 `dbPath` 不再被使用（两者只该有一个）。
+   *
+   * 取值形如 `mysql://user:pass@host:3306/ai_token_report`；未显式给时读环境变量
+   * `ATR_MYSQL_URL`（与 `portalOrigin` 同一套「选项优先、其次环境变量」的顺序）。
+   *
+   * ★ **只有部门服务端需要它**。本机库 `usage.sqlite` 恒为 SQLite ——
+   *   员工机器上跑 CLI 不需要任何数据库服务，这条边界由类型保证
+   *   （本地路径只收同步 SQLite `Database`）。
+   *
+   * 🚨 只在 **Bun** 上可用（走内建 `Bun.sql`）；Node 上会明确报错并指路。
+   *   理由：npm 版 CLI 只跑本机库，为它引 `mysql2` 会进发布产物。
+   *   详见 `docs/mysql上报库.md`。
+   *
+   * 🚨 启动横幅会打印它，**必须脱敏**（`describePortalTarget()` 负责抹掉密码）。
+   */
+  mysqlUrl?: string
   /** 凭证文件路径。默认 `<dshHome>/token-report/credentials.json`。 */
   credentialsPath?: string
+  /**
+   * 冷启动用的管理员 token（默认读环境变量 `ATR_ADMIN_TOKEN`）。
+   *
+   * ★ 用途：凭证文件为空（全新部署）或只读（配置由编排系统挂载）时，
+   *   仍然有人能进管理页发放第一个 token —— 否则是个死锁：
+   *   管理页的第一件事就是发 token，而进管理页又需要一个 token。
+   *
+   * ⚠️ 它**不写进凭证文件**：环境变量是部署期配置，写进文件等于把部署秘密
+   *   复制到磁盘的另一处，删除时两处还会不一致。
+   */
+  adminToken?: string
+  /** 环境变量管理员的显示名（默认「管理员」）。 */
+  adminName?: string
   /**
    * 部门服务端地址（本地模式用）。
    *
@@ -105,6 +117,13 @@ export interface ServerOptions {
   enableLocalApi?: boolean
   /** 注入用，便于测试。 */
   fetchImpl?: typeof fetch
+  /**
+   * 请求日志（默认**开**）。
+   *
+   * ⚠️ 默认开是因为重构前请求路径上一条日志都没有，出问题只能靠猜；
+   *   测试里关掉，免得几百行访问日志淹没真正的失败信息。
+   */
+  requestLog?: boolean
 }
 
 export interface ServerHandle {
@@ -114,20 +133,84 @@ export interface ServerHandle {
   host: string
   /** 是否因端口被占用而改用其他端口 */
   portShifted: boolean
+  /** 已登记的凭证数（启动横幅用）。 */
+  credentialCount: number
+  /**
+   * 管理员数量。
+   *
+   * ⚠️ 它是 0 时**没有任何人能进管理页发 token**（只能靠 `ATR_ADMIN_TOKEN`
+   *   或在文件里手工写 `"role": "admin"`）—— 启动时必须提示，
+   *   否则管理员会在「管理页进不去」上浪费很久。
+   */
+  adminCount: number
+  /** 凭证文件路径（管理员要知道自己在维护哪个文件）。 */
+  credentialsPath: string
+  /**
+   * 上报库的**可读描述**（启动横幅打印它）。
+   *
+   * 🚨 已经过 `describePortalTarget()` 脱敏 —— 绝不能把 `ATR_MYSQL_URL` 原样打出来，
+   *   那里面带密码，而启动日志经常被贴进工单与聊天记录。
+   */
+  portalTargetLabel: string
   /** 优雅停机 */
   stop(): Promise<void>
 }
 
-/** 创建一个已启动的服务。 */
-export async function createServer(options: ServerOptions = {}): Promise<ServerHandle> {
-  const host = options.host ?? '127.0.0.1'
-  const requestedPort = options.port ?? DEFAULT_PORT
+/** 组装结果：`createServer` 与测试共用的「不起监听」那一半。 */
+export interface HandlerBundle {
+  /** Web 标准的请求处理器 —— 两个运行时的公共入口。 */
+  handler: RequestHandler
+  /** 凭证表实例（★ 全进程唯一，见 `CredentialStore` 的注释）。 */
+  credentials: CredentialStore
+  credentialsPath: string
+  /** 上报库路径（全员数据的唯一副本）。⚠️ 配了 MySQL 时它只是**退路**，不是实际目标。 */
+  dbPath: string
+  /** 实际上报库的可读描述（已脱敏；SQLite 是路径，MySQL 是「库名 @ 主机:端口」）。 */
+  portalTargetLabel: string
+  /** 静态资源目录；未构建/未指定时为 undefined。 */
+  staticDir?: string
+}
 
+/**
+ * 组装请求处理器 —— **不起监听**。
+ *
+ * ★ 单独抽出来的理由：让「分发面」能在 `bun test` 里被直接断言。
+ *   真 HTTP（套接字、端口重试、`idleTimeout`）由 `test/e2e-*.ts` 覆盖，
+ *   但那些脚本是 `bun run` 执行的、抢固定端口，按本仓约定**不适合**放进
+ *   `bun test`（会被并发跑起来、随机失败）。而「路径 × 方法 → 状态码」
+ *   这张表用 `new Request(...)` 直接喂进处理器即可钉住 ——
+ *   见 `test/http-contract.test.ts`。
+ */
+export async function createHandlerFor(options: ServerOptions = {}): Promise<HandlerBundle> {
   const paths = resolvePaths(options.dshHome)
   const credentialsPath =
     options.credentialsPath ?? join(paths.dshHome, 'token-report', 'credentials.json')
 
-  const { store: credentials, error: credError } = CredentialStore.load(credentialsPath)
+  // 凭证表：★ 全进程**只有一个实例**，上报 / 看板 / 管理三条路由共享它。
+  // 管理页签发 token 后改的就是这个实例，因此新 token **立刻**能上报
+  // （若各路由各建一份，员工拿到 token 后要等服务端重启才生效）。
+  //
+  // 环境变量管理员只在这里注入，不落文件 —— 见 ServerOptions.adminToken 的注释。
+  const envAdmin =
+    options.adminToken !== undefined
+      ? envAdminFrom({ ATR_ADMIN_TOKEN: options.adminToken, ATR_ADMIN_NAME: options.adminName })
+      : envAdminFrom()
+  const adminUsername = options.adminUsername ?? process.env.ATR_ADMIN_USERNAME
+  const adminPassword = options.adminPassword ?? process.env.ATR_ADMIN_PASSWORD
+  if (envAdmin && adminUsername && adminPassword) {
+    const error = usernameError(adminUsername)
+    if (error) throw new Error(`ATR_ADMIN_USERNAME: ${error}`)
+    envAdmin.username = normalizeUsername(adminUsername)
+    envAdmin.passwordHash = await hashPassword(adminPassword)
+  }
+  const {
+    admin: memberAdmin,
+    store: credentials,
+    fileError: credError,
+  } = loadMembers({
+    credentialsPath,
+    ...(envAdmin ? { envAdmin } : {}),
+  })
   if (credError) {
     process.stderr.write(`⚠ 凭证文件加载失败：${credError}\n`)
   }
@@ -138,6 +221,26 @@ export async function createServer(options: ServerOptions = {}): Promise<ServerH
     ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
   })
 
+  // 上报接收：写**上报库**（默认 portal.sqlite）。它与 `/api/local/*` 用的
+  // 本地库是两个文件 —— 见 ServerOptions.dbPath 的注释。
+  const dbPath = options.dbPath ?? defaultPortalDbPath(paths.dshHome)
+  // ★ 上报库的目标在这里归一一次：显式选项优先，其次环境变量。
+  //   路由内部因此**不再出现任何 `if (mysql)`** —— 换后端不影响任何查询分支。
+  //   两者同时配置不报错：`openPortalStore()` 的语义是「有 mysqlUrl 就用它」。
+  const mysqlUrl = options.mysqlUrl ?? process.env.ATR_MYSQL_URL
+  const mysqlOption = mysqlUrl ? { mysqlUrl } : {}
+  const ingestRoute = new IngestRoute({ credentials, dbPath, ...mysqlOption })
+
+  // 部门看板查询：读**同一个上报库**（只读，一个字节都不写）。
+  // ⚠️ 与上报接口一样在两种形态下都注册 —— 单机自建一个只收自己的小服务端时，
+  //   看板同样要能打开（只是里面只有一个人）。
+  // ★ 与上报路由**必须拿到同一个目标**：一个写 MySQL、另一个读 SQLite 会让
+  //   「上报成功但看板永远是 0」—— 这类分叉不会报错，只会让人以为没人用。
+  const statsRoute = new StatsRoute({ credentials, dbPath, ...mysqlOption })
+
+  // 人员管理：**唯一会写凭证文件的通路**（管理员专用，见 admin-route.ts）。
+  const adminRoute = new AdminRoute({ store: credentials, admin: memberAdmin })
+
   // 本地直查：只有启用 `/api/local/*` 时才构造，避免部门服务端
   // 白白持有一条指向本机日志/本地库的通路。
   // 数据源是本地 SQLite 增量库（`core/db`），库不可用时自动降级直扫日志。
@@ -145,296 +248,59 @@ export async function createServer(options: ServerOptions = {}): Promise<ServerH
     ? new LocalStatsRouter(new CoreStatsProvider(paths.sessionsRoot, paths.dbPath))
     : null
 
-  const handler = createHandler({
+  const app = createApp({
+    portalOrigin: options.portalOrigin ?? process.env.ATR_PORTAL_ORIGIN,
     credentials,
     identityRoute,
+    ingestRoute,
+    statsRoute,
+    adminRoute,
     localStats,
     enableLocalApi: options.enableLocalApi ?? false,
     ...(options.staticDir ? { staticDir: options.staticDir } : {}),
+    ...(options.requestLog !== undefined ? { requestLog: options.requestLog } : {}),
   })
 
-  const { handle, port, shifted } = await serveWithPortRetry(host, requestedPort, handler)
+  return {
+    // ★ 交给最外层服务器的就是这一个函数：Bun 与 Node 共用它
+    //   （`Bun.serve({ fetch })` / `serve-node.ts` 的 node:http 桥接）。
+    handler: (req: Request) => app.fetch(req),
+    credentials,
+    credentialsPath,
+    dbPath,
+    // ★ 实际目标的可读描述（MySQL 时是「库名 @ 主机:端口」，**不含密码**）
+    portalTargetLabel: describePortalTarget(resolvePortalTarget({ sqlitePath: dbPath, mysqlUrl })),
+    ...(options.staticDir ? { staticDir: options.staticDir } : {}),
+  }
+}
+
+/** 创建一个已启动的服务。 */
+export async function createServer(options: ServerOptions = {}): Promise<ServerHandle> {
+  const host = options.host ?? '127.0.0.1'
+  const requestedPort = options.port ?? 8787
+
+  const bundle = await createHandlerFor(options)
+  const { handle, port, shifted } = await serveWithPortRetry(host, requestedPort, bundle.handler)
 
   return {
     url: `http://${host}:${port}`,
     port,
     host,
     portShifted: shifted,
+    credentialCount: bundle.credentials.size,
+    adminCount: bundle.credentials.adminCount,
+    credentialsPath: bundle.credentialsPath,
+    portalTargetLabel: bundle.portalTargetLabel,
     stop: () => handle.stop(),
   }
 }
 
-/** 是否跑在 Bun 上。决定用 `Bun.serve` 还是 `node:http`。 */
-function isBunRuntime(): boolean {
-  return typeof (globalThis as { Bun?: unknown }).Bun !== 'undefined'
-}
-
 /**
- * 在指定端口起服务；端口被占用时抛出（由调用方重试）。
+ * 上报库的默认路径。
  *
- * ★ 两个运行时的差异**只收敛在这里**：Bun 的 `Bun.serve` 端口占用是
- *   **同步抛错**，而 `node:http` 是 **异步 reject**。把它包成 async 之后，
- *   上面的重试循环对两者就是同一套写法。
+ * ⚠️ 与本地库 `usage.sqlite` **同目录但不同文件**：混用会让全员数据与本机数据
+ * 相互污染，且事后无法拆开（库里没有「数据来源」列）。
  */
-async function tryListen(
-  host: string,
-  port: number,
-  handler: (req: Request) => Response | Promise<Response>,
-): Promise<ServeHandle> {
-  if (isBunRuntime()) {
-    const server = Bun.serve({
-      hostname: host,
-      port,
-      fetch: handler,
-      // 见 IDLE_TIMEOUT_SECONDS 的注释：不设这个值，冷扫描必被掐断
-      idleTimeout: IDLE_TIMEOUT_SECONDS,
-    })
-    return {
-      port,
-      stop: async () => {
-        await server.stop(true)
-      },
-    }
-  }
-
-  // Node 运行时：请求处理器本身是 Web 标准的，这里只换最外面那层 server。
-  return serveWithNodeHttp({
-    host,
-    port,
-    idleTimeoutSeconds: IDLE_TIMEOUT_SECONDS,
-    handler,
-  })
-}
-
-/** 依次尝试端口，直到绑定成功。 */
-async function serveWithPortRetry(
-  host: string,
-  startPort: number,
-  handler: (req: Request) => Response | Promise<Response>,
-): Promise<{ handle: ServeHandle; port: number; shifted: boolean }> {
-  let lastErr: unknown
-
-  for (let i = 0; i < MAX_PORT_ATTEMPTS; i++) {
-    const port = startPort + i
-    try {
-      const handle = await tryListen(host, port, handler)
-      return { handle, port, shifted: i > 0 }
-    } catch (err) {
-      lastErr = err
-      // 只有「端口占用」才重试；其他错误（如权限）应立即失败
-      if (!isPortInUse(err)) {
-        throw err
-      }
-    }
-  }
-
-  throw new Error(
-    `端口 ${startPort}~${startPort + MAX_PORT_ATTEMPTS - 1} 都被占用，无法启动服务。` +
-      `请用 --port 指定其他端口。原始错误：${msg(lastErr)}`,
-  )
-}
-
-function isPortInUse(err: unknown): boolean {
-  const code = (err as { code?: string } | null)?.code
-  if (code === 'EADDRINUSE') return true
-  const text = msg(err).toLowerCase()
-  return text.includes('eaddrinuse') || text.includes('address already in use')
-}
-
-interface HandlerDeps {
-  credentials: CredentialStore
-  identityRoute: IdentityRoute
-  /** 本地直查路由。`enableLocalApi` 为 false 时是 null。 */
-  localStats: LocalStatsRouter | null
-  enableLocalApi: boolean
-  staticDir?: string
-}
-
-/** 构造请求处理器。 */
-function createHandler(deps: HandlerDeps): (req: Request) => Promise<Response> {
-  const { credentials, identityRoute, localStats, enableLocalApi, staticDir } = deps
-  const indexHtml = staticDir ? join(staticDir, 'index.html') : null
-
-  return async (req: Request): Promise<Response> => {
-    const url = new URL(req.url)
-    const p = url.pathname
-
-    try {
-      // ── 身份校验（部门服务端）────────────────────────────────
-      if (p === '/api/v1/identity/verify') {
-        if (req.method !== 'POST') return methodNotAllowed('POST')
-
-        let bodyToken: string | null = null
-        try {
-          const body = (await req.json()) as { token?: unknown }
-          if (typeof body?.token === 'string') bodyToken = body.token
-        } catch {
-          /* 无 body 或非法 JSON 都允许，改看 Authorization 头 */
-        }
-
-        const result = verifyToken(credentials, {
-          authorization: req.headers.get('authorization'),
-          bodyToken,
-        })
-        // 校验失败返回 200 + ok:false —— 这是业务结果，不是 HTTP 错误。
-        // 用 401 会让前端把「token 填错了」和「网络坏了」混为一谈。
-        return json(result)
-      }
-
-      // ── 本地身份读写（本地页面用）────────────────────────────
-      if (enableLocalApi && p === '/api/local/identity') {
-        if (req.method === 'GET') {
-          return json(identityRoute.get())
-        }
-        if (req.method === 'POST') {
-          let payload: unknown
-          try {
-            payload = await req.json()
-          } catch {
-            return json({ ok: false, reason: '请求体不是合法 JSON' }, 400)
-          }
-          const result = await identityRoute.submit(
-            payload as { name: string; token: string; dept?: string },
-          )
-          // 同样用 200 表达业务失败，理由同上
-          return json(result)
-        }
-        if (req.method === 'DELETE') {
-          return json(identityRoute.clear())
-        }
-        return methodNotAllowed('GET, POST, DELETE')
-      }
-
-      // ── 本地统计直查（本地页面用）──────────────────────────────
-      // ★ 只扫本机日志，不碰数据库 —— 这是「本地」名副其实的前提。
-      if (enableLocalApi && localStats && p.startsWith('/api/local/stats/')) {
-        if (req.method !== 'GET') return methodNotAllowed('GET')
-
-        const params = url.searchParams
-        const sub = p.slice('/api/local/stats/'.length)
-
-        switch (sub) {
-          case 'overview':
-            return fromRoute(await localStats.overview(params))
-          case 'series':
-            return fromRoute(await localStats.series(params))
-          case 'breakdown':
-            return fromRoute(await localStats.breakdown(params))
-          case 'diagnostics':
-            return fromRoute(await localStats.diagnostics(params))
-          default:
-            return json({ ok: false, reason: `未找到 ${p}` }, 404)
-        }
-      }
-
-      // ── 强制失效缓存重扫（本地页面用）──────────────────────────
-      if (enableLocalApi && localStats && p === '/api/local/refresh') {
-        if (req.method !== 'POST') return methodNotAllowed('POST')
-        return fromRoute(localStats.refresh())
-      }
-
-      // ── 健康检查 ────────────────────────────────────────────
-      if (p === '/api/health') {
-        return json({
-          ok: true,
-          version: SERVER_VERSION,
-          credentialsRegistered: credentials.registered,
-          credentialCount: credentials.size,
-          localApi: enableLocalApi,
-        })
-      }
-
-      // ── 静态资源（前端页面）──────────────────────────────────
-      if (staticDir && req.method === 'GET') {
-        const served = await serveStatic(staticDir, p)
-        if (served) return served
-        // 未命中文件 → 回落到 index.html，交给前端路由
-        if (indexHtml) {
-          const html = await readFileOrNull(indexHtml)
-          if (html) {
-            return new Response(html, {
-              headers: { 'Content-Type': 'text/html; charset=utf-8' },
-            })
-          }
-        }
-      }
-
-      return json({ ok: false, reason: `未找到 ${p}` }, 404)
-    } catch (err) {
-      // 兜底：任何未捕获异常都返回 JSON，而不是让连接挂断。
-      // 前端拿到结构化错误才能展示有意义的信息。
-      return json({ ok: false, reason: `服务内部错误: ${msg(err)}` }, 500)
-    }
-  }
-}
-
-/**
- * 读取一个文件；不存在或不是普通文件时返回 null。
- *
- * ★ 用 `node:fs/promises` 而不是 `Bun.file()`：后者是 Bun 专有的，
- *   而本服务要同时跑在 Bun 与 Node 上（npm 发布的 CLI 就是这么用的）。
- */
-async function readFileOrNull(path: string): Promise<Buffer | null> {
-  try {
-    const info = await stat(path)
-    if (!info.isFile()) return null
-    return await readFile(path)
-  } catch {
-    return null
-  }
-}
-
-/** 尝试提供静态文件；未命中返回 null。 */
-async function serveStatic(dir: string, pathname: string): Promise<Response | null> {
-  // decodeURIComponent 会对非法百分号编码（如 `/%zz`）抛 URIError。
-  // 这是客户端请求格式错误，不是服务缺陷 —— 直接回 400，
-  // 否则会被外层兜底 catch 转成 500，排障时误以为是服务出 bug。
-  let decoded: string
-  try {
-    decoded = decodeURIComponent(pathname)
-  } catch {
-    return json({ ok: false, reason: '请求路径包含非法的 URL 编码' }, 400)
-  }
-
-  // 去掉前导 /，并拒绝 .. 穿越
-  const rel = decoded.replace(/^\/+/, '')
-  if (!rel || rel.includes('..')) return null
-
-  const data = await readFileOrNull(join(dir, rel))
-  if (!data) return null
-
-  return new Response(data, { headers: { 'Content-Type': contentTypeOf(rel) } })
-}
-
-function contentTypeOf(path: string): string {
-  if (path.endsWith('.html')) return 'text/html; charset=utf-8'
-  if (path.endsWith('.js') || path.endsWith('.mjs')) return 'text/javascript; charset=utf-8'
-  if (path.endsWith('.css')) return 'text/css; charset=utf-8'
-  if (path.endsWith('.json')) return 'application/json; charset=utf-8'
-  if (path.endsWith('.svg')) return 'image/svg+xml'
-  if (path.endsWith('.woff2')) return 'font/woff2'
-  return 'application/octet-stream'
-}
-
-function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8' },
-  })
-}
-
-/** 把路由结果转成 Response。 */
-function fromRoute(result: { status: number; body: unknown }): Response {
-  return json(result.body, result.status)
-}
-
-function methodNotAllowed(allow: string): Response {
-  return new Response(JSON.stringify({ ok: false, reason: '方法不允许' }), {
-    status: 405,
-    headers: { 'Content-Type': 'application/json; charset=utf-8', Allow: allow },
-  })
-}
-
-function msg(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
+export function defaultPortalDbPath(dshHome: string): string {
+  return join(dshHome, 'token-report', portalDbFileName())
 }

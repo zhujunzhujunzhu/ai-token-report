@@ -19,6 +19,7 @@
     "@ai-token-report/core": "workspace:*",
     "@ai-token-report/shared": "workspace:*",
     "@noble/hashes": "2.4.0",
+    "hono": "4.13.9",
     "rate-limiter-flexible": "11.2.1"
   },
   "devDependencies": {

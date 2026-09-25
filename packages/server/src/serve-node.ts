@@ -15,13 +15,31 @@
  *
  * ## 为什么把请求体整个读进内存
  *
- * 本服务的请求体都是小 JSON（署名、token 校验），几百字节量级；
+ * 本服务的请求体都是小 JSON（署名、token 校验、一批上报），几百字节到几 MB 量级；
  * 而提交 `ReadableStream` 作为 `Request` 的 body 需要额外处理 Node 的
  * `duplex: 'half'` 约束，容易在边界上出错。用内存换确定性是划算的。
- * ⚠️ 如果将来要支持大文件上传，这里必须改成流式，不能沿用现在的写法。
+ * ⚠️ 上报接口另有一个 32 MiB 的 `Content-Length` 上限（见 `index.ts`），
+ *   将来要支持更大的上传必须改成流式，不能沿用现在的写法。
+ *
+ * ## 🚨 `node:http` 必须**动态** import
+ *
+ * 这个模块只在 Node 上被调用（Bun 走 `Bun.serve`），但静态 import 会让
+ * `node:http` 在 **Bun 上也被求值** —— 而它在被求值的那一刻就会构造
+ * `http.globalAgent`，后者要解析 `HTTP_PROXY` / `http_proxy`：
+ *
+ * ```
+ * Invalid proxy URL: http://127.0.0.1:10809      code: ERR_PROXY_INVALID_CONFIG
+ *   at parseProxyUrl (internal:http) → new Agent (node:_http_agent) → node:http
+ * ```
+ *
+ * 实测（Windows + Bun 1.4.2）：代理环境变量末尾带一个 CRLF 就会触发，
+ * 且**整个服务起不来** —— 表现是 `bun run server` 直接崩在 import 阶段，
+ * 连一行启动日志都没有，而错误信息完全不提代理是从哪来的。
+ * 把 import 挪进函数体（那时已经确定跑在 Node 上）即可绕开：
+ * 适配器的静态依赖里不该有它根本用不到的运行时。
  */
 
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 
 /** 一个已启动的 HTTP 服务（两个运行时的公共形状）。 */
 export interface ServeHandle {
@@ -35,7 +53,7 @@ export interface ServeHandle {
 export type RequestHandler = (req: Request) => Response | Promise<Response>
 
 /** 在指定端口上监听；端口被占用时抛出的错误交给调用方识别。 */
-function listen(server: ReturnType<typeof createServer>, host: string, port: number): Promise<void> {
+function listen(server: Server, host: string, port: number): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const onError = (err: unknown): void => {
       server.removeListener('listening', onListening)
@@ -52,7 +70,7 @@ function listen(server: ReturnType<typeof createServer>, host: string, port: num
 }
 
 /** 关闭一个已启动的服务并等它真的关完。 */
-function closeServer(server: ReturnType<typeof createServer>): Promise<void> {
+function closeServer(server: Server): Promise<void> {
   return new Promise<void>((resolve) => {
     server.close(() => resolve())
     // keep-alive 连接会让 close() 一直不回调，这里主动断开空闲连接。
@@ -76,6 +94,9 @@ export async function serveWithNodeHttp(options: {
   handler: RequestHandler
 }): Promise<ServeHandle> {
   const { host, port, handler } = options
+
+  // 🚨 动态 import，理由见文件头（静态 import 会让 Bun 上也在 import 期崩掉）
+  const { createServer } = await import('node:http')
 
   const server = createServer((req, res) => {
     void handleNodeRequest(req, res, handler, host, port)
@@ -137,10 +158,14 @@ async function handleNodeRequest(
 
     const response = await handler(request)
 
-    const outHeaders: Record<string, string> = {}
+    const outHeaders: Record<string, string | string[]> = {}
     response.headers.forEach((value, key) => {
-      outHeaders[key] = value
+      if (key !== 'set-cookie') outHeaders[key] = value
     })
+    // 登录会同时清除验证码 Cookie、写入会话 Cookie。逐项赋值会覆盖前一项，
+    // 逗号合并也不是合法的 Set-Cookie；Node 必须使用数组保留独立响应头。
+    const cookies = response.headers.getSetCookie()
+    if (cookies.length) outHeaders['set-cookie'] = cookies
 
     // 两个运行时的 Response 都支持 arrayBuffer()，用它统一取值，
     // 避免依赖 Node 特有的 Readable.fromWeb 桥接。
