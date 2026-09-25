@@ -1,7 +1,7 @@
 # AI Token Report —— 平台整体梳理
 
 > 本文是**目录与职责的顶层约定**：平台由哪几块组成、各自边界在哪、数据怎么流。
-> 口径细节见 `TOKEN-STATS-DESIGN.md`，插件方案见 `PLAN.md`，本文不重复。
+> 口径细节见 `docs/口径实测结论.md`，插件方案见 `docs/插件方案.md`，本文不重复。
 >
 > **已确认决策**：Bun 作为包管理器与运行时 / `--web` 起服务并自动开浏览器 /
 > 本地页与服务端页是**两个独立 web 应用** / **插件与 CLI 互补上报** /
@@ -44,7 +44,7 @@
 | `frontend/` | Vue 3 统计页 UI（卡片 / 图表 / 明细表 / 筛选） | ✅ 已改造为 `web-local` 并接真数据，原目录已删 |
 | `dsh-session-inspector/` | 会话探针插件，可在工具调用处打断点 | ✅ 与本项目主线无关，已移除 |
 | 服务端 | —— | ⚠️ 骨架已就位，ingest 接口待 S3 |
-| DSH 插件 | —— | ✅ 身份解析与上报后端均已落地（S9，见 `packages/dsh-plugin/README.md`） |
+| DSH 插件 | —— | ✅ 身份解析、上报后端、工具/服务、**界面用量面板**均已落地（S9，见 `packages/dsh-plugin/README.md`） |
 
 ### 1.1 三个必须修的裂缝
 
@@ -80,7 +80,7 @@ ai-token-report/
 ├─ package.json                # workspace 根：Bun workspaces
 ├─ bunfig.toml                 # Bun 配置
 ├─ ARCHITECTURE.md             # ★ 本文
-├─ PLAN.md / TOKEN-STATS-DESIGN.md    # 历史文档，保留
+├─ docs/                       # 中文文档：插件方案 / 口径实测结论 / npm 发布 / 本仓工程约定
 │
 ├─ packages/
 │  ├─ shared/                  # ★ 契约单一真源（两端 + 插件都 import）
@@ -129,11 +129,14 @@ ai-token-report/
 │  │   │   └─ stats.ts         #   GET  /api/v1/stats/*      ← 部门页
 │  │   └─ src/static.ts        #   托管两个 web 的构建产物
 │  │
-│  └─ dsh-plugin/              # ★ ③ DSH 插件（PLAN.md §3）
-│      ├─ src/index.ts         #   SessionTelemetryBackend 实现
-│      ├─ src/queue.ts         #   非阻塞队列（热路径只能入队！）
+│  └─ dsh-plugin/              # ★ ③ DSH 插件（docs/插件方案.md §3）
+│      ├─ src/index.ts         #   SessionTelemetryBackend 实现 + apply() 装配
+│      ├─ src/reporter.ts      #   非阻塞队列（热路径只能入队！）
 │      ├─ src/outbox.ts        #   磁盘 outbox（崩溃不丢）
-│      └─ src/identity.ts      #   方案 A 三级回退
+│      ├─ src/identity.ts      #   方案 A 三级回退
+│      ├─ src/ui-bridge.ts     #   ★ 宿主侧 UI 数据通道 GET /api/tokenReport.stats
+│      ├─ src/client/          #   ★ 浏览器半（用量条 + 标题栏徽章），构建成 lib/client.js
+│      └─ build-client.ts      #   浏览器半构建：__ModuleLoader__ 信封 + 平台模块纯度校验
 │
 ├─ tools/
 │  └─ install-task.ps1         # ④ 计划任务注册（每 10 分钟 report）—— 待 S10
@@ -297,7 +300,7 @@ JSON，只为捞出 16,021 条计费记录 —— 而且**每次查询都重来�
 
 ### 4.2 三个绝不能搞错的口径
 
-来自 `TOKEN-STATS-DESIGN.md` §2 的实测结论，已固化在 `shared/src/metrics.ts`：
+来自 `docs/口径实测结论.md` §2 的实测结论，已固化在 `shared/src/metrics.ts`：
 
 ```ts
 // 1. input 是「未命中缓存」的部分，不是总输入
@@ -548,7 +551,7 @@ Content-Type: application/json
 2. ☐ **部门页要不要金额？** ✅ 已确认：**不要**。只展示 token 数（可审计的真值）。
 3. ☐ **身份落地方式？** ✅ 已确认：**用户主动署名 + token 作为身份凭证**（§4.5）。
 4. ☐ **「数字集团 token」口径**：只算 `dashscope`，还是员工全部流量？
-   （`TOKEN-STATS-DESIGN.md` §4.1，差 2.36 亿 vs 10 亿+）—— **仍需拍板**
+   （`docs/口径实测结论.md` §4.1，差 2.36 亿 vs 10 亿+）—— **仍需拍板**
 5. ☐ **部门页开放范围**：仅 127.0.0.1？还是内网全组可访问（需鉴权）？
 6. ☐ **凭证发放方式**：管理员手工编辑 `credentials.json`，还是加一个签发页面/命令？
 7. ✅ **迁移期旧目录如何处理？** 已确认并执行：`dsh-token-stats/`、`frontend/`、
@@ -571,6 +574,7 @@ Content-Type: application/json
 | **S7** | `server`：`/api/v1/stats/*` 查询接口 | 部门数据就绪 | |
 | **S8** | `web-portal`：部门看板（人员排行等） | **部门页面可用** | |
 | **S9** | `dsh-plugin`：backend + 队列 + outbox + 全局配置 + 工具/服务 | **③ 插件上报** | ✅ 完成 |
+| **S9.5** | `dsh-plugin`：浏览器半（`conversation.input.dock` 用量条 + 标题栏徽章）+ `/api/tokenReport.stats` | **④ 界面里直接看用量** | ✅ 完成 |
 | **S10** | 计划任务 + 凭证铺开 + 合规确认 | 可运营 | |
 
 > **S0.5 已完成**：署名链路（含真实 HTTP 端到端验证 27 项）已可用。
@@ -585,6 +589,16 @@ Content-Type: application/json
 > ⚠️ **改插件后必须跑** `bun run packages/dsh-plugin/verify/verify-cordis-load.ts`：
 >    cordis 的 `ctx.get()` 返回服务代理，私有字段穿不过 Proxy，
 >    单测（拿到真实例）发现不了这类问题。
+>
+> **S9.5 已完成**：浏览器半（`lib/client.js`）把用量画进 DSH 界面 ——
+> 输入框上方的用量条（`conversation.input.dock`）与会话标题栏的徽章
+> （`conversation.session.header.utilities`），两个挂载点共用一个 store，
+> 数据由宿主半的 `GET /api/tokenReport.stats` 提供。
+> 该路由挂在 `/api` 前缀下，因此**复用 `dsh-client-connection` 的
+> Host/Origin 栅栏与浏览器会话鉴权**（DSH 的 web 服务器本身不做鉴权）。
+> 口径不变：载荷里的派生指标由宿主调 `shared/metrics.ts` 算好后透传，
+> 浏览器半只做格式化与排版。host→client 的通路、缓存依据与失败模式见
+> `packages/dsh-plugin/README.md` §4.3。
 
 > **S1 已完成**：`dsh-token-stats/src/` 全部代码已迁入
 > `packages/core`（decode / scanner / aggregate / range / state / format / types）

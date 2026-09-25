@@ -18,7 +18,7 @@ DSH token 用量统计平台。四种形态：**CLI / 本地页面 / 部门看�
 
 ```bash
 bun install
-bun test                        # 8 个文件 / 202 个测试，全绿
+bun test                        # 18 个文件 / 365 个测试，全绿
 bun run typecheck               # 7 个包全部 exit 0
 bun run build                   # web-local + web-portal 均构建成功
 bun run stats -- --period today # 终端统计（读本地库，热态 ~50ms）
@@ -30,12 +30,28 @@ bun run dev:local               # web-local 开发服务器
 # 双轨对照验证（真实日志上跑 SQL vs 直扫，断言两者逐位一致）
 bun run packages/cli/verify/verify-db-parity.ts
 
-# DSH 插件：构建 + 四层验证（从内到外逐层接近真实，改插件后全跑）
+# 双运行时驱动对照（Node 的 node:sqlite vs Bun 的 bun:sqlite，逐行比对）
+bun run --filter '@ai-token-report/core' verify:drivers
+
+# npm 发布产物（独立包 dsh-token-report）：构建 + 双运行时端到端验证
+bun run --filter '@ai-token-report/cli' build:npm     # 产物落在 packages/cli/dist
+bun run --filter '@ai-token-report/cli' verify:npm    # ★ 发布前必跑
+
+# 发布（根目录快捷方式，CLI 与插件各一套；详见 docs/npm发布*.md）
+bun run build:npm:cli && bun run verify:npm:cli       # = 上面两条 + web-local build
+bun run publish:cli:dry                               # 只断言 tarball，不发布
+bun run publish:cli:next   /   bun run publish:cli     # 真发：先 next，再 latest
+bun run build:npm:plugin && bun run verify:npm:plugin  # 插件同款
+bun run publish:plugin:dry / :next / publish:plugin    # 插件同款
+bun run publish:dry                                   # 两个包一起 dry-run
+
+# DSH 插件：构建 + 五层验证（从内到外逐层接近真实，改插件后全跑）
 bun run --filter '@ai-token-report/dsh-plugin' build
-bun run packages/dsh-plugin/verify/verify-plugin.ts        # 真 HTTP 往返（55 项）
-bun run packages/dsh-plugin/verify/verify-cordis-load.ts   # 真 cordis 装载（10 项）
-bun run packages/dsh-plugin/verify/verify-resolution.ts    # Node 语义解析（9 项）
-bun run packages/dsh-plugin/verify/diagnose-boot.ts web    # 排障：哪个包 import 就炸
+bun run packages/dsh-plugin/verify/verify-plugin.ts         # 真 HTTP 往返（55 项）
+bun run packages/dsh-plugin/verify/verify-cordis-load.ts    # 真 cordis 装载（10 项）
+bun run packages/dsh-plugin/verify/verify-resolution.ts     # Node 语义解析（9 项）
+bun run packages/dsh-plugin/verify/verify-client-bundle.ts  # ★ 浏览器半产物（25 项）
+bun run packages/dsh-plugin/verify/diagnose-boot.ts web     # 排障：哪个包 import 就炸
 ```
 
 ⚠️ 尚未实现：`bun run report`（需 S3 上报接口）、部门看板页面（S8）。
@@ -51,7 +67,7 @@ bun run packages/dsh-plugin/verify/diagnose-boot.ts web    # 排障：哪个包 
 | `packages/server` | 上报接收 + 本地直查 + 部门统计 + 静态托管 |
 | `packages/web-local` | 本地页面（`/api/local/*`） |
 | `packages/web-portal` | 部门看板 —— ⚠️ **仅骨架占位，真实看板待 S8** |
-| `packages/dsh-plugin` | DSH 插件：实时上报 + `token_usage` 工具 + `ctx.tokenReport` 服务。见其 `README.md` |
+| `packages/dsh-plugin` | DSH 插件：实时上报 + `token_usage` 工具 + `ctx.tokenReport` 服务 + **界面用量面板（宿主半 + 浏览器半）**。见其 `README.md` |
 
 > 迁移期旧目录（`dsh-token-stats/`、`p0-verify/`）**已删除**。
 > `dsh-session-inspector/` 也已移除（它是与本项目无关的独立插件）。
@@ -67,7 +83,7 @@ bun run packages/dsh-plugin/verify/diagnose-boot.ts web    # 排障：哪个包 
 | 身份署名 / 归属 | `.agents/skills/identity-attribution/SKILL.md` + `ARCHITECTURE.md` §4.5 |
 | **工程约定**（命令 / 测试位置 / 命名 / 中文注释 / 依赖） | `.agents/skills/repo-conventions/SKILL.md` + `docs/本仓工程约定.md` |
 | 目录分工 / 数据通路 | `ARCHITECTURE.md` |
-| 插件方案（历史） | `docs/PLAN.md` |
+| 插件方案（历史） | `docs/插件方案.md` |
 | **DSH 插件**（配置 / 安装 / 排障 / 为什么不能碰私有字段） | `packages/dsh-plugin/README.md` |
 
 ---
@@ -112,6 +128,25 @@ bun run packages/dsh-plugin/verify/diagnose-boot.ts web    # 排障：哪个包 
   `sessionTelemetry` 服务。装插件必须在 profile 里
   `- id: session-telemetry-otel` + `disabled: true`，
   否则 DSH 启动直接失败（报 service already registered）。
+- **🚨 浏览器半只能 `require` DSH 预置的 9 个模块**（react / react-dom /
+  cordis / client-store / ui-slots / ui-primitives / ui-dockkit 这几个）。
+  前端只预置这一张表，越界会在**物化阶段**抛错，表现为「插件没起来」。
+  最阴的一种是 JSX 走**开发版**转换（`react/jsx-dev-runtime`）—— 所以
+  `tsconfig.json` 里必须有 `"jsx": "react-jsx"`（bun build 读的是它）。
+  这两条由 `build-client.ts` 在**构建期**断言，`verify-client-bundle.ts` 再验一次。
+- **🚨 `dsh.client` 声明缺了 `exports["./client"]`（或产物文件不存在）会让
+  DSH 启动直接失败**（`ClientPackageCompositionError`），不是「面板不出现」。
+  改完插件要重新 `build`，否则下一次启动就起不来。
+- **🚨 界面路由必须挂在 `/api` 下**（`ctx.connection.fetch.register`）。
+  DSH 的 web 服务器**不做任何鉴权**；`/api` 前缀由 `dsh-client-connection`
+  加了 Host/Origin 栅栏 + 浏览器会话 cookie 校验。裸挂在别的路径上
+  等于「监听地址一旦改成 `0.0.0.0` 就向整个内网公开本机用量」。
+- **🚨 浏览器半不得重算任何口径**。载荷里的 `metrics` 由宿主用
+  `shared/metrics.ts` 算好后透传；页面只做格式化与排版。
+  在组件里写一遍除法 = 第二个口径实现，且它不会报错。
+- **插件的 `connection` 是可选依赖，绝不能写进 `inject`**。`inject` 的语义是
+  「等它就绪」，而 headless profile 永远不提供它 —— 写进去等于**上报功能在
+  headless 下直接不激活**。用 `ctx.get()` 试一次 + `ctx.inject()` 等它出现。
 - **`includeContent` 必须保持 `false`** —— 只采 token 数值与模型名，不采对话内容。
 - **服务端默认只监听 `127.0.0.1`**。改 `0.0.0.0` 前必须确认凭证已配置。
 - **身份以服务端为准**：`verifyToken()` 返回的 `name` 只可能来自凭证表，
@@ -132,10 +167,31 @@ bun run packages/dsh-plugin/verify/diagnose-boot.ts web    # 排障：哪个包 
   **进程 TZ 解析**，在 `bun test` 下两者相差 8 小时（JS 被强制成 UTC），
   表现为趋势图的点整体错位且**只在测试环境暴露**。统一用
   `aggregate.ts` 的 `toDayKey()` / `toHourKey()`。
-- **🚨 `bun:sqlite` 的 prepared statement 必须 `finalize()`**：
-  未 finalize 的语句会让 `db.close()` **不释放文件句柄**，
-  之后删除库文件抛 `EBUSY: resource busy or locked`（`--reset-db` 必失败），
-  而错误信息完全不提 prepared statement，极难定位。
+- **🚨 `core/db` 拿驱动只能经 `driver.ts`**：Bun → `bun:sqlite`，Node → `node:sqlite`，
+  两个后端的能力差异（`query()` / `transaction()` / `finalize()`）由它抹平。
+  **绝不要在 `core/db` 里重新 `import ... from 'bun:sqlite'`** ——
+  `bun build --target=node` 会把它原样留在产物顶层，Node 用户 import 即崩，
+  而**所有在 Bun 下跑的测试依然全绿**。`verify:npm` 与
+  `core/verify/run-driver-parity.ts` 分别从产物与行为两侧兜住。
+- **🚨 SQLite 绑定值里的 `undefined` 必须在 `driver.ts` 归一成 `null`**：
+  `node:sqlite` 对 `undefined` 直接抛
+  `Provided value cannot be bound to SQLite parameter`，
+  而 `UsageRecord.cwd` / `turn` / `step` 都是可选字段（`insertRecords()` 会原样绑定）。
+  别在调用点各自判空 —— 归一化只该有一处。
+- **🚨 两个 SQLite 驱动不能合并成一个**：实测 **Bun + `node:sqlite`** 在 `close()`
+  之后**不释放句柄**（`-wal` 残留 MB 级、`rmSync` 抛 `EBUSY`），
+  而它没有 `finalize()` 可补救 → `--reset-db` 会永远失败。
+  所以 Bun 必须走 `bun:sqlite`。对应地，`finalize()` 在 Bun 上**必须真的调用**
+  （未 finalize 的 `prepare()` 语句会让 `db.close()` 不释放句柄，
+  之后删库抛 `EBUSY`，而错误信息完全不提 prepared statement），
+  在 Node 后端则是空操作（GC 负责）。
+- **🚨 服务端不得依赖 `Bun.serve` / `Bun.file()`**：npm 发布出去的那份 CLI
+  要跑在 **Node** 上。请求处理器本身就是 Web 标准的 `Request`/`Response`，
+  最外层由 `server/src/index.ts` 的 `tryListen` 按运行期二选一
+  （`Bun.serve`，或 `node:http` 桥接见 `server/src/serve-node.ts`）；
+  静态文件一律走 `node:fs/promises`。
+  ⚠️ **不要为 Node 另写一套路由** —— 那会产生第二个「什么路径返回什么」的实现，
+  两边必然漂移且不会报错。
 - **本地库必须保留降级路径**：`openStats()` 在库不可用（磁盘满 / 权限 /
   `SQLITE_CORRUPT` / `SQLITE_BUSY`）时自动回退直扫日志并带 `degradedReason`。
   库是**日志的派生物**，不是真值 —— 为它让页面白屏是不划算的。
