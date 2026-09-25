@@ -213,11 +213,11 @@ export class StatsSession {
    *   这里直接复用 `timeSeries()` 的补零逻辑（把 SQL 的桶喂进去），
    *   而不是重写一遍 —— 否则会出现「命令行 30 个点、页面 4 个点」。
    */
-  series(granularity: 'day' | 'hour', fillGaps = true): { bucket: string; counts: TokenCounts }[] {
+  series(granularity: 'day' | 'hour', fillGaps = true): SeriesPointCounts[] {
     if (this.#db) {
       const points = querySeries(this.#db, granularity, this.#filter())
       if (!fillGaps) return points
-      return fillGapsFor(points, granularity)
+      return renderSeriesGaps(points, granularity)
     }
     return timeSeries(this.#records ?? [], granularity, fillGaps).map((p) => ({
       bucket: p.bucket,
@@ -364,17 +364,31 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
 }
 
 /**
+ * 时间序列的一个点（桶键 + 原始四项）。
+ *
+ * 提成具名类型是为了让上报库门面（`portal.ts`）能复用同一份补零实现，
+ * 而不是各自返回一个形状相同但定义不同的匿名结构。
+ */
+export interface SeriesPointCounts {
+  bucket: string
+  counts: TokenCounts
+}
+
+/**
  * 给 SQL 路径的时间序列补零，规则与 `aggregate.ts` 的 `timeSeries()` 一致。
  *
  * ⚠️ 刻意**不重写**补零算法，而是构造一批「只有桶键」的占位记录喂给
  *   `timeSeries()` —— 这样补零逻辑只有一份实现，两条路径永远不会分叉。
  *   占位记录用零计数，因此对结果没有贡献，只是让 `timeSeries()` 知道
  *   有哪些桶存在。
+ *
+ * ★ 上报库（`portal.ts`）也调用本函数：部门趋势图与本机趋势图的
+ *   「哪些桶存在」必须一致，否则两个页面的曲线形状会不一样。
  */
-function fillGapsFor(
-  points: { bucket: string; counts: TokenCounts }[],
+export function renderSeriesGaps(
+  points: SeriesPointCounts[],
   granularity: 'day' | 'hour',
-): { bucket: string; counts: TokenCounts }[] {
+): SeriesPointCounts[] {
   if (points.length < 2) return points
 
   const byBucket = new Map(points.map((p) => [p.bucket, p.counts]))

@@ -31,8 +31,12 @@ import {
   DB_SCHEMA_VERSION,
   EVENT_TABLE,
   ingest,
+  insertAttributedRecords,
   insertRecords,
   openDatabaseForIngest,
+  openDb,
+  openPortalDb,
+  openPortalStore,
   openStats,
   queryGroups,
   queryRecords,
@@ -42,6 +46,7 @@ import {
   resetDb,
   countEvents,
 } from '../src/db/index.js'
+import type { IngestRecord } from '../src/db/index.js'
 import type { UsageRecord } from '../src/types.js'
 
 // ── 脚手架 ───────────────────────────────────────────────────────────────
@@ -202,6 +207,54 @@ describe('db schema', () => {
     expect(cols).not.toContain('total_tokens')
     expect(cols).not.toContain('cache_hit_rate')
     db.close()
+  })
+
+  test('归属三列存在且可空（本机入库不写，服务端上报才写）', () => {
+    const db = openDatabaseForIngest(dbPath)
+    const cols = db
+      .query<{ name: string; notnull: number }, []>(`PRAGMA table_info(${EVENT_TABLE})`)
+      .all()
+    const byName = new Map(cols.map((c) => [c.name, c]))
+
+    // ★ 三列都必须存在，且**必须可空**：本机增量入库（ingest.ts）根本不写它们，
+    //   若哪天被改成 NOT NULL，本地库会立刻写不进去（而服务端库才有值）。
+    for (const name of ['user_id', 'user_name', 'dept']) {
+      expect(byName.has(name)).toBe(true)
+      expect(byName.get(name)?.notnull).toBe(0)
+    }
+    db.close()
+  })
+
+  test('openPortalDb：schema 版本不符时抛错，绝不重建（服务端数据是唯一副本）', () => {
+    // 先造一个「旧版本」的上报库，里面有一行只存在于这个库的数据
+    const db1 = openDatabaseForIngest(dbPath)
+    insertRecords(db1, [makeRecord('s1', 1)])
+    db1.exec('PRAGMA user_version = 999')
+    db1.close()
+
+    // ★ 与本地库相反：这里必须停下来报错。
+    //   本地库的真值是磁盘日志，重建只是重扫一次；
+    //   上报库里的行来自各个客户端，客户端投递成功后已清掉自己的 pending ——
+    //   自动重建等于把全部门的历史用量静默清空且无从恢复。
+    expect(() => openPortalDb(dbPath)).toThrow(/唯一副本/)
+
+    // 数据必须**原样还在**（抛错路径不许顺手删表）。
+    // ⚠️ 这里用 openDb 直接打开，**不能**用 openDatabaseForIngest ——
+    //   后者会把版本不符的库当成「本地派生物」直接重建，正好抹掉要断言的数据。
+    const db2 = openDb(dbPath)
+    expect(countEvents(db2)).toBe(1)
+    db2.close()
+  })
+
+  test('openPortalDb：全新库正常建表；已有正确版本的库可重复打开', () => {
+    const db1 = openPortalDb(dbPath)
+    expect(
+      db1.query<{ user_version: number }, []>('PRAGMA user_version').get()?.user_version,
+    ).toBe(DB_SCHEMA_VERSION)
+    db1.close()
+
+    const db2 = openPortalDb(dbPath)
+    db2.close()
   })
 
   test('WAL 模式已启用（本地页需要读写并发）', () => {
@@ -430,6 +483,124 @@ describe('db 入库', () => {
     expect(b.inserted).toBe(1)
     expect(b.duplicates).toBe(1)
     expect(countEvents(db)).toBe(3)
+    db.close()
+  })
+})
+
+// ── 服务端上报落库（POST /api/v1/token-usage 的下半段）──────────────────
+
+/** 造一条线上格式的上报记录（下划线字段）。 */
+function makeIngestRecord(eventId: string, over: Partial<IngestRecord> = {}): IngestRecord {
+  return {
+    event_id: eventId,
+    session_id: 'sess-1',
+    seq: 1,
+    ts: 1_700_000_000_000,
+    provider: 'dashscope',
+    model: 'm-1',
+    input_tokens: 10,
+    output_tokens: 2,
+    cache_read_tokens: 100,
+    cache_write_tokens: 0,
+    reasoning_tokens: 0,
+    cwd: 'D:\\proj',
+    turn: 1,
+    step: 1,
+    ...over,
+  }
+}
+
+/** 读一行归属，用于断言「谁上报的」。 */
+function ownerOf(db: ReturnType<typeof openDb>, eventId: string) {
+  // ⚠️ 位置参数必须包成数组：驱动按「数组 = 位置参数 / 对象 = 具名参数」分流，
+  //   直接传字符串会被当成具名参数对象（Object.entries('s:1') → 三个键），
+  //   结果是 `?` 没被绑定、查不到任何行。
+  return db
+    .query<{ user_id: string | null; user_name: string | null; dept: string | null }, [string]>(
+      `SELECT user_id, user_name, dept FROM ${EVENT_TABLE} WHERE event_id = ?`,
+    )
+    .get([eventId])
+}
+
+describe('上报落库（服务端）', () => {
+  test('写入鉴权得到的归属，四项 token 分列落库', async () => {
+    // ⚠️ 写入走**异步门面** `openPortalStore`（它才认 MySQL），
+    //   读回断言仍可用同步的 `openPortalDb`（同一个库文件）。
+    const store = await openPortalStore({ sqlitePath: dbPath })
+    const r = await insertAttributedRecords(store, [makeIngestRecord('s:1')], {
+      userId: '张三',
+      userName: '张三',
+      dept: '研发一部',
+    })
+    await store.close()
+
+    expect(r.inserted).toBe(1)
+    expect(r.duplicates).toBe(0)
+
+    const db = openPortalDb(dbPath)
+    expect(ownerOf(db, 's:1')).toEqual({
+      user_id: '张三',
+      user_name: '张三',
+      dept: '研发一部',
+    })
+
+    // ★ 铁律 1：四个 token 是四个独立列
+    const row = db
+      .query<{ i: number; o: number; cr: number; cw: number }, []>(
+        `SELECT input_tokens AS i, output_tokens AS o,
+                cache_read_tokens AS cr, cache_write_tokens AS cw
+         FROM ${EVENT_TABLE} WHERE event_id = 's:1'`,
+      )
+      .get()
+    expect(row).toEqual({ i: 10, o: 2, cr: 100, cw: 0 })
+    db.close()
+  })
+
+  test('幂等：同一批重发只入库一次，第二次全算 duplicates', async () => {
+    const store = await openPortalStore({ sqlitePath: dbPath })
+    const owner = { userId: '张三' }
+    const batch = [makeIngestRecord('s:1'), makeIngestRecord('s:2')]
+
+    expect(await insertAttributedRecords(store, batch, owner)).toEqual({ inserted: 2, duplicates: 0 })
+    // 插件与 CLI 同时上报同一条记录时就是这个情形：不该报错，也不该重复计费
+    expect(await insertAttributedRecords(store, batch, owner)).toEqual({ inserted: 0, duplicates: 2 })
+    await store.close()
+
+    const db = openPortalDb(dbPath)
+    expect(countEvents(db)).toBe(2)
+    db.close()
+  })
+
+  test('★ 归属以先到的为准：后到的上报不会改写已有归属', async () => {
+    const store = await openPortalStore({ sqlitePath: dbPath })
+    const rec = makeIngestRecord('s:1')
+
+    await insertAttributedRecords(store, [rec], { userId: '张三', userName: '张三', dept: '研发一部' })
+    // 同一条记录被另一个人重发（如换了 token 的同一台机器）
+    await insertAttributedRecords(store, [rec], { userId: '李四', userName: '李四', dept: '研发二部' })
+    await store.close()
+
+    const db = openPortalDb(dbPath)
+    expect(ownerOf(db, 's:1')?.user_id).toBe('张三')
+    db.close()
+  })
+
+  test('userName 缺省时回落到 userId；无部门时 dept 为 NULL', async () => {
+    const store = await openPortalStore({ sqlitePath: dbPath })
+    await insertAttributedRecords(store, [makeIngestRecord('s:1')], { userId: '张三' })
+    await store.close()
+
+    const db = openPortalDb(dbPath)
+    expect(ownerOf(db, 's:1')).toEqual({ user_id: '张三', user_name: '张三', dept: null })
+    db.close()
+  })
+
+  test('★ 本机入库路径不写归属（三列保持 NULL）', () => {
+    const db = openDatabaseForIngest(dbPath)
+    insertRecords(db, [makeRecord('s1', 1)])
+    // 本机数据只有我一个人，归属只对「上报道服务端」有意义 ——
+    // 本地路径若哪天开始写归属，说明两条链路的边界被搞混了
+    expect(ownerOf(db, 's1:1')).toEqual({ user_id: null, user_name: null, dept: null })
     db.close()
   })
 })

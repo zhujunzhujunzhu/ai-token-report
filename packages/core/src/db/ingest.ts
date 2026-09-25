@@ -31,6 +31,8 @@ import type { Database } from './driver.js'
 
 import { scanIncremental, type ScanOptions } from '../scanner.js'
 import type { ScanDiagnostics, UsageRecord } from '../types.js'
+import type { WireTokenRecord } from '@ai-token-report/shared'
+import { portalDialect, type PortalStore } from './portal-db.js'
 import { openDb, ensureSchema, needsRebuild, rebuildSchema, EVENT_TABLE } from './schema.js'
 
 /** 一次 ingest 的结果。 */
@@ -236,6 +238,86 @@ export function openDatabaseForIngest(dbPath: string): Database {
 }
 
 /**
+ * 打开**服务端上报库**的 SQLite 后端：schema 版本不符时**抛错，绝不重建**。
+ *
+ * ★ 实现只有一份 —— 从 `portal-db.ts` re-export `openPortalSqlite`。
+ *   这里曾经有过第二份「版本闸门」实现（与 `openPortalSqlite` 逐字重复）：
+ *   两份闸门必然各自演化，而它们分歧的表现是「某条路径开始静默重建上报库」，
+ *   那是**全员历史用量永久消失**级的故障。所以绝不留下第二份。
+ *
+ * ⚠️ 名字保留是兼容需要（`packages/server/test/e2e-ingest.ts` 等在用）。
+ *   新代码请优先用异步门面 `openPortalStore()` / `openPortalStats()` ——
+ *   只有它们认 MySQL 后端。
+ *
+ * 为什么与 `openDatabaseForIngest` 不同：本机库是日志的派生物（坏了重建，
+ * 代价是重扫一次）；上报库是全员数据的**唯一副本**（客户端投递成功后已清掉
+ * 自己的 pending），删掉无从恢复。详见 `portal-db.ts` 的模块注释。
+ */
+export { openPortalSqlite as openPortalDb } from './portal-db.js'
+
+/**
+ * 记录「最近一次落库时刻」，供部门看板显示**数据是什么时候到的**。
+ *
+ * ## 为什么不新建一列 / 一张表
+ *
+ * 🚨 上报库的 schema **不能动**：`openPortalStore()` 在版本不符时会抛错而
+ *   不重建（它是全员数据的唯一副本），所以任何一次 schema 变更都会让
+ *   现网的上报库直接打不开。`ingest_run` 表本来就在 schema 里
+ *   （本机库用它存扫描诊断），上报库这边它是空的 —— 复用它**不产生任何
+ *   版本变更**。
+ *
+ * ⚠️ 冲突分支**只更新 `last_ingest_ms`**，其余列一律不动：
+ *   本机库的 `writeRunStats()` 往同一行写的是扫描诊断，若这里顺手覆盖
+ *   那些列，本机页面的诊断信息会被清零。
+ *
+ * ## 两种后端
+ *
+ * ★ SQL 由 `dialect.render()` 生成：SQLite 是 `ON CONFLICT(id) DO UPDATE SET
+ *   last_ingest_ms = excluded.last_ingest_ms`，MySQL 是
+ *   `AS new ON DUPLICATE KEY UPDATE last_ingest_ms = new.last_ingest_ms`。
+ *   一套模板、两种方言，不存在第二份 upsert 语句。
+ *
+ * ⚠️ 列清单必须把 `event_types_json` / `providers_json` **显式写全**：
+ *   SQLite 侧它们有 `DEFAULT '{}'` / `DEFAULT '[]'`，而 MySQL 侧的 DDL
+ *   没有默认值且是 `NOT NULL` —— 靠默认值会在 MySQL 上报
+ *   `Field 'event_types_json' doesn't have a default value`。
+ *   显式填的字面量与 SQLite 的默认值刻意相同，两种后端的行完全一致。
+ */
+export async function recordIngestMoment(store: PortalStore, at: number = Date.now()): Promise<void> {
+  const dialect = portalDialect(store.kind)
+  const sql = dialect.render({
+    table: 'ingest_run',
+    columns: [
+      'id',
+      'last_ingest_ms',
+      'last_scan_events',
+      'total_events_ingested',
+      'mismatch_count',
+      'files_failed',
+      'frames_failed',
+      'frames_ok',
+      'usage_events',
+      'assistant_without_usage',
+      'retry_started',
+      'retry',
+      'attempts',
+      'missing_provider',
+      'files_scanned',
+      'event_types_json',
+      'providers_json',
+    ],
+    // ⚠️ `values` 里**不要自己加括号**：`dialect.render()` 已经写了
+    //   `VALUES (...)`，再加一层会变成 `VALUES ((1, ...))` —— SQLite 会报
+    //   「1 values for 17 columns」这种看不出所以然的错误。
+    values: "1, $now, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '{}', '[]'",
+    keyColumn: 'id',
+    assignments: [`last_ingest_ms = ${dialect.incoming}.last_ingest_ms`],
+  })
+
+  await store.run(sql, { $now: at })
+}
+
+/**
  * 读取库内记录总数（诊断用）。
  *
  * ⚠️ 用 `db.query().get()` 的短生命周期形式而不是长期持有 `prepare()`：
@@ -422,5 +504,119 @@ export function insertRecords(db: Database, records: UsageRecord[]): {
   //   `EBUSY: resource busy or locked`（Windows 与 Linux 都会）。
   //   实测：不 finalize 时 `--reset-db` 永远失败。
   insert.finalize()
+  return { inserted, duplicates }
+}
+
+// ─────────────────────────────────────────────────────────────
+// 服务端上报落库（POST /api/v1/token-usage）
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 落库用的上报记录 —— **刻意没有 `total_tokens`**。
+ *
+ * ⚠️ 这不是笔误：`usage_event` 表里压根没有 total 列（铁律 2 —— 库里不存
+ *   派生口径，展示时的相加由 `shared/metrics.ts` 负责）。把该字段排除在
+ *   类型之外，能让「服务端哪天顺手把客户端上报的 total 当权威值存下来」
+ *   这件事**在编译期就不可能发生**。
+ */
+export type IngestRecord = Omit<WireTokenRecord, 'total_tokens'>
+
+/**
+ * 上报方的归属身份。
+ *
+ * ★ 这三个值**只可能来自服务端的凭证表**（`Authorization` 头里的 token
+ *   查表得出），绝不用客户端在 body 里自称的 `client.userName` 覆盖 ——
+ *   否则任何人改一下本地配置就能以他人名义上报。
+ */
+export interface EventOwner {
+  /** 归属键。凭证表里没有独立的人员 ID，归属键就是**服务端认定的姓名**。 */
+  userId: string
+  /** 展示用姓名。当前与 `userId` 同值，分开是为了将来一人多 token 时能只改一处。 */
+  userName?: string | null
+  dept?: string | null
+}
+
+/**
+ * 把一批**服务端已鉴权**的上报记录写入库，并带上归属。
+ *
+ * ## 与 `insertRecords` / `ingest` 的关系
+ *
+ * 三者共用同一张表、同一套列映射与同一个幂等键（`event_id`），区别只在数据来源：
+ *
+ * | 函数 | 来源 | 归属列 | 后端 |
+ * |---|---|---|---|
+ * | `ingest` | 本机会话日志增量扫描 | 不写（NULL） | 同步 SQLite |
+ * | `insertRecords` | 已有的 `UsageRecord`（迁移 / 造数） | 不写（NULL） | 同步 SQLite |
+ * | **本函数** | **HTTP 上报（插件 / CLI）** | **写入鉴权得到的归属** | **两种（`PortalStore`）** |
+ *
+ * ★ 收 `PortalStore` 而不是 `Database`：部门服务端可能连 MySQL，
+ *   而本机库（`ingest` / `insertRecords`）**恒为同步 SQLite** —— 那条边界
+ *   是类型级的，见 `portal-db.ts` 的模块注释。
+ *
+ * ## 幂等与归属的先后
+ *
+ * 用 `dialect.insertIgnore()`（SQLite `INSERT OR IGNORE` / MySQL `INSERT IGNORE`），
+ * 冲突即跳过（`event_id` 是 PRIMARY KEY），两种后端的判据都是 `changes > 0`：
+ * MySQL 的 `affectedRows` 在 `INSERT IGNORE` 撞主键时实测为 **0**，
+ * 与 SQLite 的 `changes` 语义一致。
+ *
+ * ⚠️ 由此得到一个必须知道的语义：**同一条记录被两个上报方上报时，
+ *   归属以先到的那条为准** —— 后到的因为主键冲突整行都不写，自然不会覆盖归属。
+ *   这正是我们要的：插件与 CLI 可以在同一台机器上同时上报而无需协调。
+ *
+ * 返回的 `inserted` / `duplicates` 直接对应上报响应里的
+ * `accepted` / `duplicates`（见 `shared/src/protocol.ts` 的 `IngestResponse`）。
+ */
+export async function insertAttributedRecords(
+  store: PortalStore,
+  records: IngestRecord[],
+  owner: EventOwner,
+): Promise<{ inserted: number; duplicates: number }> {
+  const sql = `${portalDialect(store.kind).insertIgnore(EVENT_TABLE)}
+     (event_id, session_id, seq, ts, provider, model, cwd,
+      user_id, user_name, dept,
+      input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+      reasoning_tokens, turn, step)
+     VALUES ($eventId, $sessionId, $seq, $ts, $provider, $model, $cwd,
+             $userId, $userName, $dept,
+             $input, $output, $cacheRead, $cacheWrite,
+             $reasoning, $turn, $step)`
+
+  let inserted = 0
+  let duplicates = 0
+  // 归属在整批里是同一个值：先在事务外算好，避免每行重复 ?? 判断
+  const userId = owner.userId
+  const userName = owner.userName ?? owner.userId
+  const dept = owner.dept ?? null
+
+  // ★ 整批一个事务（与迁移前一致）：两种后端都支持事务，
+  //   半批写入会让客户端重试时多一次无谓的往返，也让「这一批到底进没进」
+  //   在排障时变得难以回答。
+  await store.transaction(async (tx) => {
+    for (const rec of records) {
+      const res = await tx.run(sql, {
+        $eventId: rec.event_id,
+        $sessionId: rec.session_id,
+        $seq: rec.seq,
+        $ts: rec.ts,
+        $provider: rec.provider,
+        $model: rec.model,
+        $cwd: rec.cwd,
+        $userId: userId,
+        $userName: userName,
+        $dept: dept,
+        $input: rec.input_tokens,
+        $output: rec.output_tokens,
+        $cacheRead: rec.cache_read_tokens,
+        $cacheWrite: rec.cache_write_tokens,
+        $reasoning: rec.reasoning_tokens,
+        $turn: rec.turn,
+        $step: rec.step,
+      })
+      if (res.changes > 0) inserted++
+      else duplicates++
+    }
+  })
+
   return { inserted, duplicates }
 }

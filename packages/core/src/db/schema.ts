@@ -48,8 +48,17 @@ import { dirname } from 'node:path'
  * 结构不兼容变更时 +1。`openDb()` 会比对 `user_version`：
  * 不一致时**不抛错**，而是走「重建」路径（见 `ingest.ts` 的全量重扫兜底）——
  * 抛错会让本地页白屏，而降级重建只多花一次全量扫描的时间。
+ *
+ * ⚠️ 上面这条只对**本机库**成立（它的真值是磁盘上的会话日志，重建 = 重扫）。
+ *   服务端上报库是**唯一副本**，同一份 schema 在那边由 `openPortalDb()` 打开，
+ *   版本不符时它**抛错而不是重建**。见该函数的注释。
+ *
+ * | 版本 | 变更 |
+ * |---|---|
+ * | 2 | `ingest_run` 补解析计数列 |
+ * | 3 | `usage_event` 加归属三列 `user_id` / `user_name` / `dept`（服务端上报写入） |
  */
-export const DB_SCHEMA_VERSION = 2
+export const DB_SCHEMA_VERSION = 3
 
 /** 单条计费事件表名。 */
 export const EVENT_TABLE = 'usage_event'
@@ -75,6 +84,15 @@ CREATE TABLE IF NOT EXISTS ${EVENT_TABLE} (
   -- 项目归属：取自 session 首行 cwd。增量块里通常没有该行，
   -- 靠 session_state 表继承，否则「按项目统计」会退化成 (unknown)。
   cwd                 TEXT,
+  -- ★ 归属：这条用量算谁的。**只由服务端按 Bearer token 查凭证表得出**
+  --   （server/src/verify-route.ts 的 resolveIngestIdentity），
+  --   客户端在请求体里自称的姓名一律忽略 —— 否则改一下本地配置就能冒用他人。
+  --   本机增量入库（ingest.ts）不写这三列：本机数据只有我一个人，
+  --   归属只对「上报道部门服务端」有意义。因此它们**必须可空**。
+  --   ⚠️ SQL 里的注释不能写反引号 —— 会把外层模板字符串截断。
+  user_id             TEXT,
+  user_name           TEXT,
+  dept                TEXT,
   -- ★ 四个独立列，绝不合并（铁律 1）
   input_tokens        INTEGER NOT NULL DEFAULT 0,
   output_tokens       INTEGER NOT NULL DEFAULT 0,
@@ -94,6 +112,9 @@ CREATE INDEX IF NOT EXISTS idx_usage_provider ON ${EVENT_TABLE}(provider);
 CREATE INDEX IF NOT EXISTS idx_usage_model ON ${EVENT_TABLE}(model);
 -- 会话数统计（overview 的 sessions 字段）与 L3 水位线查表都要用
 CREATE INDEX IF NOT EXISTS idx_usage_session ON ${EVENT_TABLE}(session_id);
+-- 人员归属：部门页的「人员排行」（breakdown by=user）与「只看某人」筛选
+-- 都打在这一列上，和 provider/model 同级的高频分组维度。
+CREATE INDEX IF NOT EXISTS idx_usage_user ON ${EVENT_TABLE}(user_id);
 
 -- ── 文件水位线（L1 字节数 / L2 帧数），对应 state.ts 的 FileWatermark ──
 CREATE TABLE IF NOT EXISTS file_watermark (
@@ -218,6 +239,10 @@ export function needsRebuild(db: Database): boolean {
  * 🚨 **这里删的只是「日志的派生物」**，真值始终是磁盘上的会话日志，
  *   所以重建的代价只是「下次 ingest 走全量」，不会丢任何数据。
  *   这也是本地库敢于「坏了就重建」而不是做复杂修复的原因。
+ *
+ * 🚨 **绝不可对服务端上报库调用本函数**：那边的数据是全员上报的
+ *   **唯一副本**（客户端投递成功后就会清掉自己的 pending / outbox），
+ *   删掉就永久没了。服务端库由 `openPortalDb()` 打开，版本不符时它抛错。
  */
 export function rebuildSchema(db: Database): void {
   db.exec(`DROP TABLE IF EXISTS ${EVENT_TABLE}`)
@@ -231,4 +256,15 @@ export function rebuildSchema(db: Database): void {
 /** 本地库的默认路径：`$DSH_HOME/token-report/usage.sqlite`。 */
 export function dbFileName(): string {
   return 'usage.sqlite'
+}
+
+/**
+ * 服务端上报库的默认文件名：`$DSH_HOME/token-report/portal.sqlite`。
+ *
+ * ⚠️ **必须与本地库 `usage.sqlite` 分开**：本地库存的是「这台机器的日志派生数据」，
+ *   服务端库存的是「全员上报数据」。两个文件一旦是同一个，全员数据与本机数据
+ *   会互相污染，而且事后**没有任何办法拆开**（库里没有记录来源列）。
+ */
+export function portalDbFileName(): string {
+  return 'portal.sqlite'
 }

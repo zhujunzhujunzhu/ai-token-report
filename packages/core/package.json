@@ -14,7 +14,8 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "bun test",
-    "verify:drivers": "bun run verify/run-driver-parity.ts"
+    "verify:drivers": "bun run verify/run-driver-parity.ts",
+    "verify:mysql": "bun run verify/verify-mysql-dialect.ts"
   },
   "dependencies": {
     "@ai-token-report/shared": "workspace:*"
