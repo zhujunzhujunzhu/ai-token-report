@@ -1,28 +1,12 @@
 /**
- * 布局测量：直接用无头 Chrome 的 --dump-dom 拿到渲染后的 DOM，
- * 再从 DOM 属性反推图表几何，避免依赖 playwright 的启动协议。
+ * SVG 布局几何：生产组件的逻辑 viewBox 不依赖浏览器，直接 SSR 后检查。
  *
  * 关键点：柱形的 x/width 与 viewBox 都是渲染期算出的真实值，
  * DOM 里能直接读到，足够判断「图表是否铺满卡片宽度」。
  */
-import { execFileSync } from 'node:child_process'
+import { renderChartFixture } from './chart-fixture.js'
 
-const CHROME = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
-const URL = process.env.MEASURE_URL ?? 'http://localhost:4173/'
-
-const html = execFileSync(
-  CHROME,
-  [
-    '--headless=new',
-    '--disable-gpu',
-    '--hide-scrollbars',
-    '--window-size=1180,900',
-    '--virtual-time-budget=6000',
-    '--dump-dom',
-    URL,
-  ],
-  { encoding: 'utf8', maxBuffer: 128 * 1024 * 1024, timeout: 90_000 },
-)
+const html = await renderChartFixture()
 
 const failures: string[] = []
 function check(label: string, condition: boolean, detail = ''): void {

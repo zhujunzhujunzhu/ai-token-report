@@ -2,17 +2,7 @@
  * 图表几何校验：从真实 SSR 渲染结果中提取 SVG 的 rect / path，
  * 断言柱子数量、颜色分层、面积路径确实生成了，而不只是「有个 svg 标签」。
  */
-import { createServer } from 'vite'
-import { createSSRApp } from 'vue'
-import { renderToString } from 'vue/server-renderer'
-
-const server = await createServer({
-  root: process.cwd(),
-  server: { middlewareMode: true },
-  appType: 'custom',
-  logLevel: 'error',
-  optimizeDeps: { noDiscovery: true },
-})
+import { renderChartFixture } from './chart-fixture.js'
 
 const failures: string[] = []
 function check(label: string, condition: boolean): void {
@@ -20,9 +10,8 @@ function check(label: string, condition: boolean): void {
   console.log(`${condition ? 'PASS' : 'FAIL'}  ${label}`)
 }
 
-try {
-  const { default: App } = await server.ssrLoadModule('/src/App.vue')
-  const html = await renderToString(createSSRApp(App))
+{
+  const html = await renderChartFixture(true)
 
   const rects = [...html.matchAll(/<rect[^>]*>/g)].map((m) => m[0])
   const paths = [...html.matchAll(/<path[^>]*d="([^"]*)"/g)].map((m) => m[1]!)
@@ -48,6 +37,4 @@ try {
   } else {
     console.log('图表几何断言全部通过。')
   }
-} finally {
-  await server.close()
 }
