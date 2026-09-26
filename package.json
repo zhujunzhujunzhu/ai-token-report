@@ -30,18 +30,18 @@
     "verify:npm:plugin": "bun run --filter '@ai-token-report/dsh-plugin' verify:npm",
     "verify:npm": "bun run verify:npm:cli && bun run verify:npm:plugin",
 
-    "publish:cli:dry": "bun publish --cwd packages/cli/dist --dry-run",
-    "publish:cli:next": "bun publish --cwd packages/cli/dist --tag next",
-    "publish:cli": "bun publish --cwd packages/cli/dist",
-    "publish:plugin:dry": "bun publish --cwd packages/dsh-plugin/dist --dry-run",
-    "publish:plugin:next": "bun publish --cwd packages/dsh-plugin/dist --tag next",
-    "publish:plugin": "bun publish --cwd packages/dsh-plugin/dist",
-    "publish:dry": "bun run publish:cli:dry && bun run publish:plugin:dry",
-
+    "publish:cli:dry": "bun run scripts/release.ts cli --dry-run",
+    "publish:cli:next": "bun run scripts/release.ts cli --publish --tag next",
+    "publish:cli": "bun run scripts/release.ts cli --publish --tag latest",
+    "publish:plugin:dry": "bun run scripts/release.ts plugin --dry-run",
+    "publish:plugin:next": "bun run scripts/release.ts plugin --publish --tag next",
+    "publish:plugin": "bun run scripts/release.ts plugin --publish --tag latest",
+    "publish:dry": "bun run scripts/release.ts all --dry-run",
     "repair:plugin": "bun run packages/dsh-plugin/scripts/repair-profile.ts",
 
     "server": "bun run --filter '@ai-token-report/server' start",
-    "typecheck": "bun run --filter '*' typecheck",
+    "typecheck": "bun run --filter '*' typecheck && bun run typecheck:release",
+    "typecheck:release": "tsc -p scripts/tsconfig.json --noEmit",
     "test": "bun test"
   },
   "devDependencies": {

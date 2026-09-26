@@ -379,7 +379,7 @@ try {
 process.stdout.write('\n' + '='.repeat(72) + '\n')
 if (failures.length === 0) {
   process.stdout.write('✅ 发布产物验证全部通过\n')
-  process.stdout.write(`   发布：npm publish ${distDir}\n`)
+  process.stdout.write('   发布：仓库根目录 bun run publish:plugin（强制完整验证）\n')
 } else {
   process.stdout.write(`❌ ${failures.length} 项失败：\n`)
   for (const f of failures) process.stdout.write(`   - ${f}\n`)

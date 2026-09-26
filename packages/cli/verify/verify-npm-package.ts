@@ -40,7 +40,7 @@ import { cleanChildEnv, resolveNodeBin } from '../../core/verify/lib/runtime.js'
 const here = dirname(fileURLToPath(import.meta.url))
 const pkgRoot = resolve(here, '..')
 const repoRoot = resolve(pkgRoot, '..', '..')
-const distDir = join(pkgRoot, 'dist')
+const distDir = process.env['ATR_CLI_PACKAGE_DIR'] ?? join(pkgRoot, 'dist')
 const cliPath = join(distDir, 'cli.js')
 
 const bunBin = process.execPath
@@ -59,6 +59,7 @@ if (!nodeBin) {
 
 // ══ 1. 构建产物 ═══════════════════════════════════════════════════════════
 process.stdout.write('\n=== 1. 构建发布产物 ===\n')
+if (!process.env['ATR_CLI_PACKAGE_DIR']) {
 const build = Bun.spawnSync([bunBin, join(pkgRoot, 'scripts', 'build-npm.ts')], {
   stdout: 'pipe',
   stderr: 'pipe',
@@ -69,6 +70,7 @@ if (build.exitCode !== 0) {
   process.exit(1)
 }
 process.stdout.write(new TextDecoder().decode(build.stdout))
+}
 
 // ══ 2. 产物自检 ═══════════════════════════════════════════════════════════
 process.stdout.write('\n=== 2. 产物自检 ===\n')
@@ -154,7 +156,8 @@ const totalsKey = (t: Totals): string => JSON.stringify(t)
 
 // ══ 4. 统计口径：Node 建库 → Bun 读；Bun 建库 → Node 读 ═══════════════════
 process.stdout.write('\n=== 4. 统计口径跨运行时一致 ===\n')
-const STATS_ARGS = ['--dsh-home', fixture, '--period', 'today']
+// 验收不能依赖执行当天恰有会话；午夜后真实历史仍须被纳入四列对账。
+const STATS_ARGS = ['--dsh-home', fixture]
 
 // 4a. Node 冷建库
 const nodeCold = runCliJson(nodeBin, STATS_ARGS)
@@ -269,7 +272,7 @@ async function probeWeb(
     ok &&= (await fetch(`${base}/%zz`)).status === 400
 
     // 本地 API 口径
-    const ov = (await (await fetch(`${base}/api/local/stats/overview?period=today`)).json()) as {
+    const ov = (await (await fetch(`${base}/api/local/stats/overview`)).json()) as {
       calls: number
       totalTokens: number
     }

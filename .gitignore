@@ -21,3 +21,9 @@ token-report-user.json
 .DS_Store
 .dsh
 .playwright-mcp
+.artifacts/
+*.tgz
+
+# 本轮构建与真实日志验证的临时目录；包含本地测试配置与生成产物
+/.tmp/
+/packages/server/.tmp/

@@ -371,6 +371,12 @@ bun run --filter '@ai-token-report/server' test
 
 ## 提交前
 
+发布必须通过根目录 `publish:plugin:dry` / `publish:plugin:next` / `publish:plugin`
+（CLI 同款），统一入口 `scripts/release.ts`。禁止用直接发布 dist 绕过验证。
+插件 bundle 是 `token-report` 的唯一 insert 来源，用户 profile 只能按 id 覆盖；
+改发布或安装链路必须通过真实 tarball 的 `verify-profile-boot.ts`。
+完整范围与 0.3.0 事故恢复见 `docs/发布检查与事故恢复.md`。
+
 ```bash
 bun test && bun run typecheck
 ```
