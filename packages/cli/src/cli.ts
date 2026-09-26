@@ -1154,10 +1154,7 @@ async function runReportCommand(opts: CliOptions, sessionsRoot: string): Promise
     out.push(`  输出        ${fmtInt(c.output)}`)
     out.push(`  缓存读      ${fmtInt(c.cacheRead)}`)
     out.push(`  计费总量    ${fmtInt(c.total)}`)
-    const denom = c.cacheRead + c.input
-    if (denom > 0) {
-      out.push(`  缓存命中率  ${((c.cacheRead / denom) * 100).toFixed(1)}%`)
-    }
+    out.push(`  缓存命中率  ${(derive(c).cacheHitRate * 100).toFixed(1)}%`)
 
     const byProv = aggregate(result.records, 'provider')
     out.push('')
