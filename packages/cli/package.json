@@ -21,6 +21,7 @@
     "report": "bun run src/cli.ts report",
     "build:npm": "bun run scripts/build-npm.ts",
     "verify:npm": "bun run verify/verify-npm-package.ts",
+    "verify:report": "bun run verify/verify-report-ingest.ts && bun run verify/verify-report-command.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "bun test"
   },
