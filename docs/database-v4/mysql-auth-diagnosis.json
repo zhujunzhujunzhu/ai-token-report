@@ -1,0 +1,234 @@
+{
+  "verifiedOn": "2026-09-26",
+  "scope": "真实数据库认证与错误提示验证；非应用 HTTP、浏览器或 DSH 端到端验收",
+  "environment": {
+    "bun": "1.4.2",
+    "node": "v22.21.1",
+    "mysql": "8.4.9",
+    "mysql2": "3.24.4",
+    "authenticationPlugin": "caching_sha2_password",
+    "tls": false
+  },
+  "upstreamIssue": "https://github.com/oven-sh/bun/issues/26195",
+  "boundary": {
+    "successfulLengths": [
+      16,
+      19
+    ],
+    "failingLengths": [
+      20,
+      32,
+      64,
+      128
+    ],
+    "failureErrno": 1045
+  },
+  "freshAccountMatrix": [
+    {
+      "passwordLength": 16,
+      "constructorMode": "url",
+      "success": true
+    },
+    {
+      "passwordLength": 16,
+      "constructorMode": "object",
+      "success": true
+    },
+    {
+      "passwordLength": 16,
+      "constructorMode": "override",
+      "success": true
+    },
+    {
+      "passwordLength": 16,
+      "constructorMode": "callback",
+      "success": true
+    },
+    {
+      "passwordLength": 19,
+      "constructorMode": "url",
+      "success": true
+    },
+    {
+      "passwordLength": 19,
+      "constructorMode": "object",
+      "success": true
+    },
+    {
+      "passwordLength": 19,
+      "constructorMode": "override",
+      "success": true
+    },
+    {
+      "passwordLength": 19,
+      "constructorMode": "callback",
+      "success": true
+    },
+    {
+      "passwordLength": 20,
+      "constructorMode": "url",
+      "success": false,
+      "errno": 1045,
+      "code": "ERR_MYSQL_SERVER_ERROR"
+    },
+    {
+      "passwordLength": 20,
+      "constructorMode": "object",
+      "success": false,
+      "errno": 1045,
+      "code": "ERR_MYSQL_SERVER_ERROR"
+    },
+    {
+      "passwordLength": 20,
+      "constructorMode": "override",
+      "success": false,
+      "errno": 1045,
+      "code": "ERR_MYSQL_SERVER_ERROR"
+    },
+    {
+      "passwordLength": 20,
+      "constructorMode": "callback",
+      "success": false,
+      "errno": 1045,
+      "code": "ERR_MYSQL_SERVER_ERROR"
+    },
+    {
+      "passwordLength": 32,
+      "constructorMode": "url",
+      "success": false,
+      "errno": 1045,
+      "code": "ERR_MYSQL_SERVER_ERROR"
+    },
+    {
+      "passwordLength": 32,
+      "constructorMode": "object",
+      "success": false,
+      "errno": 1045,
+      "code": "ERR_MYSQL_SERVER_ERROR"
+    },
+    {
+      "passwordLength": 32,
+      "constructorMode": "override",
+      "success": false,
+      "errno": 1045,
+      "code": "ERR_MYSQL_SERVER_ERROR"
+    },
+    {
+      "passwordLength": 32,
+      "constructorMode": "callback",
+      "success": false,
+      "errno": 1045,
+      "code": "ERR_MYSQL_SERVER_ERROR"
+    },
+    {
+      "passwordLength": 64,
+      "constructorMode": "url",
+      "success": false,
+      "errno": 1045,
+      "code": "ERR_MYSQL_SERVER_ERROR"
+    },
+    {
+      "passwordLength": 64,
+      "constructorMode": "object",
+      "success": false,
+      "errno": 1045,
+      "code": "ERR_MYSQL_SERVER_ERROR"
+    },
+    {
+      "passwordLength": 64,
+      "constructorMode": "override",
+      "success": false,
+      "errno": 1045,
+      "code": "ERR_MYSQL_SERVER_ERROR"
+    },
+    {
+      "passwordLength": 64,
+      "constructorMode": "callback",
+      "success": false,
+      "errno": 1045,
+      "code": "ERR_MYSQL_SERVER_ERROR"
+    },
+    {
+      "passwordLength": 128,
+      "constructorMode": "url",
+      "success": false,
+      "errno": 1045,
+      "code": "ERR_MYSQL_SERVER_ERROR"
+    },
+    {
+      "passwordLength": 128,
+      "constructorMode": "object",
+      "success": false,
+      "errno": 1045,
+      "code": "ERR_MYSQL_SERVER_ERROR"
+    },
+    {
+      "passwordLength": 128,
+      "constructorMode": "override",
+      "success": false,
+      "errno": 1045,
+      "code": "ERR_MYSQL_SERVER_ERROR"
+    },
+    {
+      "passwordLength": 128,
+      "constructorMode": "callback",
+      "success": false,
+      "errno": 1045,
+      "code": "ERR_MYSQL_SERVER_ERROR"
+    }
+  ],
+  "freshAccountMatrixCount": 24,
+  "firstLoginAndCache": [
+    {
+      "scenario": "Bun own fresh account, no previous login",
+      "success": false,
+      "runtime": "1.4.2",
+      "driver": "bun:sql",
+      "errno": 1045
+    },
+    {
+      "scenario": "Node own fresh account, no previous login",
+      "success": true,
+      "runtime": "v22.21.1",
+      "driver": "mysql2"
+    },
+    {
+      "scenario": "Node warms Bun account only after Bun first attempt",
+      "success": true,
+      "runtime": "v22.21.1",
+      "driver": "mysql2"
+    },
+    {
+      "scenario": "Bun after successful Node authentication",
+      "success": false,
+      "runtime": "1.4.2",
+      "driver": "bun:sql",
+      "errno": 1045
+    },
+    {
+      "scenario": "Bun after own account password reset clears cache",
+      "success": false,
+      "runtime": "1.4.2",
+      "driver": "bun:sql",
+      "errno": 1045
+    }
+  ],
+  "diagnosticHintChecks": {
+    "assertions": 21,
+    "methods": [
+      "get",
+      "transaction",
+      "withConnection"
+    ],
+    "causePreserved": true,
+    "noCredentialLeak": true,
+    "shortIncorrectPasswordKeepsOriginalError": true
+  },
+  "cleanup": {
+    "matrixSchemasAndUsersRemoved": true,
+    "firstLoginSchemaAndUsersRemoved": true,
+    "hintSchemaAndUserRemoved": true
+  },
+  "isolation": "只创建及删除本次随机隔离库与账号；未修改 ai-token、既有 QA 库、root 账号或全局认证配置。证据省略账号名、连接串、密码和临时路径。",
+  "deploymentDecision": "保留强密码和 caching_sha2_password；本次 MySQL QA 使用真正 Node + mysql2。Bun 仅在实际 1045 且所提供密码超过 19 字符时追加排障提示，不预拒、不降级认证、不自动切换驱动。"
+}

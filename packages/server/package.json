@@ -13,13 +13,15 @@
   "scripts": {
     "start": "bun run src/main.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "verify:mysql:node": "bun run verify/verify-mysql-node.ts"
   },
   "dependencies": {
     "@ai-token-report/core": "workspace:*",
     "@ai-token-report/shared": "workspace:*",
     "@noble/hashes": "2.4.0",
     "hono": "4.13.9",
+    "mysql2": "3.24.4",
     "rate-limiter-flexible": "11.2.1"
   },
   "devDependencies": {

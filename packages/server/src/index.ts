@@ -83,8 +83,11 @@ export interface ServerOptions {
    *   员工机器上跑 CLI 不需要任何数据库服务，这条边界由类型保证
    *   （本地路径只收同步 SQLite `Database`）。
    *
-   * 🚨 只在 **Bun** 上可用（走内建 `Bun.sql`）；Node 上会明确报错并指路。
-   *   理由：npm 版 CLI 只跑本机库，为它引 `mysql2` 会进发布产物。
+   * 🚨 **两个运行时都能用，但走的是不同驱动**：Bun 用内建 `Bun.sql`；
+   *   Node 用**可选依赖** `mysql2`（`packages/server` 里声明）。
+   *   两者都**不进 npm 发布产物** —— `mysql2` 是动态 import 且**说明符构建期不可静态分析**
+   *   （用变量拼），否则 core 被内联进 `packages/cli/dist/cli.js` 时会把它一起带进去，
+   *   而本仓有「发布产物零运行时依赖」的断言。没装 `mysql2` 时**明确报错并给出安装命令**。
    *   详见 `docs/mysql上报库.md`。
    *
    * 🚨 启动横幅会打印它，**必须脱敏**（`describePortalTarget()` 负责抹掉密码）。

@@ -13,7 +13,7 @@
  *
  * 单测覆盖不到它们：那是**驱动与数据库的真实行为**，只有连上真库才能证明。
  * 本脚本因此用**真实的方言层 + 真实的驱动层 + 真实的 SQL 形态**跑一遍，
- * 并在结束时清掉自己建的 `probe_*` 探测表。
+ * 并在本次随机隔离 schema 中创建 `probe_*` 探测表，结束后删除隔离 schema。
  *
  * ## 它抓到过的真 bug（留作教训）
  *
@@ -25,29 +25,20 @@
  * ## 用法
  *
  * ```bash
- * # 连接串里必须带 allowPublicKeyRetrieval（MySQL 8.4 的 caching_sha2_password）
- * ATR_MYSQL_URL='mysql://user:pass@127.0.0.1:3306/ai_token_report' \
+ * # 默认使用本机测试容器；其它环境提供有建临时库权限的测试连接。
+ * ATR_V4_TEST_MYSQL_URL='mysql://user:pass@127.0.0.1:3306/information_schema' \
  *   bun run --filter '@ai-token-report/core' verify:mysql
  * ```
  *
- * 🚨 **只会在目标库里创建/删除 `probe_` 前缀的表**，不碰 `usage_event` 等业务表，
- *   更不会跨库操作。
+ * 🚨 不连接 ATR_MYSQL_URL 指向的业务库；只创建和删除本次随机名称的隔离库。
  */
 
 import { MYSQL_DIALECT } from '../src/db/dialect.js'
 import { sharedMysqlBackend } from '../src/db/mysql.js'
 import { buildWhere } from '../src/db/query.js'
+import { createIsolatedMysql } from '../../server/verify/mysql-isolation.js'
 
-/**
- * 默认连本机的开发用 MySQL（`local-database-review-mysql` 容器，宿主端口 3335）。
- *
- * ⚠️ 账号来自**开发机的 `.env`**（`MYSQL_USER` / `MYSQL_PASSWORD`）；**库名是本项目自己的**
- *   （`ai-token`，与 `.env` 里的 `MYSQL_DATABASE=local-mysql` 不同 ——
- *   那台实例是多个项目共用的，各项目各用一张库）。
- *   CI 或别人的机器上用 `ATR_MYSQL_URL` 覆盖。
- */
-const URL =
-  process.env.ATR_MYSQL_URL ?? 'mysql://mysql_user:mysql_password@127.0.0.1:3335/ai-token'
+const isolation = await createIsolatedMysql()
 /** 探测表前缀：清理时按它删，绝不碰业务表。 */
 const T = 'probe_portal_event'
 
@@ -60,8 +51,9 @@ const check = (label: string, cond: boolean, extra = ''): void => {
   }
 }
 
-const db = await sharedMysqlBackend(URL)
+const db = await sharedMysqlBackend(isolation.url)
 
+try {
 await db.exec(`DROP TABLE IF EXISTS ${T}`)
 await db.exec(`CREATE TABLE ${T} (
   event_id VARCHAR(255) NOT NULL PRIMARY KEY,
@@ -194,4 +186,5 @@ const left = await db.all<{ t: string }>(
 check('探测表已清理干净', !left.some((r) => r.t.startsWith('probe_')), JSON.stringify(left.map((r) => r.t)))
 
 console.log(`\n结果：${failed === 0 ? '全部通过' : `${failed} 项失败`}`)
-process.exit(failed > 0 ? 1 : 0)
+process.exitCode = failed > 0 ? 1 : 0
+} finally { await isolation.dispose() }

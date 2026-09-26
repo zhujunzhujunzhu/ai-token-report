@@ -130,7 +130,7 @@ export function buildWhere(filter: QueryFilter): {
     const parts: string[] = []
     patterns.forEach((p, i) => {
       const key = `$${prefix}${i}`
-      parts.push(`LOWER(${column}) LIKE ${key} ESCAPE '\\'`)
+      parts.push(`LOWER(${column}) LIKE ${key} ESCAPE '!'`)
       params[key] = `%${escapeLike(p.toLowerCase())}%`
     })
     clauses.push(`(${parts.join(' OR ')})`)
@@ -161,9 +161,9 @@ export function buildWhere(filter: QueryFilter): {
   }
 }
 
-/** 转义 LIKE 的通配符。`\` 必须最先替换，否则会把后加的反斜杠再转义一次。 */
+/** 两个数据库统一用 ! 转义，避免 MySQL 字符串反斜线模式改变 SQL 语义。 */
 function escapeLike(s: string): string {
-  return s.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_')
+  return s.replace(/!/g, '!!').replace(/%/g, '!%').replace(/_/g, '!_')
 }
 
 // ─────────────────────────────────────────────────────────────

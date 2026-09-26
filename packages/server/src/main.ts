@@ -102,7 +102,7 @@ ai-token-report 部门服务端
   --dsh-home <p>      DSH home (默认 $DSH_HOME 或 ~/.dsh)
   --db <p>            上报库路径 (默认 <dsh-home>/token-report/portal.sqlite)
   --mysql <url>       上报库改用 MySQL，如 mysql://user:pass@host:3306/ai_token_report
-                      (也可用环境变量 ATR_MYSQL_URL；⚠️ 仅 Bun 上可用。
+                      (也可用环境变量 ATR_MYSQL_URL；Bun 与 Node 均支持。
                        本机库 usage.sqlite 不受影响，永远是 SQLite)
   --credentials <p>   凭证文件路径
   --static <p>        部门看板前端构建产物目录 (默认 packages/web-portal/dist)
