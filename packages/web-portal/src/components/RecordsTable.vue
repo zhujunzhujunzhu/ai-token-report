@@ -37,6 +37,9 @@ defineEmits<{ page: [value: number] }>()
           }}</el-descriptions-item
           ><el-descriptions-item label="项目目录">{{
             row.cwd || '未提供'
+          }}</el-descriptions-item
+          ><el-descriptions-item label="缓存写入">{{
+            formatCount(row.cacheWriteTokens)
           }}</el-descriptions-item></el-descriptions
         ></template
       ></el-table-column

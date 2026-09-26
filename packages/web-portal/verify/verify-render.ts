@@ -3,11 +3,12 @@
  * 验证登录门禁、角色路由、业务页面、空态与诊断文案；图表另由 verify-charts 验证。
  */
 import { createServer } from 'vite'
-import { createSSRApp, type Component } from 'vue'
+import { createSSRApp, h, type Component, type Slot } from 'vue'
 import { renderToString } from 'vue/server-renderer'
 import { createPinia, disposePinia } from 'pinia'
 import { createMemoryHistory } from 'vue-router'
 import { ID_INJECTION_KEY, ZINDEX_INJECTION_KEY } from 'element-plus'
+import type { BreakdownRow } from '@ai-token-report/shared'
 const server = await createServer({
   root: process.cwd(),
   server: { middlewareMode: true },
@@ -118,6 +119,12 @@ try {
   ])
     check(`总览含 ${label}`, dashboardHtml.includes(label))
   check('总览直接展示接口总量', dashboardHtml.includes('1,500'))
+  const modelRow: BreakdownRow = {
+    key: 'qa-model-plugin', totalTokens: 14690, inputTokens: 1300,
+    outputTokens: 260, cacheReadTokens: 13000, cacheWriteTokens: 130,
+    calls: 1, cacheHitRate: 0.91,
+  }
+  dashboard.breakdown = { by: 'model', rows: [modelRow] }
   const analysisHtml = await render('/src/views/AnalysisView.vue')
   for (const label of [
     '趋势分析',
@@ -127,6 +134,31 @@ try {
     '项目',
   ])
     check(`分析页含 ${label}`, analysisHtml.includes(label))
+  // Element Plus 在 mounted 时注册表格列，普通 SSR 不输出数据单元格。
+  // 先执行真实表格组件，再渲染收集到的真实列插槽，验证字段绑定与格式化。
+  const { default: BreakdownTable } = await server.ssrLoadModule('/src/components/BreakdownTable.vue')
+  const columns: Array<{ label: string; slot: Slot | undefined }> = []
+  const tableApp = createRenderApp({ render: () => h(BreakdownTable, { rows: [modelRow] }) })
+  tableApp.mixin({
+    created() {
+      if (this.$options.name === 'ElTableColumn')
+        columns.push({ label: String(this.$props.label), slot: this.$slots.default })
+    },
+  })
+  await renderToString(tableApp)
+  const cells = new Map<string, string>()
+  for (const column of columns) {
+    const html = await renderToString(createSSRApp({
+      render: () => h('td', column.slot?.({ row: modelRow })),
+    }))
+    cells.set(column.label, html)
+  }
+  check('分布表展示缓存写入及服务端非零值', cells.get('缓存写入') === '<td>130</td>')
+  check('分布表原样展示总量与其余三项',
+    cells.get('计费总量') === '<td><strong>14,690</strong></td>' &&
+    cells.get('未缓存输入') === '<td>1,300</td>' &&
+    cells.get('输出') === '<td>260</td>' &&
+    cells.get('缓存读') === '<td>13,000</td>')
   const recordsHtml = await render('/src/views/RecordsView.vue')
   check(
     '明细页及分页说明',

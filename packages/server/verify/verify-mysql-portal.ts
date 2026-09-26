@@ -165,6 +165,7 @@ function rec(
   output: number,
   cacheRead: number,
   cwd: string,
+  cacheWrite = 0,
 ): WireRecord {
   return {
     event_id: `${sessionId}:${seq}`,
@@ -176,7 +177,7 @@ function rec(
     input_tokens: input,
     output_tokens: output,
     cache_read_tokens: cacheRead,
-    cache_write_tokens: 0,
+    cache_write_tokens: cacheWrite,
     reasoning_tokens: 0,
     // ⚠️ 故意给一个**错**的 total：库里没有这一列（铁律 2），两侧都必须忽略它。
     total_tokens: input + output + cacheRead + 999_999,
@@ -193,7 +194,7 @@ function rec(
  *   ts 相同就要靠 seq 决出次序 —— 两侧必须给出**同一个顺序**。
  */
 const BATCH_ZHANG: WireRecord[] = [
-  rec('s1', 1, todayAt(9), 'dashscope', 'deepseek-v4.1-flash', 10_882, 1, 1_024, 'D:\\Coding\\proj-a'),
+  rec('s1', 1, todayAt(9), 'dashscope', 'deepseek-v4.1-flash', 10_882, 1, 1_024, 'D:\\Coding\\proj-a', 130),
   rec('s1', 2, todayAt(10), 'dashscope', 'deepseek-v4.1-flash', 120, 30, 98_976, 'D:\\Coding\\proj-a'),
   rec('s2', 1, todayAt(11), 'openai', 'gpt-4o', 500, 60, 3_000, 'D:\\Coding\\proj-b'),
 ]
@@ -207,6 +208,7 @@ const ALL = [...BATCH_ZHANG, ...BATCH_LI]
 const EXPECTED_INPUT = ALL.reduce((n, r) => n + r.input_tokens, 0)
 const EXPECTED_OUTPUT = ALL.reduce((n, r) => n + r.output_tokens, 0)
 const EXPECTED_CACHE_READ = ALL.reduce((n, r) => n + r.cache_read_tokens, 0)
+const EXPECTED_CACHE_WRITE = ALL.reduce((n, r) => n + r.cache_write_tokens, 0)
 const EXPECTED = {
   events: ALL.length,
   calls: ALL.length,
@@ -215,8 +217,9 @@ const EXPECTED = {
   input: EXPECTED_INPUT,
   output: EXPECTED_OUTPUT,
   cacheRead: EXPECTED_CACHE_READ,
-  // cacheWrite 全是 0，所以 total = 三项之和（恒等式：reasoning 不在其中）
-  total: EXPECTED_INPUT + EXPECTED_OUTPUT + EXPECTED_CACHE_READ,
+  cacheWrite: EXPECTED_CACHE_WRITE,
+  // 非零缓存写入必须独立返回，不能只藏在总量里。
+  total: EXPECTED_INPUT + EXPECTED_OUTPUT + EXPECTED_CACHE_READ + EXPECTED_CACHE_WRITE,
 }
 
 function payload(records: WireRecord[], userName: string): unknown {
@@ -429,6 +432,7 @@ try {
       overviewMy['inputTokens'] === EXPECTED.input &&
       overviewMy['outputTokens'] === EXPECTED.output &&
       overviewMy['cacheReadTokens'] === EXPECTED.cacheRead &&
+      overviewMy['cacheWriteTokens'] === EXPECTED.cacheWrite &&
       overviewMy['calls'] === EXPECTED.calls &&
       overviewMy['sessions'] === EXPECTED.sessions,
     JSON.stringify(overviewMy),
@@ -447,6 +451,8 @@ try {
     const b = await stats(mysql, 'breakdown', { period: 'today', by })
     same(`breakdown(by=${by}) 逐位一致`, a, b)
     check(`breakdown(by=${by}) 非空`, (b['rows'] as unknown[]).length > 0)
+    const rows = b['rows'] as { cacheWriteTokens: number }[]
+    check(`breakdown(by=${by}) 独立返回全部非零缓存写入`, rows.every((row) => typeof row.cacheWriteTokens === 'number') && rows.reduce((total, row) => total + row.cacheWriteTokens, 0) === EXPECTED.cacheWrite)
   }
 
   const recordsLite = await stats(sqlite, 'records', { period: 'today', limit: '50' })

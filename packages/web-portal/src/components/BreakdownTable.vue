@@ -33,6 +33,11 @@ defineProps<{ rows: BreakdownRow[] }>()
         formatCount(row.cacheReadTokens)
       }}</template></el-table-column
     >
+    <el-table-column label="缓存写入" min-width="130" align="right"
+      ><template #default="{ row }">{{
+        formatCount(row.cacheWriteTokens)
+      }}</template></el-table-column
+    >
     <el-table-column label="调用次数" min-width="100" align="right"
       ><template #default="{ row }">{{
         formatCount(row.calls)

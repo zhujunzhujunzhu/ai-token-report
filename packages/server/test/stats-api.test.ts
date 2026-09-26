@@ -26,6 +26,7 @@ import { join } from 'node:path'
 
 import { insertRecords, openPortalDb } from '@ai-token-report/core/db'
 import { cacheHitRate, unattributedRate, UNATTRIBUTED_USER } from '@ai-token-report/shared'
+import type { BreakdownResponse } from '@ai-token-report/shared'
 
 import { CredentialStore } from '../src/credentials.js'
 import { IngestRoute } from '../src/ingest-route.js'
@@ -260,6 +261,22 @@ describe('部门总览口径', () => {
 })
 
 describe('★ 人员排行（部门看板的核心诉求）', () => {
+  test('所有分组透传非零缓存写入，四项明细能对上总量', async () => {
+    await report('tok-zhang', [
+      rec('cache-write-1', { input_tokens: 100, output_tokens: 20, cache_read_tokens: 900, cache_write_tokens: 13, reasoning_tokens: 9 }),
+      rec('cache-write-2', { seq: 2, input_tokens: 300, output_tokens: 40, cache_read_tokens: 700, cache_write_tokens: 7, reasoning_tokens: 6 }),
+    ])
+
+    for (const by of ['user', 'provider', 'model', 'provider-model', 'project', 'day', 'hour']) {
+      const response = await get('breakdown', { period: 'today', by })
+      expect(response.status).toBe(200)
+      const rows = (response.body as BreakdownResponse).rows
+      expect(rows).toHaveLength(1)
+      // 非零缓存写入必须独立可见；reasoning 已包含在 output 中，不能再次加总。
+      expect(rows[0]).toMatchObject({ inputTokens: 400, outputTokens: 60, cacheReadTokens: 1600, cacheWriteTokens: 20, totalTokens: 2080, calls: 2 })
+    }
+  })
+
   test('按用量降序，未归属成组出现在 unknown 键上', async () => {
     await report('tok-zhang', [rec('z1', { input_tokens: 1000, output_tokens: 0, cache_read_tokens: 0 })])
     await report('tok-li', [rec('l1', { input_tokens: 400, output_tokens: 0, cache_read_tokens: 0 })])
@@ -384,7 +401,7 @@ describe('部门趋势与明细', () => {
   test('records 分页：总数、页大小、最新在前、未归属映射成 unknown', async () => {
     await report('tok-zhang', [
       rec('r1', { seq: 1, ts: todayAt(9) }),
-      rec('r2', { seq: 2, ts: todayAt(11) }),
+      rec('r2', { seq: 2, ts: todayAt(11), cache_write_tokens: 7, total_tokens: 1027 }),
       rec('r3', { seq: 3, ts: todayAt(10) }),
     ])
     seedUnattributed([
@@ -397,13 +414,15 @@ describe('部门趋势与明细', () => {
       total: number
       limit: number
       offset: number
-      rows: { eventId: string; ts: number; userId: string }[]
+      rows: { eventId: string; ts: number; userId: string; cacheWriteTokens: number; totalTokens: number }[]
     }
     expect(body.total).toBe(4)
     expect(body.limit).toBe(10)
     expect(body.offset).toBe(0)
     // 最新在前
     expect(body.rows.map((r) => r.eventId)).toEqual(['r2', 'r3', 'r1', 'u1'])
+    expect(body.rows[0]!.cacheWriteTokens).toBe(7)
+    expect(body.rows[0]!.totalTokens).toBe(1027)
     // ★ 未归属统一成协议里的 unknown，而不是 null
     expect(body.rows[3]!.userId).toBe(UNATTRIBUTED_USER)
 

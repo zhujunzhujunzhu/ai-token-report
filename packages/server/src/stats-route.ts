@@ -44,6 +44,7 @@ import {
 import { derive, resolveRange } from '@ai-token-report/core'
 import {
   cacheHitRate,
+  computeTotal,
   unattributedRate,
   UNATTRIBUTED_USER,
   type BreakdownResponse,
@@ -225,6 +226,7 @@ export class StatsRoute {
       inputTokens: row.counts.input,
       outputTokens: row.counts.output,
       cacheReadTokens: row.counts.cacheRead,
+      cacheWriteTokens: row.counts.cacheWrite,
       calls: row.counts.calls,
       cacheHitRate: cacheHitRate({ input: row.counts.input, cacheRead: row.counts.cacheRead }),
     }))
@@ -351,12 +353,12 @@ function toRecordRow(row: PortalRecordRow): RecordRow {
     userId: row.userId ?? UNATTRIBUTED_USER,
     provider: row.provider,
     model: row.model,
-    // 展示用总量 = 四项相加。这是**本文件唯一一次加法**，
-    // 且与 shared/metrics.ts 的 computeTotal 同义（四项分列仍然原样返回）。
-    totalTokens: row.input + row.output + row.cacheRead + row.cacheWrite,
+    // 口径只经 shared 计算；四项原始用量完整透传。
+    totalTokens: computeTotal({ input: row.input, output: row.output, cacheRead: row.cacheRead, cacheWrite: row.cacheWrite, reasoning: 0 }),
     inputTokens: row.input,
     outputTokens: row.output,
     cacheReadTokens: row.cacheRead,
+    cacheWriteTokens: row.cacheWrite,
     cwd: row.cwd,
   }
 }

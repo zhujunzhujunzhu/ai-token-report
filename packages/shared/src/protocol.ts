@@ -200,6 +200,7 @@ export interface BreakdownRow {
   inputTokens: number
   outputTokens: number
   cacheReadTokens: number
+  cacheWriteTokens: number
   calls: number
   cacheHitRate: number
 }
@@ -222,6 +223,7 @@ export interface RecordRow {
   inputTokens: number
   outputTokens: number
   cacheReadTokens: number
+  cacheWriteTokens: number
   cwd: string | null
 }
 
