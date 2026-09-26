@@ -42,6 +42,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { join } from 'node:path'
+import { randomUUID } from 'node:crypto'
 
 /** 未发送批次的前缀。 */
 const PENDING_PREFIX = 'pending-'
@@ -49,6 +50,7 @@ const PENDING_PREFIX = 'pending-'
 const INFLIGHT_PREFIX = 'inflight-'
 /** 文件后缀。 */
 const SUFFIX = '.jsonl'
+const RECONCILE_INTERVAL_MS = 30_000
 
 /** 一个待投递批次。 */
 export interface OutboxBatch {
@@ -70,11 +72,15 @@ export interface OutboxStats {
   droppedBatches: number
 }
 
+interface BatchMeta { bytes: number; records: number; mtimeMs: number }
+
 /**
- * JSONL outbox。
+ * JSONL outbox。元数据随本实例的写入、确认和丢弃增量维护。
  *
- * 所有方法都是**同步**的：调用点（`enqueue` 系列）在批量器线程上，
- * 一次写盘只有几毫秒，比引入异步竞态（同一批被两个 flush 同时取走）划算得多。
+ * ★ 方法仍在宿主线程同步执行，不能在 emit 的调用栈里调用。
+ * 目录戳变化时只读取新文件；每 30 秒核对已有文件，兜住另一个进程的
+ * 原地修改、时间戳精度及检查与写入之间的竞争。共享目录的缓存允许短暂滞后，
+ * 真正发送前总是重新读文件，并以 rename 是否成功判断是否取得该批。
  */
 export class Outbox {
   readonly #dir: string
@@ -82,16 +88,28 @@ export class Outbox {
   /** 进程内单调递增序号，保证同一毫秒内多个批次的文件名不撞。 */
   #counter = 0
   #droppedBatches = 0
+  readonly #instanceId = randomUUID()
+  readonly #now: () => number
+  readonly #entries = new Map<string, BatchMeta>()
+  #ordered: string[] = []
+  #orderedSet = new Set<string>()
+  #head = 0
+  #bytes = 0
+  #records = 0
+  #stamp = ''
+  #checkedAt = -Infinity
 
-  constructor(options: { dir: string; maxBytes: number }) {
+  constructor(options: { dir: string; maxBytes: number; now?: () => number }) {
     this.#dir = options.dir
     this.#maxBytes = options.maxBytes
+    this.#now = options.now ?? Date.now
     try {
       mkdirSync(this.#dir, { recursive: true })
     } catch {
       // 目录建不出来（磁盘满 / 权限）时**不抛错**：outbox 是兜底，
       // 让兜底把主流程拖死是本末倒置。后续写盘会各自失败并降级为「仅内存」。
     }
+    this.#refresh(true)
   }
 
   get dir(): string {
@@ -123,7 +141,8 @@ export class Outbox {
     //   不补零的话字典序是 1, 10, 100, 11, 2…，同一毫秒内写下 11 批之后
     //   顺序就乱了：不仅「先采的先上账」失效，容量超限时丢掉的也**不一定是
     //   最旧的那批**（那正是这个模块最不能出错的地方）。
-    return `${prefix}${Date.now()}-${process.pid}-${String(this.#counter).padStart(9, '0')}${SUFFIX}`
+    // 多个实例可能在同一毫秒从序号 1 开始，实例标识防止覆盖另一实例的唯一副本。
+    return `${prefix}${Date.now()}-${process.pid}-${String(this.#counter).padStart(9, '0')}-${this.#instanceId}${SUFFIX}`
   }
 
   /**
@@ -133,14 +152,21 @@ export class Outbox {
    */
   write(records: Record<string, unknown>[]): string | null {
     if (records.length === 0) return null
+    this.#refresh()
     const file = this.#nextFile(PENDING_PREFIX)
     const text = records.map((r) => JSON.stringify(r)).join('\n') + '\n'
+    const temporary = this.#pathOf(`.writing-${file}`)
     try {
-      writeFileSync(this.#pathOf(file), text, 'utf8')
+      // 另一个进程只会看到完整 pending 文件，不会把正在写的一半当成坏 JSON。
+      writeFileSync(temporary, text, 'utf8')
+      renameSync(temporary, this.#pathOf(file))
     } catch {
+      try { unlinkSync(temporary) } catch { /* 写入未完成，没有可确认的磁盘副本 */ }
       return null
     }
+    this.#remember(file, { bytes: Buffer.byteLength(text), records: records.length, mtimeMs: this.#mtime(file) })
     this.#enforceLimit()
+    this.#stamp = this.#directoryStamp()
     return file
   }
 
@@ -155,8 +181,12 @@ export class Outbox {
   markInflight(file: string): boolean {
     try {
       renameSync(this.#pathOf(file), this.#pathOf(file.replace(PENDING_PREFIX, INFLIGHT_PREFIX)))
+      this.#forget(file)
+      this.#stamp = this.#directoryStamp()
       return true
     } catch {
+      // 可能已经被另一个实例取走，不能继续发送并删除别人持有的文件。
+      this.#refresh(true)
       return false
     }
   }
@@ -171,6 +201,8 @@ export class Outbox {
         /* 已经不在就无所谓 —— ack 是幂等的 */
       }
     }
+    this.#forget(file)
+    this.#stamp = this.#directoryStamp()
   }
 
   /**
@@ -185,6 +217,9 @@ export class Outbox {
     if (!existsSync(from)) return
     try {
       renameSync(from, this.#pathOf(file))
+      const batch = this.#read(file)
+      if (batch) this.#remember(file, batch.meta)
+      this.#stamp = this.#directoryStamp()
     } catch {
       /* 改不回来时保持 inflight —— 下次启动的 recover() 会再捞一次 */
     }
@@ -207,34 +242,38 @@ export class Outbox {
         /* 单个文件坏了不影响其余 */
       }
     }
+    if (restored > 0) this.#refresh(true)
+    else this.#refresh()
     return restored
   }
 
   /**
    * 取出最早的若干批待投递记录。
    *
-   * 读不出来的文件**直接删掉**：它已经损坏（写盘时断电），
-   * 留着只会让每一轮 flush 都在同一个坏文件上失败，把整个队列卡死。
+   * 每次重读要发送的文件，缓存只保存统计和顺序，不作为记录正文的真值。
+   * 文件暂时不可读时跳过而不删除，等待下一次目录核对重试。
    */
   take(maxBatches: number): OutboxBatch[] {
+    this.#refresh()
+    this.#prune()
     const out: OutboxBatch[] = []
-    for (const file of this.#list(PENDING_PREFIX).slice(0, maxBatches)) {
-      const records = this.#read(file)
-      if (records === null) {
-        try {
-          unlinkSync(this.#pathOf(file))
-        } catch {
-          /* 删不掉也没别的办法 */
-        }
+    for (let i = this.#head; i < this.#ordered.length && out.length < maxBatches; i++) {
+      const file = this.#ordered[i]!
+      if (!this.#entries.has(file)) continue
+      const batch = this.#read(file)
+      if (batch === null) {
+        // 文件可能暂时不可读或已被其它实例领取，不能把权限/竞争误判成损坏后删除。
+        this.#forget(file)
         continue
       }
-      out.push({ file, records })
+      this.#remember(file, batch.meta)
+      out.push({ file, records: batch.records })
     }
     return out
   }
 
   /** 读取一批；损坏时返回 null。 */
-  #read(file: string): Record<string, unknown>[] | null {
+  #read(file: string): { records: Record<string, unknown>[]; meta: BatchMeta } | null {
     let text: string
     try {
       text = readFileSync(this.#pathOf(file), 'utf8')
@@ -255,29 +294,16 @@ export class Outbox {
         continue
       }
     }
-    return records
+    return { records, meta: { bytes: Buffer.byteLength(text), records: records.length, mtimeMs: this.#mtime(file) } }
   }
 
   /** 当前状态。 */
   stats(): OutboxStats {
-    let bytes = 0
-    let records = 0
-    const files = this.#list(PENDING_PREFIX)
-    for (const f of files) {
-      try {
-        bytes += statSync(this.#pathOf(f)).size
-      } catch {
-        continue
-      }
-    }
-    for (const f of files) {
-      const r = this.#read(f)
-      if (r) records += r.length
-    }
+    this.#refresh()
     return {
-      pendingBatches: files.length,
-      pendingRecords: records,
-      pendingBytes: bytes,
+      pendingBatches: this.#entries.size,
+      pendingRecords: this.#records,
+      pendingBytes: this.#bytes,
       droppedBatches: this.#droppedBatches,
     }
   }
@@ -291,28 +317,91 @@ export class Outbox {
    *   **静默丢弃是不可接受的**，那会让看板少数据而没人知道。
    */
   #enforceLimit(): void {
-    let total = 0
-    const files = this.#list(PENDING_PREFIX)
-    const sizes = new Map<string, number>()
-    for (const f of files) {
-      try {
-        const size = statSync(this.#pathOf(f)).size
-        sizes.set(f, size)
-        total += size
-      } catch {
-        continue
-      }
-    }
-    for (const f of files) {
-      if (total <= this.#maxBytes) break
+    this.#prune()
+    for (let i = this.#head; i < this.#ordered.length && this.#bytes > this.#maxBytes; i++) {
+      const f = this.#ordered[i]!
+      if (!this.#entries.has(f)) continue
       try {
         unlinkSync(this.#pathOf(f))
-        total -= sizes.get(f) ?? 0
+        this.#forget(f)
         this.#droppedBatches += 1
       } catch {
         /* 删不掉就下一轮再说 */
       }
     }
+  }
+
+  #mtime(file: string): number {
+    try { return statSync(this.#pathOf(file)).mtimeMs } catch { return -1 }
+  }
+
+  #directoryStamp(): string {
+    try {
+      const s = statSync(this.#dir)
+      return `${s.mtimeMs}:${s.ctimeMs}:${s.ino}`
+    } catch { return '' }
+  }
+
+  #forget(file: string): void {
+    const old = this.#entries.get(file)
+    if (!old) return
+    this.#bytes -= old.bytes
+    this.#records -= old.records
+    this.#entries.delete(file)
+  }
+
+  #remember(file: string, meta: BatchMeta): void {
+    this.#forget(file)
+    this.#entries.set(file, meta)
+    this.#bytes += meta.bytes
+    this.#records += meta.records
+    if (this.#orderedSet.has(file)) return
+    this.#orderedSet.add(file)
+    // 通常只是追加；只有外部新增旧文件、恢复失败批次时才需要插到队列中间。
+    let lo = this.#head
+    let hi = this.#ordered.length
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1
+      if (this.#ordered[mid]! < file) lo = mid + 1
+      else hi = mid
+    }
+    this.#ordered.splice(lo, 0, file)
+  }
+
+  #prune(): void {
+    while (this.#head < this.#ordered.length && !this.#entries.has(this.#ordered[this.#head]!)) {
+      this.#orderedSet.delete(this.#ordered[this.#head]!)
+      this.#head++
+    }
+    if (this.#head > 1024 && this.#head * 2 > this.#ordered.length) {
+      this.#ordered = this.#ordered.slice(this.#head)
+      this.#head = 0
+    }
+  }
+
+  #refresh(force = false): void {
+    const now = this.#now()
+    const deep = force || now - this.#checkedAt >= RECONCILE_INTERVAL_MS
+    const stamp = this.#directoryStamp()
+    if (!deep && stamp === this.#stamp) return
+    const files = this.#list(PENDING_PREFIX)
+    const present = new Set(files)
+    for (const file of this.#entries.keys()) if (!present.has(file)) this.#forget(file)
+    for (const file of files) {
+      const old = this.#entries.get(file)
+      if (old && !deep) continue
+      if (old) {
+        try {
+          const st = statSync(this.#pathOf(file))
+          if (st.size === old.bytes && st.mtimeMs === old.mtimeMs) continue
+        } catch { this.#forget(file); continue }
+      }
+      const batch = this.#read(file)
+      if (batch) this.#remember(file, batch.meta)
+    }
+    this.#prune()
+    this.#stamp = stamp
+    if (deep) this.#checkedAt = now
   }
 
   /** 清空 outbox（测试与「重置」场景）。 */
@@ -326,5 +415,6 @@ export class Outbox {
         }
       }
     }
+    this.#refresh(true)
   }
 }

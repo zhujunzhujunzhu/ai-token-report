@@ -698,7 +698,7 @@ function formatReporterDiagnostics(config: EffectiveConfig, backend: TokenReport
     return lines.join('\n')
   }
 
-  const stats = backend.reporterStats
+  const stats = backend.reporterStats()
   lines.push('')
   lines.push('=== 投递统计 ===')
   lines.push(`  已采集      ${n(stats.enqueued)} 条`)

@@ -10,7 +10,8 @@
  *   后者会重发，但服务端按 `event_id` 幂等 —— 宁可重发，不可漏发。
  */
 
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import * as fs from 'node:fs'
 import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -137,7 +138,7 @@ describe('损坏数据', () => {
     expect(taken[0]?.records.map((r) => r['event_id'])).toEqual(['a', 'c'])
   })
 
-  test('★ 整个文件读不出来时删掉它 —— 否则每一轮 flush 都会卡在同一个坏文件上', () => {
+  test('外部已经删除的文件不再出现在待发送队列中', () => {
     const box = new Outbox({ dir, maxBytes: 1024 * 1024 })
     box.write(records(1))
     // 目录在，但文件被外部删掉（模拟手工清理）
@@ -202,5 +203,87 @@ describe('目录不可用时的降级', () => {
     box.clear()
     expect(files()).toHaveLength(0)
     expect(existsSync(dir)).toBe(true)
+  })
+})
+
+describe('增量元数据与共享目录', () => {
+  test('已有积压时写新批与读统计不重读、解析或逐个 stat 历史文件', () => {
+    const box = new Outbox({ dir, maxBytes: 1024 * 1024, now: () => 0 })
+    for (let i = 0; i < 64; i++) box.write(records(2, `${i}:`))
+    const read = spyOn(fs, 'readFileSync')
+    const stat = spyOn(fs, 'statSync')
+    const parse = spyOn(JSON, 'parse')
+    try {
+      box.write(records(3))
+      expect(box.stats().pendingRecords).toBe(131)
+      expect(read).not.toHaveBeenCalled()
+      expect(parse).not.toHaveBeenCalled()
+      // 只允许目录戳和新文件的固定次数检查，不能随 64 个积压文件增长。
+      expect(stat.mock.calls.length).toBeLessThan(10)
+    } finally {
+      read.mockRestore(); stat.mockRestore(); parse.mockRestore()
+    }
+  })
+
+  test('同毫秒创建的两个实例不能覆盖彼此的批次', () => {
+    const first = new Outbox({ dir, maxBytes: 1024 * 1024 })
+    const second = new Outbox({ dir, maxBytes: 1024 * 1024 })
+    const clock = spyOn(Date, 'now').mockReturnValue(123456)
+    try {
+      expect(first.write(records(2, 'a'))).not.toBe(second.write(records(3, 'b')))
+    } finally { clock.mockRestore() }
+    const reopened = new Outbox({ dir, maxBytes: 1024 * 1024 })
+    expect(reopened.stats().pendingRecords).toBe(5)
+  })
+
+  test('低频核对能看见另一实例的新增、领取、释放和确认', () => {
+    let now = 0
+    const first = new Outbox({ dir, maxBytes: 1024 * 1024, now: () => now })
+    const second = new Outbox({ dir, maxBytes: 1024 * 1024, now: () => now })
+    const file = first.write(records(3))!
+    now += 30_000
+    expect(second.stats().pendingRecords).toBe(3)
+    expect(first.markInflight(file)).toBe(true)
+    expect(second.markInflight(file)).toBe(false)
+    expect(second.stats().pendingBatches).toBe(0)
+    first.release(file)
+    now += 30_000
+    expect(second.take(1)[0]?.records).toHaveLength(3)
+    second.markInflight(file)
+    second.ack(file)
+    now += 30_000
+    expect(first.stats().pendingRecords).toBe(0)
+  })
+
+  test('原地修改不改变目录戳时，也会在低频核对后更新计数', () => {
+    let now = 0
+    const box = new Outbox({ dir, maxBytes: 1024 * 1024, now: () => now })
+    const file = box.write(records(2))!
+    writeFileSync(join(dir, file), JSON.stringify({ event_id: 'after' }) + '\n')
+    now += 30_000
+    expect(box.stats().pendingRecords).toBe(1)
+  })
+
+  test('未发布的写入临时文件不进入待发送统计和队列', () => {
+    writeFileSync(join(dir, '.writing-pending-interrupted.jsonl'), '{未完成')
+    const box = new Outbox({ dir, maxBytes: 1024 * 1024 })
+    expect(box.stats().pendingBatches).toBe(0)
+    expect(box.take(1)).toHaveLength(0)
+  })
+
+  test('重复领取和释放保持一个队列条目，容量淘汰后计数仍准确', () => {
+    const box = new Outbox({ dir, maxBytes: 300 })
+    const file = box.write(records(1))!
+    for (let i = 0; i < 5; i++) {
+      expect(box.take(1)).toHaveLength(1)
+      box.markInflight(file)
+      expect(box.stats().pendingRecords).toBe(0)
+      box.release(file)
+      expect(box.take(10)).toHaveLength(1)
+    }
+    for (let i = 0; i < 10; i++) box.write(records(1, `new${i}:`))
+    const pending = box.take(100)
+    expect(box.stats().pendingRecords).toBe(pending.reduce((n, batch) => n + batch.records.length, 0))
+    expect(box.stats().pendingBytes).toBeLessThanOrEqual(300)
   })
 })

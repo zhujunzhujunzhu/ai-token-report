@@ -11,14 +11,14 @@
  * 全部用注入的假 `fetch`，一个字节都不出网。
  */
 
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { resolveConfig, type EffectiveConfig } from '../src/config.js'
-import type { BillingRecord, FoldIdentity } from '../src/fold.js'
-import { Reporter } from '../src/reporter.js'
+import { toWireRecord, type BillingRecord, type FoldIdentity } from '../src/fold.js'
+import { MAX_REPORT_BODY_BYTES, Reporter } from '../src/reporter.js'
 
 let home: string
 
@@ -113,6 +113,9 @@ describe('★ 热路径：enqueue 只入队', () => {
     expect(calls).toHaveLength(0)
 
     reporter.enqueue(billing(2))
+    // 满批同样还在 agent 同步热路径上，不能提前写盘或碰网络。
+    expect(calls).toHaveLength(0)
+    expect(readdirSync(reporter.outbox!.dir)).toHaveLength(0)
     // 触发的是异步链路，给它一个微任务的机会
     await new Promise((r) => setTimeout(r, 0))
     expect(calls).toHaveLength(1)
@@ -196,6 +199,43 @@ describe('★ 请求形状与凭证', () => {
 })
 
 describe('★ 失败不丢数据', () => {
+  test('outbox 路径不可写时仍从内存投递，不静默清掉记录', async () => {
+    const blocked = join(home, 'blocked')
+    writeFileSync(blocked, '这里是文件，不能建子目录')
+    const { impl, calls } = fakeFetch(() => okResponse(1))
+    const reporter = new Reporter({
+      config: configWith({ outbox: { dir: join(blocked, 'outbox') } }),
+      identity: IDENTITY, fetchImpl: impl,
+    })
+    reporter.enqueue(billing(1))
+    await reporter.flush()
+    expect(calls).toHaveLength(1)
+    expect(reporter.stats().delivered).toBe(1)
+    expect(reporter.stats().queueLength).toBe(0)
+  })
+
+  test('磁盘与网络同时不可用时保留内存，恢复后能补发', async () => {
+    const blocked = join(home, 'blocked')
+    writeFileSync(blocked, '这里是文件，不能建子目录')
+    let offline = true
+    const { impl } = fakeFetch(() => {
+      if (offline) throw new Error('离线')
+      return okResponse(1)
+    })
+    const reporter = new Reporter({
+      config: configWith({ outbox: { dir: join(blocked, 'outbox') } }),
+      identity: IDENTITY, fetchImpl: impl,
+    })
+    reporter.enqueue(billing(1))
+    await reporter.flush()
+    expect(reporter.stats().queueLength).toBe(1)
+    expect(reporter.stats().delivered).toBe(0)
+    offline = false
+    await reporter.shutdown()
+    expect(reporter.stats().delivered).toBe(1)
+    expect(reporter.stats().queueLength).toBe(0)
+  })
+
   test('网络错误 → 记录留在 outbox 里，不推进统计', async () => {
     const { impl } = fakeFetch(() => {
       throw new Error('ECONNREFUSED')
@@ -247,15 +287,44 @@ describe('★ 失败不丢数据', () => {
     expect(reporter.stats().outbox.pendingRecords).toBe(1)
   })
 
-  test('服务端只回空体也算成功（契约允许，判成失败会导致无限重发）', async () => {
-    const { impl } = fakeFetch(() => new Response('', { status: 200 }))
+  test.each([
+    '', '<html>反向代理首页</html>', '{}', '[]',
+    JSON.stringify({ accepted: 0, duplicates: 0, rejected: 0 }),
+    JSON.stringify({ accepted: -1, duplicates: 2, rejected: 0 }),
+    JSON.stringify({ accepted: 0.5, duplicates: 0.5, rejected: 0 }),
+  ])('2xx 但没有完整匹配回执时保留 outbox：%s', async (raw) => {
+    const { impl } = fakeFetch(() => new Response(raw, { status: 200 }))
     const reporter = new Reporter({ config: configWith(), identity: IDENTITY, fetchImpl: impl })
-
     reporter.enqueue(billing(1))
     await reporter.flush()
+    expect(reporter.stats().delivered).toBe(0)
+    expect(reporter.stats().failures).toBe(1)
+    expect(reporter.stats().outbox.pendingRecords).toBe(1)
+  })
 
-    expect(reporter.stats().delivered).toBe(1)
-    expect(reporter.stats().outbox.pendingRecords).toBe(0)
+  test('拒收回执没有逐条标识时保留整批，不猜测哪些记录可删除', async () => {
+    const { impl } = fakeFetch(() => new Response(JSON.stringify({ accepted: 0, duplicates: 0, rejected: 1 })))
+    const reporter = new Reporter({ config: configWith(), identity: IDENTITY, fetchImpl: impl })
+    reporter.enqueue(billing(1))
+    await reporter.flush()
+    expect(reporter.stats().rejected).toBe(1)
+    expect(reporter.stats().outbox.pendingRecords).toBe(1)
+    expect(reporter.stats().lastError).toContain('拒收')
+  })
+
+  test('只收到响应头而响应体悬挂时也必须超时并保留批次', async () => {
+    const { impl } = fakeFetch((_url, init) => new Response(new ReadableStream({
+      start(controller) {
+        init.signal?.addEventListener('abort', () => controller.error(new DOMException('已超时', 'AbortError')), { once: true })
+      },
+    })))
+    const reporter = new Reporter({
+      config: configWith({ batch: { timeoutMillis: 20 } }), identity: IDENTITY, fetchImpl: impl,
+    })
+    reporter.enqueue(billing(1))
+    await reporter.flush()
+    expect(reporter.stats().lastError).toContain('超时')
+    expect(reporter.stats().outbox.pendingRecords).toBe(1)
   })
 
   test('服务端返回的重复计数被如实记录（幂等去重的正常现象，不是错误）', async () => {
@@ -304,6 +373,35 @@ describe('★ 崩溃不丢：新进程重放上一轮的 inflight', () => {
 })
 
 describe('生命周期', () => {
+  test('shutdown 等待正在发送的批次，再排空后来入队的记录', async () => {
+    let finishFirst!: () => void
+    let requestCount = 0
+    const { impl, calls } = fakeFetch(async () => {
+      if (++requestCount === 1) await new Promise<void>((resolve) => { finishFirst = resolve })
+      return okResponse(1)
+    })
+    const reporter = new Reporter({ config: configWith(), identity: IDENTITY, fetchImpl: impl })
+    reporter.enqueue(billing(1))
+    const first = reporter.flush()
+    await Promise.resolve()
+    reporter.enqueue(billing(2))
+    let stopped = false
+    const stopping = reporter.shutdown().then(() => { stopped = true })
+    try {
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(stopped).toBe(false)
+    } finally {
+      finishFirst()
+      await first
+      await stopping
+    }
+    expect(calls).toHaveLength(2)
+    expect(reporter.stats().delivered).toBe(2)
+    expect(reporter.stats().queueLength).toBe(0)
+    expect(reporter.stats().outbox.pendingRecords).toBe(0)
+  })
+
   test('shutdown 把内存队列落盘并排空', async () => {
     const { impl, calls } = fakeFetch(() => okResponse(1))
     const config = configWith()
@@ -386,5 +484,116 @@ describe('outbox 关闭时的降级路径', () => {
     await reporter.flush()
     expect(reporter.stats().delivered).toBe(1)
     expect(reporter.stats().queueLength).toBe(0)
+  })
+})
+
+describe('有界工作量与快照', () => {
+  test('读取 generation 和其它标量统计不会调用磁盘快照', () => {
+    const reporter = new Reporter({ config: configWith(), identity: IDENTITY })
+    const disk = spyOn(reporter.outbox!, 'stats')
+    try {
+      reporter.enqueue(billing(1))
+      expect(reporter.stats.enqueued).toBe(1)
+      expect(reporter.stats.queueLength).toBe(1)
+      expect(reporter.stats.delivered).toBe(0)
+      expect(reporter.stats.duplicates).toBe(0)
+      expect(reporter.stats.rejected).toBe(0)
+      expect(reporter.stats.requests).toBe(0)
+      expect(reporter.stats.failures).toBe(0)
+      expect(reporter.stats.lastSuccessAt).toBe(0)
+      expect(reporter.stats.lastError).toBeNull()
+      expect(disk).not.toHaveBeenCalled()
+      reporter.stats()
+      expect(disk).toHaveBeenCalledTimes(1)
+    } finally { disk.mockRestore() }
+  })
+
+  test('同步突发入队也严格按 maxRecords 切分，所有记录各发送一次', async () => {
+    const { impl, calls } = fakeFetch((_url, init) => okResponse(JSON.parse(String(init.body)).records.length))
+    const reporter = new Reporter({ config: configWith(), identity: IDENTITY, fetchImpl: impl })
+    for (let i = 0; i < 21; i++) reporter.enqueue(billing(i))
+    expect(calls).toHaveLength(0)
+    await reporter.flush()
+    const batches = calls.map(call => (call.body as { records: { seq: number }[] }).records)
+    expect(batches.every(batch => batch.length <= 2)).toBe(true)
+    expect(batches.flat().map(record => record.seq)).toEqual(Array.from({ length: 21 }, (_, i) => i))
+    expect(reporter.stats.enqueued).toBe(21)
+    expect(reporter.stats.delivered).toBe(21)
+    expect(reporter.stats().outbox.pendingRecords).toBe(0)
+  })
+
+  test('按 UTF-8 字节而非字符串长度切分请求', async () => {
+    const { impl, calls } = fakeFetch((_url, init) => okResponse(JSON.parse(String(init.body)).records.length))
+    const reporter = new Reporter({ config: configWith(), identity: IDENTITY, fetchImpl: impl })
+    for (let i = 0; i < 2; i++) reporter.enqueue({ ...billing(i), cwd: '路'.repeat(200000) })
+    await reporter.flush()
+    expect(calls).toHaveLength(2)
+    for (const call of calls) expect(Buffer.byteLength(String(call.init.body))).toBeLessThanOrEqual(MAX_REPORT_BODY_BYTES)
+    expect(reporter.stats.delivered).toBe(2)
+  })
+
+  test.each([true, false])('不可拆分的超大单条保留副本并报告错误（outbox=%s）', async (enabled) => {
+    const { impl, calls } = fakeFetch(() => okResponse(1))
+    const reporter = new Reporter({ config: configWith({ outbox: { enabled, dir: join(home, 'outbox') } }), identity: IDENTITY, fetchImpl: impl })
+    reporter.enqueue({ ...billing(1), cwd: 'x'.repeat(MAX_REPORT_BODY_BYTES) })
+    await reporter.flush()
+    expect(calls).toHaveLength(0)
+    expect(reporter.stats.queueLength).toBe(enabled ? 0 : 1)
+    if (enabled) expect(reporter.stats().outbox.pendingRecords).toBe(1)
+    expect(reporter.stats.lastError).toContain('单条上报记录超过')
+  })
+
+  test('断网时只读取正在尝试发送的一批，不预读其它历史文件', async () => {
+    const { impl, calls } = fakeFetch(() => { throw new Error('离线') })
+    const reporter = new Reporter({ config: configWith(), identity: IDENTITY, fetchImpl: impl })
+    for (let i = 0; i < 6; i++) reporter.outbox!.write([toWireRecord(billing(i))])
+    const take = spyOn(reporter.outbox!, 'take')
+    try {
+      await reporter.flush()
+      expect(calls).toHaveLength(1)
+      expect(take.mock.calls).toEqual([[1]])
+      expect(reporter.stats().outbox.pendingRecords).toBe(6)
+    } finally { take.mockRestore() }
+  })
+
+  test('历史大文件拆请求后中途失败，保留源文件并通过幂等重试完整恢复', async () => {
+    const seen = new Set<number>()
+    let attempt = 0
+    const { impl, calls } = fakeFetch((_url, init) => {
+      if (++attempt === 2) throw new Error('中途断开')
+      const batch = JSON.parse(String(init.body)).records as { seq: number }[]
+      const accepted = batch.filter(record => !seen.has(record.seq)).length
+      for (const record of batch) seen.add(record.seq)
+      return new Response(JSON.stringify({ accepted, duplicates: batch.length - accepted, rejected: 0 }))
+    })
+    const reporter = new Reporter({ config: configWith(), identity: IDENTITY, fetchImpl: impl })
+    reporter.outbox!.write(Array.from({ length: 5 }, (_, i) => toWireRecord(billing(i))))
+    await reporter.flush()
+    expect(reporter.stats.delivered).toBe(2)
+    expect(reporter.stats().outbox.pendingRecords).toBe(5)
+    await reporter.flush()
+    expect(reporter.stats.delivered).toBe(5)
+    expect(reporter.stats.duplicates).toBe(2)
+    expect(reporter.stats().outbox.pendingRecords).toBe(0)
+    expect(calls.every(call => (call.body as { records: unknown[] }).records.length <= 2)).toBe(true)
+  })
+
+  test('内存降级路径中途失败后，只保留未确认队尾并保持顺序', async () => {
+    let attempt = 0
+    const { impl, calls } = fakeFetch((_url, init) => {
+      if (++attempt === 2) throw new Error('中途断开')
+      return okResponse(JSON.parse(String(init.body)).records.length)
+    })
+    const reporter = new Reporter({
+      config: configWith({ outbox: { enabled: false } }), identity: IDENTITY, fetchImpl: impl,
+    })
+    for (let i = 0; i < 5; i++) reporter.enqueue(billing(i))
+    await reporter.flush()
+    expect(reporter.stats.queueLength).toBe(3)
+    reporter.enqueue(billing(5))
+    await reporter.flush()
+    expect(reporter.stats.delivered).toBe(6)
+    expect(reporter.stats.queueLength).toBe(0)
+    expect(calls.slice(2).flatMap(call => (call.body as { records: { seq: number }[] }).records.map(r => r.seq))).toEqual([2, 3, 4, 5])
   })
 })

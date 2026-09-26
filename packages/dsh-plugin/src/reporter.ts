@@ -22,6 +22,7 @@
  */
 
 import { join } from 'node:path'
+import { setImmediate as yieldToHost } from 'node:timers/promises'
 
 import { SCHEMA_VERSION, type IngestResponse } from '@ai-token-report/shared'
 import { resolveDshHome } from '@ai-token-report/core'
@@ -29,6 +30,10 @@ import { resolveDshHome } from '@ai-token-report/core'
 import type { EffectiveConfig } from './config.js'
 import { toWireRecord, type BillingRecord, type FoldIdentity } from './fold.js'
 import { Outbox, type OutboxStats } from './outbox.js'
+
+/** 给一次编码/请求设硬边界；低于服务端 32 MiB 上限，并限制宿主的同步工作片段。 */
+export const MAX_REPORT_BODY_BYTES = 1024 * 1024
+const MAX_OUTBOX_BATCHES_PER_FLUSH = 50
 
 /** 运行统计 —— 暴露给诊断工具，回答「我的数据到底发出去了没有」。 */
 export interface ReporterStats {
@@ -112,10 +117,12 @@ export class Reporter {
   readonly #stats = new StatsKeeper()
 
   /** 内存队列：`enqueue()` 只碰它。 */
-  #queue: BillingRecord[] = []
+  #queue: (BillingRecord | undefined)[] = []
+  #queueHead = 0
   #timer: ReturnType<typeof setInterval> | null = null
-  /** 是否有 flush 在跑 —— 防止定时器与「满 N 条」触发并发投递同一批。 */
-  #flushing = false
+  /** 共享正在进行的一轮，停机时必须真正等待它，而不是提前返回。 */
+  #flushing: Promise<void> | null = null
+  #shutdown: Promise<void> | null = null
   #closed = false
 
   /**
@@ -146,23 +153,24 @@ export class Reporter {
     //   `Object.assign` 会**立即求值** getter，把字段冻结成构造那一刻的 0。
     //   这是本仓真实踩过的坑（脱敏测试的 `effects` getter 同样栽在这里）。
     const read = (): ReporterStats => this.#snapshot()
-    const field = (key: keyof ReporterStats): PropertyDescriptor => ({
-      get: () => read()[key],
+    const field = (get: () => unknown): PropertyDescriptor => ({
+      get,
       enumerable: true,
       configurable: false,
     })
 
     this.stats = Object.defineProperties(read, {
-      enqueued: field('enqueued'),
-      delivered: field('delivered'),
-      duplicates: field('duplicates'),
-      rejected: field('rejected'),
-      queueLength: field('queueLength'),
-      requests: field('requests'),
-      failures: field('failures'),
-      lastSuccessAt: field('lastSuccessAt'),
-      lastError: field('lastError'),
-      outbox: field('outbox'),
+      // 🚨 generation 每 3 秒读 enqueued；标量 getter 不能顺带扫描整个 outbox。
+      enqueued: field(() => this.#stats.enqueued),
+      delivered: field(() => this.#stats.delivered),
+      duplicates: field(() => this.#stats.duplicates),
+      rejected: field(() => this.#stats.rejected),
+      queueLength: field(() => this.#queueLength()),
+      requests: field(() => this.#stats.requests),
+      failures: field(() => this.#stats.failures),
+      lastSuccessAt: field(() => this.#stats.lastSuccessAt),
+      lastError: field(() => this.#stats.lastError),
+      outbox: field(() => this.#outboxStats()),
     }) as (() => ReporterStats) & ReporterStats
 
     if (options.config.outbox.enabled) {
@@ -200,19 +208,19 @@ export class Reporter {
    * 🚨 **同步、O(1)、不抛错**。这是热路径上的唯一职责。
    */
   enqueue(record: BillingRecord): void {
-    if (this.#closed) return
+    if (this.#closed || this.#shutdown) return
     this.#queue.push(record)
     this.#stats.enqueued += 1
 
     // 满一批立即触发，不必等定时器 —— 短会话也能及时上账
-    if (this.#queue.length >= this.#config.batch.maxRecords) {
+    if (this.#queueLength() >= this.#config.batch.maxRecords) {
       void this.flush()
     }
   }
 
   /** turn 结束提示：把手上攒的发出去，让长会话的延迟从 10s 降到「每轮」。 */
   hintFlush(): void {
-    if (this.#queue.length > 0) void this.flush()
+    if (this.#queueLength() > 0) void this.flush()
   }
 
   /**
@@ -221,50 +229,107 @@ export class Reporter {
    * 顺序不可调换 —— 先把内存里的落盘，再发盘上的。
    * 反过来的话，恰好在这一刻崩溃就会丢掉整个内存队列。
    */
-  async flush(): Promise<void> {
-    if (this.#closed || this.#flushing) return
-    this.#flushing = true
+  flush(): Promise<void> {
+    if (this.#closed) return Promise.resolve()
+    if (this.#flushing) return this.#flushing
+    // ★ async 函数在第一个 await 前仍同步执行。满批 enqueue 只能安排任务，
+    // 不能因此在 agent 热路径里写盘、读整份 outbox 或调用 fetch。
+    this.#flushing = Promise.resolve().then(() => this.#flushOnce()).finally(() => {
+      this.#flushing = null
+    })
+    return this.#flushing
+  }
+
+  async #flushOnce(): Promise<void> {
     try {
-      // 1. 内存 → 磁盘（先落盘，再发送）
-      if (this.#queue.length > 0 && this.#outbox) {
-        const batch = this.#queue
-        this.#queue = []
-        this.#outbox.write(batch.map(toWireRecord))
+      // 本轮只处理开始时的队列前缀，持续产生新事件不会把一次 flush 无限延长。
+      const through = this.#queue.length
+      let written = 0
+      while (this.#outbox && this.#queueHead < through) {
+        const batch = this.#memoryBatch(through, true)
+        if (this.#outbox.write(batch) === null) {
+          this.#log('warn', 'token-report: outbox 写入失败，本批暂存内存并尝试投递')
+          break
+        }
+        this.#consume(batch.length)
+        // 每次最多编码一小批，并定期让出事件循环，避免同步突发入队占住宿主。
+        if (++written % 8 === 0) await yieldToHost()
       }
 
       // 2. 发送盘上的批次（含历史遗留）
       await this.#drainOutbox()
+      // 3. 没有磁盘副本时，只在确认成功后消耗队头；失败不用复制整个积压数组。
+      while (this.#queueHead < through) {
+        const batch = this.#memoryBatch(through)
+        if (!await this.#post(batch)) break
+        this.#consume(batch.length)
+      }
     } catch (err) {
       // flush 的任何异常都不许逃到调用方（它在 emit 的调用链上）
       this.#stats.failures += 1
       this.#stats.lastError = truncate(messageOf(err))
     } finally {
-      this.#flushing = false
+      // 仅在一轮末尾压缩一次，避免每发一批就 splice 整个队列而退化为平方复杂度。
+      if (this.#queueHead > 0) {
+        this.#queue = this.#queue.slice(this.#queueHead)
+        this.#queueHead = 0
+      }
     }
+  }
+
+  #queueLength(): number { return this.#queue.length - this.#queueHead }
+
+  #consume(count: number): void {
+    // 清掉已经持久化的对象引用，等待网络时不会让整个旧队列继续占着堆。
+    for (let i = 0; i < count; i++) this.#queue[this.#queueHead++] = undefined
+  }
+
+  #memoryBatch(through: number, persistOversized = false): Record<string, unknown>[] {
+    return this.#boundedBatch(through - this.#queueHead, i => toWireRecord(this.#queue[this.#queueHead + i]!), persistOversized)
+  }
+
+  #boundedBatch(available: number, recordAt: (index: number) => Record<string, unknown>, persistOversized = false): Record<string, unknown>[] {
+    const records: Record<string, unknown>[] = []
+    let bytes = Buffer.byteLength(JSON.stringify(this.#payload([])))
+    const limit = Math.max(1, Math.floor(this.#config.batch.maxRecords))
+    for (let i = 0; i < Math.min(available, limit); i++) {
+      const record = recordAt(i)
+      const size = Buffer.byteLength(JSON.stringify(record)) + (records.length > 0 ? 1 : 0)
+      if (bytes + size > MAX_REPORT_BODY_BYTES) {
+        if (records.length > 0) break
+        // 单条原子事件不能拆字段。允许先单独保存磁盘副本，但绝不发超限 HTTP。
+        // 否则新增请求上限会把原本可恢复的记录永远留在易失内存里。
+        if (persistOversized) { records.push(record); break }
+        // 不能截断计费字段或删除这条记录；保留原副本，诊断明确说明无法发送的原因。
+        throw new Error(`单条上报记录超过 ${MAX_REPORT_BODY_BYTES} 字节，保留记录等待处理`)
+      }
+      records.push(record)
+      bytes += size
+    }
+    return records
   }
 
   /** 把 outbox 里的批次逐批发出去。 */
   async #drainOutbox(): Promise<void> {
-    if (!this.#outbox) {
-      // 没开 outbox（或磁盘不可写）时退化为「直接发内存队列」：
-      // 仍然不能丢数据，只是失去了崩溃保护。
-      if (this.#queue.length === 0) return
-      const batch = this.#queue
-      this.#queue = []
-      const ok = await this.#post(batch.map(toWireRecord))
-      if (!ok) {
-        // 发失败就把记录塞回队列头部，等下一轮
-        this.#queue = [...batch, ...this.#queue]
-      }
-      return
-    }
-
-    // 一次 flush 最多发 maxRecords 条，避免网络恢复后一次冲爆服务端
-    const batches = this.#outbox.take(this.#config.batch.maxRecords)
-    for (const batch of batches) {
+    if (!this.#outbox) return
+    for (let i = 0; i < MAX_OUTBOX_BATCHES_PER_FLUSH; i++) {
+      // 按需读一批；网络断开时，不白白预读并解析后面的 49 批。
+      const batch = this.#outbox.take(1)[0]
+      if (!batch) break
       // 先标 inflight 再发：这一步之后崩溃，下次启动会捞回来重发
-      this.#outbox.markInflight(batch.file)
-      const ok = await this.#post(batch.records)
+      if (!this.#outbox.markInflight(batch.file)) continue
+      let ok = true
+      try {
+        // 老版本可能写过一个超大的文件：按新上限逐段发，全部确认才删源文件。
+        for (let offset = 0; offset < batch.records.length;) {
+          const part = this.#boundedBatch(batch.records.length - offset, n => batch.records[offset + n]!)
+          if (!await this.#post(part)) { ok = false; break }
+          offset += part.length
+        }
+      } catch (err) {
+        this.#outbox.release(batch.file)
+        throw err
+      }
       if (ok) {
         this.#outbox.ack(batch.file)
       } else {
@@ -283,34 +348,38 @@ export class Reporter {
   async #post(records: Record<string, unknown>[]): Promise<boolean> {
     if (records.length === 0) return true
 
-    const payload = {
-      schemaVersion: SCHEMA_VERSION,
-      client: {
-        name: this.#identity.clientName,
-        userId: this.#identity.claimedUserId,
-        ...(this.#identity.userName ? { userName: this.#identity.userName } : {}),
-        ...(this.#identity.dept ? { dept: this.#identity.dept } : {}),
-      },
-      generatedAt: new Date().toISOString(),
-      records,
-    }
+    const payload = this.#payload(records)
+    const body = JSON.stringify(payload)
+    if (Buffer.byteLength(body) > MAX_REPORT_BODY_BYTES) throw new Error('上报请求超过批次字节上限，保留待投递记录')
 
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), this.#config.batch.timeoutMillis)
     this.#stats.requests += 1
 
-    let res: Response
     try {
-      res = await this.#fetch(this.#config.endpoint, {
+      const res = await this.#fetch(this.#config.endpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           // 🚨 appKey 只走请求头。写进 body 会落进服务端日志与数据库。
           Authorization: `Bearer ${this.#config.appKey}`,
         },
-        body: JSON.stringify(payload),
+        body,
         signal: controller.signal,
       })
+      // ★ 超时覆盖整个响应体。只等响应头就清定时器，会让半截回执永远卡住 flush。
+      const raw = await res.text()
+      if (!res.ok) throw new Error(truncate(`HTTP ${res.status}${raw ? ` — ${raw}` : ''}`))
+      const counts = parseCounts(raw, records.length)
+      if (counts.rejected > 0) {
+        this.#stats.rejected += counts.rejected
+        throw new Error(`服务端拒收 ${counts.rejected} 条记录，保留整批等待重试`)
+      }
+      this.#stats.delivered += counts.accepted
+      this.#stats.duplicates += counts.duplicates
+      this.#stats.lastSuccessAt = Date.now()
+      this.#stats.lastError = null
+      return true
     } catch (err) {
       this.#stats.failures += 1
       this.#stats.lastError =
@@ -321,23 +390,20 @@ export class Reporter {
     } finally {
       clearTimeout(timer)
     }
+  }
 
-    if (!res.ok) {
-      const text = await res.text().catch(() => '')
-      this.#stats.failures += 1
-      this.#stats.lastError = truncate(`HTTP ${res.status}${text ? ` — ${text}` : ''}`)
-      return false
+  #payload(records: Record<string, unknown>[]) {
+    return {
+      schemaVersion: SCHEMA_VERSION,
+      client: {
+        name: this.#identity.clientName,
+        userId: this.#identity.claimedUserId,
+        ...(this.#identity.userName ? { userName: this.#identity.userName } : {}),
+        ...(this.#identity.dept ? { dept: this.#identity.dept } : {}),
+      },
+      generatedAt: new Date().toISOString(),
+      records,
     }
-
-    // 服务端如实返回三个计数时才采信；返回空体也视为成功（兼容只回 200 的实现）
-    const raw = await res.text().catch(() => '')
-    const counts = parseCounts(raw, records.length)
-    this.#stats.delivered += counts.accepted
-    this.#stats.duplicates += counts.duplicates
-    this.#stats.rejected += counts.rejected
-    this.#stats.lastSuccessAt = Date.now()
-    this.#stats.lastError = null
-    return true
   }
 
   /**
@@ -346,42 +412,45 @@ export class Reporter {
    * 官方对 telemetry 后端的建议是给外层超时（OTel 后端用 3000ms）：
    * 退出时卡在这里比丢几条数据更让人难受，所以这里同样只等一轮。
    */
-  async shutdown(): Promise<void> {
-    if (this.#closed) return
+  shutdown(): Promise<void> {
+    if (this.#shutdown) return this.#shutdown
+    if (this.#closed) return Promise.resolve()
     if (this.#timer !== null) {
       clearInterval(this.#timer)
       this.#timer = null
     }
 
-    // 最后一次尝试把内存队列落盘 —— 即使网络不通，数据也留在磁盘上等下次启动
-    if (this.#queue.length > 0 && this.#outbox) {
-      this.#outbox.write(this.#queue.map(toWireRecord))
-      this.#queue = []
-    }
-
-    await this.flush()
-    this.#closed = true
+    this.#shutdown = (async () => {
+      await this.flush()
+      // flush 开始后可能又采集到一批；停机必须等前一轮结束，再保存这批。
+      if (this.#queueLength() > 0) await this.flush()
+      this.#closed = true
+    })()
+    return this.#shutdown
   }
 
   /** 取一次运行统计快照（公开面是上面的 `stats`）。 */
-  #snapshot(): ReporterStats {
-    const outbox = this.#outbox?.stats() ?? {
+  #outboxStats(): OutboxStats {
+    return this.#outbox?.stats() ?? {
       pendingBatches: 0,
-      pendingRecords: this.#queue.length,
+      pendingRecords: this.#queueLength(),
       pendingBytes: 0,
       droppedBatches: 0,
     }
+  }
+
+  #snapshot(): ReporterStats {
     return {
       enqueued: this.#stats.enqueued,
       delivered: this.#stats.delivered,
       duplicates: this.#stats.duplicates,
       rejected: this.#stats.rejected,
-      queueLength: this.#queue.length,
+      queueLength: this.#queueLength(),
       requests: this.#stats.requests,
       failures: this.#stats.failures,
       lastSuccessAt: this.#stats.lastSuccessAt,
       lastError: this.#stats.lastError,
-      outbox,
+      outbox: this.#outboxStats(),
     }
   }
 }
@@ -389,26 +458,24 @@ export class Reporter {
 /**
  * 解析服务端的三个计数。
  *
- * ⚠️ 缺失时**回退成「全部接受」**——与 CLI 的 `deliver.ts:147` 保持同一策略。
- *   服务端只回空体的实现在契约上是允许的，此时把它判成失败会导致无限重发。
+ * ★ HTTP 2xx 只说明请求走通，计数齐全且逐条对账才算投递确认。
+ * 反向代理回 HTML 或响应中途断开时，绝不能删除唯一的 outbox 副本。
  */
 function parseCounts(raw: string, total: number): Pick<IngestResponse, 'accepted' | 'duplicates' | 'rejected'> {
-  if (!raw.trim()) return { accepted: total, duplicates: 0, rejected: 0 }
-
   let parsed: unknown
   try {
     parsed = JSON.parse(raw)
   } catch {
-    return { accepted: total, duplicates: 0, rejected: 0 }
+    throw new Error('上报响应不是有效 JSON，保留待投递记录')
   }
 
-  const obj = (parsed ?? {}) as Record<string, unknown>
-  const n = (v: unknown, fallback: number): number =>
-    typeof v === 'number' && Number.isFinite(v) ? v : fallback
-
-  return {
-    accepted: n(obj['accepted'], total),
-    duplicates: n(obj['duplicates'], 0),
-    rejected: n(obj['rejected'], 0),
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('上报响应缺少有效计数，保留待投递记录')
   }
+  const { accepted, duplicates, rejected } = parsed as Record<string, unknown>
+  const valid = (n: unknown): n is number => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0
+  if (!valid(accepted) || !valid(duplicates) || !valid(rejected) || accepted + duplicates + rejected !== total) {
+    throw new Error('上报响应计数与本批记录不符，保留待投递记录')
+  }
+  return { accepted, duplicates, rejected }
 }
