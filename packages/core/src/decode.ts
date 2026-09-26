@@ -21,10 +21,9 @@ const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
  */
 export function findFrameOffsets(buf: Buffer): number[] {
   const offsets: number[] = []
-  for (let i = 0; i + 4 <= buf.length; i++) {
-    if (buf.compare(ZSTD_MAGIC, 0, 4, i, i + 4) === 0) {
-      offsets.push(i)
-    }
+  // 搜索交给原生实现：逐字节跨 JS/Buffer 边界会把一个 50 MiB 文件拖到秒级。
+  for (let i = buf.indexOf(ZSTD_MAGIC); i !== -1; i = buf.indexOf(ZSTD_MAGIC, i + 4)) {
+    offsets.push(i)
   }
   return offsets
 }
@@ -62,6 +61,10 @@ export interface DecodeResult {
 export interface IncrementalDecodeResult extends DecodeResult {
   /** `splitFrames` 结果的长度，即该 buffer 当前包含的帧总数。 */
   frameCount: number
+  /** 可安全跳过的帧数；末尾未完成的帧不算已消费。 */
+  consumedFrameCount: number
+  /** 相对于传入 buffer 的完整帧末尾；下次从这里读取，保留未写完的尾帧。 */
+  byteOffset: number
 }
 
 /**
@@ -82,12 +85,13 @@ export function decodeFramedZstdSync(buf: Buffer): DecodeResult {
   let framesFailed = 0
 
   for (const frame of frames) {
-    if (!isCompleteZstdFrame(frame)) {
+    const completeSize = completeFrameSize(frame)
+    if (completeSize === null) {
       framesFailed++
       continue
     }
     try {
-      text += zstdDecompressSync(frame).toString('utf8')
+      text += zstdDecompressSync(frame.subarray(0, completeSize)).toString('utf8')
       framesOk++
     } catch {
       framesFailed++
@@ -109,7 +113,6 @@ function parseFrameHeaderEnd(frame: Buffer): number {
   const descriptor = frame[4]!
   const fcsFlag = descriptor >> 6 // Frame_Content_Size_flag
   const singleSegment = (descriptor >> 5) & 1
-  const hasChecksum = (descriptor >> 2) & 1
   const dictIdFlag = descriptor & 3
 
   let pos = 5
@@ -134,21 +137,36 @@ function parseFrameHeaderEnd(frame: Buffer): number {
   if (frame.length < pos + fcsSize) return -1
   pos += fcsSize
 
-  return hasChecksum ? pos + 4 : pos
+  return pos
 }
 
 /**
  * 判断一个 zstd frame 是否完整（未被截断）。
  *
- * 判据：帧头可完整解析，且之后至少还有一个字节的 block 数据。
- * 注意 frame 的末尾一定以 EndMark block 结束——如果写入被中断，
- * 帧头之后的数据会不足，或 block 数据不完整（由解压器报错兜住）。
+ * 必须读完每个 block header 声明的长度以及可选 checksum。
+ * 只验证帧头会把「帧头完整、block 写了一半」误判为完成，Bun 还可能静默解出空值。
  */
 export function isCompleteZstdFrame(frame: Buffer): boolean {
-  const headerEnd = parseFrameHeaderEnd(frame)
-  if (headerEnd < 0) return false
-  // 帧头之后必须有 block 数据（至少 3 字节的 block header）
-  return frame.length >= headerEnd + 3
+  return completeFrameSize(frame) !== null
+}
+
+/** RFC 8878 §3.1.1.2：RLE block 仅存一个字节，其余 block 按声明长度存储。 */
+function completeFrameSize(frame: Buffer): number | null {
+  let pos = parseFrameHeaderEnd(frame)
+  if (pos < 0) return null
+  while (pos + 3 <= frame.length) {
+    const header = frame.readUIntLE(pos, 3)
+    const last = (header & 1) !== 0
+    const type = (header >> 1) & 3
+    if (type === 3) return null
+    pos += 3 + (type === 1 ? 1 : header >>> 3)
+    if (pos > frame.length) return null
+    if (last) {
+      if ((frame[4]! & 4) !== 0) pos += 4
+      return pos <= frame.length ? pos : null
+    }
+  }
+  return null
 }
 
 /**
@@ -160,12 +178,13 @@ export async function decodeFramedZstd(buf: Buffer): Promise<DecodeResult> {
   const frames = splitFrames(buf)
   const results = await Promise.all(
     frames.map(async (frame) => {
-      if (!isCompleteZstdFrame(frame)) {
+      const completeSize = completeFrameSize(frame)
+      if (completeSize === null) {
         return { ok: false as const, text: '' }
       }
       try {
         const out = await new Promise<Buffer>((resolve, reject) => {
-          zstdDecompress(frame, (err, res) =>
+          zstdDecompress(frame.subarray(0, completeSize), (err, res) =>
             err ? reject(err) : resolve(res as Buffer),
           )
         })
@@ -192,7 +211,12 @@ export async function decodeFramedZstd(buf: Buffer): Promise<DecodeResult> {
 
 /** 把解压文本按行解析为 JSON 对象，跳过空行与坏行。 */
 export function* parseJsonl(text: string): Generator<Record<string, unknown>> {
-  for (const line of text.split('\n')) {
+  // 不先 split 出整份日志的行数组，长会话只保留当前行的临时字符串。
+  for (let start = 0; start < text.length;) {
+    const newline = text.indexOf('\n', start)
+    const end = newline === -1 ? text.length : newline
+    const line = text.slice(start, end)
+    start = end + 1
     const trimmed = line.trim()
     if (!trimmed) continue
     try {
@@ -212,18 +236,9 @@ export function* parseJsonl(text: string): Generator<Record<string, unknown>> {
  * 这是「每 10 分钟扫一次」不重扫历史的关键。DSH 日志 append-only 且每帧独立，
  * 所以按帧下标续读是安全的：第 0..fromFrame-1 帧的内容不会变。
  *
- * ⚠️ **残缺帧会被计入 `frameCount`，但不会被消费**。
- *
- * 这是必须的：如果只把「成功解压的帧」计入水位线，那么尾部那个正在写的半帧
- * 会让水位线停在它前面，下一轮重新解析它——看似安全，但它**下一轮就成了完整帧**，
- * 于是永远差一帧。
- *
- * 反过来若把半帧也计入并推进，则它被永久跳过、数据丢失。
- *
- * 正确做法是：**半帧计入 `frameCount`（下一轮从它之后开始），但本轮不产出记录**——
- * 也就是让它在本轮被「消费掉」。这成立的前提是半帧里不会有完整的事件行：
- * 一个 zstd 帧在 DSH 里对应一次 append，半帧意味着这次 append 还没写完，
- * 而 JSONL 行本身是完整写入的。所以被跳过的半帧不会带走任何已提交的事件。
+ * ⚠️ `frameCount` 保留全部可见帧数的诊断语义；水位线必须使用
+ * `consumedFrameCount` / `byteOffset`，不能消费尚未写完的尾帧。
+ * 下一轮从尾帧起点重试，它完成后才能贡献用量。
  *
  * @param buf - 完整文件内容。
  * @param fromFrame - 已处理过的帧数（水位线）。从这一帧开始解压。
@@ -232,32 +247,38 @@ export function decodeFramedZstdFrom(
   buf: Buffer,
   fromFrame: number,
 ): IncrementalDecodeResult {
-  const frames = splitFrames(buf)
-  const frameCount = frames.length
+  const offsets = findFrameOffsets(buf)
+  const frameCount = offsets.length
 
   // 水位线超前（文件被截断/重建）时从头发起，而不是返回空——
   // 返回空会让水位线永久卡住，文件的新内容再也读不到。
-  const start = Number.isFinite(fromFrame) && fromFrame > 0 && fromFrame <= frameCount
+  const start = Number.isSafeInteger(fromFrame) && fromFrame > 0 && fromFrame <= frameCount
     ? fromFrame
     : 0
 
   let text = ''
   let framesOk = 0
   let framesFailed = 0
+  let consumedFrameCount = start
+  let byteOffset = offsets[start] ?? (start > 0 ? buf.length : 0)
 
   for (let i = start; i < frameCount; i++) {
-    const frame = frames[i]!
-    if (!isCompleteZstdFrame(frame)) {
+    const offset = offsets[i]!
+    const frame = buf.subarray(offset, offsets[i + 1] ?? buf.length)
+    const completeSize = completeFrameSize(frame)
+    if (completeSize === null) {
       framesFailed++
       continue
     }
     try {
-      text += zstdDecompressSync(frame).toString('utf8')
+      text += zstdDecompressSync(frame.subarray(0, completeSize)).toString('utf8')
       framesOk++
+      consumedFrameCount = i + 1
+      byteOffset = offset + completeSize
     } catch {
       framesFailed++
     }
   }
 
-  return { text, framesOk, framesFailed, frameCount }
+  return { text, framesOk, framesFailed, frameCount, consumedFrameCount, byteOffset }
 }

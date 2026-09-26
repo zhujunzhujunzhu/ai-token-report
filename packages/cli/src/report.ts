@@ -91,6 +91,7 @@ function lookupFor(state: ReportState): WatermarkLookup {
   return {
     sizeOf: (p) => state.files[p]?.size,
     frameCountOf: (p) => state.files[p]?.frameCount,
+    cursorOf: (p) => state.files[p]?.cursor,
     lastSeqOf: (s) => state.lastSeqBySession[s],
     // 上一轮记住的 cwd：增量块通常不含 session 首行，靠这个保住项目归属
     cwdOf: (s) => state.cwdBySession[s],
@@ -127,11 +128,13 @@ export async function runReport(options: RunReportOptions): Promise<RunReportRes
   // 4. 先落盘再投递 —— 崩溃安全的关键顺序
   if (!options.noSave) {
     for (const f of scan.files) {
+      if (!f.changed) continue
       state.files[f.filePath] = {
         size: f.size,
         frameCount: f.frameCount,
         mtimeMs: f.mtimeMs,
         firstSeenMs: state.files[f.filePath]?.firstSeenMs ?? Date.now(),
+        ...(f.cursor ? { cursor: f.cursor } : {}),
       }
     }
     saveState(statePath, state)

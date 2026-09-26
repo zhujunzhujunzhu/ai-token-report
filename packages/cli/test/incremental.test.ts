@@ -547,3 +547,32 @@ test('runReport：不完整或非法确认计数不得清空 pending', tracked(a
     assert.equal(loadState(statePath).state.totalDelivered, 0)
   }
 }))
+
+test('runReport：完整帧字节光标跨轮次保存，半帧完成后仍可重试投递', tracked(async () => {
+  const home = makeHome(); roots.push(home)
+  const file = makeSessionFile(home, '--proj--', 'sess-1')
+  appendFrame(file, [sessionLine('sess-1', 'D:\\proj')])
+  const statePath = join(home, 'state.json')
+  const options = { sessionsRoot: join(home, 'sessions'), statePath }
+  const deliver = async (records: UsageRecord[]) => ({ accepted: records.length, duplicates: 0, rejected: 0 })
+  await runReport({ ...options, deliver })
+  const prefixSize = statSync(file).size
+  expectCursor(prefixSize)
+  const tail = zstdCompressSync(Buffer.from(usageLine(1) + '\n'))
+  appendFileSync(file, tail.subarray(0, 5))
+  const partial = await runReport({ ...options, deliver })
+  assert.equal(partial.records.length, 0)
+  expectCursor(prefixSize)
+  appendFileSync(file, tail.subarray(5))
+  await assert.rejects(runReport({ ...options, deliver: async () => { throw new Error('temporary failure') } }), /temporary failure/)
+  const state = loadState(statePath).state
+  assert.equal(state.pending[0]?.cwd, 'D:\\proj')
+  expectCursor(statSync(file).size)
+  const retried = await runReport({ ...options, deliver })
+  assert.equal(retried.scan.bytesRead, 0, '重试投递只用 pending，无需重读已完整暂存的帧')
+  assert.equal(retried.pendingRemaining, 0)
+
+  function expectCursor(offset: number): void {
+    assert.equal(loadState(statePath).state.files[file]?.cursor?.byteOffset, offset)
+  }
+}))

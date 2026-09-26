@@ -29,8 +29,8 @@
 
 import type { Database } from './driver.js'
 
-import { scanIncremental, type ScanOptions } from '../scanner.js'
-import type { ScanDiagnostics, UsageRecord } from '../types.js'
+import { scanIncremental, sessionFilesFromPaths, type ScanOptions, type FileCursor, type WatermarkLookup } from '../scanner.js'
+import type { ScanDiagnostics, SessionMeta, UsageRecord } from '../types.js'
 import type { WireTokenRecord } from '@ai-token-report/shared'
 import { portalDialect, type PortalStore } from './portal-db.js'
 import { openDb, ensureSchema, needsRebuild, rebuildSchema, EVENT_TABLE } from './schema.js'
@@ -51,6 +51,8 @@ export interface IngestResult {
   elapsedMs: number
   /** ingest 完成时刻。 */
   ingestedAt: number
+  /** 本轮真正读取的压缩字节数，热态应为 0。 */
+  bytesRead: number
 }
 
 export interface IngestOptions {
@@ -62,6 +64,8 @@ export interface IngestOptions {
   onProgress?: ScanOptions['onProgress']
   /** 已打开的库连接。传入时复用，不关闭。 */
   db?: Database
+  /** 文件监听器报告的具体日志路径；缺省完整扫描，空数组不扫描。 */
+  changedFiles?: string[]
 }
 
 /**
@@ -85,12 +89,23 @@ export async function ingest(options: IngestOptions): Promise<IngestResult> {
   const db = options.db ?? openDatabaseForIngest(options.dbPath)
 
   try {
-    const watermarks = readWatermarks(db)
+    ensureLocalCursorSchema(db)
+    const scopedFiles = options.changedFiles === undefined
+      ? undefined : sessionFilesFromPaths(options.sessionsRoot, options.changedFiles)
+    const watermarks = readWatermarks(db, scopedFiles)
 
     const scan = await scanIncremental(options.sessionsRoot, {
       watermarks,
+      ...(options.changedFiles !== undefined ? { changedFiles: options.changedFiles } : {}),
       ...(options.onProgress ? { onProgress: options.onProgress } : {}),
     })
+
+    // 完全未变化时不产生任何写事务，也不改诊断时间戳。
+    // 读取本地快照不应导致跨进程缓存误判为「又有了新数据」。
+    if (scan.records.length === 0 && !scan.files.some((f) => f.changed) && scan.diagnostics.filesFailed === 0) {
+      return { inserted: 0, duplicates: 0, filesScanned: 0, skippedUnchanged: scan.skippedUnchanged,
+        diagnostics: scan.diagnostics, elapsedMs: Date.now() - started, ingestedAt: Date.now(), bytesRead: scan.bytesRead }
+    }
 
     // ── 单事务：写数据 + 推水位线 + 更新诊断 ──────────────────────────
     const insert = db.prepare(
@@ -112,6 +127,15 @@ export async function ingest(options: IngestOptions): Promise<IngestResult> {
          mtime_ms = excluded.mtime_ms,
          updated_at_ms = excluded.updated_at_ms`,
     )
+    const upsertCursor = db.prepare(
+      `INSERT INTO local_file_cursor
+       (file_path, byte_offset, frame_count, observed_size, file_identity, cwd, watermark_updated_at_ms)
+       VALUES ($path, $offset, $frames, $size, $identity, $cwd, $now)
+       ON CONFLICT(file_path) DO UPDATE SET
+         byte_offset = excluded.byte_offset, frame_count = excluded.frame_count,
+         observed_size = excluded.observed_size, file_identity = excluded.file_identity,
+         cwd = excluded.cwd, watermark_updated_at_ms = excluded.watermark_updated_at_ms`,
+    )
     // cwd 只在非空时覆盖 —— 增量块常没有 session 首行，
     // 用 null 冲掉已知值会让「按项目统计」在增量路径上退化成 (unknown)。
     const upsertSession = db.prepare(
@@ -130,10 +154,15 @@ export async function ingest(options: IngestOptions): Promise<IngestResult> {
     const lastSeqBySession = new Map<string, number>()
     // 每会话本轮解析出的 cwd（非空才记）
     const cwdBySession = new Map<string, string>()
-    // 一次性取回，避免在循环里对每个文件各查一次库（196 次往返）
-    const firstSeenMap = readFirstSeenMap(db)
+    for (const file of scan.files) {
+      if (!file.changed || file.cursor?.cwd == null) continue
+      cwdBySession.set(file.sessionId, file.cursor.cwd)
+      // 只有 session 首行、还没有 usage 的会话也要保存 cwd：后续新增分段文件
+      // 的定向扫描不会重读首文件。-1 保证首条合法 seq=0 仍可通过 L3。
+      lastSeqBySession.set(file.sessionId, watermarks.lastSeqOf(file.sessionId) ?? -1)
+    }
 
-    db.transaction(() => {
+    const commit = () => db.transaction(() => {
       for (const rec of scan.records) {
         // bun:sqlite 的 run() 返回 { changes, lastInsertRowid }，
         // changes=0 即被主键冲突忽略 —— 这是去重的唯一判据。
@@ -173,15 +202,21 @@ export async function ingest(options: IngestOptions): Promise<IngestResult> {
       }
 
       for (const f of scan.files) {
+        if (!f.changed) continue
         upsertFile.run({
           $path: f.filePath,
           $sessionId: f.sessionId,
           $size: f.size,
           $frameCount: f.frameCount,
           $mtime: f.mtimeMs,
-          $firstSeen: firstSeenMap.get(f.filePath) ?? now,
+          // 冲突更新本就不覆盖 first_seen_ms，无需为它再全量读一次文件表。
+          $firstSeen: now,
           $now: now,
         })
+        if (f.cursor) {
+          upsertCursor.run({ $path: f.filePath, $offset: f.cursor.byteOffset, $frames: f.cursor.frameCount,
+            $size: f.cursor.observedSize, $identity: f.cursor.fileIdentity, $cwd: f.cursor.cwd ?? null, $now: now })
+        }
       }
 
       writeRunStats(db, {
@@ -191,15 +226,15 @@ export async function ingest(options: IngestOptions): Promise<IngestResult> {
       })
     })
 
-    // ⚠️ 必须 finalize 全部 prepared statement。
-    //   bun:sqlite 里未 finalize 的语句会让 `db.close()` **不释放文件句柄**，
-    //   之后 `rmSync` 这个库文件会抛 `EBUSY: resource busy or locked`
-    //   （实测 Windows 与 Linux 都如此）。表现是 `--reset-db` 永远失败，
-    //   而错误信息完全不提 prepared statement，极难定位。
-    //   放在这里而不是 finally：成功路径才需要 —— 抛错时连接会整体关闭。
-    insert.finalize()
-    upsertFile.finalize()
-    upsertSession.finalize()
+    try {
+      commit()
+    } finally {
+      // 事务失败同样必须释放语句：调用方可能持有连接继续重试，不能遗留写句柄。
+      insert.finalize()
+      upsertFile.finalize()
+      upsertSession.finalize()
+      upsertCursor.finalize()
+    }
 
     return {
       inserted,
@@ -209,6 +244,7 @@ export async function ingest(options: IngestOptions): Promise<IngestResult> {
       diagnostics: scan.diagnostics,
       elapsedMs: Date.now() - started,
       ingestedAt: now,
+      bytesRead: scan.bytesRead,
     }
   } finally {
     // 只关闭自己打开的连接；外部传入的由调用方管理
@@ -329,21 +365,19 @@ export function countEvents(db: Database): number {
 }
 
 /**
- * 读取全部文件水位线的 firstSeenMs（保留首次见到的时间）。
- *
- * 一次性取回而不是在循环里逐文件查询：196 次往返会明显拖慢热路径，
- * 而且每次 `prepare()` 都会产生一个需要 finalize 的语句句柄。
+ * 只在本地 ingest 建附属光标表，不更改共享 schema / user_version。
+ * 上报库从不调用本函数；旧客户端也可继续读取原来的 file_watermark。
  */
-function readFirstSeenMap(db: Database): Map<string, number> {
-  const map = new Map<string, number>()
-  for (const row of db
-    .query<{ file_path: string; first_seen_ms: number }, []>(
-      'SELECT file_path, first_seen_ms FROM file_watermark',
-    )
-    .all()) {
-    map.set(row.file_path, row.first_seen_ms)
-  }
-  return map
+function ensureLocalCursorSchema(db: Database): void {
+  db.exec(`CREATE TABLE IF NOT EXISTS local_file_cursor (
+    file_path TEXT PRIMARY KEY,
+    byte_offset INTEGER NOT NULL,
+    frame_count INTEGER NOT NULL,
+    observed_size INTEGER NOT NULL,
+    file_identity TEXT NOT NULL,
+    cwd TEXT,
+    watermark_updated_at_ms INTEGER NOT NULL
+  )`)
 }
 
 /**
@@ -425,28 +459,40 @@ function writeRunStats(
  * 全部一次查询取回后放内存 Map —— 避免在扫描循环里对每个文件各查一次库
  * （196 次往返会明显拖慢热路径）。
  */
-export function readWatermarks(db: Database): {
-  sizeOf(filePath: string): number | undefined
-  frameCountOf(filePath: string): number | undefined
-  lastSeqOf(sessionId: string): number | undefined
-  cwdOf(sessionId: string): string | null | undefined
-} {
+export function readWatermarks(db: Database, scope?: readonly SessionMeta[]): Required<WatermarkLookup> {
   const files = new Map<string, { size: number; frameCount: number }>()
-  for (const row of db
-    .query<{ file_path: string; size: number; frame_count: number }, []>(
-      'SELECT file_path, size, frame_count FROM file_watermark',
-    )
-    .all()) {
-    files.set(row.file_path, { size: row.size, frameCount: row.frame_count })
+  const cursors = new Map<string, FileCursor>()
+  const hasCursors = db.query<{ name: string }, []>(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'local_file_cursor'",
+  ).get() != null
+  // 光标与原水位线绑定：旧 CLI 推进了 file_watermark 后，旧光标不能继续使用。
+  const filesSql = hasCursors
+    ? `SELECT f.file_path, f.size, f.frame_count, c.byte_offset, c.file_identity, c.cwd
+       FROM file_watermark f LEFT JOIN local_file_cursor c
+       ON c.file_path = f.file_path AND c.observed_size = f.size
+       AND c.frame_count = f.frame_count AND c.watermark_updated_at_ms = f.updated_at_ms`
+    : 'SELECT f.file_path, f.size, f.frame_count, NULL AS byte_offset, NULL AS file_identity, NULL AS cwd FROM file_watermark f'
+  for (const paths of watermarkBatches(scope?.map((f) => f.filePath))) {
+    const sql = paths ? `${filesSql} WHERE f.file_path IN (${paths.map(() => '?').join(',')})` : filesSql
+    for (const row of db
+      .query<{ file_path: string; size: number; frame_count: number;
+        byte_offset: number | null; file_identity: string | null; cwd: string | null }>(sql)
+      .all(paths)) {
+      files.set(row.file_path, { size: row.size, frameCount: row.frame_count })
+      if (row.byte_offset !== null && row.file_identity !== null) {
+        cursors.set(row.file_path, { byteOffset: row.byte_offset, frameCount: row.frame_count,
+          observedSize: row.size, fileIdentity: row.file_identity, cwd: row.cwd })
+      }
+    }
   }
 
   const sessions = new Map<string, { lastSeq: number; cwd: string | null }>()
-  for (const row of db
-    .query<{ session_id: string; last_seq: number; cwd: string | null }, []>(
-      'SELECT session_id, last_seq, cwd FROM session_state',
-    )
-    .all()) {
-    sessions.set(row.session_id, { lastSeq: row.last_seq, cwd: row.cwd })
+  for (const ids of watermarkBatches(scope?.map((f) => f.sessionId))) {
+    const sql = 'SELECT session_id, last_seq, cwd FROM session_state' +
+      (ids ? ` WHERE session_id IN (${ids.map(() => '?').join(',')})` : '')
+    for (const row of db.query<{ session_id: string; last_seq: number; cwd: string | null }>(sql).all(ids)) {
+      sessions.set(row.session_id, { lastSeq: row.last_seq, cwd: row.cwd })
+    }
   }
 
   return {
@@ -454,6 +500,7 @@ export function readWatermarks(db: Database): {
     frameCountOf: (p) => files.get(p)?.frameCount,
     lastSeqOf: (s) => sessions.get(s)?.lastSeq,
     cwdOf: (s) => sessions.get(s)?.cwd,
+    cursorOf: (p) => cursors.get(p),
   }
 }
 
@@ -619,4 +666,13 @@ export async function insertAttributedRecords(
   })
 
   return { inserted, duplicates }
+}
+
+/** 具体变更通常只有一两个文件；批量导入也不能超过 SQLite 的参数数量上限。 */
+function watermarkBatches(values: string[] | undefined): (string[] | undefined)[] {
+  if (values === undefined) return [undefined]
+  const unique = [...new Set(values)]
+  const batches: string[][] = []
+  for (let i = 0; i < unique.length; i += 200) batches.push(unique.slice(i, i + 200))
+  return batches
 }

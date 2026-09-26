@@ -31,6 +31,7 @@ import { dirname, join } from 'node:path'
 
 import { resolveDshHome } from './home.js'
 import type { UsageRecord } from './types.js'
+import type { FileCursor } from './scanner.js'
 
 /** 单个日志文件的增量水位线。 */
 export interface FileWatermark {
@@ -42,6 +43,8 @@ export interface FileWatermark {
   mtimeMs: number
   /** 首次见到该文件的时间。 */
   firstSeenMs: number
+  /** 可选的续读加速元数据；旧状态缺失时重建，不改变 pending / seq 的 v1 语义。 */
+  cursor?: FileCursor
 }
 
 /** 上报状态文件的当前版本。结构变动时递增，触发 `--reset` 重建。 */

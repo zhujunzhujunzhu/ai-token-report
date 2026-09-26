@@ -3,8 +3,9 @@
  * 解码并把 `assistant/message` 事件折叠为计费记录。
  */
 
-import { readFile, readdir, stat } from 'node:fs/promises'
-import { join } from 'node:path'
+import { open, readFile, readdir, stat } from 'node:fs/promises'
+import type { Dirent, Stats } from 'node:fs'
+import { isAbsolute, join, relative, resolve } from 'node:path'
 
 import { decodeFramedZstd, decodeFramedZstdFrom, parseJsonl } from './decode.js'
 import {
@@ -39,32 +40,34 @@ export interface ScanOptions {
 export async function listSessionFiles(sessionsRoot: string): Promise<SessionMeta[]> {
   const out: SessionMeta[] = []
 
-  let projects: string[]
+  let projects: Dirent[]
   try {
-    projects = await readdir(sessionsRoot)
+    projects = await readdir(sessionsRoot, { withFileTypes: true })
   } catch {
     return out
   }
 
-  for (const projectDir of projects) {
+  for (const project of projects) {
+    const projectDir = project.name
     const projPath = join(sessionsRoot, projectDir)
     try {
-      if (!(await stat(projPath)).isDirectory()) continue
+      if (!project.isDirectory() && !(project.isSymbolicLink() && (await stat(projPath)).isDirectory())) continue
     } catch {
       continue
     }
 
-    let sessionIds: string[]
+    let sessionIds: Dirent[]
     try {
-      sessionIds = await readdir(projPath)
+      sessionIds = await readdir(projPath, { withFileTypes: true })
     } catch {
       continue
     }
 
-    for (const sessionId of sessionIds) {
+    for (const session of sessionIds) {
+      const sessionId = session.name
       const sessPath = join(projPath, sessionId)
       try {
-        if (!(await stat(sessPath)).isDirectory()) continue
+        if (!session.isDirectory() && !(session.isSymbolicLink() && (await stat(sessPath)).isDirectory())) continue
       } catch {
         continue
       }
@@ -91,6 +94,25 @@ export async function listSessionFiles(sessionsRoot: string): Promise<SessionMet
   }
 
   return out
+}
+
+/** 文件监听器已知具体变更路径时不再遍历历史目录；目录变更由调用方触发完整扫描。 */
+export function sessionFilesFromPaths(sessionsRoot: string, paths: readonly string[]): SessionMeta[] {
+  const root = resolve(sessionsRoot)
+  const files = new Map<string, SessionMeta>()
+  for (const path of paths) {
+    if (!isAbsolute(path)) throw new Error(`变更日志路径必须是绝对路径：${path}`)
+    const filePath = resolve(path)
+    const rel = relative(root, filePath)
+    const parts = rel.split(/[\\/]/)
+    const [projectDir, sessionId, entry] = parts
+    if (isAbsolute(rel) || parts.length !== 3 || parts.some((part) => part === '..' || part === '') ||
+      !entry?.startsWith('session') || !entry.endsWith('.jsonl.zstd')) {
+      throw new Error(`变更日志路径不属于会话目录结构：${path}`)
+    }
+    files.set(filePath, { sessionId: sessionId!, projectDir: projectDir!, filePath, cwd: null, createdAt: null })
+  }
+  return [...files.values()]
 }
 
 function matchAny(value: string, patterns: string[] | undefined): boolean {
@@ -315,6 +337,20 @@ export interface IncrementalFileResult {
   mtimeMs: number
   /** 本轮新增的记录数（去重后）。 */
   produced: number
+  /** 未变化的文件只参与诊断，不必重新写入水位线。 */
+  changed: boolean
+  /** 可选性能元数据；旧版调用方缺少它时仍能按帧数续扫。 */
+  cursor?: FileCursor
+}
+
+/** 帧数用于兼容旧调用方，字节光标使追加一帧的成本不再取决于历史文件长度。 */
+export interface FileCursor {
+  byteOffset: number
+  frameCount: number
+  observedSize: number
+  fileIdentity: string
+  /** 首帧可能只有 session 元信息，尚无计费记录时也必须保住项目归属。 */
+  cwd?: string | null
 }
 
 export interface IncrementalScanResult {
@@ -325,6 +361,8 @@ export interface IncrementalScanResult {
   skippedUnchanged: number
   /** 被 L3 事件级水位线过滤掉的记录数（正常应为 0，非 0 说明帧边界有偏差）。 */
   filteredBySeq: number
+  /** 实际读取的压缩字节数，用来区分全文件重扫与真正的尾部续读。 */
+  bytesRead: number
 }
 
 /** 上一轮的水位线查表接口——避免 scanner 直接依赖 state 模块。 */
@@ -337,11 +375,49 @@ export interface WatermarkLookup {
   lastSeqOf(sessionId: string): number | undefined
   /** 上一轮该 session 解析出的 cwd（增量块缺 `session` 行时继承）。 */
   cwdOf?(sessionId: string): string | null | undefined
+  /** 已消费完整帧的字节位置。没有它的旧水位线仍可使用。 */
+  cursorOf?(filePath: string): FileCursor | undefined
 }
 
 export interface IncrementalScanOptions {
   watermarks: WatermarkLookup
   onProgress?: (done: number, total: number, file: string) => void
+  /** 仅扫描监听器报告的具体日志路径；undefined 完整对账，空数组不扫描。 */
+  changedFiles?: string[]
+}
+
+function fileIdentity(st: Stats): string {
+  // mtime 仍只作诊断；inode 与创建时刻用来识别同一路径被原子替换的情况。
+  return `${st.dev}:${st.ino}:${st.birthtimeMs}`
+}
+
+function validCursor(cursor: FileCursor | undefined, size: number | undefined, frames: number): cursor is FileCursor {
+  return cursor != null && typeof cursor === 'object' && Number.isSafeInteger(cursor.byteOffset) && cursor.byteOffset >= 0 &&
+    Number.isSafeInteger(cursor.frameCount) && cursor.frameCount >= 0 && Number.isSafeInteger(cursor.observedSize) &&
+    cursor.observedSize === size && cursor.byteOffset <= cursor.observedSize &&
+    cursor.frameCount === frames && typeof cursor.fileIdentity === 'string'
+}
+
+/** 读取 stat 时已存在的尾部，避免追加中的文件让本轮水位线越过实际读到的内容。 */
+async function readTail(path: string, previous: FileCursor | undefined) {
+  const handle = await open(path, 'r')
+  try {
+    const st = await handle.stat()
+    const identity = fileIdentity(st)
+    const resume = previous !== undefined && previous.fileIdentity === identity && st.size >= previous.observedSize
+    const offset = resume ? previous.byteOffset : 0
+    const buf = Buffer.allocUnsafe(st.size - offset)
+    let bytesRead = 0
+    while (bytesRead < buf.length) {
+      const read = await handle.read(buf, bytesRead, buf.length - bytesRead, offset + bytesRead)
+      if (read.bytesRead === 0) break
+      bytesRead += read.bytesRead
+    }
+    return { buf: buf.subarray(0, bytesRead), offset, baseFrames: resume ? previous.frameCount : 0,
+      size: offset + bytesRead, mtimeMs: st.mtimeMs, identity }
+  } finally {
+    await handle.close()
+  }
 }
 
 /**
@@ -351,7 +427,7 @@ export interface IncrementalScanOptions {
  *
  * 1. **L1 文件大小**：`size === watermark.size` ⇒ 整个文件跳过（一次 stat，零解压）。
  *    依据是日志 append-only，字节数不变则内容不变。
- * 2. **L2 帧边界**：只解压 `frameCount` 之后的帧。
+ * 2. **L2 帧边界**：有字节光标时只读取完整帧末尾之后的内容；旧水位线按帧数兼容。
  * 3. **L3 事件 seq**：`seq > lastSeqBySession[sessionId]` 兜底。
  *
  * **文件被截断/重建**（size 变小）时回退到全量读该文件，而不是信任旧水位线——
@@ -363,11 +439,14 @@ export async function scanIncremental(
   options: IncrementalScanOptions,
 ): Promise<IncrementalScanResult> {
   const diagnostics = emptyDiagnostics()
-  const files = await listSessionFiles(sessionsRoot)
+  const files = options.changedFiles === undefined
+    ? await listSessionFiles(sessionsRoot)
+    : sessionFilesFromPaths(sessionsRoot, options.changedFiles)
   const records: UsageRecord[] = []
   const fileResults: IncrementalFileResult[] = []
   let skippedUnchanged = 0
   let filteredBySeq = 0
+  let bytesRead = 0
   let done = 0
 
   // 每个 sessionId 的 cwd 缓存：增量块大多不含 `session` 首行，
@@ -377,10 +456,12 @@ export async function scanIncremental(
   for (const meta of files) {
     let size: number
     let mtimeMs: number
+    let identity: string
     try {
       const st = await stat(meta.filePath)
       size = st.size
       mtimeMs = st.mtimeMs
+      identity = fileIdentity(st)
     } catch {
       diagnostics.filesFailed++
       done++
@@ -390,10 +471,14 @@ export async function scanIncremental(
 
     const prevSize = options.watermarks.sizeOf(meta.filePath)
     const prevFrames = options.watermarks.frameCountOf(meta.filePath) ?? 0
+    const previousCursor = options.watermarks.cursorOf?.(meta.filePath)
+    const cursor = validCursor(previousCursor, prevSize, prevFrames) ? previousCursor : undefined
 
     // L1：字节数未变 ⇒ 内容未变 ⇒ 零解压跳过
-    if (prevSize !== undefined && prevSize === size) {
+    if (prevSize !== undefined && prevSize === size &&
+      (previousCursor === undefined || cursor?.fileIdentity === identity)) {
       skippedUnchanged++
+      if (cursor?.cwd != null) cwdBySession.set(meta.sessionId, cursor.cwd)
       fileResults.push({
         filePath: meta.filePath,
         sessionId: meta.sessionId,
@@ -402,15 +487,17 @@ export async function scanIncremental(
         frameCount: prevFrames,
         mtimeMs,
         produced: 0,
+        changed: false,
+        ...(cursor ? { cursor } : {}),
       })
       done++
       options.onProgress?.(done, files.length, meta.filePath)
       continue
     }
 
-    let buf: Buffer
+    let tail: Awaited<ReturnType<typeof readTail>>
     try {
-      buf = await readFile(meta.filePath)
+      tail = await readTail(meta.filePath, cursor)
     } catch {
       diagnostics.filesFailed++
       done++
@@ -419,18 +506,22 @@ export async function scanIncremental(
     }
 
     diagnostics.filesScanned++
+    bytesRead += tail.buf.length
 
     // 文件被截断/重建 ⇒ 旧帧水位线失效，从头读
-    const truncated = prevSize !== undefined && size < prevSize
-    const fromFrame = truncated ? 0 : prevFrames
+    const reset = prevSize !== undefined && (tail.size < prevSize ||
+      (previousCursor !== undefined && (cursor === undefined || cursor.fileIdentity !== tail.identity)))
+    // 旧版光标把尾部半帧也计入帧数，首次升级多重读最后一帧，L3 会去掉已消费事件。
+    const fromFrame = tail.offset > 0 || reset || cursor !== undefined ? 0 : Math.max(0, prevFrames - 1)
 
-    const decoded = decodeFramedZstdFrom(buf, fromFrame)
+    const decoded = decodeFramedZstdFrom(tail.buf, fromFrame)
     diagnostics.framesOk += decoded.framesOk
     diagnostics.framesFailed += decoded.framesFailed
 
     const parseState: ParseState = {
       cwd:
         cwdBySession.get(meta.sessionId) ??
+        cursor?.cwd ??
         options.watermarks.cwdOf?.(meta.sessionId) ??
         null,
     }
@@ -444,32 +535,40 @@ export async function scanIncremental(
     let kept = 0
     const lastSeq = options.watermarks.lastSeqOf(meta.sessionId)
     if (records.length > before) {
-      const fresh: UsageRecord[] = []
+      let next = before
       for (let i = before; i < records.length; i++) {
         const rec = records[i]!
         if (lastSeq !== undefined && rec.seq <= lastSeq) {
           filteredBySeq++
           continue
         }
-        fresh.push(rec)
+        records[next++] = rec
       }
-      records.length = before
-      records.push(...fresh)
-      kept = fresh.length
+      // 原地压紧，避免单个长会话的十几万条记录触发 spread 参数数量上限。
+      records.length = next
+      kept = next - before
     }
 
     fileResults.push({
       filePath: meta.filePath,
       sessionId: meta.sessionId,
-      size,
-      frameCount: decoded.frameCount,
-      mtimeMs,
+      size: tail.size,
+      frameCount: tail.baseFrames + decoded.consumedFrameCount,
+      mtimeMs: tail.mtimeMs,
       produced: kept,
+      changed: true,
+      cursor: {
+        byteOffset: tail.offset + decoded.byteOffset,
+        frameCount: tail.baseFrames + decoded.consumedFrameCount,
+        observedSize: tail.size,
+        fileIdentity: tail.identity,
+        cwd: parseState.cwd,
+      },
     })
 
     done++
     options.onProgress?.(done, files.length, meta.filePath)
   }
 
-  return { records, files: fileResults, diagnostics, skippedUnchanged, filteredBySeq }
+  return { records, files: fileResults, diagnostics, skippedUnchanged, filteredBySeq, bytesRead }
 }
