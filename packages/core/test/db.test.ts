@@ -188,6 +188,22 @@ async function comparePaths(
 
 // ── schema ───────────────────────────────────────────────────────────────
 
+test('重复帧与跨文件重放：直扫和 SQLite 都按 event_id 首次出现计数', async () => {
+  const first = usageLine(1, { provider: 'first', input: 12, output: 3, cacheRead: 45, cacheWrite: 6 })
+  const file = makeSession('project', 'session-replay', [sessionLine('session-replay', '/project'), first])
+  appendFrame(file, [first, usageLine(2)])
+  writeFileSync(join(sessionsRoot, 'project', 'session-replay', 'session.v4.jsonl.zstd'),
+    zstdCompressSync(Buffer.from([sessionLine('session-replay', '/project'), usageLine(1, { provider: 'later', input: 999 }), usageLine(2)].join('\n') + '\n')))
+  for (const providers of [undefined, ['first'], ['later']]) {
+    const { sql, scan } = await comparePaths(providers ? { providers } : {})
+    try {
+      assertSameTotals(sql.totals(), scan.totals(), '重放去重')
+      expect(scan.totals().calls).toBe(providers?.[0] === 'later' ? 0 : providers ? 1 : 2)
+      expect(scan.records().map((r) => r.eventId).sort()).toEqual(sql.records().map((r) => r.eventId).sort())
+    } finally { sql.close(); scan.close() }
+  }
+})
+
 describe('db schema', () => {
   test('建表后 user_version 正确，且四个 token 是独立列', () => {
     const db = openDatabaseForIngest(dbPath)

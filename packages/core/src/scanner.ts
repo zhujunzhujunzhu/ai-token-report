@@ -275,6 +275,7 @@ export async function scanAll(
   const files = await listSessionFiles(sessionsRoot)
   const sessions: SessionMeta[] = []
   const records: UsageRecord[] = []
+  const seenEvents = new Set<string>()
 
   let done = 0
   for (const meta of files) {
@@ -282,6 +283,10 @@ export async function scanAll(
     sessions.push(result.meta)
 
     for (const rec of result.records) {
+      // 与 SQLite 的 event_id 主键一致：重放帧/日志副本只认首次出现。
+      // 必须先去重再筛选，否则后来的重复事件会在筛选时冒充首次记录。
+      if (seenEvents.has(rec.eventId)) continue
+      seenEvents.add(rec.eventId)
       if (!matchAny(rec.provider, options.providers)) continue
       if (!matchAny(rec.model, options.models)) continue
       if (options.sinceMs !== undefined && rec.time < options.sinceMs) continue
