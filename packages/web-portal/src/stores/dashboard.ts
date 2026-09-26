@@ -18,7 +18,7 @@ import {
   fetchSeries,
   type PortalFilter,
 } from '../api/portal.js'
-import { bucketFor, CUSTOM_PERIOD } from '../types/portal.js'
+import { bucketFor, CUSTOM_PERIOD, identityLabel, userLabel } from '../types/portal.js'
 import { useSessionStore } from './session.js'
 
 export type StatsSection = 'overview' | 'analysis' | 'records' | 'diagnostics'
@@ -32,6 +32,7 @@ export interface DashboardFilters {
 }
 export interface UserDetail {
   userId: string
+  label?: string
   overview: OverviewResponse | null
   series: SeriesResponse | null
   models: BreakdownRow[]
@@ -243,7 +244,9 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     if (!session.signedIn || built.error) return
     const seq = ++detailSeq
     const generation = session.generation
-    detail.value = { userId, overview: null, series: null, models: [] }
+    const candidate = userOptions.value.find((row) => row.key === userId)
+    const label = candidate ? identityLabel(candidate) : userLabel(userId)
+    detail.value = { userId, label, overview: null, series: null, models: [] }
     detailLoading.value = true
     detailError.value = null
     const filter = { ...built.filter, users: [userId] }
@@ -264,6 +267,7 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     if (ov.ok && se.ok && bd.ok)
       detail.value = {
         userId,
+        label,
         overview: ov.data,
         series: se.data,
         models: bd.data.rows,

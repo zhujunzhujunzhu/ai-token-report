@@ -21,9 +21,9 @@ defineProps<{
   <template v-if="diagnostics">
     <div class="diagnostic-cards">
       <el-card shadow="never"
-        ><span>已署名人数</span
+        ><span>归属分组数</span
         ><strong
-          >{{ formatCount(diagnostics.distinctUsers) }}<small>人</small></strong
+          >{{ formatCount(diagnostics.distinctUsers) }}<small>组</small></strong
         ></el-card
       >
       <el-card shadow="never"
@@ -46,6 +46,9 @@ defineProps<{
         }}</strong></el-card
       >
     </div>
+    <p class="muted">
+      人员与尚未关联成员的历史身份分别计数，归属分组数不等同实际成员人数。未归属记录不计入分组数。
+    </p>
     <el-alert
       :type="diagnostics.unattributedEvents ? 'warning' : 'info'"
       :title="

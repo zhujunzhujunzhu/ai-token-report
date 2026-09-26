@@ -407,20 +407,28 @@ describe('登录账号持久化与迁移', () => {
     expect(!result.ok && result.status).toBe(503)
     expect(store.verify('legacy').ok).toBe(true)
   })
-  test('环境变量冷启动账号接入同一凭证表且不落盘', async () => {
+  test('环境变量只初始化数据库一次，重启不覆盖且不读写旧凭证文件', async () => {
     const f = fixture()
+    const original = readFileSync(f.path, 'utf8')
+    const dbPath = join(f.dir, 'modern-portal.sqlite')
     const bundle = await createHandlerFor({
       dshHome: f.dir,
-      credentialsPath: f.path,
+      dbPath,
+      mysqlUrl: '',
       adminToken: 'env-token',
       adminName: '部署管理员',
       adminUsername: 'bootstrap',
       adminPassword: password,
       requestLog: false,
     })
-    const env = bundle.credentials.findByUsername('bootstrap')!
-    expect(env.role).toBe('admin')
-    expect(await verifyPassword(password, env.passwordHash)).toBe(true)
-    expect(readFileSync(f.path, 'utf8')).not.toContain('bootstrap')
+    const identity = await bundle.identityStore!.resolveBearer('env-token')
+    expect(identity?.roleCodes).toContain('admin')
+    expect((await bundle.identityStore!.getViewer(identity!)).username).toBe('bootstrap')
+    expect(bundle.credentials.size).toBe(0)
+    const restarted = await createHandlerFor({ dshHome: f.dir, dbPath, mysqlUrl: '', adminToken: 'changed-env-token', adminName: '被忽略', adminUsername: 'changed', adminPassword: password, requestLog: false })
+    expect((await restarted.identityStore!.resolveBearer('env-token'))?.memberId).toBe(identity!.memberId)
+    expect(await restarted.identityStore!.resolveBearer('changed-env-token')).toBeNull()
+    expect(readFileSync(f.path, 'utf8')).toBe(original)
+    await expect(createHandlerFor({ dshHome: f.dir, dbPath, mysqlUrl: '', credentialsPath: f.path, requestLog: false })).rejects.toThrow('显式数据库迁移')
   })
 })

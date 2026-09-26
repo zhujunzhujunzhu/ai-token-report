@@ -73,7 +73,7 @@ try {
     '普通成员直接访问管理页回总览',
     router.currentRoute.value.name === 'overview',
   )
-  session.identity = { name: '测试管理员', username: 'admin', role: 'admin' }
+  session.identity = { member_id: '00000000-0000-4000-8000-000000000001', name: '测试管理员', username: 'admin', role: 'admin', permissions: ['members:read', 'members:manage', 'departments:read', 'departments:manage', 'roles:read'] }
   await router.push('/members')
   check('管理员可进入人员管理', router.currentRoute.value.name === 'members')
 
@@ -93,11 +93,12 @@ try {
   }
   dashboard.series = { bucket: 'day', points: [] }
   dashboard.diagnostics = {
-    totalEvents: 3,
+    totalEvents: 5,
     unattributedEvents: 1,
-    unattributedRate: 0.333,
+    unattributedRate: 0.2,
     identityViolations: 0,
-    distinctUsers: 1,
+    // 两个人员组、两个历史身份组，另有一条未归属；接口不提供实际成员人数。
+    distinctUsers: 4,
     earliestTs: null,
     latestTs: null,
     lastIngestAt: null,
@@ -165,6 +166,8 @@ try {
     recordsHtml.includes('用量明细') && recordsHtml.includes('20'),
   )
   const diagnosticsHtml = await render('/src/views/DiagnosticsView.vue')
+  check('诊断将人员与历史身份合计展示为4组', diagnosticsHtml.includes('归属分组数') && /4\s*<small>组<\/small>/.test(diagnosticsHtml))
+  check('诊断明确分组不等于实际人数且排除未归属', diagnosticsHtml.includes('不等同实际成员人数') && diagnosticsHtml.includes('未归属记录不计入分组数') && !diagnosticsHtml.includes('已署名人数'))
   for (const label of [
     '未署名事件',
     '数据时间边界',
@@ -189,8 +192,7 @@ try {
   )
 
   const members = useMembersStore(pinia)
-  members.writable = true
-  members.credentialsPath = 'verify/credentials.json'
+  members.storage = { kind: 'mysql', schema_version: 4, available: true, initialized: true }
   const adminHtml = await render('/src/views/AdminView.vue')
   check(
     '管理页独立入口与名单',
@@ -200,6 +202,8 @@ try {
     '管理页提供搜索与角色筛选',
     adminHtml.includes('搜索成员') && adminHtml.includes('筛选角色'),
   )
+  check('管理页连接数据库身份模型', adminHtml.includes('MySQL') && adminHtml.includes('部门目录'))
+  check('管理页不再显示凭证文件或可恢复明文', !adminHtml.includes('credentials.json') && !adminHtml.includes('显示 Token'))
   const allHtml =
     loginHtml +
     dashboardHtml +

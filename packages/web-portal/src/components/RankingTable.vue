@@ -4,7 +4,7 @@ import { ElButton, ElTable, ElTableColumn, ElTag } from 'element-plus'
 import { computed } from 'vue'
 import type { BreakdownRow } from '@ai-token-report/shared'
 import { formatCount, formatPercent } from '../utils/format.js'
-import { userLabel, isUnattributed } from '../types/portal.js'
+import { identityLabel, isUnattributed } from '../types/portal.js'
 const props = defineProps<{ rows: BreakdownRow[] }>()
 defineEmits<{ select: [userId: string] }>()
 const maxTotal = computed(() =>
@@ -32,7 +32,7 @@ const maxTotal = computed(() =>
           link
           :type="isUnattributed(row.key) ? 'warning' : 'primary'"
           @click.stop="$emit('select', row.key)"
-          >{{ userLabel(row.key) }}</el-button
+          >{{ identityLabel(row) }}</el-button
         ></template
       ></el-table-column
     >

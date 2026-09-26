@@ -32,24 +32,25 @@ import { join } from 'node:path'
 import { zstdCompressSync } from 'node:zlib'
 
 import { loadState, resetState, resolveStatePath } from '@ai-token-report/core'
-import { EVENT_TABLE, openDb } from '@ai-token-report/core/db'
+import { EVENT_TABLE, openDb, preparePortalDatabase } from '@ai-token-report/core/db'
 import { createServer } from '@ai-token-report/server'
+import { IdentityRepository } from '../../server/src/identity/repository.js'
 
 import { createHttpDeliverer } from '../src/deliver.js'
 import { runReport } from '../src/report.js'
 
 const HOME = mkdtempSync(join(tmpdir(), 'atr-verify-report-'))
-const PORT = 18803
+const PORT = 0
 const TOKEN = 'atr-zhangsan-9f3c'
 
 mkdirSync(join(HOME, 'token-report'), { recursive: true })
-const credPath = join(HOME, 'token-report', 'credentials.json')
 const dbPath = join(HOME, 'token-report', 'portal.sqlite')
-writeFileSync(
-  credPath,
-  JSON.stringify([{ token: TOKEN, name: '张三', dept: '研发一部' }]),
-  'utf8',
-)
+const target = { sqlitePath: dbPath }
+await preparePortalDatabase(target)
+await new IdentityRepository(target).importCredentials([
+  { token: 'report-test-admin', name: '测试管理员', role: 'admin' },
+  { token: TOKEN, name: '张三', dept: '研发一部' },
+], 'verify-report-ingest')
 
 const sessionsRoot = join(HOME, 'sessions')
 const sessionDir = join(sessionsRoot, 'proj-a', 'session-1')
@@ -161,7 +162,7 @@ const portal = await createServer({
   host: '127.0.0.1',
   dshHome: HOME,
   dbPath,
-  credentialsPath: credPath,
+  mysqlUrl: '',
   enableLocalApi: false,
 })
 console.log(`  服务端: ${portal.url}`)

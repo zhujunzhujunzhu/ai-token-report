@@ -11,17 +11,17 @@ import {
   type FormRules,
 } from 'element-plus'
 import type {
-  AdminLoginAccountRequest,
-  AdminMember,
+  PortalLoginAccountRequest,
+  PortalMember,
 } from '@ai-token-report/shared'
-const props = defineProps<{ member: AdminMember; busy: boolean }>()
+const props = defineProps<{ member: PortalMember; busy: boolean }>()
 const emit = defineEmits<{
-  save: [input: AdminLoginAccountRequest]
+  save: [input: PortalLoginAccountRequest]
   cancel: []
 }>()
 const form = ref<FormInstance>()
 const draft = reactive({
-  username: props.member.username ?? '',
+  username: props.member.account?.username ?? '',
   password: '',
   confirm: '',
 })
@@ -59,7 +59,8 @@ const rules: FormRules = {
 async function submit(): Promise<void> {
   if (props.busy || !(await form.value?.validate().catch(() => false))) return
   emit('save', {
-    token: props.member.token,
+    member_id: props.member.member_id,
+    expected_version: props.member.version,
     username: draft.username.trim(),
     password: draft.password,
   })

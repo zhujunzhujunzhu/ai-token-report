@@ -3,7 +3,7 @@
  *
  * ## 这个文件现在只做三件事
  *
- * 1. 把选项（`ServerOptions`）变成一条完整的依赖链：凭证表 → 四条路由 → 应用
+ * 1. 把选项（`ServerOptions`）变成一条完整的依赖链：数据库身份 → 路由 → 应用
  * 2. 起监听（两个运行时二选一，见 `runtime/listen.ts`）
  * 3. 回报启动横幅需要的那点元信息
  *
@@ -28,17 +28,16 @@
  */
 
 import { resolvePaths } from '@ai-token-report/core'
-import { describePortalTarget, portalDbFileName, resolvePortalTarget } from '@ai-token-report/core/db'
+import { describePortalTarget, portalDbFileName, resolvePortalTarget, preparePortalDatabase } from '@ai-token-report/core/db'
 import { join } from 'node:path'
 
-import { AdminRoute } from './admin-route.js'
+import { DatabaseAdminRoute } from './admin-route.js'
 import { createApp } from './app.js'
-import { hashPassword, normalizeUsername, usernameError } from './auth/password.js'
-import type { CredentialStore } from './credentials.js'
+import { CredentialStore } from './credentials.js'
+import { IdentityRepository } from './identity/index.js'
 import { IdentityRoute } from './identity-route.js'
 import { IngestRoute } from './ingest-route.js'
 import { CoreStatsProvider, LocalStatsRouter } from './local-api.js'
-import { envAdminFrom, loadMembers } from './member-admin.js'
 import { serveWithPortRetry, type RequestHandler } from './runtime/listen.js'
 import { StatsRoute } from './stats-route.js'
 
@@ -48,10 +47,12 @@ export { SERVER_VERSION } from './app.js'
 export interface ServerOptions {
   /** 后台公开源（HTTPS 反向代理时用于同源校验与 Secure Cookie）。 */
   portalOrigin?: string
-  /** 首次部署的后台登录账号；需要同时配置 adminToken，密码不落盘。 */
+  /** 首次部署的后台登录账号；密码只以哈希写入数据库。 */
   adminUsername?: string
   adminPassword?: string
-  /** 监听端口。默认 8787；被占用时自动 +1。 */
+  /** 多实例共用的验证码 HMAC 密钥。缺省时仍可上报，但后台登录不可用。 */
+  captchaHmacKey?: string
+  /** 监听端口。默认 8787；被占用时自动 +1；0 表示由系统分配空闲端口。 */
   port?: number
   /**
    * 监听地址。
@@ -93,17 +94,11 @@ export interface ServerOptions {
    * 🚨 启动横幅会打印它，**必须脱敏**（`describePortalTarget()` 负责抹掉密码）。
    */
   mysqlUrl?: string
-  /** 凭证文件路径。默认 `<dshHome>/token-report/credentials.json`。 */
+  /** @deprecated 凭证文件只能作为显式迁移输入；运行时指定将拒绝启动。 */
   credentialsPath?: string
   /**
-   * 冷启动用的管理员 token（默认读环境变量 `ATR_ADMIN_TOKEN`）。
-   *
-   * ★ 用途：凭证文件为空（全新部署）或只读（配置由编排系统挂载）时，
-   *   仍然有人能进管理页发放第一个 token —— 否则是个死锁：
-   *   管理页的第一件事就是发 token，而进管理页又需要一个 token。
-   *
-   * ⚠️ 它**不写进凭证文件**：环境变量是部署期配置，写进文件等于把部署秘密
-   *   复制到磁盘的另一处，删除时两处还会不一致。
+   * 首次初始化管理员 Token（默认 `ATR_ADMIN_TOKEN`），仅摘要写入数据库。
+   * 数据库初始化后不再重新导入环境变量，防止重启复活已停用身份。
    */
   adminToken?: string
   /** 环境变量管理员的显示名（默认「管理员」）。 */
@@ -136,17 +131,16 @@ export interface ServerHandle {
   host: string
   /** 是否因端口被占用而改用其他端口 */
   portShifted: boolean
-  /** 已登记的凭证数（启动横幅用）。 */
+  /** 有效凭证数（启动横幅用）。 */
   credentialCount: number
   /**
    * 管理员数量。
    *
-   * ⚠️ 它是 0 时**没有任何人能进管理页发 token**（只能靠 `ATR_ADMIN_TOKEN`
-   *   或在文件里手工写 `"role": "admin"`）—— 启动时必须提示，
+   * 按具有永久管理入口的不同人员计数；为空时启动横幅必须提示，
    *   否则管理员会在「管理页进不去」上浪费很久。
    */
   adminCount: number
-  /** 凭证文件路径（管理员要知道自己在维护哪个文件）。 */
+  /** @deprecated 仅保留旧调用方形状，数据库模式恒为空串。 */
   credentialsPath: string
   /**
    * 上报库的**可读描述**（启动横幅打印它）。
@@ -155,6 +149,8 @@ export interface ServerHandle {
    *   那里面带密码，而启动日志经常被贴进工单与聊天记录。
    */
   portalTargetLabel: string
+  schemaVersion: number
+  initialized: boolean
   /** 优雅停机 */
   stop(): Promise<void>
 }
@@ -163,9 +159,10 @@ export interface ServerHandle {
 export interface HandlerBundle {
   /** Web 标准的请求处理器 —— 两个运行时的公共入口。 */
   handler: RequestHandler
-  /** 凭证表实例（★ 全进程唯一，见 `CredentialStore` 的注释）。 */
+  /** @deprecated 空兼容适配器，生产鉴权由 identityStore 完成。 */
   credentials: CredentialStore
   credentialsPath: string
+  identityStore?: IdentityRepository
   /** 上报库路径（全员数据的唯一副本）。⚠️ 配了 MySQL 时它只是**退路**，不是实际目标。 */
   dbPath: string
   /** 实际上报库的可读描述（已脱敏；SQLite 是路径，MySQL 是「库名 @ 主机:端口」）。 */
@@ -186,37 +183,24 @@ export interface HandlerBundle {
  */
 export async function createHandlerFor(options: ServerOptions = {}): Promise<HandlerBundle> {
   const paths = resolvePaths(options.dshHome)
-  const credentialsPath =
-    options.credentialsPath ?? join(paths.dshHome, 'token-report', 'credentials.json')
-
-  // 凭证表：★ 全进程**只有一个实例**，上报 / 看板 / 管理三条路由共享它。
-  // 管理页签发 token 后改的就是这个实例，因此新 token **立刻**能上报
-  // （若各路由各建一份，员工拿到 token 后要等服务端重启才生效）。
-  //
-  // 环境变量管理员只在这里注入，不落文件 —— 见 ServerOptions.adminToken 的注释。
-  const envAdmin =
-    options.adminToken !== undefined
-      ? envAdminFrom({ ATR_ADMIN_TOKEN: options.adminToken, ATR_ADMIN_NAME: options.adminName })
-      : envAdminFrom()
-  const adminUsername = options.adminUsername ?? process.env.ATR_ADMIN_USERNAME
-  const adminPassword = options.adminPassword ?? process.env.ATR_ADMIN_PASSWORD
-  if (envAdmin && adminUsername && adminPassword) {
-    const error = usernameError(adminUsername)
-    if (error) throw new Error(`ATR_ADMIN_USERNAME: ${error}`)
-    envAdmin.username = normalizeUsername(adminUsername)
-    envAdmin.passwordHash = await hashPassword(adminPassword)
+  const localOnly = options.enableLocalApi === true && !options.dbPath && !options.mysqlUrl && !options.adminToken && !options.adminUsername && !options.adminPassword
+  if (!localOnly && options.credentialsPath) throw new Error('credentialsPath 已不再是运行时身份源，请先通过显式数据库迁移导入旧凭证文件')
+  // 身份、会话、上报和统计共享唯一数据库目标；连接失败不能回落文件或其他库。
+  const dbPath = options.dbPath ?? defaultPortalDbPath(paths.dshHome)
+  const mysqlUrl = localOnly ? undefined : options.mysqlUrl ?? process.env.ATR_MYSQL_URL
+  const target = resolvePortalTarget({ sqlitePath: dbPath, mysqlUrl })
+  const identityStore = localOnly ? undefined : new IdentityRepository(target)
+  if (identityStore) {
+    await preparePortalDatabase(target)
+    await identityStore.initialize({
+      adminToken: options.adminToken ?? process.env.ATR_ADMIN_TOKEN,
+      adminName: options.adminName ?? process.env.ATR_ADMIN_NAME,
+      adminUsername: options.adminUsername ?? process.env.ATR_ADMIN_USERNAME,
+      adminPassword: options.adminPassword ?? process.env.ATR_ADMIN_PASSWORD,
+    })
   }
-  const {
-    admin: memberAdmin,
-    store: credentials,
-    fileError: credError,
-  } = loadMembers({
-    credentialsPath,
-    ...(envAdmin ? { envAdmin } : {}),
-  })
-  if (credError) {
-    process.stderr.write(`⚠ 凭证文件加载失败：${credError}\n`)
-  }
+  // 仅保留旧调用方的类型形状；生产鉴权不读取或填充这份空的适配器。
+  const credentials = CredentialStore.empty()
 
   const identityRoute = new IdentityRoute({
     dshHome: paths.dshHome,
@@ -226,23 +210,21 @@ export async function createHandlerFor(options: ServerOptions = {}): Promise<Han
 
   // 上报接收：写**上报库**（默认 portal.sqlite）。它与 `/api/local/*` 用的
   // 本地库是两个文件 —— 见 ServerOptions.dbPath 的注释。
-  const dbPath = options.dbPath ?? defaultPortalDbPath(paths.dshHome)
   // ★ 上报库的目标在这里归一一次：显式选项优先，其次环境变量。
   //   路由内部因此**不再出现任何 `if (mysql)`** —— 换后端不影响任何查询分支。
   //   两者同时配置不报错：`openPortalStore()` 的语义是「有 mysqlUrl 就用它」。
-  const mysqlUrl = options.mysqlUrl ?? process.env.ATR_MYSQL_URL
   const mysqlOption = mysqlUrl ? { mysqlUrl } : {}
-  const ingestRoute = new IngestRoute({ credentials, dbPath, ...mysqlOption })
+  const ingestRoute = new IngestRoute({ identityStore, credentials, dbPath, ...mysqlOption })
 
   // 部门看板查询：读**同一个上报库**（只读，一个字节都不写）。
   // ⚠️ 与上报接口一样在两种形态下都注册 —— 单机自建一个只收自己的小服务端时，
   //   看板同样要能打开（只是里面只有一个人）。
   // ★ 与上报路由**必须拿到同一个目标**：一个写 MySQL、另一个读 SQLite 会让
   //   「上报成功但看板永远是 0」—— 这类分叉不会报错，只会让人以为没人用。
-  const statsRoute = new StatsRoute({ credentials, dbPath, ...mysqlOption })
+  const statsRoute = new StatsRoute({ identityStore, credentials, dbPath, ...mysqlOption })
 
-  // 人员管理：**唯一会写凭证文件的通路**（管理员专用，见 admin-route.ts）。
-  const adminRoute = new AdminRoute({ store: credentials, admin: memberAdmin })
+  // 人员管理与上报共用同一个身份仓储和数据库事务边界。
+  const databaseAdminRoute = identityStore ? new DatabaseAdminRoute(identityStore) : undefined
 
   // 本地直查：只有启用 `/api/local/*` 时才构造，避免部门服务端
   // 白白持有一条指向本机日志/本地库的通路。
@@ -254,10 +236,12 @@ export async function createHandlerFor(options: ServerOptions = {}): Promise<Han
   const app = createApp({
     portalOrigin: options.portalOrigin ?? process.env.ATR_PORTAL_ORIGIN,
     credentials,
+    identityStore,
+    captchaHmacKey: options.captchaHmacKey ?? process.env.ATR_CAPTCHA_HMAC_KEY,
     identityRoute,
     ingestRoute,
     statsRoute,
-    adminRoute,
+    databaseAdminRoute,
     localStats,
     enableLocalApi: options.enableLocalApi ?? false,
     ...(options.staticDir ? { staticDir: options.staticDir } : {}),
@@ -269,7 +253,8 @@ export async function createHandlerFor(options: ServerOptions = {}): Promise<Han
     //   （`Bun.serve({ fetch })` / `serve-node.ts` 的 node:http 桥接）。
     handler: (req: Request) => app.fetch(req),
     credentials,
-    credentialsPath,
+    credentialsPath: '',
+    identityStore,
     dbPath,
     // ★ 实际目标的可读描述（MySQL 时是「库名 @ 主机:端口」，**不含密码**）
     portalTargetLabel: describePortalTarget(resolvePortalTarget({ sqlitePath: dbPath, mysqlUrl })),
@@ -283,6 +268,7 @@ export async function createServer(options: ServerOptions = {}): Promise<ServerH
   const requestedPort = options.port ?? 8787
 
   const bundle = await createHandlerFor(options)
+  const health = await bundle.identityStore?.health()
   const { handle, port, shifted } = await serveWithPortRetry(host, requestedPort, bundle.handler)
 
   return {
@@ -290,10 +276,12 @@ export async function createServer(options: ServerOptions = {}): Promise<ServerH
     port,
     host,
     portShifted: shifted,
-    credentialCount: bundle.credentials.size,
-    adminCount: bundle.credentials.adminCount,
+    credentialCount: health?.token_count ?? 0,
+    adminCount: health?.admin_count ?? 0,
     credentialsPath: bundle.credentialsPath,
     portalTargetLabel: bundle.portalTargetLabel,
+    schemaVersion: bundle.identityStore ? 4 : 0,
+    initialized: health?.initialized ?? false,
     stop: () => handle.stop(),
   }
 }

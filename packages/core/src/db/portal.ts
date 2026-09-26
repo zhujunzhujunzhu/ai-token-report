@@ -81,6 +81,7 @@ import {
   type TimeBucketRow,
 } from './query.js'
 import { EVENT_TABLE } from './schema.js'
+import { Buffer } from 'node:buffer'
 
 /**
  * 数值归一 —— ★ **本仓唯一的口径边界**。
@@ -105,6 +106,11 @@ const numOrNull = toNumberOrNull
 
 /** 明细表的一行（上报库比本机库多一列归属）。 */
 export interface PortalRecordRow {
+  memberId?: string | null
+  userNameSnapshot?: string | null
+  departmentId?: string | null
+  deptSnapshot?: string | null
+  attributionStatus?: 'member' | 'legacy' | 'unattributed'
   eventId: string
   sessionId: string
   seq: number
@@ -122,6 +128,10 @@ export interface PortalRecordRow {
 
 /** 明细 SQL 的原始行（数值列在 MySQL 下可能是字符串，必须经 `num()`）。 */
 interface PortalRecordSqlRow {
+  member_id: string | null
+  user_name: string | null
+  department_id: string | null
+  dept: string | null
   event_id: string
   session_id: string
   seq: unknown
@@ -225,8 +235,16 @@ export class PortalStatsSession {
     return num(row?.c)
   }
 
-  /** 已署名人数（按 `user_id` 去重）。 */
+  /** 非空归属分组数；成员视图按稳定人员与历史身份分别计数，旧视图按 `user_id` 去重。 */
   async distinctUsers(): Promise<number> {
+    if (this.#filter.identityView === 'member') {
+      const { sql, params } = buildWhere(this.#filter)
+      const row = await this.#store.get<{ c: unknown }>(`SELECT COUNT(*) AS c FROM (
+        SELECT member_id, CASE WHEN member_id IS NULL THEN user_id ELSE NULL END AS legacy_id
+        FROM ${EVENT_TABLE}${sql}${sql ? ' AND' : ' WHERE'} (member_id IS NOT NULL OR user_id IS NOT NULL)
+        GROUP BY member_id, legacy_id) AS identities`, params)
+      return num(row?.c)
+    }
     const q = distinctUsersQuery(this.#filter)
     const row = await this.#store.get<{ c: unknown }>(q.sql, q.params)
     return num(row?.c)
@@ -255,6 +273,7 @@ export class PortalStatsSession {
    *   这里只负责「用哪种方言执行」和「异步 await」。
    */
   async groups(dim: QueryDimension): Promise<QueryGroupRow[]> {
+    if (dim === 'user' && this.#filter.identityView === 'member') return this.memberGroups()
     const q = groupsQuery(dim, this.#filter, this.#dialect)
     if (q) {
       const rows = await this.#store.all<RawGroupRow>(q.sql, q.params)
@@ -278,6 +297,52 @@ export class PortalStatsSession {
     }
 
     return []
+  }
+
+  /** 按固定人员 ID 聚合；未确认历史的 key 与当前人员、真正未归属互不混淆。 */
+  private async memberGroups(): Promise<QueryGroupRow[]> {
+    const { sql, params } = buildWhere(this.#filter)
+    const rows = await this.#store.all<RawGroupRow & {
+      member_id: string | null; legacy_id: string | null; snapshot_name: string | null
+      display_name: string | null; department_name: string | null
+    }>(`SELECT g.*, m.display_name, d.name AS department_name FROM (
+      SELECT member_id, CASE WHEN member_id IS NULL THEN user_id ELSE NULL END AS legacy_id,
+        MIN(user_name) AS snapshot_name, SUM(input_tokens) AS input, SUM(output_tokens) AS output,
+        SUM(cache_read_tokens) AS cache_read, SUM(cache_write_tokens) AS cache_write,
+        SUM(reasoning_tokens) AS reasoning, COUNT(*) AS calls, MIN(ts) AS lo, MAX(ts) AS hi,
+        COUNT(DISTINCT session_id) AS sessions
+      FROM ${EVENT_TABLE}${sql} GROUP BY member_id, legacy_id
+      ) AS g LEFT JOIN members m ON m.member_id = g.member_id
+      LEFT JOIN departments d ON d.department_id = m.department_id`, params)
+    return sortGroupRows(rows.map((row) => {
+      const attributionStatus = row.member_id ? 'member' : row.legacy_id !== null ? 'legacy' : 'unattributed'
+      const key = row.member_id ?? (row.legacy_id !== null ? `legacy:${Buffer.from(row.legacy_id, 'utf8').toString('base64url')}` : 'unknown')
+      const mapped = mapGroupRows([{ ...row, grp_key: key }])[0]!
+      return { ...mapped, memberId: row.member_id, departmentName: row.department_name,
+        attributionStatus, label: row.member_id ? row.display_name ?? row.snapshot_name ?? '已停用人员'
+          : row.legacy_id !== null ? `历史人员：${row.snapshot_name ?? row.legacy_id}（待确认）` : '未归属' }
+    }), 'user')
+  }
+
+  /** 旧页面无法表达同名/改名关系时明确拒绝，不能输出看似合理的合并排行。 */
+  async assertLegacyIdentityView(): Promise<void> {
+    if (this.#filter.identityView === 'member') return
+    const { sql, params } = buildWhere(this.#filter)
+    const pairs = await this.#store.all<{ member_id: string | null; user_id: string | null }>(
+      `SELECT DISTINCT member_id, user_id FROM ${EVENT_TABLE}${sql}`, params,
+    )
+    const byLegacy = new Map<string, Set<string>>(), byMember = new Map<string, Set<string>>()
+    for (const row of pairs) {
+      if (row.member_id && row.user_id === null) throw new IdentityViewRequiredError()
+      if (row.user_id === null) continue
+      const identities = byLegacy.get(row.user_id) ?? new Set<string>()
+      identities.add(row.member_id ?? 'legacy'); byLegacy.set(row.user_id, identities)
+      if (row.member_id) {
+        const names = byMember.get(row.member_id) ?? new Set<string>()
+        names.add(row.user_id); byMember.set(row.member_id, names)
+      }
+    }
+    if ([...byLegacy.values(), ...byMember.values()].some((ids) => ids.size > 1)) throw new IdentityViewRequiredError()
   }
 
   /**
@@ -309,10 +374,10 @@ export class PortalStatsSession {
     const rows = await this.#store.all<PortalRecordSqlRow>(
       // ⚠️ ORDER BY 用 (ts, seq) 而不是 ts：同一毫秒内的多条记录需要有
       //   稳定的次序，否则翻页时会出现「第 2 页重复了第 1 页的最后一行」。
-      `SELECT event_id, session_id, seq, ts, user_id, provider, model, cwd,
+      `SELECT event_id, session_id, seq, ts, user_id, member_id, user_name, department_id, dept, provider, model, cwd,
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
        FROM ${EVENT_TABLE}${sql}
-       ORDER BY ts DESC, seq DESC
+       ORDER BY ts DESC, seq DESC, event_id DESC
        LIMIT $limit OFFSET $offset`,
       { ...params, $limit: limit, $offset: offset },
     )
@@ -325,6 +390,10 @@ export class PortalStatsSession {
         seq: num(r.seq),
         ts: num(r.ts),
         userId: r.user_id,
+        ...(this.#filter.identityView === 'member' ? {
+          memberId: r.member_id, userNameSnapshot: r.user_name, departmentId: r.department_id,
+          deptSnapshot: r.dept, attributionStatus: r.member_id ? 'member' as const : r.user_id !== null ? 'legacy' as const : 'unattributed' as const,
+        } : {}),
         provider: r.provider,
         model: r.model,
         cwd: r.cwd,
@@ -358,5 +427,15 @@ export async function openPortalStats(
   filter: QueryFilter = {},
 ): Promise<PortalStatsSession> {
   const store = await openPortalStore(target)
-  return new PortalStatsSession({ store, target, filter })
+  const session = new PortalStatsSession({ store, target, filter })
+  try {
+    await session.assertLegacyIdentityView()
+    return session
+  } catch (error) { await store.close(); throw error }
+}
+
+/** HTTP 层将它映射为 409，数据库故障仍保持 503。 */
+export class IdentityViewRequiredError extends Error {
+  readonly code = 'identity_view_required'
+  constructor() { super('当前归属无法用旧版人员视图准确表达，请使用 identity_view=member') }
 }

@@ -125,7 +125,8 @@ ai-token-report/
 │  │   ├─ src/ingest-route.ts  #   POST /api/v1/token-usage  ← 插件 & CLI（S3，已落地）
 │  │   ├─ src/stats-route.ts   #   GET  /api/v1/stats/*      ← 部门页（S7，已落地）
 │  │   ├─ src/local-api.ts     #   /api/local/*  ← 本地页专用（本地增量库）
-│  │   ├─ src/credentials.ts   #   凭证表：身份判定的唯一权威来源
+│  │   ├─ src/identity/        #   数据库身份、账号、权限、会话和审计
+│  │   ├─ src/credentials.ts   #   旧凭证格式及历史兼容测试；生产不读写
 │  │   ├─ src/verify-route.ts  #   POST /api/v1/identity/verify + 上报归属/看板身份解析
 │  │   ├─ src/identity-route.ts#   /api/local/identity  ← 引导页读写
 │  │   └─ src/serve-node.ts    #   node:http 适配器（★ 必须动态 import node:http）
@@ -325,7 +326,7 @@ cacheHitRate = cacheRead / (cacheRead + input)
 event_id = `${sessionId}:${seq}`
 ```
 
-- 服务端 `PRIMARY KEY` + `INSERT ... ON CONFLICT DO NOTHING`
+- 服务端以 `event_id` 为主键，普通 INSERT 只捕获该主键冲突；其他约束错误回滚并返回非 2xx
 - 所有上报方只需保证 **at-least-once**，重试与 outbox 重放天然安全
 - 与 DSH 官方建议的 `(session.id, format_version, seq)` 去重口径一致
 
@@ -405,60 +406,49 @@ $DSH_HOME/token-report/identity.json
 | **权限 0600** | 文件含 token（凭证） |
 | **解析失败不抛错**，降级为「未署名」 | 抛错会让页面白屏，而用户此时最需要看到引导页 |
 
-### 4.5.5 管理员准备凭证
+### 4.5.5 数据库初始化与旧凭证导入
 
-服务端启动前放置 `<dshHome>/token-report/credentials.json`：
+生产服务端的身份与权限事实和用量事件存于同一个 portal 数据库，支持 MySQL 和 SQLite。
+人员 UUID、部门、角色权限、账号、Token 摘要、会话、挑战、限流及审计均持久化。
+`credentials.json` 不再是运行时来源；指定 `credentialsPath` 会拒绝启动，禁止文件与数据库双写。
 
-```jsonc
-// 推荐：一 token 一人；role 缺省是 member
-[ { "token": "atr-zhangsan-9f3c", "name": "张三", "dept": "研发一部" },
-  { "token": "atr-boss-9f3c",     "name": "李经理", "role": "admin" } ]
+空库初始化为独立 portal v4，本地 `usage.sqlite` 仍为 v3。首次管理员可以由
+`ATR_ADMIN_USERNAME` / `ATR_ADMIN_PASSWORD` 成对初始化，`ATR_ADMIN_TOKEN` 可作为初始化输入，
+`ATR_ADMIN_NAME` 为显示名。密码只保存 KDF 哈希，Token 只保存摘要。
+初始化标记存在后，不会因重启重新导入环境变量或复活已停用人员。
 
-// 或简写（该格式下所有人都是普通成员）
-{ "张三": "atr-zhangsan-9f3c" }
-```
+旧库必须先停止旧服务、备份并运行 `packages/server/scripts/migrate-db.ts` 的
+inspect/migrate/resume，再通过 `packages/server/scripts/import-credentials.ts` 显式离线导入旧文件。
+导入检查原始重复 Token、用户名冲突、角色和哈希格式；源文件不改写，报告不输出秘密。
+旧姓名历史保持 pending，只有人工确认映射才回填人员 ID。
 
-> 凭证文件损坏时服务端**照常启动**（空表 + 告警），
-> 不会因为一份文件写错就让已署名的员工全部失效。
-> 但从那一刻起**管理页拒绝一切写入** —— 覆盖一份读不懂的文件 =
-> 静默吊销全员（AGENTS.md「凭证文件是唯一真值」）。
+数据库不可用、版本不符或迁移未完成均明确失败，不降级为空身份文件。
+旧 `CredentialStore`、`member-admin.ts` 和 `LegacyPortalAuth` 只保留历史独立处理器测试。
+表结构和操作边界见 [数据库重设计](docs/数据库重设计.md) 与 [接口与验收](docs/数据库重设计-接口与验收.md)。
 
 ### 4.5.6 人员管理与 token 发放（管理页）
 
-手工维护一个文件在人数增长后迅速变得不划算（入职手写一行、泄露手工改一行、
-查「谁还没发」人肉比对）。因此服务端提供了一组**管理员专用**接口，
-看板上多一个「人员管理」页签：
+人员管理按稳定的 `member_id` 操作；显示名可以重复，用户名仍唯一。
+账号和上报 Token 独立关联人员，Token 列表不返回明文，只在签发或轮换成功时返回一次。
+后台权限由数据库角色关系决定；Bearer 还须与该 Token scopes 取交集。
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| GET | `/api/v1/admin/members` | 人员列表 + 凭证文件状态（路径 / 是否可写） |
-| POST | `/api/v1/admin/members` | **签发 token** |
-| POST | `/api/v1/admin/members/update` | 改姓名 / 部门 / 角色（token 不变） |
-| POST | `/api/v1/admin/members/rotate` | 重置 token（旧 token 立即失效） |
-| POST | `/api/v1/admin/members/revoke` | 吊销 |
+| GET / POST | `/api/v1/admin/members` | 列表 / 创建人员 |
+| POST | `/api/v1/admin/members/update`、`roles`、`status` | 人员资料、角色与状态 |
+| POST | `/api/v1/admin/members/login`、`login/status` | 设置独立登录账号、启停账号 |
+| GET / POST | `/api/v1/admin/members/tokens` | 凭证摘要列表 / 签发 |
+| POST | `/api/v1/admin/members/tokens/rotate`、`revoke`、`scopes` | 轮换、吊销与范围变更 |
+| GET | `/api/v1/admin/roles`、`storage`、`audit`、`legacy-attributions` | 角色、数据库状态、审计与历史映射 |
 
-★ **`role` 是权限的唯一来源**（`admin` / `member`，缺省 `member`）：
+实现位于 `packages/server/src/identity/`。写事务先锁住 `portal_identity_state`，重新验证操作者，
+再执行 CAS 版本检查、业务修改和成功审计；提交后其他进程立即读到新状态。
+最后一个仍有可恢复管理入口的管理员不能停用、降级或失去最后有效凭证。
+历史外键采用 RESTRICT；改名、Token 轮换均不改写旧事件快照。
 
-- `member`：可看全部门看板（部门看板是组内公开的用量页），看不到管理页
-- `admin`：额外可进入管理页发放 / 重置 / 吊销 token
-
-**绝不要用姓名白名单判断管理员** —— 姓名是可以随时改的显示值。
-
-三条实现上的硬约束（`packages/server/src/member-admin.ts`）：
-
-| 约束 | 不这么做会怎样 |
-|---|---|
-| **先落盘、再整体替换内存镜像** | 反过来会出现「页面上 token 能用、重启后消失」 |
-| **文件读不懂时拒绝一切写入** | 按内存空表覆盖 = 静默吊销全员 |
-| **最后一个管理员不可删 / 不可降级** | 一次误操作后所有人都无法再发放 token |
-
-另外两条与身份可信边界同源：
-
-- **签发即刻生效**：`CredentialStore` 全进程只有一个实例（上报 / 看板 / 管理共享），
-  否则员工拿到 token 后要等服务端重启才能上报，而管理员这边一切正常
-- **冷启动兜底 `ATR_ADMIN_TOKEN`**：凭证文件为空（全新部署）或只读（编排系统挂载）时，
-  没有它就没有任何人能进管理页 —— 而管理页的第一件事就是发放第一个 token。
-  该凭证**不落文件**（部署秘密不该被复制到磁盘的另一处）
+新 Token 默认仅有 `identity:read` / `usage:write`。普通后台账号可读取部门统计；管理权限由角色目录授予，
+不能用姓名白名单，也不能把上报 Token 默认当作后台登录密码。
+无效身份、权限不足、未初始化/数据库不可用分别返回 401、403、503；版本或管理护栏冲突返回 409。
 
 ### 4.5.7 提示文案的三条原则
 
@@ -474,21 +464,20 @@ $DSH_HOME/token-report/identity.json
 ### 4.5.8 部门后台的账号登录
 
 部门后台现在以 **用户名 + 密码 + 图形验证码** 登录；CLI / 插件仍使用上报 Token。
-账号与同一个人员凭证绑定，在 `credentials.json` 增加可选 `username` / `passwordHash`，
-既有 Token 不自动成为密码。新增账号或重置密码由人员管理页完成，仍先落盘再替换内存镜像。
+账号通过 `login_accounts.member_id` 关联人员，用户名唯一，既有 Token 不自动成为密码。
+新增账号和密码重置由人员管理页完成，密码版本与撤权状态在数据库事务内更新。
 
 - `server/src/auth/password.ts`：`@noble/hashes` scrypt，随机盐，密码不明文落盘。
-- `auth/captcha.ts`：PNG 位图，服务端保存答案，绑定浏览器、2 分钟有效且只能使用一次。
-- `auth/portal-auth.ts`：进程内会话与限流。会话 8 小时过期，权限每次从凭证表重读。
+- `auth/captcha.ts`：生成 PNG 位图；数据库保存绑定挑战 ID 的答案 HMAC 和浏览器 binding 摘要，2 分钟有效、CAS 一次消费。
+- `identity/portal-auth.ts`：数据库会话与限流。会话 8 小时过期，秘密只保存摘要；每次从数据库重读账号、人员和角色权限。
 - `app.ts`：`/api/v1/auth/{captcha,login,session,logout}`；后台可使用 HttpOnly Cookie，
   原 Bearer API 契约保留。POST Cookie 操作校验同源及自定义请求头。
 - `POST /api/v1/admin/members/login`：管理员设置 username / password，响应不含密码或哈希。
 
-首次部署在原 `ATR_ADMIN_TOKEN` 基础上增加 `ATR_ADMIN_USERNAME` / `ATR_ADMIN_PASSWORD`；
-环境变量账号不落文件。HTTPS 反向代理需配置 `ATR_PORTAL_ORIGIN`。
-密码或账号变更、Token 重置或吊销会使旧会话失效；服务重启后需要重新登录。
-当前会话、验证码与限流均为单进程存储。页面拆分、迁移与部署步骤见
-[部门前端重构方案](docs/部门前端重构方案.md)。
+首次初始化见 §4.5.5；所有实例共享至少 32 字符的 `ATR_CAPTCHA_HMAC_KEY`，密钥留在部署环境、不入数据库。
+HTTPS 反向代理需配置 `ATR_PORTAL_ORIGIN`。密码版本变化、账号/人员停用使旧会话失效；
+单独轮换或吊销上报 Token 不使后台会话退出。数据库会话与验证码可跨服务重启、跨进程使用，
+请求仍执行同源校验和当前权限重验。迁移和验证结果见 [Portal v4 验证记录](docs/database-v4/验证记录.md)。
 
 ## 5. 接口契约
 
@@ -579,12 +568,12 @@ Content-Type: application/json
 |---|---|---|
 | **鉴权失败回 401/503，不是 `200 + ok:false`** | ★ 与 §5.1.1 的 `/identity/verify` **刻意相反** | 客户端把 2xx 当成「已投递」并清掉 `pending`，那批用量**静默消失** |
 | **归属取 token 查凭证表** | ★ `client.userName` 一律忽略，只用于排查 | 改一下本地配置就能以他人名义上报 |
-| **`event_id` 主键幂等** | `INSERT OR IGNORE`，冲突破主键即跳过 | 插件与 CLI 同时上报会重复计费 |
+| **`event_id` 主键幂等** | 普通 INSERT，仅事件主键冲突记为重复；其他数据库约束错误整批回滚 | 将外键/CHECK 错误当成重复会错误确认投递 |
 | **单行拒收不牵连整批** | 坏行计入 `rejected`，好行照常入库 | 一条脏数据让整批 10 分钟的增量被反复重投 |
 
-> 归属的三列（`user_id` / `user_name` / `dept`）与四项 token 同表存储
-> （`usage_event`，schema 版本 3），**本机库同一份 schema 但三列为 NULL**
-> —— 本机数据只有我一个人，归属只对上报道意义。
+> portal v4 新增 `member_id`、`department_id`、`report_token_id` 和 `received_at_ms`，
+> 原 `user_id` / `user_name` / `dept` 姓名快照、事件键和四项 token 保持原意。
+> 本地派生库仍为 v3；两个入口和版本独立，不能共用库文件。
 
 #### 🚨 上报库（`portal.sqlite`）绝不自动重建
 
@@ -613,10 +602,16 @@ Content-Type: application/json
 - **异步只在 portal 一侧**：MySQL 驱动只有异步 API，所以上报库门面统一异步；
   本机库路径保持同步（`bun run stats` 的终端表格就是产品本身）。
 - **MySQL 的 `close()` 是空操作**：连接来自进程内共享池，每请求关池会重新握手。
-- **Node 上不支持 MySQL**（明确报错并指路）：npm 版 CLI 只跑本机库，
-  为一条用不到的通路引 `mysql2` 会进发布产物。
+- **两个运行时都能用，但驱动不同**：Bun 走内建 `Bun.sql`；Node 走**可选依赖 `mysql2`**
+  （只声明在 `packages/server`）。🚨 两者都**不进 npm 发布产物** —— Node 那条是
+  动态 import 且说明符构建期不可静态分析，否则 core 被内联时会把它带进 `cli.js`；
+  没装 `mysql2` 时明确报错并给出安装命令。
+  ⚠️ 部署含义：Node 上跑服务端时，入口要落在**能解析到 `mysql2`** 的位置
+  （本仓是隔离式依赖布局，根 `node_modules` 里没有它）。
 - 验收：`bun run packages/server/verify/verify-mysql-portal.ts`（53 项）断言
-  两种后端在**同一批数据**下每个接口的响应体**逐位一致**。
+  两种后端在**同一批数据**下每个接口的响应体**逐位一致**；
+  Node 那条通路另有一份真 Node 的活体脚本
+  （`bun run --filter '@ai-token-report/server' verify:mysql:node`，55 项）。
 
 ### 5.3 服务端查询（部门页用）
 
@@ -651,12 +646,12 @@ Content-Type: application/json
 | **鉴权失败回 401/503，不是 `200 + ok:false`** | ★ 与 §5.1.1 的 `/identity/verify` **刻意相反**，理由同 §5.2 | 响应体里装的是**数据**，回 2xx 会让前端把「token 不对」渲染成「这段时间没人用」—— 一个 0 值空看板 |
 | **只读上报库，一个字节都不写** | `openPortalStats()` → `openPortalDb()` | 写坏唯一副本；schema 版本不符时还会触发「重建」 |
 | **没有降级路径** | 库打不开 → `500` + 具体原因 | 上报库没有可重扫的真值，拿空数据冒充「今天没人用」比报错危险 |
-| **未归属统一成 `unknown`** | SQL `COALESCE(user_id,'unknown')`，筛选值同值 | 那批数据会被 `GROUP BY` 丢进 NULL，「有多少人没署名」永远浮不上来 |
+| **未归属统一成 `unknown`** | v4 区分稳定人员、历史待确认和真正未归属；旧姓名视图保持原键含义 | 待确认历史不能冒充匿名或自动归给同名人员 |
 | **时间窗由服务端解析** | 页面只传 `period`，服务端调 `core/range.ts` | 前端自己算「本月从哪天开始」= 时区口径的第二份实现 |
 
-> ⚠️ **角色列已落地**（`role: admin | member`，见 §4.5.6）：任何有效 token 都能查看
-> **全部门**看板（部门看板是「组内公开」的用量页），而**只有管理员**能进人员管理页
-> 发放 / 重置 / 吊销 token。鉴权失败分 401 / **403** / 503 三者，
+> ⚠️ **权限来自数据库角色关系**（见 §4.5.6）：后台账号可按角色读取部门看板，
+> Bearer 还要求 Token scope 包含 `stats:read`；新默认上报 Token 没有看板或管理权限。
+> 管理动作逐项检查对应权限。鉴权失败分 401 / **403** / 503 三者，
 > 绝不能用姓名硬编码白名单判断管理员。
 >
 > ⚠️ 诊断里的 `identityViolations` **恒为 0 且是结构性的**：上报库不存
@@ -679,7 +674,7 @@ CLI / 插件 ──POST /api/v1/token-usage──► portal.sqlite ──只读�
 | 使用者 | 我自己 | 管理者 / 全组 |
 | 数据范围 | 本机 | 全员 |
 | 数据源 | `/api/local/*`（本地增量库） | `/api/v1/stats/*`（只读上报库） |
-| 鉴权 | 无（仅 127.0.0.1） | **Bearer token**：页面顶部填一次，存 localStorage，可点「退出」清除 |
+| 鉴权 | 无（仅 127.0.0.1） | 用户名、密码、验证码登录；HttpOnly Cookie 会话，退出后清除页面数据 |
 | 部署 | CLI 内置，随命令启动 | 独立部署（`bun run server` 托管 `packages/web-portal/dist`） |
 | 核心视图 | **首次署名引导** / 我的用量 / 我的项目分布 | **人员排行** / 部门趋势 / 模型分布 / 单人下钻 / 用量明细 / 采集诊断 |
 | 管理视图 | ❌ 无（本机数据只有我自己） | ★ **人员管理**（仅 `role=admin` 可见）：发放 / 重置 / 吊销 token |
@@ -691,16 +686,13 @@ CLI / 插件 ──POST /api/v1/token-usage──► portal.sqlite ──只读�
 但**构建产物、路由、部署方式完全独立** —— 样式文件刻意各存一份，
 不为几个 CSS 变量把两个应用绑成同一个构建单元。
 
-> **看板的 token 门禁**：`web-portal` 未登录时只渲染门禁页，**一个统计请求都不发**
-> （发了必然 401）。校验走 `/api/v1/identity/verify`（`200 + ok:false` 语义），
-> 因此页面能区分「token 填错了」与「管理员还没配凭证」——
-> 后者用户做什么都没用，提示必须不同。
-> token 失效（401/503）时立刻退回门禁页，**不能只挂一条红字**：
+> **看板的账号门禁**：`web-portal` 未登录时只渲染登录页，不发统计请求。
+> `/api/v1/auth/{captcha,login,session,logout}` 对接数据库认证；客户端署名仍走独立 Token 校验。
+> 会话失效时退回登录页并清空旧数据；数据库不可用明确展示错误，不能当成空统计。
 > 页面上还留着上一轮的数据，使用者会以为「这是最新的，只是有个警告」。
 >
-> **管理页签的显示只由 `role` 决定，而它来自服务端**（`/api/v1/identity/verify`
-> 的 `role` 字段，见 §4.5.6）。前端隐藏入口是排版，不是权限：
-> 非管理员直接打 `/api/v1/admin/members*` 会拿到 **403**。
+> **管理入口和操作能力来自服务端当前权限**（见 §4.5.6）。前端隐藏入口是排版，不是权限：
+> 权限不足直接请求管理 API 会拿到 **403**。
 > 权限判断只写在前端 = 没有权限。
 
 ---
@@ -717,12 +709,11 @@ CLI / 插件 ──POST /api/v1/token-usage──► portal.sqlite ──只读�
    （`docs/口径实测结论.md` §4.1，差 2.36 亿 vs 10 亿+）—— **仍需拍板**
 5. ☐ **部门页开放范围**：仅 127.0.0.1？还是内网全组可访问（需鉴权）？
    ✅ 已定：**监听地址仍默认 127.0.0.1，对全组开放用 `--host 0.0.0.0`；
-   所有 `/api/v1/stats/*` 与页面数据都要求身份 token**（见 §5.3 与 §6）。
+   所有 `/api/v1/stats/*` 与页面数据均要求有效会话或含对应 scope 的 Token**（见 §5.3 与 §6）。
 6. ☐ **凭证发放方式**：管理员手工编辑 `credentials.json`，还是加一个签发页面/命令？
-   ✅ 已定并实现：**两者都有**。手工维护只用于铺开第一个管理员
-   （写 `"role": "admin"`，或用 `ATR_ADMIN_TOKEN` 兜底）；
-   之后一律在**人员管理页**发放 / 重置 / 吊销（§4.5.6）。
-   权限用**凭证角色列**，不用姓名白名单。
+   ✅ Portal v4 已改为**数据库初始化 + 人员管理页**。旧文件只作显式离线导入源；
+   环境变量只初始化一次，不作为永久旁路。之后在人员管理页操作独立账号与 Token（§4.5.6）。
+   权限使用数据库角色和 scope，不用姓名白名单；部署命令见 [数据库部署与迁移](docs/数据库部署与迁移.md)。
 7. ✅ **迁移期旧目录如何处理？** 已确认并执行：`dsh-token-stats/`、`frontend/`、
    `p0-verify/`、`dsh-session-inspector/` 全部删除；`.bun-cache/`、`node_modules/` 一并清理。
    `dsh-token-stats/` 的代码先迁入 `packages/core` + `packages/cli` 并验证后才删。
@@ -852,7 +843,7 @@ CLI / 插件 ──POST /api/v1/token-usage──► portal.sqlite ──只读�
 > **鉴权失败回 401/503 而不是 200 + ok:false**（响应体里装的是数据）；
 > **未归属必须成组出现在人员排行里**（否则覆盖率缺口永远浮不上来）。
 
-> **S11 已完成**：角色与人员管理落地 —— 凭证表多一列 `role`（缺省 `member`），
+> **S11 历史实现记录（Portal v4 已替换身份存储，当前规则见 §4.5）**：角色与人员管理落地 —— 凭证表多一列 `role`（缺省 `member`），
 > 看板上多一个**仅管理员可见**的「人员管理」页签，可以在页面上
 > 签发 / 重置 / 吊销 token；看板的筛选栏也补齐了**人员多选**与**自定义时间段**。
 >

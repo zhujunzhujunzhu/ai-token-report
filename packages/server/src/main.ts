@@ -72,9 +72,7 @@ function parseArgs(argv: string[]): Args | null {
         i++
         break
       case '--credentials':
-        args.credentialsPath = take(i, a)
-        i++
-        break
+        throw new Error('--credentials 已停用；旧凭证文件须先通过显式数据库迁移导入')
       case '--static':
         args.staticDir = take(i, a)
         i++
@@ -104,27 +102,19 @@ ai-token-report 部门服务端
   --mysql <url>       上报库改用 MySQL，如 mysql://user:pass@host:3306/ai_token_report
                       (也可用环境变量 ATR_MYSQL_URL；Bun 与 Node 均支持。
                        本机库 usage.sqlite 不受影响，永远是 SQLite)
-  --credentials <p>   凭证文件路径
   --static <p>        部门看板前端构建产物目录 (默认 packages/web-portal/dist)
   --portal <url>      部门服务端自身地址 (本地模式用)
   -h, --help          显示帮助
 
-凭证文件格式 (credentials.json):
-  [ { "token": "atr-zhangsan-9f3c", "name": "张三", "dept": "研发一部" },
-    { "token": "atr-admin-0001",     "name": "李经理", "role": "admin" } ]
-  或
-  { "张三": "atr-zhangsan-9f3c" }
-
-  role 缺省为 member（可看全部门看板）；admin 额外可以进入看板上的
-  「人员管理」页签发 / 重置 / 吊销 token。手工维护只需第一个管理员，
-  之后都在页面上发放。
-
-冷启动兜底:
-  配置 ATR_ADMIN_TOKEN、ATR_ADMIN_USERNAME、ATR_ADMIN_PASSWORD（12～128 位）。
+数据库身份初始化:
+  配置 ATR_ADMIN_USERNAME、ATR_ADMIN_PASSWORD（12～128 位）。
+  ATR_ADMIN_TOKEN 可选，仅在确实需要初始化管理 API 凭证时配置。
   ATR_ADMIN_NAME 可选。使用用户名 + 密码 + 图形验证码进入管理页。
-  部署账号不写入凭证文件；已有 Token 不自动成为登录密码。
+  这些值只在空数据库初始化一次；以后以数据库为准，停用身份不会因重启复活。
+  ATR_CAPTCHA_HMAC_KEY 必须在所有实例保持一致；未配置时后台登录返回 503。
+  旧 v3 库和 credentials.json 必须显式迁移，服务不会自动改写旧业务库。
   HTTPS 反向代理请配置 ATR_PORTAL_ORIGIN=https://你的域名。
-  详见 docs/部门前端重构方案.md。
+  详见 docs/数据库部署与迁移.md。
 `
 
 async function main(): Promise<number> {
@@ -167,8 +157,8 @@ async function main(): Promise<number> {
     out.push(`  ⚠ 端口 ${args.port} 被占用，已改用 ${handle.port}`)
   }
   out.push(`  DSH home  ${paths.dshHome}`)
-  out.push(`  凭证文件  ${handle.credentialsPath}`)
-  out.push(`  已发凭证  ${handle.credentialCount} 人（其中管理员 ${handle.adminCount} 人）`)
+  out.push(`  身份存储  数据库 v${handle.schemaVersion}（${handle.initialized ? '已初始化' : '待初始化'}）`)
+  out.push(`  有效凭证  ${handle.credentialCount} 枚，可用管理员 ${handle.adminCount} 人`)
   // 上报库必须打印出来：它是全员数据的唯一副本，出问题时管理员要知道去备份哪个库。
   // ★ 用 handle 里的描述而不是自己拼路径：配了 MySQL 时它要打印「库名 @ 主机:端口」，
   //   而且**必须脱敏**（`ATR_MYSQL_URL` 里带密码，启动日志经常被贴进工单）。
@@ -184,9 +174,7 @@ async function main(): Promise<number> {
   //   而管理页的第一件事恰恰是「发放第一个 token」—— 不说就是个死锁。
   if (handle.adminCount === 0) {
     out.push('')
-    out.push('  ⚠ 当前没有任何管理员，人员管理页无法进入。二选一：')
-    out.push(`     1) 在 ${handle.credentialsPath} 里给某人加 "role": "admin" 后重启`)
-    out.push('     2) 用环境变量起服务：ATR_ADMIN_TOKEN=<自定token> bun run start')
+    out.push('  ⚠ 数据库尚未建立可用管理入口。全新部署请配置 ATR_ADMIN_USERNAME / ATR_ADMIN_PASSWORD 后启动。')
   }
   if (!args.dbPath && !args.dshHome && !args.mysqlUrl && !process.env.ATR_MYSQL_URL) {
     out.push(`  ⚠ 上报库默认落在 DSH home 下；生产部署建议用 --db 指到独立数据盘，或用 --mysql。`)

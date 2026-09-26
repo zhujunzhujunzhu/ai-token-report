@@ -1,366 +1,149 @@
-/**
- * 端到端验证：真实 HTTP 走通「人员管理 + token 发放」全链路。
- *
- * 与 `member-admin.test.ts` 的区别：那个直接调 `MemberAdmin` / `AdminRoute`，
- * 这里**真的起一个 HTTP 服务**，用真实 `fetch` 打 `/api/v1/admin/members*`，
- * 并回到库与文件上核对结果。它覆盖的是「只有跨进程才暴露」的东西：
- * 路由挂载、方法限制、`/api/v1/admin/members` 与子路径的分发、
- * 以及**签发出来的 token 立刻能上报、能看看板**这条端到端性质。
- *
- * ```
- * bun run packages/server/test/e2e-admin.ts
- * ```
- *
- * ★ 最关键的一条断言是「签发即刻生效」：
- *   管理员在页面上拿到 token 的那一刻就会发给员工，
- *   若服务端要重启才认这个 token，员工那边看到的是「token 无效」——
- *   而管理员这边一切正常，排障方向会被完全带偏。
- */
-
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+/** 数据库 v4 管理 → 上报 → SQL 对账，真 HTTP、隔离目录、动态端口。 */
+import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { openPortalStore } from '@ai-token-report/core/db'
+import { createServer, type ServerHandle } from '../src/index.js'
+import { createIsolatedMysql } from '../verify/mysql-isolation.js'
 
-import type { AdminMemberResponse, AdminMembersResponse } from '@ai-token-report/shared'
-
-import { createServer } from '../src/index.js'
-
-const PORT = 18811
-/** 环境变量注入的管理员 —— 冷启动兜底那条路（凭证文件为空/只读时唯一的入口）。 */
-const ENV_ADMIN_TOKEN = 'atr-env-admin-0001'
-const BOSS_TOKEN = 'atr-boss-9f3c'
-const ZHANG_TOKEN = 'atr-zhangsan-9f3c'
-
-let passed = 0
-let failed = 0
-
-function check(label: string, cond: boolean, extra = ''): void {
-  if (cond) {
-    passed++
-    console.log(`  ✅ ${label}`)
-  } else {
-    failed++
-    console.log(`  ❌ ${label}${extra ? ` — ${extra}` : ''}`)
-  }
+const home = mkdtempSync(join(tmpdir(), 'atr-admin-v4-'))
+const dbPath = join(home, 'portal.sqlite')
+const isolation = process.argv.includes('--mysql') ? await createIsolatedMysql() : null
+const target = { sqlitePath: dbPath, ...(isolation ? { mysqlUrl: isolation.url } : {}) }
+const adminToken = 'isolated-admin-secret'
+const servers: ServerHandle[] = []
+let checks = 0
+function equal(actual: unknown, expected: unknown, message: string) { assert.deepEqual(actual, expected, message); checks++ }
+async function start(extra: Record<string, unknown> = {}) {
+  const server = await createServer({ port: 0, dshHome: home, dbPath, mysqlUrl: isolation?.url ?? '', adminToken, adminName: '验收管理员', requestLog: false, ...extra })
+  servers.push(server)
+  return server
 }
-
-/**
- * 发一个请求并把响应解析成 JSON（非 JSON 也照原样返回，便于断言状态码）。
- *
- * ⚠️ `body` 用 `any`：这是一个验证脚本，每个断言都按当时的响应形状就地取值，
- *   为它写一套响应类型只会把注意力从「端到端行为」引开。
- *   类型契约的守卫在 `shared/src/protocol.ts` 与各 `*.test.ts`。
- */
-async function call(
-  url: string,
-  init: { method?: string; token?: string; body?: unknown } = {},
-): Promise<{ status: number; body: any; headers: Headers }> {
-  const res = await fetch(url, {
-    method: init.method ?? 'GET',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(init.token ? { Authorization: `Bearer ${init.token}` } : {}),
-    },
-    ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+async function request(server: ServerHandle, path: string, token: string | null = adminToken, body?: unknown) {
+  const response = await fetch(server.url + '/api/v1/' + path, {
+    method: body === undefined ? 'GET' : 'POST',
+    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   })
-  const text = await res.text()
-  let parsed: unknown = null
+  return { status: response.status, data: await response.json() as any }
+}
+const event = (id: string) => ({ event_id: id, session_id: 'database-v4', seq: 1, ts: Date.now(), provider: 'fixture', model: 'fixture', input_tokens: 11, output_tokens: 2, cache_read_tokens: 70, cache_write_tokens: 3, reasoning_tokens: 1 })
+const payload = (id: string) => ({ schemaVersion: 1, client: { userName: '伪造者' }, generatedAt: new Date().toISOString(), records: [event(id)] })
+
+try {
+  let a = await start()
+  const b = await start({ adminToken: 'must-not-overwrite-existing-admin' })
+  equal((await request(b, 'admin/members', 'must-not-overwrite-existing-admin')).status, 401, '环境变量不会覆盖已初始化数据库')
+  equal((await request(a, 'admin/members', null)).status, 401, '未认证401')
+  equal((await request(a, 'admin/members', 'wrong')).status, 401, '错误身份401')
+  const roles = (await request(a, 'admin/roles')).data.roles
+  const memberRole = roles.find((role: any) => role.code === 'member').role_id
+  assert(roles.every((role: any) => Array.isArray(role.permissions))); checks++
+  const dept = (await request(a, 'admin/departments', adminToken, { name: '研发部' })).data.department
+  equal((await request(b, 'departments')).data.departments[0].department_id, dept.department_id, '部门立即跨实例可见')
+  const create = async () => request(a, 'admin/members', adminToken, { name: '同名成员', role_ids: [memberRole], department_id: dept.department_id })
+  let first = (await create()).data.member
+  const second = (await create()).data.member
+  assert(first.member_id !== second.member_id); checks++
+  const firstIssue = await request(a, 'admin/members/tokens', adminToken, { member_id: first.member_id, label: '插件' })
+  const firstSecret = firstIssue.data.token_secret
+  const firstToken = firstIssue.data.token
+  const secondIssue = await request(a, 'admin/members/tokens', adminToken, { member_id: second.member_id, label: 'CLI' })
+  equal(firstIssue.status, 200, '签发成功')
+  equal((await request(b, 'identity/verify', firstSecret, {})).data.member_id, first.member_id, '新凭证立即跨实例识别稳定ID')
+  equal((await request(b, 'admin/members', firstSecret)).status, 403, '普通身份不能查人员')
+  equal((await request(b, 'stats/overview?identity_view=member', firstSecret)).status, 403, '新上报scope不能读取看板')
+  equal((await request(b, 'token-usage', firstSecret, payload('v4:1'))).data, { accepted: 1, duplicates: 0, rejected: 0 }, '签发即刻可上报')
+  equal((await request(a, 'token-usage', secondIssue.data.token_secret, payload('v4:2'))).status, 200, '同名第二人可上报')
+  equal((await request(a, 'token-usage', secondIssue.data.token_secret, payload('v4:1'))).data, { accepted: 0, duplicates: 1, rejected: 0 }, '跨凭证重放幂等')
+  const ranking = await request(a, 'stats/breakdown?identity_view=member&by=user')
+  equal(ranking.status, 200, '稳定身份排行可用')
+  equal(ranking.data.rows.length, 2, '同名人员在排行中为两行')
+  equal(ranking.data.rows.map((row: any) => row.label), ['同名成员', '同名成员'], '排行标签与ID分开')
+  equal(new Set(ranking.data.rows.map((row: any) => row.member_id)).size, 2, '稳定排行ID唯一')
+  const selected = await request(a, `stats/overview?identity_view=member&member_id=${first.member_id}`)
+  equal([selected.data.calls, selected.data.totalTokens], [1, 86], '按稳定ID精确筛选且四项完整')
+  const legacy = await request(a, 'stats/overview')
+  equal([legacy.status, legacy.data.code], [409, 'identity_view_required'], '旧姓名视图不能静默合并同名成员')
+  const store = await openPortalStore(target)
   try {
-    parsed = JSON.parse(text)
-  } catch {
-    /* 非 JSON 响应也照原样返回，让断言能看到 status */
-  }
-  return { status: res.status, body: parsed, headers: res.headers }
+    const rows = await store.all<any>('SELECT * FROM usage_event ORDER BY event_id')
+    equal(rows.map(row => row.member_id), [first.member_id, second.member_id], '同名人员不合并，首次归属不漂移')
+    equal(rows[0].report_token_id, firstToken.token_id, '首次上报凭证ID不可被重放覆盖')
+    equal([rows[0].input_tokens, rows[0].output_tokens, rows[0].cache_read_tokens, rows[0].cache_write_tokens], [11, 2, 70, 3], '四列原值一致')
+    assert(rows[0].received_at_ms > 0); checks++
+  } finally { await store.close() }
+  const failedStore = await openPortalStore(target)
+  try { await failedStore.exec(isolation
+    ? "CREATE TRIGGER fixture_fail_write BEFORE INSERT ON usage_event FOR EACH ROW BEGIN IF NEW.event_id = 'v4:failure' THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'injected write failure'; END IF; END"
+    : "CREATE TRIGGER fixture_fail_write BEFORE INSERT ON usage_event WHEN NEW.event_id = 'v4:failure' BEGIN SELECT RAISE(ABORT, 'injected write failure'); END") } finally { await failedStore.close() }
+  equal((await request(b, 'token-usage', firstSecret, payload('v4:failure'))).status, 503, '数据库写失败不能伪报duplicates或成功ACK')
+  const recoveryStore = await openPortalStore(target)
+  try { await recoveryStore.exec('DROP TRIGGER fixture_fail_write') } finally { await recoveryStore.close() }
+  equal((await request(b, 'token-usage', firstSecret, payload('v4:failure'))).data.accepted, 1, '恢复后同批仍可重试入库')
+  equal((await request(b, 'token-usage', firstSecret, payload('v4:failure'))).data.duplicates, 1, '恢复重放仅计费一次')
+  const memberList = await request(b, 'admin/members')
+  const tokenList = await request(b, `admin/members/tokens?member_id=${first.member_id}`)
+  assert(!JSON.stringify([memberList, tokenList]).includes(firstSecret)); checks++
+  assert(!JSON.stringify(memberList).includes('credentialsPath')); checks++
+  equal((await request(a, 'admin/members/update', adminToken, { token: firstSecret, name: '非法旧载荷' })).status, 400, '旧token定位载荷明确拒绝')
+  const renamed = await request(a, 'admin/members/update', adminToken, { member_id: first.member_id, expected_version: first.version, name: '改名成员' })
+  equal(renamed.status, 200, '按ID改名成功')
+  first = renamed.data.member
+  equal((await request(a, 'admin/members/update', adminToken, { member_id: first.member_id, expected_version: first.version - 1, name: '覆盖' })).status, 409, '旧版本拒绝覆盖')
+  equal((await request(b, 'identity/verify', firstSecret, {})).data.name, '改名成员', '当前身份名跨实例更新')
+  const detail = await request(a, `stats/records?identity_view=member&member_id=${first.member_id}`)
+  equal(detail.data.rows[0].member_id, first.member_id, '明细给出稳定ID')
+  equal(detail.data.rows[0].user_name_snapshot, '同名成员', '改名不改接收时快照')
+  const rotated = await request(a, 'admin/members/tokens/rotate', adminToken, { member_id: first.member_id, token_id: firstToken.token_id, expected_version: firstToken.version })
+  equal(rotated.status, 200, '轮换凭证成功')
+  equal((await request(b, 'token-usage', firstSecret, payload('v4:3'))).status, 401, '旧凭证立即失效')
+  equal((await request(b, 'token-usage', rotated.data.token_secret, payload('v4:3'))).status, 200, '新凭证立即可用')
+  equal((await request(a, 'admin/members/tokens/revoke', adminToken, { member_id: second.member_id, token_id: rotated.data.token.token_id, expected_version: 1 })).status, 404, '不能跨人员操作Token')
+  const disabled = await request(a, 'admin/members/status', adminToken, { member_id: first.member_id, expected_version: first.version, status: 'disabled' })
+  equal(disabled.status, 200, '停用人员成功')
+  equal((await request(b, 'token-usage', rotated.data.token_secret, payload('v4:4'))).status, 401, '停用人员凭证全部失效')
+  const restored = await request(a, 'admin/members/status', adminToken, { member_id: first.member_id, expected_version: disabled.data.member.version, status: 'active' })
+  equal(restored.status, 200, '恢复人员成功')
+  equal((await request(b, 'token-usage', rotated.data.token_secret, payload('v4:4'))).status, 401, '恢复不复活已吊销凭证')
+  const self = memberList.data.members.find((member: any) => member.name === '验收管理员')
+  equal((await request(a, 'admin/members/roles', adminToken, { member_id: self.member_id, expected_version: self.version, role_ids: [memberRole] })).status, 409, '最后管理入口不能移除')
+  equal((await request(a, 'admin/storage')).data, { kind: isolation ? 'mysql' : 'sqlite', schema_version: 4, available: true, initialized: true }, '存储描述不泄露连接凭证')
+  equal((await request(a, 'admin/audit?limit=2&offset=0')).data.rows.length, 2, '审计分页')
+  equal((await request(a, 'admin/audit?limit=nope')).status, 400, '非法分页不降级全量')
+  const mappingId = randomUUID()
+  const legacyKey = 'legacy:' + Buffer.from('同名成员').toString('base64url')
+  const historicalStore = await openPortalStore(target)
+  try {
+    await historicalStore.run('INSERT INTO usage_event (event_id,session_id,seq,ts,provider,model,user_id,user_name,dept,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens) VALUES ($id,$session,1,$now,$provider,$model,$name,$snapshot,$dept,5,1,7,0)', { $id: 'legacy:1', $session: 'legacy', $now: Date.now(), $provider: 'fixture', $model: 'fixture', $name: '同名成员', $snapshot: '原姓名快照', $dept: '原部门快照' })
+    await historicalStore.run('INSERT INTO legacy_attribution_map (mapping_id,legacy_user_id,source_import_ref,created_at_ms) VALUES ($id,$name,$source,$now)', { $id: mappingId, $name: '同名成员', $source: 'fixture-explicit-import', $now: Date.now() })
+  } finally { await historicalStore.close() }
+  equal((await request(a, 'admin/legacy-attributions')).data.mappings[0].status, 'pending', '历史映射先显式待确认')
+  const legacyFilter = 'stats/overview?identity_view=member&legacy_user=' + encodeURIComponent(legacyKey)
+  equal((await request(a, legacyFilter)).data.totalTokens, 13, '历史选择器只选择旧子集')
+  const confirmation = { mapping_id: mappingId, member_id: first.member_id, expected_status: 'pending', source_import_ref: 'fixture-explicit-import', reason: '隔离夹具核对原始归属' }
+  equal((await request(a, 'admin/legacy-attributions/confirm', adminToken, { ...confirmation, source_import_ref: 'wrong' })).status, 409, '确认来源CAS不匹配拒绝')
+  equal((await request(a, 'admin/legacy-attributions/confirm', adminToken, confirmation)).data.updated_events, 1, '确认只回填指定历史')
+  equal((await request(a, legacyFilter)).data.totalTokens, 13, '确认后收藏的历史选择器不扩大到成员新事件')
+  equal((await request(a, `stats/overview?identity_view=member&member_id=${second.member_id}`)).data.calls, 1, '另一个同名人员不受历史映射影响')
+  equal((await request(a, 'admin/legacy-attributions/confirm', adminToken, confirmation)).status, 409, '重复确认不静默覆盖')
+  equal((await request(a, 'stats/overview?member_id=' + first.member_id)).status, 400, '新筛选不能隐式切换旧视图')
+  equal((await request(a, 'stats/overview?identity_view=member&user=同名成员')).status, 400, '旧筛选不能混入新视图')
+  equal((await request(a, 'stats/overview?identity_view=member&legacy_user=legacy:_w')).status, 400, '损坏UTF8历史键拒绝')
+  await a.stop()
+  a = await start()
+  equal((await request(a, 'identity/verify', secondIssue.data.token_secret, {})).data.member_id, second.member_id, '重启后凭证仍有效')
+  writeFileSync(join(home, 'credentials.json'), 'broken obsolete file')
+  equal((await request(a, 'admin/members')).status, 200, '旧文件不能改变已初始化数据库')
+  const empty = await createServer({ port: 0, dshHome: home, dbPath: join(home, 'empty.sqlite'), mysqlUrl: '', adminToken: '', adminUsername: '', adminPassword: '', requestLog: false })
+  servers.push(empty)
+  equal((await request(empty, 'token-usage', firstSecret, payload('v4:5'))).status, 503, '未初始化上报非2xx')
+  equal((await request(empty, 'admin/members')).status, 503, '未初始化管理503')
+  console.log(`${typeof Bun === 'undefined' ? 'Node' : 'Bun'} + ${isolation ? 'MySQL' : 'SQLite'} 数据库 v4 真 HTTP 管理与上报通过：${checks} 项`)
+} finally {
+  await Promise.all(servers.map(server => server.stop().catch(() => {})))
+  await isolation?.dispose()
+  rmSync(home, { recursive: true, force: true })
 }
-
-/** 一条线上记录（下划线字段，四个 token 分列）。 */
-function record(eventId: string): Record<string, unknown> {
-  return {
-    event_id: eventId,
-    session_id: 'session-e2e-admin',
-    seq: 1,
-    ts: Date.now(),
-    provider: 'dashscope',
-    model: 'deepseek-v4.1-flash',
-    input_tokens: 100,
-    output_tokens: 10,
-    cache_read_tokens: 900,
-    cache_write_tokens: 0,
-    reasoning_tokens: 0,
-    total_tokens: 1010,
-    cwd: 'D:\\Coding\\ai-token-report',
-    turn: 1,
-    step: 1,
-  }
-}
-
-function ingestPayload(eventId: string): unknown {
-  return {
-    schemaVersion: 1,
-    client: { userId: 'ignored', userName: 'ignored' },
-    generatedAt: new Date().toISOString(),
-    records: [record(eventId)],
-  }
-}
-
-// ── 0. 准备：一个手工维护的凭证文件（一个管理员 + 一个成员）───────────────
-const home = mkdtempSync(join(tmpdir(), 'atr-e2e-admin-'))
-mkdirSync(join(home, 'token-report'), { recursive: true })
-const credPath = join(home, 'token-report', 'credentials.json')
-const dbPath = join(home, 'token-report', 'portal.sqlite')
-writeFileSync(
-  credPath,
-  JSON.stringify([
-    { token: BOSS_TOKEN, name: '李经理', dept: '研发一部', role: 'admin' },
-    { token: ZHANG_TOKEN, name: '张三', dept: '研发一部' },
-  ]),
-  'utf8',
-)
-
-// ── 1. 起服务 ───────────────────────────────────────────────────────────────
-console.log('\n【1】启动部门服务端（凭证文件 + 环境变量管理员）')
-const portal = await createServer({
-  port: PORT,
-  host: '127.0.0.1',
-  dshHome: home,
-  dbPath,
-  credentialsPath: credPath,
-  adminToken: ENV_ADMIN_TOKEN,
-  adminName: '部署管理员',
-  enableLocalApi: false,
-})
-const base = portal.url
-const members = `${base}/api/v1/admin/members`
-
-const health = (await (await fetch(`${base}/api/health`)).json()) as {
-  credentialsRegistered: boolean
-  credentialCount: number
-  adminCount: number
-}
-check('健康检查：凭证已登记', health.credentialsRegistered === true)
-check('健康检查：凭证数量 3（李经理 / 张三 / 环境变量管理员）', health.credentialCount === 3, String(health.credentialCount))
-check('健康检查：管理员数量 2', health.adminCount === 2, String(health.adminCount))
-
-// ── 2. 角色来自服务端（页面据此决定显不显示管理页签）────────────────────
-console.log('\n【2】身份校验带回角色')
-const bossVerify = await call(`${base}/api/v1/identity/verify`, {
-  method: 'POST',
-  token: BOSS_TOKEN,
-  body: { token: BOSS_TOKEN },
-})
-check('管理员 token → role=admin', bossVerify.body?.role === 'admin', JSON.stringify(bossVerify.body))
-
-const zhangVerify = await call(`${base}/api/v1/identity/verify`, {
-  method: 'POST',
-  token: ZHANG_TOKEN,
-  body: { token: ZHANG_TOKEN },
-})
-check('★ 成员 token → role=member（绝不默认成管理员）', zhangVerify.body?.role === 'member', JSON.stringify(zhangVerify.body))
-
-const envVerify = await call(`${base}/api/v1/identity/verify`, {
-  method: 'POST',
-  token: ENV_ADMIN_TOKEN,
-  body: { token: ENV_ADMIN_TOKEN },
-})
-check('环境变量管理员 → role=admin，姓名来自配置', envVerify.body?.role === 'admin' && envVerify.body?.name === '部署管理员', JSON.stringify(envVerify.body))
-
-// ── 3. 鉴权三类分开 ─────────────────────────────────────────────────────────
-console.log('\n【3】鉴权：401 / 403 必须分开')
-const noAuth = await call(members)
-check('★ 缺 token → 401', noAuth.status === 401, String(noAuth.status))
-
-const badToken = await call(members, { token: 'atr-nope' })
-check('★ token 不对 → 401', badToken.status === 401, String(badToken.status))
-
-const asMember = await call(members, { token: ZHANG_TOKEN })
-check('★ 成员 token → 403（不是 401，重填没用）', asMember.status === 403, String(asMember.status))
-check('403 响应体里没有人员名单', !('members' in (asMember.body ?? {})))
-check('403 原因指向「要管理员 token」', String(asMember.body?.reason).includes('管理员'))
-
-// ── 4. 人员列表 ─────────────────────────────────────────────────────────────
-console.log('\n【4】人员列表（管理员）')
-const list = await call(members, { token: ENV_ADMIN_TOKEN })
-const listBody = list.body as AdminMembersResponse
-check('HTTP 200', list.status === 200, String(list.status))
-check('三人都在：李经理 / 张三 / 部署管理员', listBody.members?.length === 3, JSON.stringify(listBody.members?.map((m) => m.name)))
-check('★ 管理员排在前面', listBody.members?.[0]?.role === 'admin')
-check('环境变量管理员标成 source=env（页面据此禁掉操作）', listBody.members?.some((m) => m.source === 'env' && m.name === '部署管理员'))
-check('token 明文返回（页面要把它发给本人）', listBody.members?.some((m) => m.token === ZHANG_TOKEN))
-check('凭证文件可写', listBody.writable === true)
-check('凭证文件路径与配置一致', listBody.credentialsPath === credPath)
-
-// ── 5. ★ 签发：新 token 立刻能上报、能看看板 ────────────────────────────────
-console.log('\n【5】签发新 token，并立刻用它上报')
-const issued = await call(members, {
-  method: 'POST',
-  token: ENV_ADMIN_TOKEN,
-  body: { name: '王五', dept: '研发二部' },
-})
-const issuedBody = issued.body as AdminMemberResponse
-check('HTTP 200 + ok', issued.status === 200 && issuedBody.ok === true, JSON.stringify(issued.body))
-const wangToken = issuedBody.member?.token ?? ''
-check('token 形如 atr-<16 hex>', /^atr-[0-9a-f]{16}$/.test(wangToken), wangToken)
-check('角色缺省是普通成员', issuedBody.member?.role === 'member')
-
-const fileAfterIssue = JSON.parse(readFileSync(credPath, 'utf8')) as Record<string, unknown>[]
-const wangEntry = fileAfterIssue.find((e) => e['name'] === '王五')
-check('★ 落盘了（文件里能读出王五）', !!wangEntry)
-check('成员不写 role 字段（缺省即成员）', wangEntry !== undefined && !('role' in wangEntry))
-check('原来的管理员条目仍在（没有覆盖手工维护的内容）', fileAfterIssue.some((e) => e['token'] === BOSS_TOKEN && e['role'] === 'admin'))
-
-const wangReport = await call(`${base}/api/v1/token-usage`, {
-  method: 'POST',
-  token: wangToken,
-  body: ingestPayload('e2e-wang:1'),
-})
-check('★★ 新 token 立刻可上报（不必重启服务端）', wangReport.status === 200 && wangReport.body?.accepted === 1, JSON.stringify(wangReport.body))
-
-const stats = await call(`${base}/api/v1/stats/breakdown?by=user&period=today`, { token: wangToken })
-const statsRows = (stats.body as { rows: { key: string }[] }).rows ?? []
-check('★★ 新 token 也能打开看板并看到自己的用量', stats.status === 200 && statsRows.some((r) => r.key === '王五'), JSON.stringify(statsRows))
-
-// ★ 人员筛选走的是**前端拼出来的查询串**（`URLSearchParams` 会把逗号编码成 %2C），
-//   这里用同样的方式拼一次，确认多选筛选在真实 HTTP 上成立。
-const multiQuery = new URLSearchParams({
-  by: 'user',
-  period: 'today',
-  user: `王五,${'unknown'}`,
-})
-const multi = await call(`${base}/api/v1/stats/breakdown?${multiQuery.toString()}`, {
-  token: wangToken,
-})
-const multiRows = (multi.body as { rows: { key: string }[] }).rows ?? []
-check(
-  '★ 人员多选（逗号分隔，URL 编码后）只返回选中的人',
-  multi.status === 200 && multiRows.length === 1 && multiRows[0]?.key === '王五',
-  JSON.stringify(multiRows),
-)
-
-// ── 6. 业务失败是 200 + ok:false ────────────────────────────────────────────
-console.log('\n【6】业务失败：200 + ok:false（要改的是输入）')
-const dup = await call(members, { method: 'POST', token: ENV_ADMIN_TOKEN, body: { name: '张三' } })
-check('重名 → 200 + ok:false', dup.status === 200 && dup.body?.ok === false, JSON.stringify(dup.body))
-check('原因说清同名会并成一个人', String(dup.body?.reason).includes('同名'))
-
-const reserved = await call(members, { method: 'POST', token: ENV_ADMIN_TOKEN, body: { name: 'unknown' } })
-check('姓名 unknown（未归属保留键）被拒', reserved.body?.ok === false)
-
-const badShape = await call(members, { method: 'POST', token: ENV_ADMIN_TOKEN, body: {} })
-check('请求形状不对 → 400', badShape.status === 400, String(badShape.status))
-
-// ── 7. 重置 / 吊销 ──────────────────────────────────────────────────────────
-console.log('\n【7】重置与吊销')
-const rotated = await call(`${members}/rotate`, { method: 'POST', token: ENV_ADMIN_TOKEN, body: { token: wangToken } })
-const newWangToken = (rotated.body as AdminMemberResponse).member?.token ?? ''
-check('重置返回新 token', rotated.status === 200 && newWangToken !== wangToken, JSON.stringify(rotated.body))
-
-const oldAfterRotate = await call(`${base}/api/v1/stats/overview?period=today`, { token: wangToken })
-check('★ 旧 token 立刻失效（看板 401）', oldAfterRotate.status === 401, String(oldAfterRotate.status))
-const newAfterRotate = await call(`${base}/api/v1/stats/overview?period=today`, { token: newWangToken })
-check('新 token 可用', newAfterRotate.status === 200, String(newAfterRotate.status))
-
-const renamed = await call(`${members}/update`, {
-  method: 'POST',
-  token: ENV_ADMIN_TOKEN,
-  body: { token: newWangToken, name: '王五（研发二部）', dept: '研发二部' },
-})
-check('改名成功且 token 不变', (renamed.body as AdminMemberResponse).member?.token === newWangToken)
-check('改名落到文件', readFileSync(credPath, 'utf8').includes('王五（研发二部）'))
-
-const revoked = await call(`${members}/revoke`, { method: 'POST', token: ENV_ADMIN_TOKEN, body: { token: newWangToken } })
-check('吊销成功', revoked.status === 200 && (revoked.body as AdminMemberResponse).ok === true)
-const afterRevoke = await call(`${base}/api/v1/stats/overview?period=today`, { token: newWangToken })
-check('★ 吊销后看板 401', afterRevoke.status === 401, String(afterRevoke.status))
-check('吊销后文件里也没有他了', !readFileSync(credPath, 'utf8').includes('王五'))
-
-// ── 8. 环境变量管理员不可在页面上维护 ──────────────────────────────────────
-console.log('\n【8】环境变量注入的管理员只能在部署侧改')
-const revokeEnv = await call(`${members}/revoke`, { method: 'POST', token: ENV_ADMIN_TOKEN, body: { token: ENV_ADMIN_TOKEN } })
-check('删除被拒（200 + ok:false）', revokeEnv.status === 200 && revokeEnv.body?.ok === false)
-check('原因指向 ATR_ADMIN_TOKEN', String(revokeEnv.body?.reason).includes('ATR_ADMIN_TOKEN'))
-
-// ── 9. 路由分发与 404/405 ───────────────────────────────────────────────────
-console.log('\n【9】路由分发')
-const wrongMethod = await call(`${members}/rotate`, { token: ENV_ADMIN_TOKEN })
-check('GET 子动作 → 405', wrongMethod.status === 405, String(wrongMethod.status))
-check('405 带 Allow: POST', wrongMethod.headers.get('allow') === 'POST', String(wrongMethod.headers.get('allow')))
-const getMembersPost = await call(`${members}/nope`, { method: 'POST', token: ENV_ADMIN_TOKEN, body: { token: 'x' } })
-check('未知子路径 → 404', getMembersPost.status === 404, String(getMembersPost.status))
-const issueOnSub = await call(`${members}/issue`, { method: 'POST', token: ENV_ADMIN_TOKEN, body: { name: '甲' } })
-check('签发挂在 /members 而不是 /members/issue → 404 且给出指引', issueOnSub.status === 404 && String(issueOnSub.body?.reason).includes('POST /api/v1/admin/members'))
-
-// ── 10. 第二个服务：只有文件里的一个管理员 → 最后一个管理员护栏 ────────────
-console.log('\n【10】没有环境变量管理员时的「最后一个管理员」护栏')
-const home2 = mkdtempSync(join(tmpdir(), 'atr-e2e-admin2-'))
-mkdirSync(join(home2, 'token-report'), { recursive: true })
-const credPath2 = join(home2, 'token-report', 'credentials.json')
-writeFileSync(credPath2, JSON.stringify([{ token: BOSS_TOKEN, name: '李经理', role: 'admin' }]), 'utf8')
-
-const solo = await createServer({
-  port: PORT + 1,
-  host: '127.0.0.1',
-  dshHome: home2,
-  dbPath: join(home2, 'token-report', 'portal.sqlite'),
-  credentialsPath: credPath2,
-  enableLocalApi: false,
-})
-const soloHealth = (await (await fetch(`${solo.url}/api/health`)).json()) as { adminCount: number }
-check('该服务只有 1 个管理员', soloHealth.adminCount === 1)
-
-const dropLastAdmin = await call(`${solo.url}/api/v1/admin/members/revoke`, {
-  method: 'POST',
-  token: BOSS_TOKEN,
-  body: { token: BOSS_TOKEN },
-})
-check('★ 删最后一个管理员被拒', dropLastAdmin.status === 200 && dropLastAdmin.body?.ok === false, JSON.stringify(dropLastAdmin.body))
-check('原因说清后果（没人能再发 token）', String(dropLastAdmin.body?.reason).includes('最后一个管理员'))
-check('文件没被动过', JSON.parse(readFileSync(credPath2, 'utf8')).length === 1)
-
-const demoteLastAdmin = await call(`${solo.url}/api/v1/admin/members/update`, {
-  method: 'POST',
-  token: BOSS_TOKEN,
-  body: { token: BOSS_TOKEN, role: 'member' },
-})
-check('★ 降级最后一个管理员同样被拒', demoteLastAdmin.body?.ok === false)
-await solo.stop()
-
-// ── 11. 第三个服务：凭证文件读不懂 → 拒绝写入，且服务照常起 ────────────────
-console.log('\n【11】凭证文件损坏时：服务能起，但拒绝一切写入')
-const home3 = mkdtempSync(join(tmpdir(), 'atr-e2e-admin3-'))
-mkdirSync(join(home3, 'token-report'), { recursive: true })
-const credPath3 = join(home3, 'token-report', 'credentials.json')
-const broken = '[ { "token": "atr-x", "name": "甲" },, ]'
-writeFileSync(credPath3, broken, 'utf8')
-
-const damaged = await createServer({
-  port: PORT + 2,
-  host: '127.0.0.1',
-  dshHome: home3,
-  dbPath: join(home3, 'token-report', 'portal.sqlite'),
-  credentialsPath: credPath3,
-  adminToken: ENV_ADMIN_TOKEN,
-  enableLocalApi: false,
-})
-// 凭证文件坏了，但环境变量管理员还在 —— 这是「文件坏了怎么救」的唯一入口
-const damagedList = await call(`${damaged.url}/api/v1/admin/members`, { token: ENV_ADMIN_TOKEN })
-const damagedBody = damagedList.body as AdminMembersResponse
-check('服务照常启动，仍能进管理页', damagedList.status === 200, String(damagedList.status))
-check('页面看到「不可写」与原因', damagedBody.writable === false && String(damagedBody.writeBlockedReason).includes('无法解析'))
-const damagedIssue = await call(`${damaged.url}/api/v1/admin/members`, {
-  method: 'POST',
-  token: ENV_ADMIN_TOKEN,
-  body: { name: '乙' },
-})
-check('★ 签发被拒（不拿空表覆盖唯一真值）', damagedIssue.body?.ok === false && String(damagedIssue.body?.reason).includes('拒绝写入'))
-check('★ 原文件一个字节都没动', readFileSync(credPath3, 'utf8') === broken)
-await damaged.stop()
-
-// ── 清理 ────────────────────────────────────────────────────────────────────
-await portal.stop()
-rmSync(home, { recursive: true, force: true })
-rmSync(home2, { recursive: true, force: true })
-rmSync(home3, { recursive: true, force: true })
-
-console.log(`\n${'─'.repeat(50)}`)
-console.log(`结果：${passed} 项通过，${failed} 项失败`)
-process.exit(failed > 0 ? 1 : 0)

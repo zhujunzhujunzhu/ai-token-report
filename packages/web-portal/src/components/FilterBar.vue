@@ -14,7 +14,7 @@ import {
 import { reactive, watch } from 'vue'
 import { Search, RefreshLeft } from '@element-plus/icons-vue'
 import { useDashboardStore } from '../stores/dashboard.js'
-import { TIME_RANGES, CUSTOM_PERIOD, userLabel } from '../types/portal.js'
+import { TIME_RANGES, CUSTOM_PERIOD, identityLabel } from '../types/portal.js'
 const dashboard = useDashboardStore()
 const draft = reactive({
   ...dashboard.filters,
@@ -62,7 +62,7 @@ async function reset(): Promise<void> {
             v-for="row in dashboard.userOptions"
             :key="row.key"
             :value="row.key"
-            :label="userLabel(row.key)" /></el-select
+            :label="identityLabel(row)" /></el-select
       ></el-form-item>
       <el-form-item label="厂商"
         ><el-input

@@ -123,6 +123,10 @@ export const UNATTRIBUTED_USER = 'unknown' as const
 
 /** 查询的公共筛选条件。所有 stats 接口共用。 */
 export interface StatsQuery {
+  identity_view?: 'legacy' | 'member'
+  member_id?: string[]
+  legacy_user?: string[]
+  unattributed?: boolean
   /** epoch 毫秒；缺省表示不限 */
   from?: number
   to?: number
@@ -198,6 +202,10 @@ export interface SeriesResponse {
 /** 分组排行的一行。 */
 export interface BreakdownRow {
   key: string
+  label?: string
+  member_id?: string | null
+  department_name?: string | null
+  attribution_status?: import('./portal-identity.js').PortalAttributionStatus
   totalTokens: number
   inputTokens: number
   outputTokens: number
@@ -219,6 +227,11 @@ export interface RecordRow {
   seq: number
   ts: number
   userId: string
+  member_id?: string | null
+  user_name_snapshot?: string | null
+  department_id?: string | null
+  dept_snapshot?: string | null
+  attribution_status?: import('./portal-identity.js').PortalAttributionStatus
   provider: string
   model: string
   totalTokens: number
@@ -250,7 +263,7 @@ export interface DiagnosticsResponse {
   unattributedRate: number
   /** 恒等式校验失败的行数（应恒为 0） */
   identityViolations: number
-  /** 已上报的机器数（按 userId 去重） */
+  /** 非空归属分组数；成员视图分别统计稳定人员与待关联历史身份，不等于机器数或实际人数。 */
   distinctUsers: number
   /** 最早 / 最晚事件时间 */
   earliestTs: number | null
@@ -469,6 +482,7 @@ export interface LocalIdentitySubmitResponse {
  */
 export interface VerifyTokenResponse {
   ok: boolean
+  member_id?: string
   /** 该 token 对应的姓名（由服务端决定，客户端不可覆盖）。 */
   name?: string
   dept?: string
@@ -486,24 +500,17 @@ export interface VerifyTokenResponse {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 人员管理与 token 发放：管理页 → 服务端（/api/v1/admin/members*）
+// 旧文件凭证兼容类型：仅供旧构造器测试和迁移解析使用。
 // ─────────────────────────────────────────────────────────────
 //
-// ★ 这一组接口是**唯一会写凭证文件的通路**。凭证文件此前只由管理员手工维护，
-//   现在管理页可以签发/重置/吊销 token，因此多出三条硬约束：
-//
-//   1. **只有管理员能调用**（`role === 'admin'`）：403 而不是静默返回空列表，
-//      否则页面会把「你没权限」渲染成「部门里没有人」。
-//   2. **最后一个管理员不可删除 / 不可降级**：否则一次误操作会让
-//      *所有人都失去发放 token 的能力*，且只能靠改文件恢复。
-//   3. **文件解析失败时拒绝写入**：覆盖一份读不懂的凭证文件 = 静默吊销全员，
-//      与「上报库绝不自动重建」是同一类事故（见 AGENTS.md）。
+// 生产管理接口的数据库 DTO 位于 portal-identity.ts；不要给新页面使用下面的
+// AdminMember/AdminFileStatus。正常服务的人员、权限与凭证唯一真值已经是数据库。
 
 /**
  * 角色。
  *
- * ⚠️ 这是**权限的唯一来源**：不要用姓名硬编码白名单
- *   （ARCHITECTURE.md §5.3 早已写死这条），姓名是可以随便改的显示值。
+ * 旧客户端和导入格式的兼容角色。生产授权查数据库当前 permissions，
+ * Bearer 再与 Token scopes 取交集；姓名绝不能作为授权依据。
  */
 export type UserRole = 'admin' | 'member'
 
@@ -590,6 +597,11 @@ export interface AdminLoginAccountRequest {
 
 /** 后台认证的公开身份，不含上报 Token。 */
 export interface PortalViewer {
+  member_id?: string
+  department_id?: string | null
+  department_name?: string | null
+  roles?: import('./portal-identity.js').PortalRole[]
+  permissions?: string[]
   name: string
   username: string
   dept?: string

@@ -55,6 +55,10 @@ export type QueryDimension = GroupDimension | 'user'
 
 /** 查询筛选条件。字段语义与 CLI 的 `--period/--provider/--model` 一致。 */
 export interface QueryFilter {
+  identityView?: 'legacy' | 'member'
+  memberIds?: string[]
+  legacyUserIds?: string[]
+  unattributedOnly?: boolean
   /** 起始时间（含），epoch ms。 */
   sinceMs?: number
   /** 结束时间（含），epoch ms。 */
@@ -154,6 +158,20 @@ export function buildWhere(filter: QueryFilter): {
     })
     clauses.push(`(${parts.join(' OR ')})`)
   }
+
+  // ★ 仅 portal v4 使用这些列；本地 usage.sqlite 的 schema 和查询保持独立。
+  const identities: string[] = []
+  filter.memberIds?.forEach((id, i) => {
+    const key = `$member${i}`
+    identities.push(`member_id = ${key}`); params[key] = id
+  })
+  filter.legacyUserIds?.forEach((id, i) => {
+    const key = `$legacy${i}`
+    // 旧 key 永远指历史子集；显式映射后也不能扩展到该人员的新事件。
+    identities.push(`(received_at_ms IS NULL AND user_id = ${key})`); params[key] = id
+  })
+  if (filter.unattributedOnly) identities.push('(member_id IS NULL AND user_id IS NULL)')
+  if (identities.length) clauses.push(`(${identities.join(' OR ')})`)
 
   return {
     sql: clauses.length > 0 ? ` WHERE ${clauses.join(' AND ')}` : '',
@@ -261,7 +279,8 @@ export function unattributedCallsQuery(filter: QueryFilter = {}): SqlQuery {
   const { sql, params } = buildWhere(filter)
   // 未归属条件与筛选条件用 AND 组合：filter 里若已有 user_id 条件，
   // 也能正确收敛（例如只看某个已署名的人 → 未归属恒为 0）
-  const clause = sql ? `${sql} AND user_id IS NULL` : ' WHERE user_id IS NULL'
+  const condition = filter.identityView === 'member' ? 'member_id IS NULL AND user_id IS NULL' : 'user_id IS NULL'
+  const clause = sql ? `${sql} AND ${condition}` : ` WHERE ${condition}`
   return { sql: `SELECT COUNT(*) AS c FROM ${EVENT_TABLE}${clause}`, params }
 }
 
@@ -466,6 +485,10 @@ export function queryIngestMoment(db: Database): number | null {
  *   后者是为了绕开 MySQL 的保留字（见 {@link groupsQuery}）。
  */
 export interface QueryGroupRow {
+  label?: string
+  memberId?: string | null
+  departmentName?: string | null
+  attributionStatus?: 'member' | 'legacy' | 'unattributed'
   key: string
   counts: TokenCounts
   firstTime: number

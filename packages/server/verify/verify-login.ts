@@ -4,8 +4,9 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createApp } from '../src/app.js'
-import { loadMembers } from '../src/member-admin.js'
-import { AdminRoute } from '../src/admin-route.js'
+import { DatabaseAdminRoute } from '../src/admin-route.js'
+import { CredentialStore } from '../src/credentials.js'
+import { seedDatabaseIdentity } from '../test/database-fixture.js'
 import { IdentityRoute } from '../src/identity-route.js'
 import { IngestRoute } from '../src/ingest-route.js'
 import { StatsRoute } from '../src/stats-route.js'
@@ -30,35 +31,43 @@ writeFileSync(
     },
   ]),
 )
-const { store, admin } = loadMembers({ credentialsPath: path })
+const repository = await seedDatabaseIdentity({ sqlitePath: join(dir, 'portal.sqlite') }, [{
+  name: '验收管理员', role: 'admin', token: 'fixture-report-token',
+  username: 'fixture-admin', passwordHash: await hashPassword(password),
+}])
+const store = CredentialStore.empty()
 let answer = ''
-const auth = new PortalAuth(store, Date.now, () => {
+const auth = new PortalAuth(repository, { hmacKey: 'isolated-captcha-key-at-least-32-characters', makeImage: () => {
   const generated = createCaptchaImage()
   answer = generated.answer
   return generated
-})
+} })
 const app = createApp({
   credentials: store,
+  identityStore: repository,
   portalAuth: auth,
-  adminRoute: new AdminRoute({ store, admin }),
+  databaseAdminRoute: new DatabaseAdminRoute(repository),
   identityRoute: new IdentityRoute({ dshHome: dir }),
   ingestRoute: new IngestRoute({
-    credentials: store,
+    identityStore: repository,
     dbPath: join(dir, 'portal.sqlite'),
   }),
   statsRoute: new StatsRoute({
-    credentials: store,
+    identityStore: repository,
     dbPath: join(dir, 'portal.sqlite'),
   }),
   localStats: null,
   enableLocalApi: false,
   requestLog: false,
 })
-const listener = await serveWithPortRetry('127.0.0.1', 19620, (req) =>
+const listener = await serveWithPortRetry('127.0.0.1', 0, (req) =>
   app.fetch(req),
 )
 const url = `http://127.0.0.1:${listener.port}/api/v1`
 try {
+  assert(listener.port > 0, '端口 0 必须回传系统分配的真实端口')
+  assert.equal(listener.port, listener.handle.port)
+  assert.equal(listener.shifted, false)
   const challenge = await fetch(url + '/auth/captcha')
   assert.equal(challenge.status, 200)
   const data = (await challenge.json()) as { captcha_id: string; image: string }
@@ -120,7 +129,7 @@ try {
     401,
   )
   console.log(
-    `${typeof Bun === 'undefined' ? 'Node' : 'Bun'} 真 HTTP 登录验证通过（14 项）`,
+    `${typeof Bun === 'undefined' ? 'Node' : 'Bun'} 真 HTTP 登录验证通过（17 项）`,
   )
 } finally {
   await listener.handle.stop()

@@ -12,6 +12,8 @@
   },
   "scripts": {
     "start": "bun run src/main.ts",
+    "build:node": "bun run scripts/build-node.ts",
+    "start:node": "node dist/main.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "bun test",
     "verify:mysql:node": "bun run verify/verify-mysql-node.ts"

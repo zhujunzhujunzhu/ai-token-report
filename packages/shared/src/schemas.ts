@@ -40,6 +40,7 @@
 import { z } from 'zod'
 
 import { SCHEMA_VERSION } from './protocol.js'
+import { validateName } from './identity.js'
 
 /** 形状校验结果：要么给出归一化后的值，要么给出**可直接展示给排障者**的中文原因。 */
 export type ShapeResult<T> = { ok: true; value: T } | { ok: false; reason: string }
@@ -246,6 +247,59 @@ export function parseAdminTokenBody(value: unknown): ShapeResult<AdminTokenBody>
 
 export function parseAdminLoginBody(value: unknown): ShapeResult<AdminLoginBody> {
   return check(adminLoginBodySchema, [null, 'token', 'username', 'password'], value)
+}
+
+// 数据库身份接口使用严格对象，旧的 token 定位载荷不能被静默当成新版请求。
+const portalId = z.uuid({ error: '需要有效的对象 ID，请刷新页面' })
+const portalVersion = z.int().min(1, { error: '缺少有效的 expected_version，请刷新页面' })
+const portalName = z.string().superRefine((value, ctx) => {
+  const result = validateName(value)
+  if (!result.ok) ctx.addIssue({ code: 'custom', message: result.reason ?? '姓名不合法' })
+}).transform((value) => value.trim())
+const roleIds = z.array(portalId).min(1).max(32)
+const scopes = z.array(z.string().min(1).max(64)).min(1).max(64)
+const memberVersion = { member_id: portalId, expected_version: portalVersion }
+const tokenVersion = { ...memberVersion, token_id: portalId }
+const departmentVersion = { department_id: portalId, expected_version: portalVersion }
+const departmentName = z.string().min(1).max(64).refine(
+  (name) => !!name.trim() && !/[\r\n\t]/.test(name), { error: '部门名称不能为空或包含换行、制表符' },
+).transform((name) => name.trim())
+
+export const portalCreateMemberSchema = z.strictObject({
+  name: portalName, department_id: portalId.nullable().optional(), role_ids: roleIds,
+})
+export const portalUpdateMemberSchema = z.strictObject({
+  ...memberVersion, name: portalName.optional(), department_id: portalId.nullable().optional(),
+}).refine((value) => value.name !== undefined || value.department_id !== undefined, {
+  error: '至少提供姓名或部门',
+})
+export const portalMemberRolesSchema = z.strictObject({ ...memberVersion, role_ids: roleIds })
+export const portalMemberStatusSchema = z.strictObject({
+  ...memberVersion, status: z.enum(['active', 'disabled', 'archived']),
+})
+export const portalLoginAccountSchema = z.strictObject({
+  ...memberVersion, username: z.string().min(3).max(64), password: z.string().min(1).max(256),
+})
+export const portalLoginStatusSchema = z.strictObject({ ...memberVersion, enabled: z.boolean() })
+export const portalIssueTokenSchema = z.strictObject({
+  member_id: portalId, label: z.string().trim().min(1).max(128), scopes: scopes.optional(),
+  expires_at_ms: z.int().positive().nullable().optional(),
+})
+export const portalTokenVersionSchema = z.strictObject(tokenVersion)
+export const portalTokenScopesSchema = z.strictObject({ ...tokenVersion, scopes })
+export const portalCreateDepartmentSchema = z.strictObject({ name: departmentName })
+export const portalUpdateDepartmentSchema = z.strictObject({ ...departmentVersion, name: departmentName })
+export const portalDepartmentStatusSchema = z.strictObject({
+  ...departmentVersion, status: z.enum(['active', 'disabled']),
+})
+export const portalConfirmLegacySchema = z.strictObject({
+  mapping_id: portalId, member_id: portalId, expected_status: z.literal('pending'),
+  source_import_ref: z.string().min(1).max(128), reason: z.string().trim().min(1).max(512),
+})
+
+/** 新管理接口共用校验出口，不改变既有上报与署名的错误优先级。 */
+export function parsePortalBody<T extends z.ZodType>(schema: T, value: unknown): ShapeResult<z.infer<T>> {
+  return check(schema, [null, 'member_id', 'token_id', 'department_id', 'expected_version'], value)
 }
 
 // ─────────────────────────────────────────────────────────────

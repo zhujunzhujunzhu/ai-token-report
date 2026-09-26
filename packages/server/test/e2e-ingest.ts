@@ -25,6 +25,7 @@ import { EVENT_TABLE, openDb } from '@ai-token-report/core/db'
 import type { IngestPayload, IngestResponse } from '@ai-token-report/shared'
 
 import { createServer } from '../src/index.js'
+import { seedDatabaseIdentity } from './database-fixture.js'
 
 const home = mkdtempSync(join(tmpdir(), 'atr-e2e-ingest-'))
 const PORT = 18801
@@ -40,6 +41,10 @@ writeFileSync(
   ]),
   'utf8',
 )
+await seedDatabaseIdentity({ sqlitePath: dbPath }, [
+  { token: 'atr-zhangsan-9f3c', name: '张三', dept: '研发一部' },
+  { token: 'atr-lisi-a17b', name: '李四', dept: '研发二部' },
+])
 
 let passed = 0
 let failed = 0
@@ -153,14 +158,14 @@ const portal = await createServer({
   host: '127.0.0.1',
   dshHome: home,
   dbPath,
-  credentialsPath: credPath,
+  mysqlUrl: '',
   enableLocalApi: false,
 })
 console.log(`  服务端: ${portal.url}`)
 
 const health = await (await fetch(`${portal.url}/api/health`)).json()
-check('健康检查：凭证已登记', health.credentialsRegistered === true)
-check('健康检查：凭证数量 2', health.credentialCount === 2)
+check('健康检查：身份已入库', health.initialized === true)
+check('健康检查：schema v4', health.schema_version === 4)
 check('健康检查：未启用本地 API（部门形态）', health.localApi === false)
 
 // ── 2. 正常上报（CLI 形态）──────────────────────────────────────────────────
@@ -268,12 +273,15 @@ check('两条通路各自入库（张三 3 条 + 李四 1 条）', countByUser('
 
 // ── 8. 本地形态同样收上报 ───────────────────────────────────────────────────
 console.log('\n【8】单机形态（enableLocalApi）也注册上报接口')
+await seedDatabaseIdentity({ sqlitePath: join(home, 'token-report', 'portal-local.sqlite') }, [
+  { token: 'atr-zhangsan-9f3c', name: '张三', dept: '研发一部' },
+])
 const local = await createServer({
   port: PORT + 1,
   host: '127.0.0.1',
   dshHome: home,
   dbPath: join(home, 'token-report', 'portal-local.sqlite'),
-  credentialsPath: credPath,
+  mysqlUrl: '',
   enableLocalApi: true,
 })
 const localRes = await fetch(`${local.url}/api/v1/token-usage`, {

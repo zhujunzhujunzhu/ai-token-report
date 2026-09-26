@@ -6,28 +6,36 @@
 
 ---
 
-## 0. 落地状态（全部已落地并验收通过）
+## 0. 原 MySQL 接入阶段的历史验收快照
+
+本节 707 项等数字记录旧阶段，不能替代当前 Portal v4 验收。当前身份和用量已共用数据库，显式迁移、约束目录核验及独立进程 HTTP 结果见 [v4 验证记录](database-v4/验证记录.md)；正式命令见 [数据库部署与迁移](数据库部署与迁移.md)。
 
 | 部分 | 状态 | 证据 |
 |---|---|---|
 | 方言层 `dialect.ts` | ✅ | `bun run --filter '@ai-token-report/core' verify:mysql` → **17 项全过**（活体，真实 MySQL） |
 | 驱动层 `mysql.ts`（`Bun.sql` + 共享池 + `$name`→`?`） | ✅ | 同上（含「同名参数出现多次」「缺参数抛错」） |
+| 驱动层 `mysql.ts`（**Node 侧可选 `mysql2`**） | ✅ | `bun run --filter '@ai-token-report/server' verify:mysql:node` → **49 项 + 编排 6 项全过**（真 Node + 真 mysql2）；含两驱动 `changes` 对照表（§2.7） |
 | 上报库门面 `portal-db.ts`（异步 + MySQL DDL + 版本闸门） | ✅ | 同上（upsert 语义、幂等 `changes` 判据、`AS new` 别名） |
 | 查询构建器（`query.ts`，两种后端共用一份 SQL）+ `portal.ts` 异步会话 + `num()` 归一 | ✅ | `packages/server/verify/verify-mysql-portal.ts` → **53 项全过** |
 | 服务端接线（`--mysql` / `ATR_MYSQL_URL` / 横幅脱敏 / 上报与看板同一目标） | ✅ | 同上脚本走**生产入口** `createServer()`；横幅断言「不含密码」 |
 | 双后端逐位对账 | ✅ | 同一批数据下 `overview` / `series(day,hour)` / `breakdown(user,provider,model,provider-model,project,day,hour)` / `records` 的**整个响应体 JSON 全等** |
 | 单测（方言 + 位置参数翻译） | ✅ | `packages/core/test/dialect.test.ts`（16 项，纯单元，进 `bun test`） |
-| SQLite 退路 | ✅ | 三个 e2e（35/54/27）与契约测试全部走 SQLite 默认路径，全绿 |
+| SQLite 退路 | ✅ | 三个 e2e（35/54/29）与契约测试全部走 SQLite 默认路径，全绿 |
 
 **验收命令与真实数字**：
 
 ```
-bun test                                                  617 pass / 0 fail / 28 files   (exit 0)
-bun run packages/server/verify/verify-mysql-portal.ts     53 项通过                     (exit 0)
-bun run --filter '@ai-token-report/core' verify:mysql      17 项通过                     (exit 0)
-bun run packages/server/test/e2e-{ingest,admin,identity}.ts  35 / 54 / 27 项通过          (exit 0)
-bun run build:npm:cli && bun run verify:npm:cli            双运行时全绿；发布产物仍零运行时依赖
+bun test                                                     707 pass / 0 fail / 32 files  (exit 0)
+bun run typecheck                                            7 个包全部                   (exit 0)
+bun run packages/server/verify/verify-mysql-portal.ts        53 项通过                    (exit 0)
+bun run --filter '@ai-token-report/core' verify:mysql        17 项通过                    (exit 0)
+bun run --filter '@ai-token-report/server' verify:mysql:node 49 项 + 编排 6 项通过（真 Node）(exit 0)
+bun run packages/server/test/e2e-{ingest,admin,identity}.ts  35 / 54 / 29 项通过          (exit 0)
+bun run build:npm:cli && bun run verify:npm:cli              双运行时全绿；发布产物仍零运行时依赖
 ```
+
+> ⚠️ 上面这些**条数**（`bun test` 的文件数、e2e 的项数）会随仓里新增测试而变化 ——
+> 口径是「**0 fail**」，不是「恰好 N 项」。看到数字变大不要当成回归。
 
 > ⚠️ 在 pwsh 里 `bun ... 2>&1 | Select-Object -First N` 有**两个**坑：
 > ① 它会把 bun 的 stderr 当错误记录，从而虚报 `exit 1`（真实退出码要单独取）；
@@ -49,20 +57,51 @@ bun run build:npm:cli && bun run verify:npm:cli            双运行时全绿；
 而 MySQL 侧只有异步的 `PortalStore` —— 本地路径**够不到** MySQL。
 `docs/server架构重构方案.md` §5 的迁移红线在这里同样成立。
 
-### Node 上暂不支持 MySQL（刻意的）
+### Node 上走**可选依赖 `mysql2`**（Bun 上走内建 `Bun.sql`）
 
-Node 没有内建 MySQL 客户端，要靠 `mysql2`（7 个传递依赖）。而：
+| 运行时 | 驱动 | 说明 |
+|---|---|---|
+| **Bun** | 内建 `Bun.sql` | 本地 SQLite 部署可使用 Bun；MySQL 长密码兼容限制见下文 |
+| **Node** | **`mysql2`**（3.24.4，正式服务端依赖） | 正式 MySQL 部署推荐使用 Node/mysql2；core 仍在运行时动态加载，CLI/插件不内联 |
 
-- 部门服务端的部署形态本来就是 **Bun**；
-- npm 发布出去的那份 CLI 只跑本机库（SQLite），**永远用不到 MySQL**。
+### 已知兼容限制：Bun 1.4.2 与长 MySQL 密码
 
-为一条用不到的通路引依赖、并把它塞进发布产物，是净负担。所以 Node 上配了 MySQL 会
-**明确报错并给出路**（用 Bun 跑服务端，或改用 `--db` 走 SQLite 退路），
-而不是静默降级成 SQLite 让人以为连上了。
+2026-09-26 在 MySQL 8.4.9、默认 `caching_sha2_password`、仅获隔离库权限的新账号上实测：16、19 字符密码通过；20、32、64、128 字符密码在 Bun 1.4.2 原生驱动均返回认证错误 1045。URL、配置对象、显式 password 覆盖、password 回调四种传参结果一致，共 24 个新账号首次认证组合。真正 Node v22.21.1/mysql2 使用相同 64 位随机十六进制强密码首次登录成功；先让 Node 登录也不能修复 Bun 登录。
+
+这与 [Bun 官方 issue #26195](https://github.com/oven-sh/bun/issues/26195) 报告的超过 19 字符密码认证问题一致。需要长密码的部署使用真正的 Node + mysql2，保留强密码和既有认证插件；不要缩短密码或切换旧认证策略绕过问题。
+
+本仓仅在 Bun **实际返回 1045 且所提供密码长度超过 19** 时补充中文排障提示，保留原始错误为 `cause`；不会预先拒绝长密码、切换驱动或打印连接串/密码。若后续 Bun 版本修复，应重新执行新账号首次认证测试后更新本限制。脱敏矩阵和清理证据见 [database-v4/mysql-auth-diagnosis.json](database-v4/mysql-auth-diagnosis.json)。
+
+没装 mysql2 时**明确报错并给出确切的安装命令**，绝不静默降级成 SQLite
+（降级会让人以为「连上了」，实际数据写进了另一条通路）：
+
+```bash
+cd packages/server && bun add mysql2
+```
+
+⚠️ **两边都不进 npm 发布产物**：`packages/cli` 的产物会把 core 整个内联进 `cli.js`，
+而 mysql2 走的是**动态 import + 构建期不可静态分析的说明符**
+（源码 `const specifier = 'mysql2/promise'; await import(specifier)`，
+产物里保留的也是 `await import(specifier)`，**没有被折叠成字面量**）——
+打包器没法把它折叠成常量，于是既不会内联、也不会写进发布清单。
+实测证据（`packages/cli/dist/cli.js`，2026-09-25）：
+
+| 检查 | 结果 |
+|---|---|
+| `from 'mysql2'` / `require('mysql2')` 形式的**静态引入** | **0** |
+| mysql2 的传递依赖名（`sqlstring` / `denque` / `iconv-lite` / `named-placeholders` / `seq-queue` / `generate-function` / `aws-ssl-profiles` / `lru-cache`） | 各 **0** |
+| 产物清单里的 `dependencies` 字段 | **整段不存在**（`verify:npm:cli` 断言的就是「零运行时依赖」） |
+| 裸搜子串 `mysql2`（`Select-String -SimpleMatch`） | **18 处命中 —— 全是我们自己的字符串与标识符**：函数名 `loadMysql2` / `mysql2Channel` / `wrapMysql2` / `mysql2PoolBackend`、`const specifier = "mysql2/promise"`、`driver: "mysql2"`，以及那条「怎么装 mysql2」的错误文案。⚠️ 那个说明符**必须**留在产物里，否则运行期动态 import 无从取值 ⇒ 这条子串搜索**不能**当作「产物里有 mysql2 依赖」的判据，判据是上面三行。 |
+
+⚠️ **解析位置**：本仓 `bun install` 是**隔离式布局**（每个包各有一份 `node_modules`，
+`mysql2` 只在 `packages/server/node_modules` 里，根 `node_modules` **没有**它）。
+而裸说明符是按**导入它的那个文件**所在目录逐级向上找的 —— 所以 Node 侧要在
+**部门服务端自己的入口/产物**（`packages/server/...`）里跑，否则会报「解析不到 mysql2」。
+活体验证脚本自己处理了这件事（在临时目录里给 `mysql2` 做一个 junction），见 §5。
 
 ---
 
-## 2. 六条实测结论（都是「猜错就静默出错」的那类）
+## 2. 八条实测结论（都是「猜错就静默出错」的那类）
 
 > 全部在本机 Docker 的 MySQL 8.4.9 上实测，脚本见「附录：怎么自己复核」。
 
@@ -128,6 +167,32 @@ MySQL 也有 `MAX()`，但那是**聚合函数**，用在 `SET` 里会报错。
 - **`realpath`/软链无关**，但表结构上：索引列用 `VARCHAR(255)`（utf8mb4 下 1020 字节，
   远小于 InnoDB 3072 字节的索引上限），`cwd` 用 `TEXT`（不索引、不分组）。
 
+### 2.7 ⚠️ `changes`：两个驱动**只有一半**一致
+
+`changes` 是本仓**唯一被消费**的驱动语义（`ingest.ts` 的「`changes > 0` 即新插入」去重判据）。
+`verify:mysql:node` 用**逐字相同**的语句在两个驱动上各量一遍并并排打印，实测：
+
+| 语句 | `Bun.sql` | `mysql2` | |
+|---|---|---|---|
+| `INSERT IGNORE` 新插入 / 撞主键 | 1 / **0** | 1 / **0** | ★ 本仓消费这一行，两边一致 |
+| `INSERT` | 1 | 1 | |
+| `ON DUPLICATE KEY UPDATE`：真的改了值 | 2 | 2 | |
+| `ON DUPLICATE KEY UPDATE`：**匹配上但值没变** | **0** | **1** | ⚠️ 不一致 |
+| `UPDATE`：匹配上但值没变 | **0** | **1** | ⚠️ 不一致 |
+
+差在最后两行：mysql2 默认带 **`CLIENT_FOUND_ROWS`**（`connection_config.js` 的
+`getDefaultFlags` 里就有它），于是它返回的是**匹配行数**而不是改动行数。
+本仓不消费这类语句的返回值（`recordIngestMoment()` 直接丢掉结果），所以差异目前是**潜在**的 ——
+但**将来谁要拿 `changes` 判「有没有真的写进去」，必须先在两个驱动上分别实测**。
+
+### 2.8 Node 侧（mysql2）另外三条与 Bun 不同的地方
+
+| 关注点 | `Bun.sql` | `mysql2` |
+|---|---|---|
+| `allowPublicKeyRetrieval` | **必需**（8.4 的 `caching_sha2_password`） | **不认**：传了会打 `Ignoring invalid configuration option` 告警，而它并不需要（实测直连成功） |
+| 多语句（`exec()` 拿到的整段 DDL） | `unsafe()` 直接跑 | 必须 `query()`（文本协议）+ **`multipleStatements: true`**；`execute()` 一律拒绝多语句 |
+| 默认字符集 | utf8mb4 | utf8mb4（实测，4 字节字符往返无损 ⇒ 不必显式传 charset） |
+
 ---
 
 ## 3. 架构：一份 SQL，两种后端
@@ -135,9 +200,13 @@ MySQL 也有 `MAX()`，但那是**聚合函数**，用在 `SET` 里会报错。
 ```
 packages/core/src/db/
   dialect.ts      ★ 四处语法差异的**唯一**落点（含 concat/scalarMax/upsert 模板）
-  mysql.ts        异步 MySQL 后端：Bun.sql + 进程内共享池 + $name→? 翻译
+  mysql.ts        异步 MySQL 后端：Bun.sql（内建）/ mysql2（Node 可选依赖）
+                  + 进程内共享池 + $name→? 翻译；事务用**同一条连接**
   portal-db.ts    ★ 上报库门面：openPortalStore(target) → PortalStore（异步，两种后端共用）
-                  + MySQL DDL + 「schema 不符抛错绝不重建」闸门
+                  + 「schema 不符抛错绝不重建」闸门
+  portal-schema-v4.ts  内嵌受控 DDL，与 docs SQL 逐字对照，产物无需 docs 目录
+  portal-migrations.ts 显式 inspect/migrate/resume、备份、检查点及实际约束校验
+  portal-connection.ts 固定连接事务、SQLite FULL 与异步写锁排队
   query.ts        ★ SQL 构建器（两种后端共用同一份文本）+ 同步执行器（本地路径）
   portal.ts       部门看板会话（异步，用构建器 + 方言）
   ingest.ts       本地路径（**同步 SQLite**）；portal 写入（异步 + 方言）
@@ -156,8 +225,8 @@ packages/core/src/db/
 3. **`close()` 的语义按后端不同**：SQLite 真的关；MySQL **空操作**（连接来自进程内
    共享池，每请求关池会让下一个请求重新 TCP + 认证握手）。上层照常
    `finally { await store.close() }`，两种后端形状一致。
-4. **MySQL 侧只建 portal 真正用到的两张表**（`usage_event` + `ingest_run` + 版本表
-   `portal_meta`）：`file_watermark` / `session_state` 是**本机增量扫描**的水位线，
+4. **MySQL Portal v4 使用 17 张身份/事实表、`ingest_run` 和 `portal_meta`**。
+   `file_watermark` / `session_state` 是**本机增量扫描**的水位线，
    部门服务端从不扫日志，建了永远是空表。
 
 ---
@@ -181,10 +250,9 @@ packages/core/src/db/
 ATR_MYSQL_URL='mysql://mysql_user:mysql_password@127.0.0.1:3335/ai-token'
 ```
 
-⚠️ 这台实例是**多个项目共用**的（里面还有 `g92-mysql` / `presales-kb` /
-`stec-promis-jyzg` / `suit-mysql` / `test` / `local-mysql`）。本项目**只碰 `ai-token`**，
-在里面建三张表：`usage_event` / `ingest_run` / `portal_meta`。
-两个验收脚本的默认连接串就是这个（可用 `ATR_MYSQL_URL` 覆盖）。
+⚠️ 这台实例由多个项目共用。上面的 `ai-token` 是既有业务库，不能拿它做 v4 破坏、建删表或迁移演练。
+当前方言与 v4 验证脚本创建并清理自己随机命名的隔离 schema；MySQL 应用 QA 使用仅授权专用隔离库的账号。
+验证结果不表示既有业务库已经升级。正式部署和备份迁移步骤以 [数据库部署与迁移](数据库部署与迁移.md) 为准。
 
 > 💡 容器卷已存在时，MySQL 官方镜像的初始化脚本**不会重跑** —— 所以
 > 即使 env 里有 `MYSQL_DATABASE`，库也可能并不存在（授权倒是早就给了）。
@@ -219,7 +287,7 @@ ATR_MYSQL_URL='mysql://atr_user:<密码>@127.0.0.1:3306/ai_token_report' \
 # 等价写法（命令行旗标）
 bun run --filter '@ai-token-report/server' start --mysql 'mysql://…' --port 8787
 
-# 或继续用 SQLite（默认；也是 Node 上的唯一选择）
+# 或继续用 SQLite（默认；没装 mysql2 或不想依赖数据库服务时的退路）
 bun run --filter '@ai-token-report/server' start --db /var/lib/atr/portal.sqlite
 ```
 
@@ -256,6 +324,16 @@ bun run --filter '@ai-token-report/core' verify:mysql
 #    它还覆盖生产入口（`createServer` + 横幅脱敏）与清理（只删自己造的行、绝不 DROP 表）。
 #    默认同样连本机开发实例，可用 ATR_MYSQL_URL 覆盖。
 bun run packages/server/verify/verify-mysql-portal.ts
+
+# ★★ Node 侧活体验证（49 项 + 编排 6 项）：bun build --target=node 打成临时 .mjs
+#    （放 %TEMP%，脚本自己清理），再用**真 Node** 运行。断言 Node + mysql2 + 我们的
+#    驱动/门面这条通路：INSERT IGNORE 的 0/1 判据、SUM(BIGINT) 的字符串、CONCAT 拼接键、
+#    upsert 的 GREATEST/COALESCE、事务回滚、嵌套事务不隐式提交、utf8mb4 往返；
+#    并并排打印两个驱动的 `changes` 对照（§2.7）。
+#    ⚠️ 脚本自己找真 node：`bun run <package.json 脚本>` 时 PATH 上会多出一个
+#    **Bun 的副本冒充 node**（`%TEMP%\bun-node-<hash>\node.exe`），用它跑等于没验 Node。
+#    可用 ATR_NODE_BIN 指定 node 可执行文件。
+bun run --filter '@ai-token-report/server' verify:mysql:node
 ```
 
 > 这个脚本抓到过一个真 bug：`toPositional()` 曾用**剥掉 `$` 的名字**去查参数表，

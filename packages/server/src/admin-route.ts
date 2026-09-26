@@ -41,14 +41,20 @@
 
 import type { AdminMemberResponse, AdminMembersResponse, UserRole } from '@ai-token-report/shared'
 import {
+  portalConfirmLegacySchema,
   parseAdminIssueBody,
   parseAdminLoginBody,
   parseAdminTokenBody,
   parseAdminUpdateBody,
+  parsePortalBody,
+  portalCreateMemberSchema, portalUpdateMemberSchema, portalMemberRolesSchema, portalMemberStatusSchema,
+  portalLoginAccountSchema, portalLoginStatusSchema, portalIssueTokenSchema, portalTokenVersionSchema,
+  portalTokenScopesSchema, portalCreateDepartmentSchema, portalUpdateDepartmentSchema, portalDepartmentStatusSchema,
 } from '@ai-token-report/shared/schemas'
 
 import type { CredentialStore } from './credentials.js'
-import { authorize } from './http/auth.js'
+import { authorize, authorizeDatabase, databaseFailure, type Authentication } from './http/auth.js'
+import type { IdentityRepository } from './identity/index.js'
 import type { MemberAdmin, MemberResult } from './member-admin.js'
 import { VIEWER_AUTH_MESSAGES } from './verify-route.js'
 
@@ -199,3 +205,84 @@ function fromMember(result: MemberResult): AdminRouteResult {
 function badRequest(reason: string): AdminRouteResult {
   return { status: 400, body: { ok: false, reason } }
 }
+
+/** 数据库管理入口。旧类只供旧领域单测，生产装配始终使用本类。 */
+export class DatabaseAdminRoute {
+  constructor(private readonly repository: IdentityRepository) {}
+
+  async handle(method: string, path: string, authentication: Authentication, body: unknown, params: URLSearchParams): Promise<AdminRouteResult> {
+    const key = `${method} ${path}`
+    const permissions: Record<string, string> = {
+      'GET members': 'members:read', 'POST members': 'members:manage',
+      'POST members/update': 'members:manage', 'POST members/roles': 'roles:assign',
+      'POST members/status': 'members:manage', 'POST members/login': 'accounts:manage',
+      'POST members/login/status': 'accounts:manage', 'GET members/tokens': 'tokens:manage',
+      'POST members/tokens': 'tokens:manage', 'POST members/tokens/rotate': 'tokens:manage',
+      'POST members/tokens/revoke': 'tokens:manage', 'POST members/tokens/scopes': 'tokens:manage',
+      'GET roles': 'roles:read', 'GET departments': 'departments:read',
+      'POST departments': 'departments:manage', 'POST departments/update': 'departments:manage',
+      'POST departments/status': 'departments:manage', 'GET audit': 'audit:read', 'GET storage': 'members:read',
+      'GET legacy-attributions': 'members:read', 'POST legacy-attributions/confirm': 'members:manage',
+    }
+    const permission = permissions[key]
+    if (!permission) return { status: 404, body: { ok: false, reason: '未找到管理接口' } }
+    const auth = await authorizeDatabase(this.repository, authentication, permission, VIEWER_AUTH_MESSAGES)
+    if (!auth.ok) return { status: auth.status, body: { ok: false, reason: auth.reason } }
+    const actor = auth.viewer
+    const r = this.repository
+    const ok = (value: unknown): AdminRouteResult => ({ status: 200, body: value })
+    const mutate = async <T>(shape: { ok: true; value: T } | { ok: false; reason: string }, action: (input: T) => Promise<unknown>): Promise<AdminRouteResult> =>
+      shape.ok ? ok(await action(shape.value)) : badRequest(shape.reason)
+    try {
+      switch (key) {
+        case 'GET members': return ok(await r.listMembers(actor))
+        case 'GET roles': return ok(await r.listRoles(actor))
+        case 'GET departments': return ok(await r.listDepartments(actor))
+        case 'GET storage': return ok(await r.storage(actor))
+        case 'GET legacy-attributions': return ok(await r.listLegacyAttributions(actor))
+        case 'POST legacy-attributions/confirm': return mutate(parsePortalBody(portalConfirmLegacySchema, body), input => r.confirmLegacyAttribution(actor, input))
+        case 'GET audit': {
+          for (const key of ['limit', 'offset', 'from', 'to']) {
+            if (params.has(key) && !/^\d+$/.test(params.get(key)!)) return badRequest(`${key} 需要是非负整数`)
+          }
+          const limit = params.has('limit') ? Number(params.get('limit')) : 50
+          const offset = params.has('offset') ? Number(params.get('offset')) : 0
+          if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) return badRequest('limit 需要在 1~200 之间')
+          if (!Number.isSafeInteger(offset) || offset < 0) return badRequest('offset 需要是非负整数')
+          const from = params.has('from') ? Number(params.get('from')) : undefined
+          const to = params.has('to') ? Number(params.get('to')) : undefined
+          if ((from !== undefined && !Number.isSafeInteger(from)) || (to !== undefined && !Number.isSafeInteger(to))) return badRequest('审计时间需要是 epoch 毫秒整数')
+          if (from !== undefined && to !== undefined && from > to) return badRequest('起始时间晚于结束时间')
+          const targetType = params.get('target_type'), targetId = params.get('target_id')
+          if (targetType !== null && !/^[a-z_]{1,32}$/.test(targetType)) return badRequest('target_type 无效')
+          if (targetId !== null && !UUID.test(targetId)) return badRequest('target_id 需要有效 ID')
+          return ok(await r.listAudit(actor, { limit, offset, ...(from !== undefined ? { from } : {}), ...(to !== undefined ? { to } : {}), ...(targetType ? { target_type: targetType } : {}), ...(targetId ? { target_id: targetId } : {}) }))
+        }
+        case 'GET members/tokens': {
+          const memberId = params.get('member_id')
+          if (!memberId || !UUID.test(memberId)) return badRequest('member_id 需要有效的人员 ID')
+          return ok(await r.listTokens(actor, memberId))
+        }
+        case 'POST members': return mutate(parsePortalBody(portalCreateMemberSchema, body), input => r.createMember(actor, input))
+        case 'POST members/update': return mutate(parsePortalBody(portalUpdateMemberSchema, body), input => r.updateMember(actor, input))
+        case 'POST members/roles': return mutate(parsePortalBody(portalMemberRolesSchema, body), input => r.setRoles(actor, input))
+        case 'POST members/status': return mutate(parsePortalBody(portalMemberStatusSchema, body), input => r.setMemberStatus(actor, input))
+        case 'POST members/login': return mutate(parsePortalBody(portalLoginAccountSchema, body), input => r.setLogin(actor, input))
+        case 'POST members/login/status': return mutate(parsePortalBody(portalLoginStatusSchema, body), input => r.setLoginStatus(actor, input))
+        case 'POST members/tokens': return mutate(parsePortalBody(portalIssueTokenSchema, body), input => r.issueToken(actor, input))
+        case 'POST members/tokens/rotate': return mutate(parsePortalBody(portalTokenVersionSchema, body), input => r.rotateToken(actor, input))
+        case 'POST members/tokens/revoke': return mutate(parsePortalBody(portalTokenVersionSchema, body), input => r.revokeToken(actor, input))
+        case 'POST members/tokens/scopes': return mutate(parsePortalBody(portalTokenScopesSchema, body), input => r.setTokenScopes(actor, input))
+        case 'POST departments': return mutate(parsePortalBody(portalCreateDepartmentSchema, body), input => r.createDepartment(actor, input))
+        case 'POST departments/update': return mutate(parsePortalBody(portalUpdateDepartmentSchema, body), input => r.updateDepartment(actor, input))
+        case 'POST departments/status': return mutate(parsePortalBody(portalDepartmentStatusSchema, body), input => r.setDepartmentStatus(actor, input))
+        default: return { status: 404, body: { ok: false, reason: '未找到管理接口' } }
+      }
+    } catch (err) {
+      const failure = databaseFailure(err)
+      return { status: failure.status, body: { ok: false, reason: failure.reason, ...(failure.code ? { code: failure.code } : {}) } }
+    }
+  }
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/

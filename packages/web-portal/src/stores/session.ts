@@ -17,7 +17,8 @@ export const useSessionStore = defineStore('portal-session', () => {
   // 每次会话更换都递增，统计与人员 Store 据此丢弃迟到响应。
   const generation = ref(0)
   const signedIn = computed(() => identity.value !== null)
-  const isAdmin = computed(() => identity.value?.role === 'admin')
+  function can(permission: string): boolean { return identity.value?.permissions?.includes(permission) ?? false }
+  const isAdmin = computed(() => can('members:read'))
   let revision = 0
   let restoring: Promise<void> | null = null
 
@@ -100,6 +101,7 @@ export const useSessionStore = defineStore('portal-session', () => {
     error,
     signedIn,
     isAdmin,
+    can,
     signIn,
     signOut,
     expire,

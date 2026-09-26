@@ -18,7 +18,7 @@ DSH token 用量统计平台。四种形态：**CLI / 本地页面 / 部门看�
 
 ```bash
 bun install
-bun test                        # 29 个文件 / 677 个测试，全绿
+bun test                        # 32 个文件 / 707 个测试，全绿
 bun run typecheck               # 7 个包全部 exit 0
 bun run build                   # web-local + web-portal 均构建成功
 bun run stats -- --period today # 终端统计（读本地库，热态 ~50ms）
@@ -33,7 +33,7 @@ bun run dev:portal              # web-portal 开发服务器（5198，/api 代�
 bun run packages/server/test/e2e-ingest.ts           # 服务端侧 POST /api/v1/token-usage（35 项）
 bun run packages/cli/verify/verify-report-ingest.ts  # ④整条链 CLI report → 服务端 → 库（28 项）
 
-# 人员管理与权限端到端（真 HTTP；改 admin 路由 / 凭证文件 / 角色后全跑）
+# 人员管理与权限端到端（真 HTTP；改 admin 路由 / 数据库身份 / 角色后全跑）
 bun run packages/server/test/e2e-admin.ts            # 签发即刻生效 + 401/403 + 护栏（54 项）
 
 # 分发面契约（67 项，含 S12.3 的静态托管断言；改 app.ts / 路由 / 方法 / 状态码后必跑）
@@ -45,8 +45,8 @@ bun run packages/cli/verify/verify-db-parity.ts
 # 双运行时驱动对照（Node 的 node:sqlite vs Bun 的 bun:sqlite，逐行比对）
 bun run --filter '@ai-token-report/core' verify:drivers
 
-# MySQL 方言活体验证（17 项；需要本机可连的 MySQL；只建/删 probe_* 探测表）
-# 默认连本机开发库（3335 / ai-token），别的机器用 ATR_MYSQL_URL 覆盖
+# MySQL 方言活体验证（17 项；需要可创建隔离 schema 的测试连接；只建/删自己随机测试库）
+# 本机可用开发 Docker 管理连接；别的机器用 ATR_MYSQL_URL，禁止拿业务库做建删演练
 bun run --filter '@ai-token-report/core' verify:mysql
 
 # ★ 双后端逐位对账（53 项；需要本机可连的 MySQL；改上报库 / 看板查询后必跑）
@@ -93,9 +93,9 @@ bun run --filter '@ai-token-report/web-portal' verify
 | `packages/core` | **内核**：decode / scanner / aggregate / range / state / format / types / home / identity-store |
 | `packages/core/src/db` | ★ **本地 SQLite 增量库**（独立入口 `@ai-token-report/core/db`）：schema / ingest / query / stats / **portal（上报库只读查询）** |
 | `packages/cli` | **命令入口**：`cli.ts` / `deliver.ts` / `report.ts` |
-| `packages/server` | 上报接收 + 本地直查 + 部门统计 + **人员管理（凭证读写）** + 静态托管 |
+| `packages/server` | 上报接收 + 本地直查 + 部门统计 + **数据库身份、账号、会话与人员管理** + 静态托管 |
 | `packages/web-local` | 本地页面（`/api/local/*`） |
-| `packages/web-portal` | 部门看板：人员排行 / 趋势 / 分布 / 明细 / 诊断 + **人员管理页（仅管理员）**，数据来自 `/api/v1/stats/*` 与 `/api/v1/admin/members*`（**需身份 token**） |
+| `packages/web-portal` | 部门看板：人员排行 / 趋势 / 分布 / 明细 / 诊断 + **人员管理页（按权限）**，后台账号登录，数据来自 `/api/v1/stats/*` 与 `/api/v1/admin/members*` |
 | `packages/dsh-plugin` | DSH 插件：实时上报 + `token_usage` 工具 + `ctx.tokenReport` 服务 + **界面用量面板（宿主半 + 浏览器半）**。见其 `README.md` |
 
 > 迁移期旧目录（`dsh-token-stats/`、`p0-verify/`）**已删除**。
@@ -110,13 +110,14 @@ bun run --filter '@ai-token-report/web-portal' verify
 | 字段 / 接口契约 | `packages/shared/src/protocol.ts` |
 | 会话日志解析 | `.agents/skills/dsh-session-log-parsing/SKILL.md` |
 | 身份署名 / 归属 | `.agents/skills/identity-attribution/SKILL.md` + `ARCHITECTURE.md` §4.5 |
-| **权限 / 人员管理 / token 发放** | `packages/server/src/member-admin.ts` + `ARCHITECTURE.md` §4.5.5~§4.5.6 |
+| **权限 / 人员管理 / token 发放** | `packages/server/src/identity/` + `docs/数据库重设计.md` + `ARCHITECTURE.md` §4.5.5~§4.5.8；`member-admin.ts` 仅历史兼容测试 |
 | **工程约定**（命令 / 测试位置 / 命名 / 中文注释 / 依赖） | `.agents/skills/repo-conventions/SKILL.md` + `docs/本仓工程约定.md` |
 | 目录分工 / 数据通路 | `ARCHITECTURE.md` |
 | 插件方案（历史） | `docs/插件方案.md` |
 | **DSH 插件**（配置 / 安装 / 排障 / 为什么不能碰私有字段） | `packages/dsh-plugin/README.md` |
 | **server 层分层 / 要不要引入第三方库** | `docs/server架构重构方案.md` + `.agents/skills/repo-conventions/SKILL.md` |
 | **部门上报库接 MySQL（方言坑 / 部署 / 备份）** | `docs/mysql上报库.md` |
+| **Portal v4 部署 / 显式迁移 / 身份导入** | `docs/数据库部署与迁移.md` + `docs/数据库重设计.md` |
 
 ---
 
@@ -137,7 +138,7 @@ bun run --filter '@ai-token-report/web-portal' verify
 - **命名约定**：DB 列 / HTTP 线上字段用 `snake_case`（`cache_read_tokens`），
   TS 内存类型用 `camelCase`（`cacheReadTokens`）。转换只发生在边界。
 - **上报只需 at-least-once**：幂等键 `event_id = ${sessionId}:${seq}`，
-  服务端 `ON CONFLICT DO NOTHING` 去重。插件与 CLI 可同时上报而无需协调。
+  服务端普通 INSERT，仅把事件主键冲突记为重复。外键/CHECK/截断等错误必须回滚并返回非 2xx；插件与 CLI 可同时上报而无需协调。
 - **未署名 = 不采集也不上报**。不要加 `unknown` 兜底上报 —— 那是未授权采集。
 - **插件 `emit()` 在同步热路径**，只能入队。任何 `await fetch` 都会拖慢 agent loop。
 - **🚨 插件的公开方法不得访问 `this.#私有字段`**。cordis 的 `ctx.get(name)`
@@ -181,38 +182,33 @@ bun run --filter '@ai-token-report/web-portal' verify
   headless 下直接不激活**。用 `ctx.get()` 试一次 + `ctx.inject()` 等它出现。
 - **`includeContent` 必须保持 `false`** —— 只采 token 数值与模型名，不采对话内容。
 - **服务端默认只监听 `127.0.0.1`**。改 `0.0.0.0` 前必须确认凭证已配置。
-- **身份以服务端为准**：`verifyToken()` 返回的 `name` 只可能来自凭证表，
+- **身份以服务端为准**：校验返回的 `name` 只可能来自数据库人员表，
   绝不回显客户端提交的内容。改动此处等于打开冒用身份的口子。
-- **🚨 角色（`role: admin | member`）是权限的唯一来源**，缺省 `member`。
+- **🚨 权限来自数据库角色关系；Bearer 权限还须与 Token scopes 取交集**。
+  新上报 Token 默认仅 `identity:read` / `usage:write`，不是后台登录凭证。
+  旧客户端兼容字段 `role: admin | member` 缺省 `member`。
   **绝不要用姓名白名单判断管理员** —— 姓名是可以随便改的显示值。
   消费方（页面 / 插件）拿到缺字段的校验响应时**必须按 `member` 处理**：
   默认成管理员意味着「服务端少返回一个字段」直接变成「人人可发 token」。
-- **🚨 人员管理接口（`/api/v1/admin/members*`）的鉴权失败要分三类**：
-  `401`（没带 / token 不对）、**`403`**（token 有效但不是管理员）、
-  `503`（服务端没配凭证）。合并成一个状态码，页面就只能说一句含糊的「操作失败」；
-  而回 `200 + ok:false` 更糟 —— 响应体里装的是**人员名单与 token**。
-  业务失败（重名、最后一个管理员不能删……）才是 `200 + ok:false`。
-- **🚨 凭证文件是唯一真值，且有两道不可移除的护栏**（`member-admin.ts`）：
-  1. **先落盘、再整体替换内存镜像**（`CredentialStore.replaceAll`）。
-     反过来会出现「页面上 token 能用、重启后消失」。
-  2. **文件读不懂时拒绝一切写入** —— 拿内存空表覆盖 = 静默吊销全员，
-     与「上报库绝不自动重建」同类。
-  另有 **最后一个管理员不可删 / 不可降级**（否则没人能再发 token），
-  以及**姓名唯一**（看板按姓名分组，同名会被并成一个人且看不出异常）。
-- **🚨 全进程只能有一个 `CredentialStore` 实例**（上报 / 看板 / 管理共享）：
-  管理页签发的 token 必须**立刻**可用于上报。若各路由各建一份，
-  员工拿到 token 后要等服务端重启才生效，而管理员这边一切正常 ——
-  排障方向会被完全带偏。`e2e-admin.ts` 钉着这条。
-- **冷启动兜底是 `ATR_ADMIN_TOKEN`**（`ATR_ADMIN_NAME` 可选）：
-  凭证文件为空（全新部署）或只读（编排系统挂载）时，没有它就没有任何人
-  能进管理页 —— 而管理页的第一件事正是发放第一个 token。**它不落文件**。
-- **看板的人员筛选是精确匹配、可多选**（`?user=张三,李四`）；
+- **🚨 数据库管理接口的失败使用真实 HTTP 状态**：`401`（身份无效）、
+  `403`（权限不足）、`503`（未初始化或数据库不可用）；版本冲突和最后管理员护栏为 `409`，输入错误为 `400`。
+  `200 + ok:false` 的旧业务约定只留在历史独立处理器测试，不可照搬到新路由。
+- **🚨 生产身份的唯一真值是与用量共用的 portal 数据库**（`server/src/identity/`）。
+  人员、部门、角色、账号、Token 摘要、会话、挑战、限流和审计均入库；管理变更和成功审计在同一事务提交。
+  写事务锁住 `portal_identity_state` 后重新鉴权，跨进程签发/撤权立即生效，不能用内存长期缓存替代数据库事实。
+- **稳定归属使用 `member_id` UUID**；显示姓名允许重复、用户名仍唯一。
+  改名或轮换 Token 不改写旧事件快照。历史引用使用 RESTRICT；最后一个仍有管理入口的管理员不可停用、降级或失去最后有效凭证。
+- **`credentials.json` 只作为显式离线导入源**：先完成 v4 结构迁移，再运行 `packages/server/scripts/import-credentials.ts`。
+  `credentials.ts` / `member-admin.ts` 和 `LegacyPortalAuth` 仅保留历史兼容测试；生产启动拒绝 `credentialsPath`，不双写文件。
+- **首次管理员初始化只允许空身份库执行一次**：`ATR_ADMIN_USERNAME` / `ATR_ADMIN_PASSWORD` 成对配置，
+  `ATR_ADMIN_TOKEN` 可作为初始化输入；密码仅哈希、Token 仅摘要入库。已有初始化标记后重启不会从环境变量复活停用身份。
+  后台验证码需要所有实例共享至少 32 字符的 `ATR_CAPTCHA_HMAC_KEY`，密钥不入数据库。
+- **看板的人员筛选是精确匹配、可多选**：新页面使用 `identity_view=member` 及稳定 ID；旧 `user` 视图有同名歧义时明确拒绝，不能静默合并。
   provider / model 才是子串匹配。页面上的**人员候选必须用不含人员筛选的
   同窗口查询**取回：从已筛选结果里取候选，选中一个人之后下拉会塌缩成一个选项
   （自锁定），使用者再也加不回别人，而页面看起来像「其余人都没数据」。
 - **不展示金额**（已确认决策）：无单价来源，只展示 token 数。
-- **解析失败要降级不要抛错**：身份文件 / 凭证文件损坏时降级为「未配置」并告警，
-  抛错会让页面白屏或服务起不来。
+- **本地身份文件解析失败降级为未署名并告警**；生产数据库损坏、不可用或版本不符则明确失败，不能退回空文件身份或另一个数据库。
 - **`Bun.serve` 必须显式设 `idleTimeout`**：默认 10 秒太短 —— 首次冷建库
   要约 15 秒，客户端会看到 `ECONNRESET` 而**服务端一条日志都没有**。
   已在 `server/src/runtime/listen.ts` 设为 120 秒，改动此处前先读那段注释。
@@ -280,9 +276,11 @@ bun run --filter '@ai-token-report/web-portal' verify
   那几处的文案与「非法值不许静默当成没给」的语义被逐字断言钉着。
 - **部门上报库可选 MySQL；本机库 `usage.sqlite` 恒为 SQLite**：
   本地路径的函数只收**同步 SQLite `Database`**，MySQL 侧只有异步 `PortalStore` ——
-  「员工机器上跑 CLI 要有 MySQL」这件事**在类型上就不可能**。Node 上配 MySQL 会
-  明确报错（Node 无内建 MySQL 客户端，而 npm 版 CLI 只跑本机库，不为用不到的通路引依赖）。
-  详见 `docs/mysql上报库.md`。
+  「员工机器上跑 CLI 要有 MySQL」这件事**在类型上就不可能**。Bun 上用内建 `Bun.sql`，
+  Node 上用可选依赖 `mysql2`（动态 import + 可变说明符，**两边都不进 npm 发布产物**；
+  没装时明确报错并给出 `cd packages/server && bun add mysql2`）。
+  Node 那条路的活体验证：`bun run --filter '@ai-token-report/server' verify:mysql:node`
+  （真 Node，49 项 + 编排 6 项）。详见 `docs/mysql上报库.md`。
 - **🚨 MySQL 有三处「静默语义变化」的方言坑**（都在 `core/src/db/dialect.ts` 收口，
   改 SQL 前必读）：
   1. `a || b` 在 MySQL 是**逻辑或**，`provider || '/' || model` 会返回 `0`/`1` ——
@@ -298,8 +296,9 @@ bun run --filter '@ai-token-report/web-portal' verify
   写成剥掉 `$` 的名字会让**每一句真实 SQL 都抛「参数缺失」**（这个 bug 被活体脚本抓到过）。
 - **MySQL 侧 `close()` 是空操作**（连接来自进程内共享池，每请求关池 = 每请求重新
   握手）。上层照常 `finally { await store.close() }`，两种后端形状一致。
-- **上报库的 schema 变更绝不能自愈**：SQLite 与 MySQL 两条路都在版本不符时**抛错**
-  （`portal-db.ts`），绝不重建、绝不 drop —— 它是全员数据的唯一副本。
+- **上报库的 schema 变更绝不能自愈**：portal 使用独立 v4，本地 `usage.sqlite` 仍为 v3。
+  空 portal 库可初始化；旧库/半完成迁移拒绝普通业务写入，只能通过 `packages/server/scripts/migrate-db.ts`
+  显式 inspect/migrate/resume。SQLite 先一致性备份，MySQL 需离线确认和备份证明；不 DROP/重建事件。
 - **本地库必须保留降级路径**：`openStats()` 在库不可用（磁盘满 / 权限 /
   `SQLITE_CORRUPT` / `SQLITE_BUSY`）时自动回退直扫日志并带 `degradedReason`。
   库是**日志的派生物**，不是真值 —— 为它让页面白屏是不划算的。
@@ -308,8 +307,8 @@ bun run --filter '@ai-token-report/web-portal' verify
 - **🚨 上报库（`portal.sqlite`）是唯一副本，绝不自动重建**：它由
   `openPortalDb()` 打开，schema 版本不符时**抛错**（不是 `rebuildSchema`）。
   客户端投递成功后已清掉自己的 pending / outbox，删掉 = 全员历史用量永久消失。
-  同一份 schema 在本地走 `openDatabaseForIngest()`（可重建）、
-  在服务端走 `openPortalDb()`（不可重建），**两个入口不能混用**。
+  本地 v3 走 `openDatabaseForIngest()`（可重建），服务端独立 v4 走
+  `openPortalStore()`（不可重建），**两个入口和版本不能混用**。
   上报库还必须与本地库 `usage.sqlite` 分开：混用后无法事后拆开。
 - **🚨 `server/src/serve-node.ts` 必须动态 `import('node:http')`**：
   它在被求值的那一刻就构造 `http.globalAgent` 并解析 `HTTP_PROXY`，
@@ -319,8 +318,8 @@ bun run --filter '@ai-token-report/web-portal' verify
 - **🚨 上报接口的鉴权失败必须是非 2xx**（`401` / 未配置凭证时 `503`），
   **不能学 `/api/v1/identity/verify` 的 `200 + ok:false`**：客户端把 2xx 当作
   「已投递」并清掉 pending，回 200 等于把那批用量静默丢掉。
-- **上报的归属只信服务端**：`client.userName` 一律忽略，只取
-  `Authorization` 头查凭证表的结果（`user_id/user_name/dept` 三列）。
+- **上报的归属只信服务端**：`client.userName` 一律忽略，写入可信 `member_id`、部门 ID、Token ID 和接收时间，
+  同时保留 `user_id/user_name/dept` 的原姓名/快照语义。鉴权重验与插入在同一事务内。
   同一条记录被两个上报方上报时，归属以**先到的**为准（主键冲突整行不写）。
 - **🚨 看板接口（`/api/v1/stats/*`）的鉴权失败也必须是非 2xx**（`401` /
   未配置凭证时 `503`）。理由与上报不同但同样硬：它的响应体里装的是**数据**，
@@ -329,10 +328,9 @@ bun run --filter '@ai-token-report/web-portal' verify
 - **🚨 看板只读上报库，`stats-route.ts` 不写一个字节**。它由
   `openPortalStats()`（内部走 `openPortalDb()`）打开，schema 版本不符时
   **抛错而不是重建**；这里**没有降级直扫这条退路** —— 上报库没有可重扫的真值。
-- **未归属只有一种表述**：库里是 `user_id IS NULL`，对外一律用
-  `shared` 的 `UNATTRIBUTED_USER`（`'unknown'`）。分组键用
-  `COALESCE(user_id, 'unknown')`，筛选值同为 `'unknown'` —— 两处一旦不同值，
-  「点开未署名」会得到 0 行且**没有任何报错**。
+- **未归属对外使用 `UNATTRIBUTED_USER`（`'unknown'`）**。v4 新视图区分稳定人员、
+  legacy 待确认和真正未归属；旧历史标记为 `received_at_ms IS NULL`，legacy selector 只查这一子集。
+  旧 `user` 视图保留原姓名键语义，有歧义时报错；禁止将待确认历史当成匿名或自动映射同名人员。
 - **按人筛选是精确匹配，provider/model 才是子串匹配**。人名做子串会把
   「张三」和「张三丰」并成一个人 —— 那是数据错误，不是便利。
 - **`user` 维度只存在于查询层**（`core/db/query.ts` 的 `QueryDimension`），

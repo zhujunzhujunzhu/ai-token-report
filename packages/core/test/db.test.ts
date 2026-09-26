@@ -1,3 +1,4 @@
+import { PORTAL_SCHEMA_VERSION } from '../src/db/portal-db.js'
 /**
  * 本地 SQLite 增量库测试。
  *
@@ -266,7 +267,7 @@ describe('db schema', () => {
     const db1 = openPortalDb(dbPath)
     expect(
       db1.query<{ user_version: number }, []>('PRAGMA user_version').get()?.user_version,
-    ).toBe(DB_SCHEMA_VERSION)
+    ).toBe(PORTAL_SCHEMA_VERSION)
     db1.close()
 
     const db2 = openPortalDb(dbPath)

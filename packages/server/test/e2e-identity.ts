@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { createServer } from '../src/index.js'
+import { seedDatabaseIdentity } from './database-fixture.js'
 
 const home = mkdtempSync(join(tmpdir(), 'atr-e2e-'))
 
@@ -27,6 +28,9 @@ writeFileSync(
   JSON.stringify([{ token: 'atr-zhangsan-9f3c', name: '张三', dept: '研发一部' }]),
   'utf8',
 )
+await seedDatabaseIdentity({ sqlitePath: join(home, 'token-report', 'portal.sqlite') }, [
+  { token: 'atr-zhangsan-9f3c', name: '张三', dept: '研发一部' },
+])
 
 let passed = 0
 let failed = 0
@@ -47,14 +51,14 @@ const portal = await createServer({
   port: 18787,
   host: '127.0.0.1',
   dshHome: home,
-  credentialsPath: credPath,
+  mysqlUrl: '',
   enableLocalApi: false,
 })
 console.log(`  部门服务端: ${portal.url}`)
 
 const health = await (await fetch(`${portal.url}/api/health`)).json()
-check('健康检查返回凭证已登记', health.credentialsRegistered === true)
-check('凭证数量为 1', health.credentialCount === 1)
+check('健康检查返回身份已入库', health.initialized === true)
+check('schema为v4', health.schema_version === 4)
 
 // ── 2. 直接验证校验端点 ─────────────────────────────────────
 console.log('\n【2】部门服务端的校验端点')
@@ -85,7 +89,6 @@ const local = await createServer({
   port: 18788,
   host: '127.0.0.1',
   dshHome: home,
-  credentialsPath: credPath,
   portalUrl: portal.url,
   enableLocalApi: true,
 })
@@ -158,12 +161,14 @@ await second.stop()
 // ── 6. 静态托管的健壮性（仅当构建产物存在时）────────────────
 console.log('\n【6】静态托管健壮性')
 const staticProbe = await createServer({
-  port: 18790,
+  port: 0,
   host: '127.0.0.1',
   dshHome: home,
   enableLocalApi: true,
   staticDir: 'packages/web-local/dist',
 })
+check('端口 0 回传系统分配的真实端口', staticProbe.port > 0, `实际 ${staticProbe.port}`)
+check('系统分配端口不算占用重试', staticProbe.portShifted === false)
 
 // 目录穿越：绝不应泄露 dist 之外的文件
 const traversal = await fetch(`${staticProbe.url}/../../package.json`)

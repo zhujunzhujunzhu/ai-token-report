@@ -576,11 +576,16 @@ export type IngestRecord = Omit<WireTokenRecord, 'total_tokens'>
  *   否则任何人改一下本地配置就能以他人名义上报。
  */
 export interface EventOwner {
-  /** 归属键。凭证表里没有独立的人员 ID，归属键就是**服务端认定的姓名**。 */
+  /** 保留旧 user_id 的姓名快照语义；v4 稳定归属使用 memberId。 */
   userId: string
   /** 展示用姓名。当前与 `userId` 同值，分开是为了将来一人多 token 时能只改一处。 */
   userName?: string | null
   dept?: string | null
+  /** v4 归属只接受服务端解析出的稳定 ID；旧造数与本地路径仍可空。 */
+  memberId?: string | null
+  departmentId?: string | null
+  tokenId?: string | null
+  receivedAtMs?: number | null
 }
 
 /**
@@ -602,10 +607,8 @@ export interface EventOwner {
  *
  * ## 幂等与归属的先后
  *
- * 用 `dialect.insertIgnore()`（SQLite `INSERT OR IGNORE` / MySQL `INSERT IGNORE`），
- * 冲突即跳过（`event_id` 是 PRIMARY KEY），两种后端的判据都是 `changes > 0`：
- * MySQL 的 `affectedRows` 在 `INSERT IGNORE` 撞主键时实测为 **0**，
- * 与 SQLite 的 `changes` 语义一致。
+ * 使用普通 INSERT，只捕获 event_id 主键重复；其余外键与约束错误回滚整批。
+ * 不能使用 IGNORE，否则无效归属会被误认为已成功投递。
  *
  * ⚠️ 由此得到一个必须知道的语义：**同一条记录被两个上报方上报时，
  *   归属以先到的那条为准** —— 后到的因为主键冲突整行都不写，自然不会覆盖归属。
@@ -619,15 +622,41 @@ export async function insertAttributedRecords(
   records: IngestRecord[],
   owner: EventOwner,
 ): Promise<{ inserted: number; duplicates: number }> {
-  const sql = `${portalDialect(store.kind).insertIgnore(EVENT_TABLE)}
+  return store.transaction((tx) => insertAttributedRecordsInTransaction(tx, records, owner))
+}
+
+/** 具体变更通常只有一两个文件；批量导入也不能超过 SQLite 的参数数量上限。 */
+function watermarkBatches(values: string[] | undefined): (string[] | undefined)[] {
+  if (values === undefined) return [undefined]
+  const unique = [...new Set(values)]
+  const batches: string[][] = []
+  for (let i = 0; i < unique.length; i += 200) batches.push(unique.slice(i, i + 200))
+  return batches
+}
+
+/** 调用方已开启事务时使用，让撤权重验与整批事件写入共享同一把锁。 */
+export async function insertAttributedRecordsInTransaction(
+  store: PortalStore,
+  records: IngestRecord[],
+  owner: EventOwner,
+): Promise<{ inserted: number; duplicates: number }> {
+  if (store.kind === 'mysql') {
+    // 非严格模式会先截断 VARCHAR 再判主键，超长新事件可能被误报为历史重复。
+    // 必须在实际事务连接内检查，检查连接池里随机另一条连接没有意义。
+    const mode = await store.get<{ mode: string }>('SELECT @@SESSION.sql_mode AS mode')
+    if (!/(?:^|,)(STRICT_ALL_TABLES|STRICT_TRANS_TABLES)(?:,|$)/.test(mode?.mode ?? '')) {
+      throw new Error('MySQL 上报事务要求 STRICT_ALL_TABLES 或 STRICT_TRANS_TABLES，拒绝可能截断原始事件的写入')
+    }
+  }
+  const sql = `INSERT INTO ${EVENT_TABLE}
      (event_id, session_id, seq, ts, provider, model, cwd,
       user_id, user_name, dept,
       input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-      reasoning_tokens, turn, step)
+      reasoning_tokens, turn, step, member_id, department_id, report_token_id, received_at_ms)
      VALUES ($eventId, $sessionId, $seq, $ts, $provider, $model, $cwd,
              $userId, $userName, $dept,
              $input, $output, $cacheRead, $cacheWrite,
-             $reasoning, $turn, $step)`
+             $reasoning, $turn, $step, $memberId, $departmentId, $tokenId, $receivedAtMs)`
 
   let inserted = 0
   let duplicates = 0
@@ -639,9 +668,9 @@ export async function insertAttributedRecords(
   // ★ 整批一个事务（与迁移前一致）：两种后端都支持事务，
   //   半批写入会让客户端重试时多一次无谓的往返，也让「这一批到底进没进」
   //   在排障时变得难以回答。
-  await store.transaction(async (tx) => {
-    for (const rec of records) {
-      const res = await tx.run(sql, {
+  for (const rec of records) {
+    try {
+      const result = await store.run(sql, {
         $eventId: rec.event_id,
         $sessionId: rec.session_id,
         $seq: rec.seq,
@@ -659,20 +688,24 @@ export async function insertAttributedRecords(
         $reasoning: rec.reasoning_tokens,
         $turn: rec.turn,
         $step: rec.step,
+        $memberId: owner.memberId ?? null,
+        $departmentId: owner.departmentId ?? null,
+        $tokenId: owner.tokenId ?? null,
+        $receivedAtMs: owner.receivedAtMs ?? null,
       })
-      if (res.changes > 0) inserted++
-      else duplicates++
+      if (result.changes !== 1) throw new Error('上报 INSERT 未写入恰好一条事件，拒绝确认投递')
+      inserted++
+    } catch (error) {
+        // 🚨 仅主键重投算幂等；IGNORE 会把外键/CHECK 失败也吞成成功投递。
+        const message = error instanceof Error ? error.message : String(error)
+        const detail = error as { errno?: number; code?: string }
+        const duplicate = store.kind === 'sqlite'
+          ? /UNIQUE constraint failed: usage_event\.event_id(?:$|\s)/.test(message)
+          : (detail.errno === 1062 || detail.code === 'ER_DUP_ENTRY' || /Duplicate entry/.test(message)) && /(?:usage_event\.)?PRIMARY['`]/.test(message)
+        if (!duplicate) throw error
+        duplicates++
     }
-  })
+  }
 
   return { inserted, duplicates }
-}
-
-/** 具体变更通常只有一两个文件；批量导入也不能超过 SQLite 的参数数量上限。 */
-function watermarkBatches(values: string[] | undefined): (string[] | undefined)[] {
-  if (values === undefined) return [undefined]
-  const unique = [...new Set(values)]
-  const batches: string[][] = []
-  for (let i = 0; i < unique.length; i += 200) batches.push(unique.slice(i, i + 200))
-  return batches
 }

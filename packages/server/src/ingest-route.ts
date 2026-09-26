@@ -62,6 +62,7 @@
 
 import {
   insertAttributedRecords,
+  insertAttributedRecordsInTransaction,
   openPortalStore,
   recordIngestMoment,
   resolvePortalTarget,
@@ -73,7 +74,8 @@ import type { IngestResponse } from '@ai-token-report/shared'
 import { ingestRecordSchema, parseIngestEnvelope } from '@ai-token-report/shared/schemas'
 
 import type { CredentialStore } from './credentials.js'
-import { authorize } from './http/auth.js'
+import { authorize, authorizeDatabase, databaseFailure } from './http/auth.js'
+import type { IdentityRepository } from './identity/index.js'
 import { INGEST_AUTH_MESSAGES } from './verify-route.js'
 
 /** 路由结果：状态码 + 响应体。`index.ts` 的 `fromRoute()` 直接吃这个形状。 */
@@ -83,7 +85,8 @@ export interface IngestResult {
 }
 
 export interface IngestRouteOptions {
-  credentials: CredentialStore
+  credentials?: CredentialStore
+  identityStore?: IdentityRepository
   /** 服务端上报库路径（与本地库 `usage.sqlite` 是**两个文件**）。 */
   dbPath: string
   /**
@@ -105,11 +108,13 @@ export interface IngestRouteOptions {
  *   MySQL 下 `close()` 是空操作（连接来自进程内共享池），调用形状不变。
  */
 export class IngestRoute {
-  readonly #credentials: CredentialStore
+  readonly #credentials: CredentialStore | undefined
+  readonly #identityStore: IdentityRepository | undefined
   readonly #target: PortalTarget
 
   constructor(options: IngestRouteOptions) {
     this.#credentials = options.credentials
+    this.#identityStore = options.identityStore
     // ★ 配置只在这里归一成 `PortalTarget`：路由内部不再散落 if (mysql)，
     //   换后端不影响任何业务分支。
     this.#target = resolvePortalTarget({
@@ -125,10 +130,11 @@ export class IngestRoute {
    * 未通过鉴权的请求体没有任何理由被解析或写进库。
    */
   async submit(payload: unknown, authorization: string | null): Promise<IngestResult> {
+    if (this.#identityStore) return this.#submitDatabase(payload, authorization)
     // ── 1. 身份（★ 归属的唯一来源）──────────────────────────────
     // 401/503 的判定在 `http/auth.ts` 的 `authorize()` 里 —— 全仓唯一一处。
     // 这里只用它的结果，不再自己算状态码（重构前这段映射在三个路由里各写了一遍）。
-    const auth = authorize(this.#credentials, authorization, INGEST_AUTH_MESSAGES)
+    const auth = authorize(this.#credentials!, authorization, INGEST_AUTH_MESSAGES)
     if (!auth.ok) {
       return { status: auth.status, body: { ok: false, reason: auth.reason } }
     }
@@ -163,6 +169,31 @@ export class IngestRoute {
       rejected: parsed.rejected,
     }
     return { status: 200, body }
+  }
+
+  /** 重新鉴权与写入持有同一身份锁，使撤权提交和上报提交具有明确先后顺序。 */
+  async #submitDatabase(payload: unknown, authorization: string | null): Promise<IngestResult> {
+    const repository = this.#identityStore!
+    const auth = await authorizeDatabase(repository, authorization, 'usage:write', INGEST_AUTH_MESSAGES)
+    if (!auth.ok) return { status: auth.status, body: { ok: false, reason: auth.reason } }
+    const parsed = parseIngestPayload(payload)
+    if (!parsed.ok) return { status: 400, body: { ok: false, reason: parsed.reason } }
+    try {
+      const stored = await repository.withWrite(auth.viewer, 'usage:write', async (tx, fresh) => {
+        const result = await insertAttributedRecordsInTransaction(tx, parsed.records, {
+          userId: fresh.name, userName: fresh.name, dept: fresh.dept ?? null,
+          memberId: fresh.memberId, departmentId: fresh.departmentId,
+          tokenId: fresh.auth.kind === 'token' ? fresh.auth.tokenId : null,
+          receivedAtMs: Date.now(),
+        })
+        await recordIngestMoment(tx)
+        return result
+      })
+      return { status: 200, body: { accepted: stored.inserted, duplicates: stored.duplicates, rejected: parsed.rejected } satisfies IngestResponse }
+    } catch (err) {
+      const failure = databaseFailure(err)
+      return { status: failure.status, body: { ok: false, reason: failure.reason } }
+    }
   }
 
   /**

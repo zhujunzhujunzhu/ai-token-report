@@ -58,7 +58,8 @@ import {
 } from '@ai-token-report/shared'
 
 import type { CredentialStore } from './credentials.js'
-import { authorize } from './http/auth.js'
+import { authorize, authorizeDatabase, type Authentication } from './http/auth.js'
+import type { IdentityRepository } from './identity/index.js'
 import { VIEWER_AUTH_MESSAGES } from './verify-route.js'
 
 /**
@@ -88,7 +89,8 @@ export interface StatsRouteResult {
 }
 
 export interface StatsRouteOptions {
-  credentials: CredentialStore
+  credentials?: CredentialStore
+  identityStore?: IdentityRepository
   /** **上报库**路径（全员数据，与本地库 `usage.sqlite` 是两个文件）。 */
   dbPath: string
   /**
@@ -109,11 +111,13 @@ export interface StatsRouteOptions {
  *   `close()` 是空操作，调用形状与 SQLite 一致。
  */
 export class StatsRoute {
-  readonly #credentials: CredentialStore
+  readonly #credentials: CredentialStore | undefined
+  readonly #identityStore: IdentityRepository | undefined
   readonly #target: PortalTarget
 
   constructor(options: StatsRouteOptions) {
     this.#credentials = options.credentials
+    this.#identityStore = options.identityStore
     // ★ 配置只在这里归一成 `PortalTarget`：换后端不影响任何查询分支。
     this.#target = resolvePortalTarget({
       sqlitePath: options.dbPath,
@@ -130,11 +134,13 @@ export class StatsRoute {
   async handle(
     sub: string,
     params: URLSearchParams,
-    authorization: string | null,
+    authorization: Authentication,
   ): Promise<StatsRouteResult> {
     // ── 1. 身份（★ 与上报共用同一套可信边界）───────────────────────
     // 401/503 的判定在 `http/auth.ts` 的 `authorize()` 里（全仓唯一一处）。
-    const auth = authorize(this.#credentials, authorization, VIEWER_AUTH_MESSAGES)
+    const auth = this.#identityStore
+      ? await authorizeDatabase(this.#identityStore, authorization, 'stats:read', VIEWER_AUTH_MESSAGES)
+      : authorize(this.#credentials!, typeof authorization === 'string' ? authorization : null, VIEWER_AUTH_MESSAGES)
     if (!auth.ok) {
       return { status: auth.status, body: { ok: false, reason: auth.reason } }
     }
@@ -157,6 +163,8 @@ export class StatsRoute {
     try {
       session = await openPortalStats(this.#target, filter)
     } catch (err) {
+      if (isIdentityViewRequired(err)) return { status: 409, body: { ok: false, code: 'identity_view_required', reason: err.message } }
+      if (this.#identityStore) return { status: 503, body: { ok: false, reason: '统计数据库暂时不可用，请稍后重试' } }
       // 上报库打不开（含 schema 版本不符：**绝不自动重建**）→ 500。
       // 这里没有「降级直扫」这条退路：上报库是全员数据的唯一副本，
       // 拿空数据冒充「今天没人用」比报错危险得多。
@@ -180,6 +188,8 @@ export class StatsRoute {
           return { status: 404, body: { ok: false, reason: `未找到 /api/v1/stats/${sub}` } }
       }
     } catch (err) {
+      if (isIdentityViewRequired(err)) return { status: 409, body: { ok: false, code: 'identity_view_required', reason: err.message } }
+      if (this.#identityStore) return { status: 503, body: { ok: false, reason: '统计数据库暂时不可用，请稍后重试' } }
       return { status: 500, body: { ok: false, reason: `查询失败: ${msg(err)}` } }
     } finally {
       await session.close()
@@ -222,6 +232,12 @@ export class StatsRoute {
 
     const rows = (await session.groups(by)).map((row) => ({
       key: row.key,
+      ...(row.attributionStatus ? {
+        label: row.label,
+        member_id: row.memberId ?? null,
+        department_name: row.departmentName ?? null,
+        attribution_status: row.attributionStatus,
+      } : {}),
       totalTokens: row.counts.total,
       inputTokens: row.counts.input,
       outputTokens: row.counts.output,
@@ -351,6 +367,13 @@ function toRecordRow(row: PortalRecordRow): RecordRow {
     // ★ 未归属统一成协议里的 UNATTRIBUTED_USER，而不是 null：
     //   前端只需处理一种「未知」，且它与 breakdown by=user 的分组键同值。
     userId: row.userId ?? UNATTRIBUTED_USER,
+    ...(row.attributionStatus ? {
+      member_id: row.memberId ?? null,
+      user_name_snapshot: row.userNameSnapshot ?? null,
+      department_id: row.departmentId ?? null,
+      dept_snapshot: row.deptSnapshot ?? null,
+      attribution_status: row.attributionStatus,
+    } : {}),
     provider: row.provider,
     model: row.model,
     // 口径只经 shared 计算；四项原始用量完整透传。
@@ -361,6 +384,10 @@ function toRecordRow(row: PortalRecordRow): RecordRow {
     cacheWriteTokens: row.cacheWrite,
     cwd: row.cwd,
   }
+}
+
+function isIdentityViewRequired(error: unknown): error is Error & { code: 'identity_view_required' } {
+  return error instanceof Error && 'code' in error && error.code === 'identity_view_required'
 }
 
 // ── 参数解析 ────────────────────────────────────────────────────────────────
@@ -409,6 +436,24 @@ function parseWindow(params: URLSearchParams): ParsedWindow | { error: string } 
   const users = splitList(params.get('user'))
   const providers = splitList(params.get('provider'))
   const models = splitList(params.get('model'))
+  const identityView = params.get('identity_view') ?? 'legacy'
+  if (identityView !== 'member' && identityView !== 'legacy') return { error: 'identity_view 只支持 member 或 legacy' }
+  const hasSelectors = ['member_id', 'legacy_user', 'unattributed'].some(key => params.has(key))
+  if (params.has('user') && hasSelectors) return { error: 'user 不能与新的人员筛选参数同时使用' }
+  if (identityView === 'member' && params.has('user')) return { error: 'user 仅支持 identity_view=legacy' }
+  if (identityView === 'legacy' && hasSelectors) return { error: '新的人员筛选参数需要 identity_view=member' }
+  const memberIds = [...new Set(params.getAll('member_id'))]
+  if (memberIds.some(id => !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id))) return { error: 'member_id 需要有效的人员 ID' }
+  const legacyUserIds: string[] = []
+  for (const key of new Set(params.getAll('legacy_user'))) {
+    if (!/^legacy:[A-Za-z0-9_-]+$/.test(key)) return { error: 'legacy_user 需要有效的历史人员键' }
+    const encoded = key.slice(7)
+    const decoded = Buffer.from(encoded, 'base64url').toString('utf8')
+    if (!decoded || Buffer.from(decoded, 'utf8').toString('base64url') !== encoded) return { error: 'legacy_user 需要有效的历史人员键' }
+    legacyUserIds.push(decoded)
+  }
+  const unattributed = params.get('unattributed')
+  if (unattributed !== null && unattributed !== 'true' && unattributed !== 'false') return { error: 'unattributed 只支持 true 或 false' }
 
   return {
     ...(sinceMs !== undefined ? { sinceMs } : {}),
@@ -421,6 +466,10 @@ function parseWindow(params: URLSearchParams): ParsedWindow | { error: string } 
       ...(providers.length > 0 ? { providers } : {}),
       ...(models.length > 0 ? { models } : {}),
       ...(users.length > 0 ? { userIds: users } : {}),
+      identityView,
+      ...(memberIds.length ? { memberIds } : {}),
+      ...(legacyUserIds.length ? { legacyUserIds } : {}),
+      ...(unattributed === 'true' ? { unattributedOnly: true } : {}),
     },
   }
 }

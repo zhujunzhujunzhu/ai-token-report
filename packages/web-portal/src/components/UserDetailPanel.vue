@@ -14,7 +14,7 @@ const detail = computed(() => dashboard.detail)
 <template>
   <el-drawer
     :model-value="!!detail"
-    :title="detail ? userLabel(detail.userId) + ' · 用量详情' : '用量详情'"
+    :title="detail ? (detail.label ?? userLabel(detail.userId)) + ' · 用量详情' : '用量详情'"
     size="min(920px, 100vw)"
     destroy-on-close
     @close="dashboard.closeUser()"

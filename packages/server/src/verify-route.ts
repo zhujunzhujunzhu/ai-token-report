@@ -28,6 +28,13 @@
 import { ROLE_MEMBER, type UserRole, type VerifyTokenResponse } from '@ai-token-report/shared'
 
 import type { CredentialStore } from './credentials.js'
+import type { IdentityRepository } from './identity/index.js'
+
+/** 保持旧身份校验 wire 形状；新凭证的范围也由数据库判定。 */
+export async function verifyDatabaseToken(store: IdentityRepository, input: VerifyTokenInput): Promise<VerifyTokenResponse> {
+  const token = tokenFromHeader(input.authorization) ?? input.bodyToken?.trim() ?? ''
+  return store.verifyIdentity(token)
+}
 
 /**
  * 上报方向的两句失败文案。

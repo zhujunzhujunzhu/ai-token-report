@@ -4,6 +4,7 @@ import { createPinia, disposePinia, setActivePinia, type Pinia } from 'pinia'
 import { useSessionStore } from '../src/stores/session.js'
 import { buildFilter, useDashboardStore } from '../src/stores/dashboard.js'
 import { useMembersStore } from '../src/stores/members.js'
+import { issueMember } from '../src/api/admin.js'
 
 const originalFetch = globalThis.fetch
 let pinia: Pinia
@@ -35,7 +36,8 @@ function respond(
 }
 function signIn(role: 'admin' | 'member' = 'member'): void {
   const session = useSessionStore()
-  session.identity = { name: '测试成员', username: 'test-user', role }
+  session.identity = { member_id: '00000000-0000-4000-8000-000000000001', name: '测试成员', username: 'test-user', role,
+    permissions: role === 'admin' ? ['members:read', 'members:manage', 'tokens:manage', 'roles:read', 'departments:read'] : ['stats:read'] }
   session.generation++
   session.initialized = true
 }
@@ -146,23 +148,25 @@ describe('统计状态', () => {
       urls.push(url)
       if (url.pathname.endsWith('overview')) return json(overview)
       if (url.pathname.endsWith('records')) return json({ rows: [], total: 45 })
-      return json({ rows: [{ key: '张三' }, { key: '李四' }] })
+      return json({ rows: [{ key: '00000000-0000-4000-8000-000000000003', label: '张三' }, { key: '00000000-0000-4000-8000-000000000004', label: '李四' }] })
     })
     const dashboard = useDashboardStore()
     await dashboard.activate('records')
-    await dashboard.applyFilters({ ...dashboard.filters, users: ['张三'] })
+    await dashboard.applyFilters({ ...dashboard.filters, users: ['00000000-0000-4000-8000-000000000003'] })
     await dashboard.setPage(2)
     const last = urls.slice(-3)
     expect(
       last
         .find((u) => u.pathname.endsWith('breakdown'))
-        ?.searchParams.has('user'),
+        ?.searchParams.has('member_id'),
     ).toBe(false)
     expect(
       last
         .find((u) => u.pathname.endsWith('records'))
-        ?.searchParams.get('user'),
-    ).toBe('张三')
+        ?.searchParams.get('member_id'),
+    ).toBe('00000000-0000-4000-8000-000000000003')
+    expect(urls.every((u) => u.searchParams.get('identity_view') === 'member')).toBe(true)
+    expect(urls.every((u) => !u.searchParams.has('user'))).toBe(true)
     expect(
       last
         .find((u) => u.pathname.endsWith('records'))
@@ -172,8 +176,8 @@ describe('统计状态', () => {
       false,
     )
     expect(dashboard.userOptions.map((row) => row.key)).toEqual([
-      '张三',
-      '李四',
+      '00000000-0000-4000-8000-000000000003',
+      '00000000-0000-4000-8000-000000000004',
     ])
   })
   test('旧查询晚到不会覆盖新时间范围', async () => {
@@ -258,29 +262,44 @@ describe('人员管理状态', () => {
   test('退出后迟到的名单不能回填', async () => {
     signIn('admin')
     const old = deferred<Response>()
-    respond(() => old.promise)
+    respond((url) => url.endsWith('/members') ? old.promise : json({ roles: [], departments: [] }))
     const admin = useMembersStore()
     const pending = admin.load()
     useSessionStore().expire()
     old.resolve(
-      json({ members: [{ name: '旧成员', token: 'secret' }], writable: true }),
+      json({ members: [{ member_id: 'old', name: '旧成员' }] }),
     )
     await pending
     expect(admin.members).toEqual([])
-    expect(admin.writable).toBe(false)
+    expect(admin.storage).toBeNull()
+    expect(admin.issuedSecret).toBeNull()
   })
   test('业务失败不得展示发放成功，403 单独处理', async () => {
     signIn('admin')
     const admin = useMembersStore()
-    admin.writable = true
-    respond(() => json({ ok: false, reason: '姓名重复' }))
-    expect(await admin.issue({ name: '张三', role: 'member' })).toBe(false)
-    expect(admin.error).toBe('姓名重复')
-    expect(admin.justIssued).toBeNull()
+    respond(() => json({ ok: false, reason: '最后一个管理入口不可停用' }))
+    expect(await admin.mutate(() => issueMember({ name: '张三', role_ids: ['00000000-0000-4000-8000-000000000002'] }), 'new-member')).toBeNull()
+    expect(admin.error).toBe('最后一个管理入口不可停用')
+    expect(admin.issuedSecret).toBeNull()
     respond(() => json({ reason: '没有权限' }, 403))
     await admin.load()
-    expect(admin.forbidden).toContain('没有人员管理权限')
+    expect(admin.forbidden).toContain('没有权限')
     expect(useSessionStore().signedIn).toBe(true)
-    expect(useSessionStore().isAdmin).toBe(false)
+    // 单个操作被拒不等于整个管理员角色已丢失；页面不能替服务端猜角色。
+    expect(useSessionStore().isAdmin).toBe(true)
+  })
+  test('并发目录查询中途过期，成功返回的名单也不能在退出后回填', async () => {
+    signIn('admin')
+    respond((url) => url.endsWith('/roles') ? json({ reason: '会话已过期' }, 401)
+      : url.endsWith('/members') ? json({ members: [{ member_id: 'old', name: '旧会话成员' }] })
+      : url.endsWith('/departments') ? json({ departments: [{ department_id: 'old', name: '旧部门' }] })
+      : json({ kind: 'mysql', available: true }))
+    const admin = useMembersStore()
+    await admin.load()
+    expect(useSessionStore().signedIn).toBe(false)
+    expect(admin.members).toEqual([])
+    expect(admin.departments).toEqual([])
+    expect(admin.roles).toEqual([])
+    expect(admin.storage).toBeNull()
   })
 })

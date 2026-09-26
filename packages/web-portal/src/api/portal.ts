@@ -47,26 +47,23 @@ export interface PortalFilter {
   to?: number
   provider?: string
   model?: string
-  /**
-   * 按署名筛选（可多选，逗号分隔发出去）。**精确匹配**；
-   * {@link UNATTRIBUTED_USER} 表示只看未归属。
-   *
-   * ★ 与「说过的名字」无关：服务端把人名当实体，不做子串匹配 ——
-   *   「张三」不会把「张三丰」并进来（`stats-api.test.ts` 钉着这条）。
-   */
+  /** 服务端返回的不透明归属键：人员 UUID / legacy:… / unknown。 */
   users?: string[]
 }
 
 /** 把筛选条件拼成查询串（省略空值，避免发出 `?provider=` 这种噪声）。 */
 function toQuery(filter: PortalFilter): string {
   const params = new URLSearchParams()
+  params.set('identity_view', 'member')
   if (filter.period) params.set('period', filter.period)
   if (filter.from !== undefined) params.set('from', String(filter.from))
   if (filter.to !== undefined) params.set('to', String(filter.to))
   if (filter.provider) params.set('provider', filter.provider)
   if (filter.model) params.set('model', filter.model)
-  if (filter.users && filter.users.length > 0)
-    params.set('user', filter.users.join(','))
+  for (const key of new Set(filter.users ?? [])) {
+    if (key === 'unknown') params.set('unattributed', 'true')
+    else params.append(key.startsWith('legacy:') ? 'legacy_user' : 'member_id', key)
+  }
   return params.toString()
 }
 

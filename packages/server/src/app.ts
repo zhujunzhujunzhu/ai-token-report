@@ -11,7 +11,7 @@
  * | `/api/v1/identity/verify` | 本地服务代用户校验 | 凭证表 | Bearer |
  * | `/api/v1/token-usage` | 插件 & CLI 上报 | 写入**上报库**（`portal.sqlite`） | Bearer |
  * | `/api/v1/stats/*` | 部门看板页面 | 读上报库（只读） | Bearer |
- * | `/api/v1/admin/members*` | 部门看板的**人员管理页** | 读写**凭证文件** | Bearer + **管理员** |
+ * | `/api/v1/admin/*` | 部门看板管理页 | 数据库人员、部门、账号、凭证 | Principal + 当前权限 |
  * | `/api/health` | 运维探活 | 无 | 无 |
  *
  * ⚠️ **`/api/v1/token-usage` 在两个形态下都注册**（不管 `enableLocalApi`）：
@@ -32,7 +32,7 @@
  * ## ★ 业务护栏**不**交给库
  *
  * 401/403/503 的语义、上报必须非 2xx、凭证唯一真值、最后管理员护栏……
- * 全部留在 `domain`（原文件不动）。中间件只做「HTTP 机械动作」。
+ * 全部留在身份仓储。中间件只做 HTTP 分发与 Cookie/Origin 校验。
  * 逐条红线见 `docs/server架构重构方案.md` §5。
  *
  * ## ⚠️ 为什么不把 6 个 handler 拆成 `routes/*.ts`
@@ -52,7 +52,10 @@ import { secureHeaders } from 'hono/secure-headers'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import { PortalAuth, viewerOf, SESSION_SECONDS, CAPTCHA_SECONDS } from './auth/portal-auth.js'
 
-import type { AdminRoute } from './admin-route.js'
+import type { AdminRoute, DatabaseAdminRoute } from './admin-route.js'
+import { IdentityError, type IdentityRepository, type Principal } from './identity/index.js'
+import type { Credential } from './credentials.js'
+import type { Authentication } from './http/auth.js'
 import type { CredentialStore } from './credentials.js'
 import { readJsonBodyLenient, readJsonBodyStrict, requestBodyLimit } from './http/body.js'
 import { fail, json, methodNotAllowed as methodNotAllowedBody, msg, respond } from './http/envelope.js'
@@ -61,7 +64,7 @@ import type { IdentityRoute } from './identity-route.js'
 import type { IngestRoute } from './ingest-route.js'
 import type { LocalStatsRouter } from './local-api.js'
 import type { StatsRoute } from './stats-route.js'
-import { INGEST_AUTH_MESSAGES, VIEWER_AUTH_MESSAGES, verifyToken } from './verify-route.js'
+import { verifyDatabaseToken, verifyToken } from './verify-route.js'
 
 /** 服务端版本（`/api/health` 会回报它，便于确认线上到底是哪一版）。 */
 export const SERVER_VERSION = '0.1.0'
@@ -70,11 +73,14 @@ export interface AppDeps {
   /** HTTPS 反向代理部署时显式配置公开地址，不信任客户端转发头。 */
   portalOrigin?: string
   portalAuth?: PortalAuth
+  identityStore?: IdentityRepository
+  databaseAdminRoute?: DatabaseAdminRoute
+  captchaHmacKey?: string
   credentials: CredentialStore
   identityRoute: IdentityRoute
   ingestRoute: IngestRoute
   statsRoute: StatsRoute
-  adminRoute: AdminRoute
+  adminRoute?: AdminRoute
   /** 本地直查路由。`enableLocalApi` 为 false 时是 null。 */
   localStats: LocalStatsRouter | null
   enableLocalApi: boolean
@@ -91,7 +97,9 @@ export interface AppDeps {
 /** 构造应用（不起监听）。 */
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono()
-  const portalAuth = deps.portalAuth ?? new PortalAuth(deps.credentials)
+  const portalAuth = deps.portalAuth ?? (deps.identityStore
+    ? new PortalAuth(deps.identityStore, { hmacKey: deps.captchaHmacKey })
+    : new PortalAuth(deps.credentials))
   const sessionCookie = 'atr_portal_session'
   const captchaCookie = 'atr_portal_captcha'
   const publicOrigin = deps.portalOrigin ? new URL(deps.portalOrigin).origin : null
@@ -99,12 +107,13 @@ export function createApp(deps: AppDeps): Hono {
     httpOnly: true, sameSite: 'Strict' as const, path: '/api/v1',
     secure: new URL(publicOrigin ?? c.req.url).protocol === 'https:', maxAge,
   })
-  // Cookie 只用于后台，进入旧领域路由前转换为服务端保存的 Token。
-  // 上报 / 身份验证继续只接受调用方显式提供的 Bearer。
-  const portalAuthorization = (c: Context): string | null => {
+  // ★ Cookie 直接产生 Principal，生产路径不保存也不还原上报 Token。
+  const portalAuthorization = async (c: Context): Promise<Authentication> => {
     if (authOf(c)) return authOf(c)
-    const identity = portalAuth.resolve(getCookie(c, sessionCookie))
-    return identity ? `Bearer ${identity.token}` : null
+    const identity = await portalAuth.resolve(getCookie(c, sessionCookie))
+    if (deps.identityStore) return identity as Principal | null
+    // 仅旧领域测试显式传 CredentialStore 时使用旧适配，生产 index 不会走这里。
+    return identity ? `Bearer ${(identity as Credential).token}` : null
   }
 
   // ── 中间件：顺序即语义 ──────────────────────────────────────────
@@ -166,25 +175,32 @@ export function createApp(deps: AppDeps): Hono {
     const result = await portalAuth.login(parsed.value, getCookie(c, captchaCookie))
     deleteCookie(c, captchaCookie, { path: '/api/v1' })
     if (!result.ok) return fail(result.reason, result.status)
-    portalAuth.logout(getCookie(c, sessionCookie))
+    await portalAuth.logout(getCookie(c, sessionCookie))
     setCookie(c, sessionCookie, result.sessionId, cookieOptions(c, SESSION_SECONDS))
     return c.json({ ok: true, viewer: result.viewer })
   })
-  app.get('/api/v1/auth/session', (c) => {
-    const identity = portalAuth.resolve(getCookie(c, sessionCookie))
+  app.get('/api/v1/auth/session', async (c) => {
+    const identity = await portalAuth.resolve(getCookie(c, sessionCookie))
     if (!identity) return fail('登录已失效，请重新登录', 401)
-    return c.json({ ok: true, viewer: viewerOf(identity) })
+    return c.json({ ok: true, viewer: deps.identityStore
+      ? await deps.identityStore.getViewer(identity as Principal)
+      : viewerOf(identity as Credential) })
   })
-  app.post('/api/v1/auth/logout', (c) => {
-    portalAuth.logout(getCookie(c, sessionCookie))
+  app.post('/api/v1/auth/logout', async (c) => {
+    await portalAuth.logout(getCookie(c, sessionCookie))
     deleteCookie(c, sessionCookie, { path: '/api/v1' })
     return c.json({ ok: true })
   })
 
   // ── 健康检查 ──────────────────────────────────────────────────
   // ⚠️ 刻意不校验方法：探活工具常发 HEAD/POST，回 405 会让监控误判服务已死。
-  app.all('/api/health', () =>
-    json({
+  app.all('/api/health', async () => {
+    if (deps.identityStore) return json({
+      ok: true, version: SERVER_VERSION, localApi: deps.enableLocalApi,
+      schema_version: 4, initialized: await deps.identityStore.isRegistered(),
+      identity_storage: 'database',
+    })
+    return json({
       ok: true,
       version: SERVER_VERSION,
       credentialsRegistered: deps.credentials.registered,
@@ -193,8 +209,8 @@ export function createApp(deps: AppDeps): Hono {
       // 它是 0 时管理页谁都进不去（只能靠 ATR_ADMIN_TOKEN 或改文件）。
       adminCount: deps.credentials.adminCount,
       localApi: deps.enableLocalApi,
-    }),
-  )
+    })
+  })
 
   // ── 用量上报（插件 & CLI）────────────────────────────────────
   // ★ 两个形态都注册：插件的默认 endpoint 就是 127.0.0.1:8787 的这个路径。
@@ -221,7 +237,9 @@ export function createApp(deps: AppDeps): Hono {
 
     // ★ 永远 200 + ok:false 表达业务失败：用 401 会让前端把
     //   「token 填错了」和「网络坏了」混为一谈（见契约测试）。
-    return json(verifyToken(deps.credentials, { authorization: authOf(c), bodyToken }))
+    return json(deps.identityStore
+      ? await verifyDatabaseToken(deps.identityStore, { authorization: authOf(c), bodyToken })
+      : verifyToken(deps.credentials, { authorization: authOf(c), bodyToken }))
   })
 
   // ── 部门看板查询（web-portal 用）────────────────────────────
@@ -232,17 +250,40 @@ export function createApp(deps: AppDeps): Hono {
     const url = new URL(c.req.url)
     const sub = url.pathname.slice('/api/v1/stats/'.length)
     c.header('Cache-Control', 'no-store')
-    return respond(await deps.statsRoute.handle(sub, url.searchParams, portalAuthorization(c)))
+    return respond(await deps.statsRoute.handle(sub, url.searchParams, await portalAuthorization(c)))
   })
 
   // ── 人员管理与 token 发放（web-portal 的管理页）──────────────
   // ★ 唯一会写凭证文件的通路。鉴权失败回 401 / 403 / 503 三者之一，
   //   含义各不相同（见 `admin-route.ts` 的表）—— 绝不能是 200 + ok:false。
-  app.get('/api/v1/admin/members', (c) => respond(deps.adminRoute.list(portalAuthorization(c))))
+  if (deps.databaseAdminRoute) {
+    const route = deps.databaseAdminRoute
+    const dispatch = async (c: Context, action: string): Promise<Response> => {
+      const parsed = c.req.method === 'POST' ? await readJsonBodyLenient(c) : { value: undefined }
+      if ('error' in parsed) return fail(parsed.error, 400)
+      return respond(await route.handle(c.req.method, action, await portalAuthorization(c), parsed.value, new URL(c.req.url).searchParams))
+    }
+    for (const path of ['members', 'members/tokens', 'roles', 'audit', 'storage', 'legacy-attributions']) {
+      app.get(`/api/v1/admin/${path}`, c => dispatch(c, path))
+    }
+    app.get('/api/v1/departments', c => dispatch(c, 'departments'))
+    for (const path of [
+      'members', 'members/update', 'members/roles', 'members/status', 'members/login',
+      'members/login/status', 'members/tokens', 'members/tokens/rotate', 'members/tokens/revoke',
+      'members/tokens/scopes', 'departments', 'departments/update', 'departments/status',
+      'legacy-attributions/confirm',
+    ]) app.post(`/api/v1/admin/${path}`, c => dispatch(c, path))
+  } else if (deps.adminRoute) {
+  const legacyAdmin = deps.adminRoute
+  const legacyAuthorization = async (c: Context): Promise<string | null> => {
+    const value = await portalAuthorization(c)
+    return typeof value === 'string' ? value : null
+  }
+  app.get('/api/v1/admin/members', async (c) => respond(legacyAdmin.list(await legacyAuthorization(c))))
   app.post('/api/v1/admin/members', async (c) => {
     const parsed = await readJsonBodyLenient(c)
     if ('error' in parsed) return fail(parsed.error, 400)
-    return respond(deps.adminRoute.issue(portalAuthorization(c), parsed.value))
+    return respond(legacyAdmin.issue(await legacyAuthorization(c), parsed.value))
   })
   app.post('/api/v1/admin/members/*', async (c) => {
     const pathname = new URL(c.req.url).pathname
@@ -259,18 +300,19 @@ export function createApp(deps: AppDeps): Hono {
 
     switch (action) {
       case 'login':
-        return respond(await deps.adminRoute.setLogin(portalAuthorization(c), parsed.value))
+        return respond(await legacyAdmin.setLogin(await legacyAuthorization(c), parsed.value))
       case 'update':
-        return respond(deps.adminRoute.update(portalAuthorization(c), parsed.value))
+        return respond(legacyAdmin.update(await legacyAuthorization(c), parsed.value))
       case 'rotate':
-        return respond(deps.adminRoute.rotate(portalAuthorization(c), parsed.value))
+        return respond(legacyAdmin.rotate(await legacyAuthorization(c), parsed.value))
       case 'revoke':
-        return respond(deps.adminRoute.revoke(portalAuthorization(c), parsed.value))
+        return respond(legacyAdmin.revoke(await legacyAuthorization(c), parsed.value))
       default:
         // `issue` 挂在 `/api/v1/admin/members` 上（见上），这里只可能是拼错
         return fail('签发 token 请 POST /api/v1/admin/members（不带子路径）', 404)
     }
   })
+  }
 
   // ── 本地身份读写（本地页面用；仅 `--web` 形态）──────────────
   if (deps.enableLocalApi) {
@@ -329,6 +371,8 @@ export function createApp(deps: AppDeps): Hono {
   app.notFound((c) => fallback(c, deps))
 
   app.onError((err, c) => {
+    if (err instanceof IdentityError) return json({ ok: false, reason: err.message, ...(err.code ? { code: err.code } : {}) }, err.status)
+    if (deps.identityStore) return fail('数据库服务暂时不可用，请稍后重试', 503)
     // 兜底：任何未捕获异常都返回 JSON，而不是让连接挂断。
     // 前端拿到结构化错误才能展示有意义的信息。
     // ⚠️ 不回显堆栈：它可能带上文件路径与内部结构，日志里有 request-id 可追。

@@ -7,7 +7,7 @@
  *   与后端完全对不上，接上真数据后就是一片空图表 —— 不再重演。
  */
 
-import { UNATTRIBUTED_USER, type GroupBy } from '@ai-token-report/shared'
+import { UNATTRIBUTED_USER, type GroupBy, type BreakdownRow } from '@ai-token-report/shared'
 
 /** 时间窗选项（value 是服务端认识的具名周期）。 */
 export interface TimeRangeOption {
@@ -112,6 +112,12 @@ export function bucketFor(period: string, spanMs?: number): 'day' | 'hour' {
  */
 export function userLabel(key: string): string {
   return key === UNATTRIBUTED_USER ? '未署名' : key
+}
+
+/** 同名人员用部门与短 ID 辅助区分；旧响应仍可显示旧人名。 */
+export function identityLabel(row: BreakdownRow): string {
+  const name = row.label ?? userLabel(row.key)
+  return row.member_id ? `${name} · ${row.department_name ? row.department_name + ' · ' : ''}${row.member_id.slice(0, 8)}` : name
 }
 
 /** 未归属行的展示标记（用于给那一行加醒目的底色）。 */

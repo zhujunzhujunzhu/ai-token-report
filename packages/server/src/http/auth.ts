@@ -25,6 +25,40 @@
 
 import type { CredentialStore } from '../credentials.js'
 import { resolveIdentity, type IdentityResolution } from '../verify-route.js'
+import { tokenFromHeader } from '../verify-route.js'
+import { IdentityError, type IdentityRepository, type Principal } from '../identity/index.js'
+
+/** Cookie 已解析成可信 Principal；只接受服务端组装的对象，不从请求体取身份。 */
+export type Authentication = string | Principal | null | undefined
+export type DatabaseAuthOutcome =
+  | { ok: true; viewer: Principal }
+  | { ok: false; status: number; reason: string }
+
+/** 数据库权限裁决；旧 authorize 只留给显式构造 CredentialStore 的兼容测试。 */
+export async function authorizeDatabase(
+  repository: IdentityRepository,
+  authentication: Authentication,
+  permission: string,
+  messages: AuthMessages,
+): Promise<DatabaseAuthOutcome> {
+  try {
+    if (!await repository.isRegistered()) return { ok: false, status: 503, reason: messages.unregistered }
+    const principal = typeof authentication === 'object' && authentication
+      ? authentication
+      : await repository.resolveBearer(tokenFromHeader(authentication) ?? '')
+    if (!principal) return { ok: false, status: 401, reason: authentication ? 'token 无效或登录已失效' : messages.missingToken }
+    return { ok: true, viewer: await repository.authorize(principal, permission) }
+  } catch (err) {
+    return databaseFailure(err)
+  }
+}
+
+/** 存储故障不伪装成无权限；也不把含连接串的驱动错误回显给浏览器。 */
+export function databaseFailure(err: unknown): { ok: false; status: number; reason: string; code?: string } {
+  return err instanceof IdentityError
+    ? { ok: false, status: err.status, reason: err.message, ...(err.code ? { code: err.code } : {}) }
+    : { ok: false, status: 503, reason: '身份数据库暂时不可用，请稍后重试' }
+}
 
 /** 非管理员访问管理接口时的统一文案（前端直接展示，别改）。 */
 export const ADMIN_ONLY_REASON = '人员管理仅管理员可用：请改用管理员发放的管理员 token 登录'

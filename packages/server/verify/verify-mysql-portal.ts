@@ -32,10 +32,8 @@
  * 而启动日志经常被贴进工单）。手工装配会绕过这两处，正是「脚本全绿但线上配不上」
  * 的经典盲区。
  *
- * ## 🚨 只动 `ai_token_report`
- *
- * 脚本只做三件事：读 `usage_event` 的列名、按 `session_id` 前缀写/删自己造的行、
- * 恢复 `ingest_run` 原来的 `last_ingest_ms`。**不 DROP 任何表、不跨库**。
+ * 每次创建随机 atr_http_v4_* 隔离库，显式导入夹具身份；结束后删除该隔离库。
+ * 管理连接取 ATR_V4_TEST_MYSQL_URL 或本机开发容器，不打开现有业务库。
  */
 
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -52,19 +50,16 @@ import {
 //   了「`mysqlUrl` 怎么从配置走到路由」这一段（`index.ts` 的接线 + 脱敏横幅），
 //   而手工装配会绕过它 —— 那正是「脚本全绿但线上配不上」的经典盲区。
 import { createServer } from '../src/index.js'
+import { seedDatabaseIdentity } from '../test/database-fixture.js'
+import { createIsolatedMysql } from './mysql-isolation.js'
 
 // ── 配置 ────────────────────────────────────────────────────────────────────
 
 /**
- * 默认连本机的开发用 MySQL（`local-database-review-mysql` 容器，宿主端口 3335）。
- *
- * ⚠️ 账号来自开发机的 `.env`（`MYSQL_USER` / `MYSQL_PASSWORD`）；
- *   库名是本项目自己的 **`ai-token`**（那台实例多项目共用，各用一张库）。
- *   别的机器/CI 用 `ATR_MYSQL_URL` 覆盖。
+ * 使用本次专属隔离库；管理连接和密码不打印。
  */
-const MYSQL_URL =
-  process.env['ATR_MYSQL_URL'] ??
-  'mysql://mysql_user:mysql_password@127.0.0.1:3335/ai-token'
+const isolation = await createIsolatedMysql()
+const MYSQL_URL = isolation.url
 
 /**
  * 从连接串里取出密码 —— 只用于断言「启动横幅里绝不出现它」。
@@ -248,6 +243,10 @@ async function startServer(opts: {
   dbPath: string
   mysqlUrl?: string
 }): Promise<RunningServer> {
+  await seedDatabaseIdentity({ sqlitePath: opts.dbPath, ...(opts.mysqlUrl ? { mysqlUrl: opts.mysqlUrl } : {}) }, [
+    { token: TOKENS.zhang, name: '张三', dept: '研发一部' },
+    { token: TOKENS.li, name: '李四', dept: '研发二部' },
+  ])
   // ★ 生产入口：凭证表、三条路由、应用装配、端口重试全在里面。
   //   `credentialsPath` 由 `dshHome` 推导（`<home>/token-report/credentials.json`），
   //   与 fixture 写下的位置一致。
@@ -257,7 +256,8 @@ async function startServer(opts: {
     host: '127.0.0.1',
     dshHome: home,
     dbPath: opts.dbPath,
-    ...(opts.mysqlUrl ? { mysqlUrl: opts.mysqlUrl } : {}),
+    // SQLite 对照组必须显式屏蔽环境变量，否则 ATR_MYSQL_URL 会让两端写进同一个库。
+    mysqlUrl: opts.mysqlUrl ?? '',
     requestLog: false,
   })
   return {
@@ -348,9 +348,9 @@ try {
   for (const s of [sqlite, mysql]) {
     const health = (await (await fetch(`${s.url}/api/health`)).json()) as {
       ok?: boolean
-      credentialCount?: number
+      initialized?: boolean
     }
-    check(`${s.label}: /api/health 正常且凭证已登记`, health.ok === true && health.credentialCount === 2)
+    check(`${s.label}: /api/health 正常且身份已入库`, health.ok === true && health.initialized === true)
   }
 
   // ── 2. 记录 MySQL 侧原状态（跑完恢复，绝不留痕）──────────────────────────
@@ -539,6 +539,7 @@ try {
   if (mysql) await mysql.stop().catch(() => undefined)
   // MySQL 后端 close() 是空操作（连接来自共享池），进程退出时统一关池
   await closeAllMysqlBackends().catch(() => undefined)
+  await isolation.dispose()
   try {
     rmSync(home, { recursive: true, force: true })
   } catch {

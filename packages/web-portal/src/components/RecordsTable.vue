@@ -38,6 +38,12 @@ defineEmits<{ page: [value: number] }>()
           ><el-descriptions-item label="项目目录">{{
             row.cwd || '未提供'
           }}</el-descriptions-item
+          ><el-descriptions-item label="人员 ID">{{
+            row.member_id || '待确认历史或未归属'
+          }}</el-descriptions-item
+          ><el-descriptions-item label="上报时部门">{{
+            row.dept_snapshot || '未提供'
+          }}</el-descriptions-item
           ><el-descriptions-item label="缓存写入">{{
             formatCount(row.cacheWriteTokens)
           }}</el-descriptions-item></el-descriptions
@@ -51,7 +57,7 @@ defineEmits<{ page: [value: number] }>()
     >
     <el-table-column label="署名" min-width="105"
       ><template #default="{ row }">{{
-        userLabel(row.userId)
+        row.user_name_snapshot ?? userLabel(row.userId)
       }}</template></el-table-column
     >
     <el-table-column

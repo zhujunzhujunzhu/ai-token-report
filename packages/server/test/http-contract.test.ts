@@ -40,6 +40,7 @@ import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
 
 import { createHandlerFor, type HandlerBundle } from '../src/index.js'
+import { seedDatabaseIdentity } from './database-fixture.js'
 
 // ── 临时环境 ──────────────────────────────────────────────────
 // 全部落在系统临时目录下：不碰真实的 $DSH_HOME，也不写仓内任何文件。
@@ -120,6 +121,7 @@ function makeHome(tag: string): { home: string; staticDir: string } {
 
 const deptHome = makeHome('dept')
 const localHome = makeHome('local')
+await seedDatabaseIdentity({ sqlitePath: join(deptHome.home, 'token-report', 'portal.sqlite') }, JSON.parse(CREDENTIALS))
 
 /** 部门形态：开静态托管，**关** `/api/local/*`。 */
 const dept: HandlerBundle = await createHandlerFor({
@@ -255,8 +257,9 @@ describe('现状契约：健康检查', () => {
     expect(r.status).toBe(200)
     const b = r.body as Record<string, unknown>
     expect(b.ok).toBe(true)
-    expect(b.credentialCount).toBe(2)
-    expect(b.adminCount).toBe(1)
+    expect(b.initialized).toBe(true)
+    expect(b.schema_version).toBe(4)
+    expect(b.identity_storage).toBe('database')
     expect(b.localApi).toBe(false)
   })
 
@@ -409,8 +412,8 @@ describe('现状契约：/api/v1/admin/members*', () => {
     expect(r.allow).toBe('GET, POST')
   })
 
-  test('GET /members/revoke → 405 且 Allow 恰好是 POST', async () => {
-    const r = await call(dept, 'GET', '/api/v1/admin/members/revoke')
+  test('GET /members/tokens/revoke → 405 且 Allow 恰好是 POST', async () => {
+    const r = await call(dept, 'GET', '/api/v1/admin/members/tokens/revoke')
     expect(r.status).toBe(405)
     expect(r.allow).toBe('POST')
   })
@@ -433,15 +436,15 @@ describe('现状契约：/api/v1/admin/members*', () => {
     expect(reason(r)).toBe('未找到 /api/v1/admin/members/rotote')
   })
 
-  test('业务失败（重名）→ 200 + ok:false（不是 4xx）', async () => {
+  test('同名人员通过稳定 ID 独立创建', async () => {
     const r = await call(dept, 'POST', '/api/v1/admin/members', {
       headers: { ...JSON_HEADERS, ...ADMIN },
-      body: JSON.stringify({ name: '张三' }),
+      body: JSON.stringify({ name: '张三', role_ids: ['00000000-0000-4000-8000-000000000002'] }),
     })
     expect(r.status).toBe(200)
     const b = r.body as Record<string, unknown>
-    expect(b.ok).toBe(false)
-    expect(String(b.reason)).toContain('已存在')
+    expect(b.ok).toBe(true)
+    expect((b.member as { member_id: string }).member_id).toMatch(/^[0-9a-f-]{36}$/)
   })
 })
 
