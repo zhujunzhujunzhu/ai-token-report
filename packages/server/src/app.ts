@@ -110,7 +110,11 @@ export function createApp(deps: AppDeps): Hono {
   // ── 中间件：顺序即语义 ──────────────────────────────────────────
   // 1) request-id 最先：后面所有日志与错误都带上它
   app.use('*', requestId())
-  // 2) 405 + Allow：读 Hono 自己的路由表，晚一步注册也没关系（首次 404 时才建索引）
+  // 2) 访问日志必须包住 405 中间件：它在返回时把 404 改成 405，
+  //    日志放在内层会提前把实际的 405 请求误记成 404。
+  //    只记方法 / 路径 / 状态 / 耗时，Authorization 里的 token 绝不写进日志。
+  if (deps.requestLog !== false) app.use('*', logger())
+  // 3) 405 + Allow：读 Hono 自己的路由表，晚一步注册也没关系（首次 404 时才建索引）
   app.use(
     '*',
     methodNotAllowed({
@@ -118,9 +122,6 @@ export function createApp(deps: AppDeps): Hono {
       onMethodNotAllowed: (_c, methods) => methodNotAllowedBody(allowHeader(methods)),
     }),
   )
-  // 3) 访问日志。⚠️ 只记方法 / 路径 / 状态 / 耗时 ——
-  //    token 在 Authorization 头里，**任何情况下都不许写进日志**。
-  if (deps.requestLog !== false) app.use('*', logger())
   // 4) 安全响应头（默认不含 CSP，见 `secureHeaders()` 的默认值：
   //    它是一个静态 SPA，加上默认 CSP 会把内联样式/脚本挡住）
   app.use('*', secureHeaders())
