@@ -205,6 +205,28 @@ describe('详情体', () => {
     const html = renderToStaticMarkup(createElement(UsageDetail, { state: store.getSnapshot(), store }))
     expect(html).toContain('SQLITE_CORRUPT')
   })
+
+  test('★ 自定义触发器：平时只说「自定义」，生效时把区间写在按钮上', async () => {
+    const store = await readyStore()
+    const state = store.getSnapshot()
+    const idle = renderToStaticMarkup(createElement(UsageDetail, { state, store }))
+    expect(idle).toContain('atr-date-trigger')
+    expect(idle).toContain('自定义')
+    expect(idle).toContain('atr-chevron')
+    expect(idle).toContain('aria-expanded="false"')
+    expect(idle).toContain('aria-pressed="false"')
+    // 收起时不该渲染浮层
+    expect(idle).not.toContain('选择日期范围')
+
+    const active = renderToStaticMarkup(createElement(UsageDetail, {
+      // 生效范围写在按钮上，使用者不必去读标题栏那行 rangeLabel
+      state: { ...state, period: 'custom', dateRange: { since: '2026-09-12', until: '2026-10-06' } },
+      store,
+    }))
+    expect(active).toContain('09-12 – 10-06')
+    expect(active).toContain('自定义范围：2026-09-12 至 2026-10-06')
+    expect(active).toContain('aria-pressed="true"')
+  })
 })
 
 describe('两个挂载点', () => {

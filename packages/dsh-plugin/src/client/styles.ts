@@ -157,26 +157,53 @@ export const CSS = calendarCss.replaceAll('.rdp-', '.atr-rdp-') + `
 .atr-breakdown{border-radius:8px;background:var(--dsw-specific-tip,var(--dsw-alias-bg-layer-1));margin:0 10px 10px;padding:12px;font-size:11px}
 .atr-foot{font-size:10px;gap:8px 16px;padding-top:14px}.atr-empty{padding:24px;text-align:center}
 .atr-date-picker{position:static}
-.atr-date-trigger{display:flex;align-items:center;gap:8px}
+.atr-date-trigger{display:flex;align-items:center;gap:8px;font-variant-numeric:tabular-nums}
+.atr-date-trigger .atr-chevron{flex:none;color:var(--dsw-alias-label-tertiary);transition:transform .15s ease}
+.atr-date-trigger .atr-chevron[data-open="true"]{transform:rotate(180deg)}
 .atr-date-trigger[aria-pressed="true"],.atr-date-trigger[aria-expanded="true"]{color:var(--atr-accent);background:var(--atr-soft);border-color:color-mix(in srgb,var(--atr-accent) 30%,transparent)}
-.atr-calendar-popover{box-sizing:border-box;position:absolute;left:0;top:calc(100% - 12px);z-index:5;width:630px;max-width:100%;padding:20px;border:1px solid var(--dsw-alias-border-l2);border-radius:16px;background:var(--dsw-alias-bg-base,#fff);box-shadow:0 16px 48px rgba(0,0,0,.15)}
-.atr-calendar-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:16px}.atr-calendar-heading strong{font-size:14px}.atr-calendar-heading span{color:var(--dsw-alias-label-tertiary);font-size:11px}
-.atr-calendar-selection{display:flex;align-items:center;gap:20px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;padding:12px 16px;margin-bottom:16px;background:var(--dsw-specific-tip,var(--dsw-alias-bg-layer-1))}
-.atr-calendar-selection>div{display:flex;flex:1;flex-direction:column;gap:4px}.atr-calendar-selection span{font-size:11px;color:var(--dsw-alias-label-tertiary)}.atr-calendar-selection strong{font-size:13px;font-weight:500;font-variant-numeric:tabular-nums}
+.atr-date-trigger[aria-pressed="true"] .atr-chevron,.atr-date-trigger[aria-expanded="true"] .atr-chevron{color:currentColor}
+/* ★ 浮层挂在筛选行（position:relative）上，top 取 calc(100% + 8px) 让它整体落在页签行
+   下方 —— 之前是 calc(100% - 12px)，浮层上沿会切进「自定义」按钮本身。
+   右对齐（right:0）使它贴着触发器那侧展开，同时在窄屏也不会溢出容器。 */
+.atr-calendar-popover{box-sizing:border-box;position:absolute;right:0;top:calc(100% + 8px);z-index:5;width:630px;max-width:100%;padding:20px;border:1px solid var(--dsw-alias-border-l2);border-radius:16px;background:var(--dsw-alias-bg-base,#fff);box-shadow:0 16px 48px rgba(0,0,0,.15);animation:atr-pop-in .14s ease-out}
+@keyframes atr-pop-in{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+.atr-calendar-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:14px}.atr-calendar-heading strong{font-size:14px}
+.atr-calendar-hint{font-size:11px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}
+.atr-calendar-selection{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:12px;margin-bottom:16px}
+.atr-calendar-field{display:flex;min-width:0;flex-direction:column;gap:6px}
+.atr-calendar-field>span{font-size:11px;color:var(--dsw-alias-label-tertiary)}
+.atr-calendar-input{box-sizing:border-box;width:100%;padding:9px 11px;border:1px solid var(--dsw-alias-border-l2);border-radius:9px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;font-variant-numeric:tabular-nums;transition:border-color .15s,box-shadow .15s}
+.atr-calendar-input::placeholder{color:var(--dsw-alias-label-caption)}
+.atr-calendar-input:hover:not(:disabled){border-color:var(--dsw-alias-border-l4)}
+.atr-calendar-input:focus{outline:none;border-color:var(--atr-accent);box-shadow:0 0 0 3px var(--atr-soft)}
+.atr-calendar-input-invalid{border-color:var(--dsw-alias-state-error-primary)}
+.atr-calendar-input-invalid:focus{box-shadow:0 0 0 3px color-mix(in srgb,var(--dsw-alias-state-error-primary) 12%,transparent)}
+.atr-calendar-arrow{color:var(--dsw-alias-label-tertiary);font-size:13px}
 .atr-calendar{--rdp-accent-color:var(--atr-accent);--rdp-accent-background-color:var(--atr-soft);--rdp-day-height:36px;--rdp-day-width:38px;--rdp-day_button-height:34px;--rdp-day_button-width:34px;--rdp-day_button-border-radius:8px;--rdp-months-gap:20px;--rdp-selected-border:0;--rdp-nav-height:36px;--rdp-nav_button-width:28px;--rdp-nav_button-height:28px}
 .atr-calendar .atr-rdp-root{--rdp-accent-color:var(--atr-accent);--rdp-accent-background-color:var(--atr-soft);--rdp-day-height:36px;--rdp-day-width:38px;--rdp-day_button-height:34px;--rdp-day_button-width:34px;--rdp-day_button-border-radius:8px;--rdp-months-gap:20px;--rdp-selected-border:0;--rdp-nav-height:36px;--rdp-nav_button-width:28px;--rdp-nav_button-height:28px;font-size:12px}
 .atr-calendar{display:flex;justify-content:space-between;gap:20px}.atr-calendar .atr-rdp-months{max-width:none;justify-content:space-between}.atr-calendar .atr-rdp-month_caption{font-size:13px;font-weight:600}.atr-calendar .atr-rdp-weekday{font-size:11px;font-weight:400;color:var(--dsw-alias-label-tertiary)}
+/* 两栏是各自独立的月份，给它们一条分隔线，免得看成一个跨月大网格。 */
+.atr-calendar>.atr-rdp-root+.atr-rdp-root{border-left:1px solid var(--dsw-alias-border-l1);padding-left:20px}
 .atr-calendar .atr-rdp-day_button:hover{background:var(--atr-soft)}
 .atr-calendar .atr-rdp-selected{font-size:inherit;font-weight:600}
-.atr-calendar .atr-rdp-range_start .atr-rdp-day_button,.atr-calendar .atr-rdp-range_end .atr-rdp-day_button{background:var(--atr-accent);color:#fff}
+/* ★ 只选了开始日（结束日还没有）时，RDP **不会**给 range_start 修饰符 ——
+   它只给 selected，而 selected 的唯一视觉是那个被我们置零的边框。
+   于是「点了开始日却什么都没高亮」。这里用 inset 阴影补上：
+   不占布局（border 会把 34px 的按钮撑到 38px，溢出 36px 的格子）。
+   ⚠️ 必须排掉 range_*：区间中的每一天也带 selected，否则整段区间都套上边框。 */
+.atr-calendar .atr-rdp-selected:not(.atr-rdp-range_start):not(.atr-rdp-range_middle):not(.atr-rdp-range_end) .atr-rdp-day_button{box-shadow:inset 0 0 0 2px var(--atr-accent);color:var(--atr-accent)}
+.atr-calendar .atr-rdp-range_start .atr-rdp-day_button,.atr-calendar .atr-rdp-range_end .atr-rdp-day_button{background:var(--atr-accent);color:#fff;box-shadow:none}
 .atr-calendar .atr-rdp-dropdown{background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary)}
 .atr-calendar-footer{display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid var(--dsw-alias-border-l1);margin-top:16px;padding-top:16px}.atr-calendar-footer>span{color:var(--dsw-alias-label-tertiary);font-size:11px}.atr-calendar-footer>div{display:flex;gap:8px}
 .atr-dialog .atr-primary{background:var(--atr-accent);border-color:var(--atr-accent);color:#fff}.atr-dialog .atr-primary:hover{filter:brightness(1.06)}
 .atr-calendar button:focus-visible,.atr-date-trigger:focus-visible,.atr-chart-data summary:focus-visible{outline:2px solid var(--atr-accent);outline-offset:2px}
-@media(max-width:700px){.atr-cells{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.atr-dialog .atr-card{padding:18px;gap:16px}.atr-mask{padding:8px}.atr-title{font-size:20px}.atr-row{grid-template-columns:minmax(70px,1fr) 65px 55px 58px;gap:6px;padding:12px 4px}.atr-cell{padding:16px}.atr-cell-v{font-size:24px}.atr-strip-metrics{gap:8px}.atr-strip-period{max-width:120px;overflow:hidden;text-overflow:ellipsis}.atr-section{padding:14px}.atr-chart{height:190px}.atr-filter-bar{gap:8px}.atr-filter-bar .atr-segmented{flex-basis:100%;justify-content:space-between}.atr-filter-bar .atr-segmented .atr-btn{padding:8px}.atr-calendar-popover{width:330px;padding:14px}.atr-calendar .atr-rdp-months{justify-content:center}.atr-calendar-footer{flex-wrap:wrap}.atr-calendar-footer>div{margin-left:auto}.atr-calendar-heading span{font-size:10px}}
-@media(prefers-reduced-motion:reduce){.atr-dialog .atr-btn{transition:none}.atr-refresh[aria-busy="true"] svg{animation:none}}
+@media(max-width:700px){.atr-cells{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.atr-dialog .atr-card{padding:18px;gap:16px}.atr-mask{padding:8px}.atr-title{font-size:20px}.atr-row{grid-template-columns:minmax(70px,1fr) 65px 55px 58px;gap:6px;padding:12px 4px}.atr-cell{padding:16px}.atr-cell-v{font-size:24px}.atr-strip-metrics{gap:8px}.atr-strip-period{max-width:120px;overflow:hidden;text-overflow:ellipsis}.atr-section{padding:14px}.atr-chart{height:190px}.atr-filter-bar{gap:8px}.atr-filter-bar .atr-segmented{flex-basis:100%;justify-content:space-between}.atr-filter-bar .atr-segmented .atr-btn{padding:8px}.atr-calendar-popover{width:330px;padding:14px}.atr-calendar .atr-rdp-months{justify-content:center}.atr-calendar-footer{flex-wrap:wrap}.atr-calendar-footer>div{margin-left:auto}.atr-calendar-hint{font-size:10px}}
+@media(prefers-reduced-motion:reduce){.atr-dialog .atr-btn{transition:none}.atr-refresh[aria-busy="true"] svg{animation:none}.atr-calendar-popover{animation:none}.atr-date-trigger .atr-chevron{transition:none}}
 @media(max-width:700px){.atr-dialog .atr-card{padding:0;gap:0}.atr-page-head{padding:18px 18px 0;gap:16px}.atr-body{padding:16px 18px 18px;gap:16px}.atr-heading-actions{gap:6px}}
-@media(max-height:760px){.atr-calendar-popover{max-height:calc(90vh - 220px);overflow:auto;overscroll-behavior:contain}}
+@media(max-height:760px){.atr-calendar-popover{max-height:calc(90vh - 220px);overflow:auto;overscroll-behavior:contain}
+/* 矮屏时浮层自己滚动：标题与底部按钮钉住，否则「应用范围」要滚到底才够得着。 */
+.atr-calendar-heading{position:sticky;top:0;z-index:2;padding-top:2px;background:var(--dsw-alias-bg-base)}
+.atr-calendar-footer{position:sticky;bottom:0;z-index:2;padding-bottom:2px;background:var(--dsw-alias-bg-base)}}
 
 `
 
