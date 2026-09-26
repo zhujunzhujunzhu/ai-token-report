@@ -44,7 +44,7 @@ import { emptyCounts, mergeCounts, type TokenCounts, type UsageRecord } from '@a
 export type Deliverer = (records: UsageRecord[]) => Promise<DeliverOutcome>
 
 export interface DeliverOutcome {
-  /** 服务端接受（含重复）的条数。 */
+  /** 服务端新接受的条数（不含重复）。 */
   accepted: number
   /** 服务端判定为重复的条数。 */
   duplicates: number
@@ -163,16 +163,14 @@ export async function runReport(options: RunReportOptions): Promise<RunReportRes
 
   const outcome = await options.deliver(toSend)
 
-  // 服务端拒收的记录留在 pending，不计入 ack —— 否则会静默丢数据
-  const rejected = Math.max(0, outcome.rejected)
-  if (rejected > 0) {
-    const acceptedCount = toSend.length - rejected
-    ackRecords(state, toSend.slice(0, acceptedCount), Date.now())
-    // 被拒的部分保留在 pending 以便排查；不推进 lastFlushMs 的语义由 ack 决定
-    state.pending = state.pending.filter((r) => toSend.slice(acceptedCount).some((x) => x.eventId === r.eventId))
-  } else {
-    ackRecords(state, toSend, Date.now())
+  const counts = [outcome.accepted, outcome.duplicates, outcome.rejected]
+  if (counts.some(n => !Number.isSafeInteger(n) || n < 0) || counts.reduce((sum, n) => sum + n, 0) !== toSend.length) {
+    throw new Error('上报确认计数不完整，已保留整批 pending 等待重试')
   }
+  // 响应只有拒收数量，没有逐条 event_id；拒收可能出现在任意位置。
+  // 🚨 不能把前 N 条当作已接受。保留整批重试，已接收的记录由服务端幂等去重。
+  if (outcome.rejected > 0) throw new Error(`服务端拒收 ${outcome.rejected} 条，已保留整批 pending 等待修正后重试`)
+  ackRecords(state, toSend, Date.now())
 
   saveState(statePath, state)
 

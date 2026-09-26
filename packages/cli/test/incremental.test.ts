@@ -510,3 +510,40 @@ test('runReport：reset 后全量重扫（幂等由服务端保证）', tracked(
   const second = await runReport({ sessionsRoot: join(home, 'sessions'), statePath, deliver })
   assert.equal(second.records.length, 2, 'reset 后应重扫出全部记录')
 }))
+
+test('runReport：部分拒收不能按位置确认，重放时允许接受与重复混合', tracked(async () => {
+  const home = makeHome(); roots.push(home)
+  const file = makeSessionFile(home, '--proj--', 'sess-1')
+  appendFrame(file, [sessionLine('sess-1', 'D:\\proj'), usageLine(1), usageLine(2)])
+  const statePath = join(home, 'state.json')
+  const options = { sessionsRoot: join(home, 'sessions'), statePath }
+
+  await assert.rejects(runReport({ ...options, deliver: async () => ({ accepted: 1, duplicates: 0, rejected: 1 }) }), /拒收 1 条/)
+  const retained = loadState(statePath).state
+  assert.deepEqual(retained.pending.map(r => r.seq), [1, 2], '没有拒收 event_id 时整批都必须保留')
+  assert.equal(retained.totalDelivered, 0)
+  assert.equal(retained.lastFlushMs, 0)
+
+  await runReport({ ...options, deliver: async records => {
+    assert.deepEqual(records.map(r => r.seq), [1, 2])
+    return { accepted: 1, duplicates: 1, rejected: 0 }
+  } })
+  assert.equal(loadState(statePath).state.pending.length, 0)
+  assert.equal(loadState(statePath).state.totalDelivered, 2)
+}))
+
+test('runReport：不完整或非法确认计数不得清空 pending', tracked(async () => {
+  const home = makeHome(); roots.push(home)
+  const file = makeSessionFile(home, '--proj--', 'sess-1')
+  appendFrame(file, [sessionLine('sess-1', 'D:\\proj'), usageLine(1), usageLine(2)])
+  const statePath = join(home, 'state.json')
+  for (const outcome of [
+    { accepted: 1, duplicates: 0, rejected: 0 },
+    { accepted: 3, duplicates: -1, rejected: 0 },
+    { accepted: 1.5, duplicates: 0.5, rejected: 0 },
+  ]) {
+    await assert.rejects(runReport({ sessionsRoot: join(home, 'sessions'), statePath, deliver: async () => outcome }), /确认计数不完整/)
+    assert.equal(loadState(statePath).state.pending.length, 2)
+    assert.equal(loadState(statePath).state.totalDelivered, 0)
+  }
+}))

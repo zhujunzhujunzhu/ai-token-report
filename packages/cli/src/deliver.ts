@@ -102,6 +102,7 @@ export function createHttpDeliverer(options: HttpDeliverOptions): Deliverer {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
     let res: Response
+    let raw: string
     try {
       res = await doFetch(options.endpoint, {
         method: 'POST',
@@ -112,6 +113,8 @@ export function createHttpDeliverer(options: HttpDeliverOptions): Deliverer {
         body,
         signal: controller.signal,
       })
+      // 收到响应头不代表收到确认；超时必须覆盖 body，避免网关半响应永久卡住。
+      raw = await res.text()
     } catch (err) {
       const reason = err instanceof Error && err.name === 'AbortError'
         ? `请求超时（${timeoutMs}ms）`
@@ -122,32 +125,31 @@ export function createHttpDeliverer(options: HttpDeliverOptions): Deliverer {
     }
 
     if (!res.ok) {
-      const text = await res.text().catch(() => '')
-      throw new Error(`上报失败: HTTP ${res.status}${text ? ` — ${text.slice(0, 300)}` : ''}`)
-    }
-
-    // 兼容服务端只返回 200 空体
-    const raw = await res.text().catch(() => '')
-    if (!raw.trim()) {
-      return { accepted: records.length, duplicates: 0, rejected: 0 }
+      throw new Error(`上报失败: HTTP ${res.status}${raw ? ` — ${raw.slice(0, 300)}` : ''}`)
     }
 
     let parsed: unknown
     try {
       parsed = JSON.parse(raw)
     } catch {
-      // 2xx 但响应不是 JSON：视为全部接受（服务端已收到）
-      return { accepted: records.length, duplicates: 0, rejected: 0 }
+      throw new Error('上报失败: 响应不是有效 JSON 确认，待发记录已保留')
     }
-
-    const obj = (parsed ?? {}) as Record<string, unknown>
-    const num = (v: unknown, fallback: number): number =>
-      typeof v === 'number' && Number.isFinite(v) ? v : fallback
-
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('上报失败: 响应缺少确认计数，待发记录已保留')
+    }
+    const obj = parsed as Record<string, unknown>
+    const counts = [obj['accepted'], obj['duplicates'], obj['rejected']]
+    if (counts.some(n => typeof n !== 'number' || !Number.isSafeInteger(n) || n < 0)) {
+      throw new Error('上报失败: 响应确认计数非法，待发记录已保留')
+    }
+    // HTML 登录页、代理空响应和不完整确认都不能证明服务端已经入库。
+    if ((obj['accepted'] as number) + (obj['duplicates'] as number) + (obj['rejected'] as number) !== records.length) {
+      throw new Error('上报失败: 响应确认计数与批次数不符，待发记录已保留')
+    }
     return {
-      accepted: num(obj['accepted'], records.length),
-      duplicates: num(obj['duplicates'], 0),
-      rejected: num(obj['rejected'], 0),
+      accepted: obj['accepted'] as number,
+      duplicates: obj['duplicates'] as number,
+      rejected: obj['rejected'] as number,
     }
   }
 }
