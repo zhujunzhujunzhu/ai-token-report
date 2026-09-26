@@ -143,15 +143,34 @@ describe('详情体', () => {
     expect(html).toContain('未命中缓存的输入 token')
   })
 
-  test('提供趋势画布、可访问的精确数据表与排行行', async () => {
+  test('提供趋势画布和精确值入口，折叠时不构造数据表', async () => {
     const store = await readyStore()
     const html = renderToStaticMarkup(createElement(UsageDetail, { state: store.getSnapshot(), store }))
     expect(html).toContain('<canvas')
     expect(html).toContain('Token 总量趋势图')
     expect(html).toContain('查看图表数据')
-    expect(html).toContain('10时')
-    expect(html).toContain('11时')
+    expect(html).not.toContain('scope="row"')
+    expect(html).not.toContain('atr-chart-table')
     expect(html).toContain('1.23M')
+  })
+
+  test('宿主分页仅返回第二页时不再本地切片，保留全部维度与真实总页数', async () => {
+    const store = await readyStore()
+    const state = store.getSnapshot()
+    const data = state.data!
+    const row = data.groups[0]!.rows[0]!
+    const html = renderToStaticMarkup(createElement(UsageDetail, {
+      store, state: { ...state, detail: { by: 'session', page: 2 }, data: { ...data, view: 'detail',
+        pagination: { by: 'session', page: 2, pageSize: 10, totalRows: 103 },
+        groups: [{ by: 'session', rows: Array.from({ length: 10 }, (_, i) => ({ ...row, key: `会话-${i + 11}` })) }],
+      } },
+    }))
+    expect(html.match(/class="atr-row-detail"/g)?.length).toBe(10)
+    expect(html).toContain('会话-11')
+    expect(html).toContain('会话-20')
+    expect(html).toContain('共 103 条')
+    expect(html).toContain('2 / 11')
+    for (const label of ['模型', '服务商', '项目', '会话']) expect(html).toContain(label)
   })
 
   test('没有数据且没有错误 → 说明「首次统计要十几秒」，不显示空白', () => {

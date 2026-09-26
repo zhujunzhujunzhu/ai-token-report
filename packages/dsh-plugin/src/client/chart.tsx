@@ -1,5 +1,5 @@
 /** 趋势图只展示宿主已算好的序列；按需注册 Chart.js，卸载时释放画布与监听。 */
-import { createElement as h, useEffect, useRef } from 'react'
+import { createElement as h, useEffect, useRef, useState } from 'react'
 import {
   Chart, BarController, BarElement, LineController, LineElement, PointElement,
   CategoryScale, LinearScale, Tooltip, Filler, type ChartConfiguration,
@@ -16,6 +16,12 @@ export function Trend(props: { series: UiSeriesPoint[]; metric: TrendMetric }) {
   const canvas = useRef<HTMLCanvasElement>(null)
   const chart = useRef<Chart<'bar' | 'line'>>()
   const { series, metric } = props
+  const [dataOpen, setDataOpen] = useState(false)
+  const [dataPage, setDataPage] = useState(1)
+  const dataPageSize = 50
+  const dataPages = Math.max(1, Math.ceil(series.length / dataPageSize))
+  const currentDataPage = Math.min(dataPage, dataPages)
+  useEffect(() => setDataPage(1), [series])
   useEffect(() => {
     const element = canvas.current
     if (!element) return
@@ -101,11 +107,19 @@ export function Trend(props: { series: UiSeriesPoint[]; metric: TrendMetric }) {
     h('div', { className: 'atr-chart' }, h('canvas', {
       ref: canvas, role: 'img', 'aria-label': `${LABELS[metric]}趋势图，${series.length} 个时间点；精确值见图表数据`,
     })),
-    h('details', { className: 'atr-chart-data' },
+    h('details', { className: 'atr-chart-data', onToggle: (event: { currentTarget: HTMLDetailsElement }) => setDataOpen(event.currentTarget.open) },
       h('summary', null, '查看图表数据'),
+      // 原生 details 只隐藏内容，不延迟创建 DOM；展开后才挂载一页精确值。
+      dataOpen ? h('div', null,
       h('div', { className: 'atr-chart-table' }, h('table', null,
         h('thead', null, h('tr', null, ...['时间', 'Token 总量', '调用数', '命中率'].map(label => h('th', { key: label }, label)))),
-        h('tbody', null, ...series.map(point => h('tr', { key: point.bucket },
+        h('tbody', null, ...series.slice((currentDataPage - 1) * dataPageSize, currentDataPage * dataPageSize).map(point => h('tr', { key: point.bucket },
           h('th', { scope: 'row' }, point.bucket.replace('T', ' ') + (point.bucket.includes('T') ? '时' : '')),
-          h('td', null, fmtInt(point.total)), h('td', null, fmtInt(point.calls)), h('td', null, fmtPct(point.cacheHitRate)))))))))
+          h('td', null, fmtInt(point.total)), h('td', null, fmtInt(point.calls)), h('td', null, fmtPct(point.cacheHitRate))))))),
+      dataPages > 1 ? h('nav', { className: 'atr-pagination', 'aria-label': '图表数据分页' },
+        h('button', { type: 'button', className: 'atr-btn', disabled: currentDataPage === 1,
+          onClick: () => setDataPage(currentDataPage - 1) }, '上一页'),
+        h('span', { role: 'status' }, `${currentDataPage} / ${dataPages} · 共 ${series.length} 个时间点`),
+        h('button', { type: 'button', className: 'atr-btn', disabled: currentDataPage === dataPages,
+          onClick: () => setDataPage(currentDataPage + 1) }, '下一页')) : null) : null))
 }

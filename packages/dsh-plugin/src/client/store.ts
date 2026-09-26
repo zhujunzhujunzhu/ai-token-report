@@ -40,9 +40,12 @@ import {
   UI_DEFAULT_PERIOD,
   readUiResponse,
   validDateRange,
+  UI_GROUP_BY,
+  UI_PAGE_SIZE,
   type UiDateRange,
   type UiPayload,
   type UiPeriod,
+  type UiGroupBy,
 } from './protocol.js'
 
 /** 代次探针周期：高频但零成本（宿主侧只比一个整数，回 204 时连载荷都没有）。 */
@@ -94,6 +97,8 @@ export interface UsageStoreDeps {
 export interface UsageState {
   period: UiPeriod
   dateRange?: UiDateRange
+  /** 有详情订阅者时才查询趋势与当前维度的一页。 */
+  detail?: { by: UiGroupBy; page: number }
   /** 首次加载（`data` 还没有值时）。 */
   loading: boolean
   /** 后台刷新中（已有数据，正在取更新的）。 */
@@ -116,6 +121,9 @@ export interface UsageStore {
   setCustomRange(range: UiDateRange): void
   /** 手动刷新（绕过宿主缓存）。 */
   refresh(): void
+  /** 详情按打开的面板计数；同页多个入口共享一次取数。 */
+  acquireDetails(): () => void
+  setDetail(by: UiGroupBy, page?: number): void
   /** 停止轮询并取消在途请求。 */
   dispose(): void
 }
@@ -164,6 +172,11 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
   /** 请求序号：只认最新一次，旧响应直接丢弃。 */
   let seq = 0
   let disposed = false
+  let requestPending = false
+  let detailSubscribers = 0
+  let detailBy: UiGroupBy = 'provider-model'
+  let detailPage = 1
+  let snapshotKey: string | undefined
   /**
    * 上一次**全量**取数的发起时刻。
    *
@@ -200,95 +213,121 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
     dateRange = state.dateRange,
     mode: LoadMode = 'full',
   ): Promise<void> => {
+    if (disposed) return
     const mine = ++seq
     controller?.abort()
     const own = new AbortController()
     controller = own
+    requestPending = true
 
-    if (mode === 'full') {
-      lastFullAt = now()
-      // 切换期间保留上次成功内容与其范围标签，避免卡片/图表卸载造成弹框塌缩。
-      // 新结果到达后整体替换；失败时继续显示原范围，不冒充已切换成功。
-      patch({ period, dateRange, loading: state.data === undefined,
-        refreshing: state.data !== undefined, error: undefined })
-    }
-
-    const query = new URLSearchParams({ period })
-    if (force) query.set('refresh', '1')
-    if (period === 'custom' && dateRange) {
-      query.set('since', dateRange.since)
-      query.set('until', dateRange.until)
-    }
-    // ★ 探针：告诉宿主「我手上是第几代」。代次没变宿主回 204，一个字节都不用传。
-    const gen = state.data?.gen
-    if (mode === 'probe' && gen !== undefined) query.set('gen', String(gen))
-
-    let body: unknown
-    let status = 200
     try {
-      const res = await deps.fetch(`${UI_STATS_PATH}?${query.toString()}`, { signal: own.signal })
-      status = res.status
-      // 204 = 代次没变：手上这份载荷仍然是最新的，什么都不用做
-      if (status === 204) return
-      if (res.ok) {
-        try {
-          body = await res.json()
-        } catch {
-          // 非 JSON（例如 HTML 兜底页）：交给下面统一翻译
-          body = undefined
-        }
+      if (mode === 'full' && (period !== state.period || dateRange?.since !== state.dateRange?.since
+        || dateRange?.until !== state.dateRange?.until)) detailPage = 1
+      const detail = detailSubscribers > 0 ? { by: detailBy, page: detailPage } : undefined
+
+      if (mode === 'full') {
+        lastFullAt = now()
+        // 切换期间保留上次成功内容与其范围标签，避免卡片/图表卸载造成弹框塌缩。
+        // 新结果到达后整体替换；失败时继续显示原范围，不冒充已切换成功。
+        patch({ period, dateRange, detail, loading: state.data === undefined,
+          refreshing: state.data !== undefined, error: undefined })
       }
-    } catch (err) {
-      // 主动 abort（切周期 / 卸载）不是错误，静默退出即可
+
+      const query = new URLSearchParams({ period })
+      query.set('view', detail ? 'detail' : 'summary')
+      if (detail) {
+        query.set('by', detail.by)
+        query.set('page', String(detail.page))
+        query.set('pageSize', String(UI_PAGE_SIZE))
+      }
+      if (force) query.set('refresh', '1')
+      if (period === 'custom' && dateRange) {
+        query.set('since', dateRange.since)
+        query.set('until', dateRange.until)
+      }
+      const snapshotParams = new URLSearchParams(query)
+      snapshotParams.delete('refresh')
+      const requestKey = snapshotParams.toString()
+      // ★ 探针：告诉宿主「我手上是第几代」。代次没变宿主回 204，一个字节都不用传。
+      const gen = state.data?.gen
+      if (mode === 'probe' && gen !== undefined && snapshotKey === requestKey) query.set('gen', String(gen))
+
+      let body: unknown
+      let status = 200
+      try {
+        const res = await deps.fetch(`${UI_STATS_PATH}?${query.toString()}`, { signal: own.signal })
+        status = res.status
+        // 204 = 代次没变：手上这份载荷仍然是最新的，什么都不用做
+        if (status === 204) return
+        if (res.ok) {
+          try {
+            body = await res.json()
+          } catch {
+            // 非 JSON（例如 HTML 兜底页）：交给下面统一翻译
+            body = undefined
+          }
+        }
+      } catch (err) {
+        // 主动 abort（切周期 / 卸载）不是错误，静默退出即可
+        if (disposed || mine !== seq) return
+        // 后台探针失败不打扰使用者：兜底全量取数会把持续的故障如实报出来
+        if (mode === 'probe') return
+        patch({
+          loading: false,
+          refreshing: false,
+          error: `请求失败：${err instanceof Error ? err.message : String(err)}`,
+        })
+        return
+      }
+
+      // ★ 迟到的响应必须丢掉：否则「点了本月却显示今天的数」
       if (disposed || mine !== seq) return
-      // 后台探针失败不打扰使用者：兜底全量取数会把持续的故障如实报出来
-      if (mode === 'probe') return
+
+      const parsed = body === undefined ? undefined : readUiResponse(body)
+      if (parsed === undefined || !parsed.ok) {
+        if (mode === 'probe') return
+        patch({
+          loading: false,
+          refreshing: false,
+          error: parsed !== undefined && !parsed.ok ? parsed.error : describeFetchFailure(status, body),
+        })
+        return
+      }
+
+      // ★ 数据没变就不要产生新快照。
+      //
+      //   宿主侧 TTL（30s）会让「探针说变了、随即全量取数」拿到一份**仍是旧代次**
+      //   的载荷（在途的那次查询还没把新数据算进去）。此时若无条件 `patch`，
+      //   面板就会在每次 tick 上重渲染一遍（图表整个重画、悬浮提示被清掉），
+      //   而数字一个字都没变 —— 纯负收益。
+      if (
+        mode === 'probe' &&
+        snapshotKey === requestKey &&
+        state.data !== undefined &&
+        parsed.payload.period === state.data.period &&
+        parsed.payload.gen !== undefined &&
+        parsed.payload.gen === state.data.gen
+      ) {
+        if (state.error !== undefined) patch({ error: undefined })
+        return
+      }
+
+      if (detail && parsed.payload.pagination) detailPage = parsed.payload.pagination.page
+      // 页码被宿主钳到最后一页时，后续探针应认这份实际返回的页面快照。
+      if (detail) snapshotParams.set('page', String(detailPage))
+      snapshotKey = snapshotParams.toString()
       patch({
         loading: false,
         refreshing: false,
-        error: `请求失败：${err instanceof Error ? err.message : String(err)}`,
+        data: parsed.payload,
+        fetchedAt: now(),
+        error: undefined,
+        ...(detail ? { detail: { by: detailBy, page: detailPage } } : {}),
       })
-      return
+    } finally {
+      // 探针保持界面安静，但在途状态必须独立记录，否则下一个 tick 会取消慢查询。
+      if (mine === seq) requestPending = false
     }
-
-    // ★ 迟到的响应必须丢掉：否则「点了本月却显示今天的数」
-    if (disposed || mine !== seq) return
-
-    const parsed = body === undefined ? undefined : readUiResponse(body)
-    if (parsed === undefined || !parsed.ok) {
-      if (mode === 'probe') return
-      patch({
-        loading: false,
-        refreshing: false,
-        error: parsed !== undefined && !parsed.ok ? parsed.error : describeFetchFailure(status, body),
-      })
-      return
-    }
-
-    // ★ 数据没变就不要产生新快照。
-    //
-    //   宿主侧 TTL（30s）会让「探针说变了、随即全量取数」拿到一份**仍是旧代次**
-    //   的载荷（在途的那次查询还没把新数据算进去）。此时若无条件 `patch`，
-    //   面板就会在每次 tick 上重渲染一遍（图表整个重画、悬浮提示被清掉），
-    //   而数字一个字都没变 —— 纯负收益。
-    if (
-      mode === 'probe' &&
-      state.data !== undefined &&
-      parsed.payload.period === state.data.period &&
-      parsed.payload.gen !== undefined &&
-      parsed.payload.gen === state.data.gen
-    ) {
-      if (state.error !== undefined) patch({ error: undefined })
-      return
-    }
-
-    patch({
-      loading: false,
-      refreshing: false,
-      data: parsed.payload,
-      fetchedAt: now(),
-      error: undefined,
-    })
   }
 
   /** 一次 tick：优先兜底全量，其次代次探针（见文件头「刷新模型」）。 */
@@ -297,7 +336,7 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
     // 后台标签页什么都不做：回来时下面的 onVisible 会立刻补一次
     if (visibility?.isHidden() === true) return
     // 慢查询在途时不再叠加：探针与全量取数都等它
-    if (state.loading || state.refreshing) return
+    if (requestPending) return
 
     if (now() - lastFullAt >= fullIntervalMs) {
       void load(state.period, false, state.dateRange, 'full')
@@ -315,7 +354,7 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
   /** 从后台切回前台：使用者正要盯着看，立刻补一次全量（宿主 TTL 会吸收掉密集切换）。 */
   const onVisible = (): void => {
     if (disposed || visibility?.isHidden() === true) return
-    if (state.loading || state.refreshing) return
+    if (requestPending) return
     void load(state.period, false, state.dateRange, 'full')
   }
 
@@ -357,6 +396,7 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
           seq++
           controller?.abort()
           controller = undefined
+          requestPending = false
         }
       }
     },
@@ -376,11 +416,39 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
       void load(state.period, true)
     },
 
+    acquireDetails() {
+      if (disposed) return () => {}
+      detailSubscribers++
+      if (detailSubscribers === 1) {
+        detailPage = 1
+        void load(state.period, false)
+      }
+      let released = false
+      return () => {
+        if (released) return
+        released = true
+        detailSubscribers--
+        if (detailSubscribers === 0 && !disposed) {
+          if (disposers > 0) void load(state.period, false)
+          else patch({ detail: undefined, loading: state.data === undefined, refreshing: false })
+        }
+      }
+    },
+
+    setDetail(by, page = 1) {
+      if (disposed || !UI_GROUP_BY.includes(by) || !Number.isSafeInteger(page) || page < 1) return
+      if (by === detailBy && page === detailPage) return
+      detailBy = by
+      detailPage = page
+      if (detailSubscribers > 0) void load(state.period, false)
+    },
+
     dispose() {
       disposed = true
       stopPolling()
       controller?.abort()
       controller = undefined
+      requestPending = false
       listeners.clear()
     },
   }

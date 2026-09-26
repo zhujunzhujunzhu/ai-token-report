@@ -42,6 +42,7 @@ import {
 import { openStats } from '@ai-token-report/core/db'
 
 import type { EffectiveConfig } from './config.js'
+import { queryInStatsWorker } from './stats-worker-client.js'
 
 /** 数据来源。如实反映实际走的那条路径。 */
 export type StatsSource = 'local-db' | 'scan' | 'none'
@@ -68,6 +69,12 @@ export interface UsageQuery {
   by?: GroupDimension[]
   /** 只显示前 N 行。 */
   top?: number
+  /** 分组分页偏移；总行数在截断前统计。 */
+  offset?: number
+  /** 常驻摘要只需要总计和精确会话数。 */
+  summaryOnly?: boolean
+  /** 手动刷新要求重新检查本地日志。 */
+  refresh?: boolean
   /** 趋势粒度。给了就附带时间序列。 */
   series?: 'day' | 'hour'
   /** provider 子串过滤。 */
@@ -104,7 +111,7 @@ export interface UsageResult {
   /** ★ 派生指标：由 `shared/metrics.ts` 计算，不是本地重写的公式。 */
   metrics: UsageMetrics
   /** 分组排行。 */
-  groups: { by: GroupDimension; rows: UsageGroupRow[] }[]
+  groups: { by: GroupDimension; rows: UsageGroupRow[]; rowCount?: number }[]
   /** 时间序列（可选）。 */
   series?: { bucket: string; total: number; input: number; output: number; cacheRead: number; calls: number; cacheHitRate: number }[]
   /** 涉及的会话数。 */
@@ -117,11 +124,13 @@ export interface UsageResult {
 
 /** 本次统计是否可用（供服务层快速判断，避免把异常抛给调用方）。 */
 export interface StatsContext {
-  config: EffectiveConfig
+  config: Pick<EffectiveConfig, 'localDb'>
   /** 会话日志根目录。 */
   sessionsRoot: string
   /** 本地库路径。 */
   dbPath: string
+  /** DSH 宿主启用独立线程，直接调用方仍可使用当前线程。 */
+  backgroundQueries?: boolean
 }
 
 /** 把分组结果转成输出行（派生指标交给 `shared`）。 */
@@ -148,6 +157,7 @@ function toRows(rows: ReturnType<typeof aggregate>): UsageGroupRow[] {
 // 同一个库的增量写入串行执行，避免多个周期/工具同时打开连接互相等写锁。
 const pendingQueries = new Map<string, Promise<unknown>>()
 export function queryUsage(ctx: StatsContext, query: UsageQuery = {}): Promise<UsageResult> {
+  if (ctx.backgroundQueries) return queryInStatsWorker(ctx, query)
   const previous = pendingQueries.get(ctx.dbPath) ?? Promise.resolve()
   const task = previous.catch(() => {}).then(() => executeQuery(ctx, query))
   pendingQueries.set(ctx.dbPath, task)
@@ -157,7 +167,7 @@ export function queryUsage(ctx: StatsContext, query: UsageQuery = {}): Promise<U
   return task
 }
 
-async function executeQuery(ctx: StatsContext, query: UsageQuery): Promise<UsageResult> {
+export async function executeQuery(ctx: StatsContext, query: UsageQuery, options: { readOnly?: boolean; changedFiles?: string[] } = {}): Promise<UsageResult> {
   const t0 = Date.now()
 
   // 时间窗解析复用 `core/range.ts` —— 保证「工具说的今天」与「CLI 说的今天」是同一段
@@ -168,6 +178,9 @@ async function executeQuery(ctx: StatsContext, query: UsageQuery): Promise<Usage
     sessionsRoot: ctx.sessionsRoot,
     dbPath: ctx.dbPath,
     forceScan: !ctx.config.localDb,
+    rollup: query.summaryOnly ? 'summary' : true,
+    readOnly: options.readOnly,
+    changedFiles: options.changedFiles,
     ...(range.sinceMs !== undefined ? { sinceMs: range.sinceMs } : {}),
     ...(range.untilMs !== undefined ? { untilMs: range.untilMs } : {}),
     ...(query.provider ? { providers: [query.provider] } : {}),
@@ -181,10 +194,11 @@ async function executeQuery(ctx: StatsContext, query: UsageQuery): Promise<Usage
     const dims = query.by && query.by.length > 0 ? query.by : (['provider-model'] as GroupDimension[])
     const top = query.top && query.top > 0 ? query.top : 30
 
-    const groups = dims.map((dim) => ({
-      by: dim,
-      rows: toRows(session.groups(dim)).slice(0, top),
-    }))
+    const offset = Math.max(0, Math.floor(query.offset ?? 0))
+    const groups = query.summaryOnly ? [] : dims.map((dim) => {
+      const rows = session.groups(dim)
+      return { by: dim, rowCount: rows.length, rows: toRows(rows.slice(offset, offset + top)) }
+    })
 
     const result: UsageResult = {
       source,
@@ -212,7 +226,7 @@ async function executeQuery(ctx: StatsContext, query: UsageQuery): Promise<Usage
       scannedAt: session.scannedAt,
     }
 
-    if (query.series) {
+    if (query.series && !query.summaryOnly) {
       result.series = session.series(query.series, false).map((p) => ({
         bucket: p.bucket,
         total: p.counts.total,

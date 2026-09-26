@@ -121,6 +121,23 @@ export const UI_DEFAULT_PERIOD: UiPeriod = 'today'
 /** 趋势图最多画多少个点（超出取最近的 N 个）。 */
 export const UI_SERIES_POINTS = 31
 
+/** 明细只按当前维度取一页，常驻入口只取摘要。未声明 view 的旧客户端仍读全量。 */
+export const UI_GROUP_BY = ['provider-model', 'provider', 'project', 'session'] as const
+export type UiGroupBy = (typeof UI_GROUP_BY)[number]
+export const UI_PAGE_SIZE = 10
+export interface UiSelection {
+  view: 'summary' | 'detail'
+  by?: UiGroupBy
+  page?: number
+  pageSize?: number
+}
+export interface UiPagination {
+  by: UiGroupBy
+  page: number
+  pageSize: number
+  totalRows: number
+}
+
 /** 数据来源。与宿主 `stats.ts` 的 `StatsSource` 同义，如实标注实际走的那条路径。 */
 export type UiSource = 'local-db' | 'scan' | 'none'
 
@@ -148,6 +165,9 @@ export interface UiSeriesPoint {
 /** 取数成功的载荷。 */
 export interface UiPayload {
   period: UiPeriod
+  /** 缺省表示旧版全量载荷，浏览器继续支持本地分页。 */
+  view?: 'summary' | 'detail'
+  pagination?: UiPagination
   /** 宿主办认的时间窗描述（"今天" / "最近 30 天（自然日）"…）。 */
   rangeLabel: string
   source: UiSource
@@ -314,10 +334,23 @@ export function readUiResponse(value: unknown): { ok: true; payload: UiPayload }
   // ★ 代次只认有限数字；缺字段/脏值时**整个字段不带**，
   //   让浏览器半能区分「宿主说自己没变过（0）」与「宿主根本不认识这个协议」。
   const gen = raw['gen']
+  const rawPage = record(raw['pagination'])
+  const pagination = rawPage !== undefined && UI_GROUP_BY.includes(rawPage['by'] as UiGroupBy)
+    && Number.isSafeInteger(rawPage['page']) && Number(rawPage['page']) >= 1
+    && Number.isSafeInteger(rawPage['pageSize']) && Number(rawPage['pageSize']) >= 1
+    && Number.isSafeInteger(rawPage['totalRows']) && Number(rawPage['totalRows']) >= 0
+    ? { by: rawPage['by'] as UiGroupBy, page: Number(rawPage['page']),
+      pageSize: Number(rawPage['pageSize']), totalRows: Number(rawPage['totalRows']) }
+    : undefined
+  if (raw['view'] === 'detail' && pagination === undefined) {
+    return { ok: false, error: '响应格式不认识（缺少有效分页信息）' }
+  }
 
   return {
     ok: true,
     payload: {
+      ...(raw['view'] === 'summary' || raw['view'] === 'detail' ? { view: raw['view'] } : {}),
+      ...(pagination ? { pagination } : {}),
       period: coercePeriod(raw['period']),
       rangeLabel: text(raw['rangeLabel'], ''),
       source: coerceSource(raw['source']),

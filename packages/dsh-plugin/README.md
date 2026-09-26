@@ -551,13 +551,16 @@ svc.signed()                                            // → 身份是否就�
 宿主半    installUiRoute 注册的常量路由（不查库、不读文件）→ { position }
               ↓  ★ 取不到（旧宿主 404 / 超时）就按默认位置挂载，面板照常出现
 
-浏览器半  fetch('/api/tokenReport.stats?period=today')     ← 同源，自带宿主会话 cookie
+浏览器半  fetch('/api/tokenReport.stats?period=today&view=summary') ← 常驻摘要，同源 cookie
               ↓  DSH 的 /api 前缀先做 Host/Origin 栅栏 + 浏览器鉴权
 宿主半    ctx.connection.fetch.register(...)  精确 Fetch 路由
               ↓
           queryUsage()   ← 与 CLI `dsh-token`、`token_usage` 工具**同一个函数**
 
-浏览器半  fetch('/api/tokenReport.stats?period=today&gen=N')  ← 之后每 3 秒一次的**探针**
+浏览器半  fetch('/api/tokenReport.stats?period=today&view=detail&by=session&page=1&pageSize=10')
+              ↓  打开详情后才查询选定分组、当前页及趋势
+
+浏览器半  fetch('/api/tokenReport.stats?period=today&view=summary&gen=N') ← 当前视图的代次探针
               ↓  宿主发现还是第 N 代 → 204（零载荷、不查库）；变了才回载荷
 ```
 
@@ -598,9 +601,21 @@ DSH 的 web 服务器**不做任何鉴权**（`dsh-host-webserver` 的文档明�
 
 #### 缓存与轮询
 
-默认走 SQLite 增量查询；每次先检查日志变化，未变化文件跳过解压。
-不同周期和工具查询对同一库串行执行，避免增量写入互相等待写锁。
-手动刷新绕过响应缓存，但仍走增量 SQLite，不会强制全量重扫。
+默认走 SQLite 增量查询。宿主通过独立 Worker 执行日志解码、建索引和统计，
+同一库的任务串行执行；空闲线程不阻止退出，插件卸载时释放线程和文件观察器。
+启动、手动刷新及距离上次完整检查超过 30 秒后的下一次真查询会检查全部文件；
+其余查询只处理文件观察器提示的变化文件。完整检查也只读取新增的完整 zstd 帧，
+半帧留到下次重试，未变化文件不写水位线。
+
+本地派生索引按小时、会话、模型、cwd 压缩重复事件，只保存独立原始 token 列。
+摘要在 SQLite 内求和及精确去重会话，不向 JS 返回全部分组；自定义时间切开小时
+时回查边界原始记录。CLI 追加会增量补齐；覆盖、删除、重建或时区变化会使辅助索引
+失效。首次索引构建有一次成本，原始记录仍是可从日志恢复的真值。
+
+常驻条只请求摘要；打开详情后才查询当前分组的 10 行及趋势，翻页在宿主执行。
+图表数据表展开后才创建，每页 50 行。宿主响应缓存同时限制 64 项及 8 MiB，
+缓存键包含范围、视图、分组和页码；旧调用方不带 view 时仍返回完整格式。
+手动刷新绕过响应缓存，并使同范围其它视图与分页缓存失效。
 脚注显示实际数据来源、耗时和统计时刻；库不可用时明确显示直扫与降级原因。
 
 刷新分三层，**代次探针是为了让「看一眼有没有新数」不再等于「扫一遍日志」**：
@@ -614,11 +629,15 @@ DSH 的 web 服务器**不做任何鉴权**（`dsh-host-webserver` 的文档明�
 代次由宿主的上报器计数（本进程每采集到一条计费记录 +1），因此**上报未启用时它恒为 0**，
 此时面板退回「每 120 秒全量取数」——与探针引入前一致，不会变成永不刷新。
 
-新鲜度的上限是**宿主响应缓存（30 秒）**，不是 3 秒：这是刻意的 ——
-热态查询要先做一次增量 ingest（实测 25~100ms，积压变更时 2.7s，
-降级直扫时 3.3s，见 §4.3），而宿主与 agent 是**同一个进程**，
-每 3 秒真查一次等于把同步 zstd 解码塞进 agent loop。
+本进程采集后的自动更新仍受**宿主响应缓存（30 秒）**限制，不是每 3 秒执行查询。
+代次探针只读上报器内存计数，不扫描 outbox；旧缓存还有效时返回 204，避免反复传输
+浏览器随后会丢弃的旧数据。慢探针有独立在途状态，不会被下一轮轮询不断取消。
+其它进程的变更由 120 秒兜底查询发现；手动刷新可立即检查。
 实测（真 HTTP 往返）：空闲时 20 次探针 = 20 × `204`、0 字节、0 次查询、平均 0.1ms。
+
+100 亿 token 合成压测及限制见 [性能分析与实现结果](../../docs/dsh-plugin性能分析-2026-09-26.md)。
+可在构建插件后运行 `bun run packages/dsh-plugin/verify/verify-performance.ts` 复现百万记录场景；
+`--records 100000 --sessions 100000` 可测高会话数量。脚本只创建隔离合成数据。
 
 #### 面板的失败模式（都是刻意不静默的）
 
@@ -823,6 +842,7 @@ bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败
 | `src/outbox.ts` | 磁盘 outbox（两态 + 启动重放） |
 | `src/reporter.ts` | 内存队列 → 批量 → HTTP（热路径只入队） |
 | `src/stats.ts` | 统计查询与渲染（**不实现任何公式**） |
+| `src/stats-worker-client.ts` / `src/stats-worker.ts` | 有界线程调度、日志变化合并及周期性完整对账 |
 | `src/identity.ts` | 身份解析（复用 core 的存储，与本地页共用同一份文件） |
 | `src/ui-bridge.ts` | 宿主侧 UI 数据通道：`/api/tokenReport.stats` + `/api/tokenReport.config`（面板位置）+ TTL 缓存 + 并发合并 |
 | `src/client/protocol.ts` | ★ **双半唯一契约**：载荷类型、周期、**面板位置枚举与配置解析**、响应解析（零依赖，两边都能 import） |

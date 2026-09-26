@@ -31,7 +31,7 @@
   },
   "scripts": {
     "build": "bun run build:host && bun run build:client",
-    "build:host": "bun build src/index.ts --target=node --format=esm --outfile=lib/index.js --external '@deepseek-ai/*'",
+    "build:host": "bun run scripts/build-host.ts",
     "build:client": "bun run build-client.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
     "test": "bun test",

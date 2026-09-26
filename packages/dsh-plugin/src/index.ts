@@ -68,6 +68,7 @@ import { Reporter, type ReporterStats } from './reporter.js'
 import { createSettingsHandler, withSavedConnection } from './settings.js'
 import { installUiRoute, type UiHostContext } from './ui-bridge.js'
 import type { UiRouteInstall } from './client/protocol.js'
+import { closeStatsWorker } from './stats-worker-client.js'
 import {
   formatUsage,
   queryUsage,
@@ -495,6 +496,7 @@ export function apply(
   const status = evaluateStatus(identityState, config)
 
   const statsContext = buildStatsContext(config)
+  ctx.effect(() => () => { void closeStatsWorker(statsContext.dbPath) })
 
   // ── ① 实时上报 ────────────────────────────────────────────────────
   let backend: TokenReportBackend | null = null
@@ -564,6 +566,7 @@ function buildStatsContext(config: EffectiveConfig): StatsContext {
     config,
     sessionsRoot: paths.sessionsRoot,
     dbPath: paths.dbPath,
+    backgroundQueries: true,
   }
 }
 

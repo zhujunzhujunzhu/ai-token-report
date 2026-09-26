@@ -613,3 +613,141 @@ test('自定义日期在刷新后保留，切预设后不携带旧范围', async
   expect(urls).toHaveLength(count)
   store.dispose()
 })
+
+describe('按需详情与慢探针', () => {
+  test('新协议缺少有效分页元数据时明确报错，旧全量协议仍可读取', () => {
+    expect(readUiResponse(payloadBody()).ok).toBe(true)
+    for (const pagination of [undefined, { by: 'session', page: -1, pageSize: 10, totalRows: 103 },
+      { by: 'session', page: 1, pageSize: 10, totalRows: '103' }]) {
+      expect(readUiResponse(payloadBody({ view: 'detail', pagination })).ok).toBe(false)
+    }
+  })
+
+  test('常驻摘要 → 打开详情 → 切维度/页码 → 关闭详情回到摘要', async () => {
+    const { impl, urls } = fakeFetch(url => {
+      const params = new URL(`http://host${url}`).searchParams
+      const view = params.get('view')
+      return { body: payloadBody({ view, period: params.get('period'),
+        ...(view === 'detail' ? { pagination: { by: params.get('by'), page: Number(params.get('page')),
+          pageSize: 10, totalRows: 103 } } : {}) }) }
+    })
+    const store = createUsageStore({ fetch: impl, intervalMs: 60_000 })
+    const off = store.subscribe(() => {})
+    await settle()
+    expect(urls[0]).toContain('view=summary')
+    expect(urls[0]).not.toContain('by=')
+    const close = store.acquireDetails()
+    await settle()
+    expect(urls[1]).toContain('view=detail')
+    expect(urls[1]).toContain('by=provider-model')
+    const closeOther = store.acquireDetails()
+    await settle()
+    expect(urls).toHaveLength(2)
+    store.setDetail('session', 3)
+    await settle()
+    expect(urls[2]).toContain('by=session')
+    expect(urls[2]).toContain('page=3')
+    expect(store.getSnapshot().data?.pagination?.page).toBe(3)
+    store.setPeriod('year')
+    await settle()
+    expect(urls[3]).toContain('page=1')
+    expect(urls[3]).toContain('by=session')
+    close()
+    await settle()
+    expect(urls).toHaveLength(4)
+    closeOther()
+    await settle()
+    expect(urls[4]).toContain('view=summary')
+    expect(store.getSnapshot().detail).toBeUndefined()
+    expect(store.getSnapshot().data?.pagination).toBeUndefined()
+    off()
+    store.dispose()
+  })
+
+  test('详情卸载时没有常驻订阅者，不再补发摘要请求', async () => {
+    const { impl, urls } = fakeFetch(() => ({ body: payloadBody() }))
+    const store = createUsageStore({ fetch: impl, intervalMs: 60_000 })
+    const off = store.subscribe(() => {})
+    await settle()
+    const close = store.acquireDetails()
+    await settle()
+    off()
+    close()
+    await settle()
+    expect(urls).toHaveLength(2)
+    store.dispose()
+  })
+
+  test('慢探针超过多个 tick 仍只发一次并成功更新，不被下一次探针取消', async () => {
+    let calls = 0, aborted = 0, pending = false
+    let release: (() => void) | undefined
+    const store = createUsageStore({ intervalMs: 5, fullIntervalMs: 60_000, fetch: async (_url, init) => {
+      calls++
+      if (calls === 1) return { ok: true, status: 200, json: async () => payloadBody() }
+      if (calls > 2) return { ok: true, status: 204, json: async () => undefined }
+      pending = true
+      await new Promise<void>(resolve => { release = resolve
+        init?.signal?.addEventListener('abort', () => { if (pending) aborted++ }, { once: true }) })
+      pending = false
+      return { ok: true, status: 200, json: async () => payloadBody({ gen: 2 }) }
+    } })
+    const off = store.subscribe(() => {})
+    try {
+      await Bun.sleep(35)
+      expect(calls).toBe(2)
+      expect(aborted).toBe(0)
+      expect(store.getSnapshot().refreshing).toBe(false)
+      release?.()
+      await settle()
+      expect(store.getSnapshot().data?.gen).toBe(2)
+    } finally {
+      release?.()
+      off()
+      store.dispose()
+    }
+  })
+
+  test('迟到的摘要不能覆盖已打开详情的页码、行数和内容', async () => {
+    let finishSummary: (() => void) | undefined
+    const store = createUsageStore({ intervalMs: 60_000, fetch: async url => {
+      if (url.includes('view=summary')) await new Promise<void>(resolve => { finishSummary = resolve })
+      const detail = url.includes('view=detail')
+      return { ok: true, status: 200, json: async () => payloadBody({ view: detail ? 'detail' : 'summary',
+        ...(detail ? { pagination: { by: 'provider-model', page: 1, pageSize: 10, totalRows: 103 } } : {}) }) }
+    } })
+    const off = store.subscribe(() => {})
+    store.acquireDetails()
+    await settle()
+    finishSummary?.()
+    await settle()
+    expect(store.getSnapshot().data?.view).toBe('detail')
+    expect(store.getSnapshot().data?.pagination?.totalRows).toBe(103)
+    off()
+    store.dispose()
+  })
+
+  test('详情首次请求失败后，不把摘要代次当作详情快照，后台可自动恢复', async () => {
+    let detailCalls = 0
+    let recoveryHadGen = true
+    const store = createUsageStore({ intervalMs: 5, fullIntervalMs: 60_000, fetch: async url => {
+      const params = new URL(`http://host${url}`).searchParams
+      if (params.get('view') === 'summary') return { ok: true, status: 200,
+        json: async () => payloadBody({ view: 'summary' }) }
+      detailCalls++
+      if (detailCalls === 1) return { ok: true, status: 200, json: async () => ({ error: '临时失败' }) }
+      if (detailCalls === 2) recoveryHadGen = params.has('gen')
+      return { ok: true, status: params.has('gen') ? 204 : 200,
+        json: async () => payloadBody({ view: 'detail',
+          pagination: { by: 'provider-model', page: 1, pageSize: 10, totalRows: 103 } }) }
+    } })
+    const off = store.subscribe(() => {})
+    await settle()
+    store.acquireDetails()
+    await Bun.sleep(25)
+    expect(recoveryHadGen).toBe(false)
+    expect(store.getSnapshot().data?.view).toBe('detail')
+    expect(store.getSnapshot().error).toBeUndefined()
+    off()
+    store.dispose()
+  })
+})

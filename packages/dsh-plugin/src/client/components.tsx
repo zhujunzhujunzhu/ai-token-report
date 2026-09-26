@@ -46,7 +46,7 @@ import {
   fmtInt,
   fmtPct,
 } from './format.js'
-import { UI_PERIODS, type UiGroupRow, type UiPeriod } from './protocol.js'
+import { UI_PERIODS, UI_GROUP_BY, UI_PAGE_SIZE, type UiGroupBy, type UiGroupRow, type UiPeriod } from './protocol.js'
 import type { UsageState, UsageStore } from './store.js'
 
 /**
@@ -121,14 +121,18 @@ const GROUP_LABELS: Record<string, string> = {
 export function UsageDetail(props: { state: UsageState; store: UsageStore; onClose?(): void }): ReactNode {
   const { state, store } = props
   const [settings, setSettings] = useState(false)
-  const [groupBy, setGroupBy] = useState('provider-model')
+  const [localGroupBy, setGroupBy] = useState('provider-model')
   const [page, setPage] = useState(1)
-  const pageSize = 10
+  const remote = state.data?.view !== undefined
+  const pagination = state.data?.pagination
+  const groupBy = remote ? state.detail?.by ?? pagination?.by ?? 'provider-model' : localGroupBy
+  const pageSize = pagination?.pageSize ?? UI_PAGE_SIZE
   useEffect(() => setPage(1), [groupBy, state.period, state.dateRange?.since, state.dateRange?.until])
-  const rowCount = state.data?.groups.find((group) => group.by === groupBy)?.rows.length
-    ?? state.data?.groups[0]?.rows.length ?? 0
+  const rowCount = remote ? pagination?.totalRows ?? 0
+    : state.data?.groups.find((group) => group.by === groupBy)?.rows.length
+      ?? state.data?.groups[0]?.rows.length ?? 0
   const pageCount = Math.max(1, Math.ceil(rowCount / pageSize))
-  const currentPage = Math.min(page, pageCount)
+  const currentPage = remote ? pagination?.page ?? 1 : Math.min(page, pageCount)
   useEffect(() => setPage((previous) => Math.min(previous, pageCount)), [pageCount])
   const [trendMetric, setTrendMetric] = useState<'total' | 'calls' | 'cacheHitRate'>('total')
   const data = state.data
@@ -196,6 +200,17 @@ export function UsageDetail(props: { state: UsageState; store: UsageStore; onClo
   const m = data.metrics
   const topGroup = data.groups.find((group) => group.by === groupBy) ?? data.groups[0]
   const series = data.series ?? []
+  const detailPending = data.view === 'summary'
+  const pickGroup = (by: string): void => {
+    if (remote) store.setDetail(by as UiGroupBy)
+    else setGroupBy(by)
+  }
+  const pickPage = (next: number): void => {
+    if (remote) store.setDetail(groupBy as UiGroupBy, next)
+    else setPage(next)
+  }
+  const visibleRows = remote ? topGroup?.rows
+    : topGroup?.rows.slice((currentPage - 1) * pageSize, currentPage * pageSize)
 
   return createElement(
     'div',
@@ -231,18 +246,18 @@ export function UsageDetail(props: { state: UsageState; store: UsageStore; onClo
           key: metric, type: 'button', className: 'atr-btn', 'aria-pressed': metric === trendMetric,
           onClick: () => setTrendMetric(metric),
         }, { total: 'Token 总量', calls: '调用数', cacheHitRate: '命中率' }[metric])))),
-      series.length > 0 ? createElement(Trend, { series, metric: trendMetric }) : createElement('div', { className: 'atr-chart atr-chart-empty' }, '暂无趋势数据')),
+      series.length > 0 ? createElement(Trend, { series, metric: trendMetric }) : createElement('div', { className: 'atr-chart atr-chart-empty' }, detailPending ? '正在读取趋势…' : '暂无趋势数据')),
 
     createElement('section', { className: 'atr-section atr-detail-section' },
     createElement('div', { className: 'atr-head' },
       createElement('strong', { className: 'atr-section-title' }, '用量明细'),
       createElement('span', { className: 'atr-grow' }),
     createElement('div', { className: 'atr-tabs atr-segmented', role: 'tablist', 'aria-label': '明细分组' },
-      ...data.groups.map((group) => createElement('button', {
-        key: group.by, type: 'button', role: 'tab', className: 'atr-btn',
-        'aria-selected': group.by === topGroup?.by, 'aria-pressed': group.by === topGroup?.by,
-        onClick: () => setGroupBy(group.by),
-      }, GROUP_LABELS[group.by] ?? group.by)))),
+      ...(remote ? UI_GROUP_BY : data.groups.map(group => group.by)).map((by) => createElement('button', {
+        key: by, type: 'button', role: 'tab', className: 'atr-btn',
+        'aria-selected': by === (topGroup?.by ?? groupBy), 'aria-pressed': by === (topGroup?.by ?? groupBy),
+        onClick: () => pickGroup(by),
+      }, GROUP_LABELS[by] ?? by)))),
     createElement('div', { className: 'atr-row atr-table-head' },
       ...['明细（点击展开）', 'Token 总量', '命中率', '调用数'].map((label) => createElement('span', { key: label }, label))),
 
@@ -250,15 +265,15 @@ export function UsageDetail(props: { state: UsageState; store: UsageStore; onClo
       ? createElement(
           'div',
           { className: 'atr-rows' },
-          ...topGroup.rows.slice((currentPage - 1) * pageSize, currentPage * pageSize).map((row) => createElement(Row, { key: `${topGroup.by}:${row.key}`, row })),
+          ...(visibleRows ?? []).map((row) => createElement(Row, { key: `${topGroup.by}:${row.key}`, row })),
         )
-      : createElement('div', { className: 'atr-empty' }, `${data.rangeLabel}没有计费事件。`),
+      : createElement('div', { className: 'atr-empty' }, detailPending ? '正在读取用量明细…' : `${data.rangeLabel}没有计费事件。`),
     pageCount > 1 ? createElement('nav', { className: 'atr-pagination', 'aria-label': '用量明细分页' },
       createElement('span', { className: 'atr-page-summary', role: 'status' },
         `共 ${fmtInt(rowCount)} 条 · 第 ${(currentPage - 1) * pageSize + 1}–${Math.min(currentPage * pageSize, rowCount)} 条`),
-      createElement('button', { type: 'button', className: 'atr-btn', disabled: currentPage === 1, onClick: () => setPage(currentPage - 1) }, '上一页'),
+      createElement('button', { type: 'button', className: 'atr-btn', disabled: currentPage === 1 || (remote && busy), onClick: () => pickPage(currentPage - 1) }, '上一页'),
       createElement('span', null, `${currentPage} / ${pageCount}`),
-      createElement('button', { type: 'button', className: 'atr-btn', disabled: currentPage === pageCount, onClick: () => setPage(currentPage + 1) }, '下一页')) : null),
+      createElement('button', { type: 'button', className: 'atr-btn', disabled: currentPage === pageCount || (remote && busy), onClick: () => pickPage(currentPage + 1) }, '下一页')) : null),
 
     // 刷新失败时旧数据仍然显示，但必须把失败讲出来
     state.error !== undefined ? createElement('div', { className: 'atr-warn', role: 'alert' }, `更新失败，仍显示「${data.rangeLabel}」的数据：${state.error}`) : null,
@@ -362,6 +377,7 @@ export function UsageBadge(props: { usage: UsageStore }): ReactNode {
 function UsageDialog(props: { state: UsageState; store: UsageStore; onClose(): void }): ReactNode {
   const { state, store, onClose } = props
   const dialogRef = useRef<HTMLDivElement>(null)
+  useEffect(() => store.acquireDetails(), [store])
   useEffect(() => {
     const previous = globalThis.document.activeElement as HTMLElement | null
     const focusable = (): HTMLElement[] => Array.from(dialogRef.current?.querySelectorAll<HTMLElement>(

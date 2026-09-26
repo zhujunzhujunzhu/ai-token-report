@@ -42,6 +42,8 @@ import {
   UI_STATS_PATH,
   UI_SETTINGS_PATH,
   UI_SERIES_POINTS,
+  UI_GROUP_BY,
+  UI_PAGE_SIZE,
   coercePeriod,
   validDateRange,
   type UiConfigPayload,
@@ -55,10 +57,14 @@ import {
   type UiRouteInstall,
   type UiSeriesPoint,
   type UiSource,
+  type UiSelection,
+  type UiGroupBy,
 } from './client/protocol.js'
 
 /** 多标签页共享短期缓存；SQL 降级直扫时仍合并并发，避免重复解压。 */
 const DEFAULT_TTL_MS = 30_000
+/** 按 JSON 字节给缓存设预算，避免多个大范围在 64 个条目的限额内仍占用数百 MB。 */
+const DEFAULT_CACHE_BYTES = 8 * 1024 * 1024
 
 /**
  * 趋势粒度：看「今天」要看小时，「近 30 天」要看天。
@@ -75,9 +81,9 @@ export function seriesFor(period: UiPeriod): 'day' | 'hour' {
  * ★ 这是本文件唯一做「搬运」的地方，而搬运的原则是**只裁剪、不改写**：
  *   - 四个 token 列 + `reasoning` 原样抄，
  *   - `metrics` 整块照搬（**绝不在这里重算缓存命中率**），
- *   - 明细保留全部行供浏览器分页，序列点只做 `slice`，不动里面的数。
+ *   - 明细透传查询已经选出的行，序列点只做 `slice`，不动里面的数。
  *
- * 明细不能截断，否则浏览器翻页后无法看到后面的会话。
+ * 旧客户端仍可拿完整明细；新客户端由 provider 附带分页元数据，不在这里再次截断。
  */
 export function toUiPayload(result: UsageResult, period: UiPeriod, gen = 0): UiPayload {
   const groups = result.groups.map((group) => ({
@@ -144,7 +150,7 @@ export interface UiStatsProvider {
    * @param period - 已收窄的周期。
    * @param force - 绕过缓存（用户点了「刷新」）。仍然会与在途请求合并。
    */
-  get(period: UiPeriod, force?: boolean, dateRange?: UiDateRange): Promise<UiResponse>
+  get(period: UiPeriod, force?: boolean, dateRange?: UiDateRange, selection?: UiSelection): Promise<UiResponse>
 
   /**
    * ★ 数据代次：宿主每次**采集到**新的计费记录就加一。
@@ -158,10 +164,10 @@ export interface UiStatsProvider {
 }
 
 /**
- * 造一个带「TTL 缓存 + 在途合并 + 代次探针」的取数器。
+ * 造一个带「按需投影 + 有界 TTL 缓存 + 在途合并 + 代次探针」的取数器。
  *
  * 三件事各解决一个真实问题：
- * - **TTL 缓存**：面板轮询不该等于「每轮扫一遍日志」。
+ * - **TTL 缓存**：面板轮询不该等于「每轮扫一遍日志」，同时受字节预算与 64 项限制。
  * - **在途合并**：两个面板（输入框上方的条 + 标题栏的徽章）同时挂载时
  *   会各发一次请求，而扫描是 CPU 密集型 —— 合并后只扫一次。
  * - **代次探针**：`generation()` 没变就回 `204`（见 `makeStatsFetch`），
@@ -183,6 +189,7 @@ export function createUiStatsProvider(options: {
   /** 注入时钟，便于单测断言 TTL。 */
   now?: () => number
   ttlMs?: number
+  maxCacheBytes?: number
   /**
    * 数据代次的来源（缺省恒为 0 = 不提供探针）。
    *
@@ -195,12 +202,20 @@ export function createUiStatsProvider(options: {
   const now = options.now ?? (() => Date.now())
   const ttlMs = options.ttlMs ?? DEFAULT_TTL_MS
   const generation = options.generation ?? (() => 0)
+  const maxCacheBytes = Math.max(0, options.maxCacheBytes ?? DEFAULT_CACHE_BYTES)
 
   /** 缓存项。⚠️ 刻意**不**用「代次相同」当命中条件 —— 见下面 `get()` 的注释。 */
-  const cache = new Map<string, { at: number; body: UiResponse }>()
+  const cache = new Map<string, { at: number; body: UiResponse; bytes: number }>()
+  let cacheBytes = 0
   const inflight = new Map<string, Promise<UiResponse>>()
 
-  const load = async (period: UiPeriod, dateRange?: UiDateRange): Promise<UiResponse> => {
+  const removeCached = (key: string): void => {
+    const entry = cache.get(key)
+    if (entry) cacheBytes -= entry.bytes
+    cache.delete(key)
+  }
+
+  const load = async (period: UiPeriod, dateRange?: UiDateRange, selection?: UiSelection, force = false): Promise<UiResponse> => {
     // ★ 代次必须在**开查之前**取。
     //
     //   反过来（查完再读）会漏数：查询期间刚好采集到一条记录时，载荷会带上
@@ -209,13 +224,32 @@ export function createUiStatsProvider(options: {
     //   开查前取则相反：代次偏旧 → 探针立刻失配 → 多取一次，数字只会晚不会丢。
     const genAtStart = generation()
     try {
-      const result = await options.run({
+      const pageSize = selection?.pageSize ?? UI_PAGE_SIZE
+      let page = selection?.page ?? 1
+      const by = selection?.by ?? 'provider-model'
+      const query: UsageQuery = {
         ...(period === 'custom' ? dateRange : { period }),
-        by: ['provider-model', 'provider', 'project', 'session'],
-        top: Number.MAX_SAFE_INTEGER,
-        series: period === 'custom' && dateRange?.since === dateRange?.until ? 'hour' : seriesFor(period),
-      })
-      return toUiPayload(result, period, genAtStart)
+        ...(force ? { refresh: true } : {}),
+        ...(selection?.view === 'summary' ? { summaryOnly: true } : {
+          by: selection?.view === 'detail' ? [by] : [...UI_GROUP_BY],
+          top: selection?.view === 'detail' ? pageSize : Number.MAX_SAFE_INTEGER,
+          ...(selection?.view === 'detail' ? { offset: (page - 1) * pageSize } : {}),
+          series: period === 'custom' && dateRange?.since === dateRange?.until ? 'hour' : seriesFor(period),
+        }),
+      }
+      let result = await options.run(query)
+      if (selection?.view === 'detail') {
+        const totalRows = result.groups[0]?.rowCount ?? result.groups[0]?.rows.length ?? 0
+        const lastPage = Math.max(1, Math.ceil(totalRows / pageSize))
+        if (page > lastPage) {
+          page = lastPage
+          result = await options.run({ ...query, offset: (page - 1) * pageSize, refresh: false })
+        }
+        return { ...toUiPayload(result, period, genAtStart), view: 'detail',
+          pagination: { by, page, pageSize, totalRows } }
+      }
+      return { ...toUiPayload(selection?.view === 'summary' ? { ...result, groups: [], series: undefined } : result,
+        period, genAtStart), ...(selection ? { view: selection.view } : {}) }
     } catch (err) {
       // ★ 扫描失败不抛给浏览器：面板要能就地显示「为什么没数」
       const body: UiErrorPayload = {
@@ -229,11 +263,16 @@ export function createUiStatsProvider(options: {
   return {
     generation,
 
-    async get(period, force = false, dateRange) {
+    async get(period, force = false, dateRange, selection) {
       if (period === 'custom' && !validDateRange(dateRange)) {
         return { period, error: '请选择有效的开始和结束日期，开始日期不能晚于结束日期' }
       }
-      const key = period === 'custom' ? `${period}:${dateRange!.since}:${dateRange!.until}` : period
+      const rangeKey = period === 'custom' ? `${period}:${dateRange!.since}:${dateRange!.until}` : period
+      const key = `${rangeKey}:${selection?.view ?? 'legacy'}:${selection?.by ?? 'provider-model'}:${selection?.page ?? 1}:${selection?.pageSize ?? UI_PAGE_SIZE}`
+      if (force) {
+        // 手动刷新当前范围时，其它页与摘要也应在下次读取时换成新快照。
+        for (const cachedKey of cache.keys()) if (cachedKey.startsWith(`${rangeKey}:`)) removeCached(cachedKey)
+      }
       const hit = cache.get(key)
       // 🚨 命中条件**只有 TTL 一条**。
       //
@@ -243,15 +282,30 @@ export function createUiStatsProvider(options: {
       //   「代次很久没动」就等于「缓存永不失效」——
       //   兜底全量轮询会永远返回同一份旧载荷，而页面看起来一切正常。
       //   代次只用来回答探针（`?gen=N` → 204），不参与缓存判定。
-      if (!force && hit !== undefined && now() - hit.at < ttlMs) return hit.body
+      if (!force && hit !== undefined && now() - hit.at < ttlMs) {
+        cache.delete(key)
+        cache.set(key, hit)
+        return hit.body
+      }
+      removeCached(key)
 
       const running = inflight.get(key)
       if (running !== undefined) return running
 
-      const task = load(period, dateRange)
+      const task = load(period, dateRange, selection, force)
         .then((body) => {
-          if (cache.size >= 64) cache.delete(cache.keys().next().value!)
-          cache.set(key, { at: now(), body })
+          const bytes = new TextEncoder().encode(JSON.stringify(body)).byteLength
+          // 超预算的旧版全量响应仍可发送，但不长期保留在宿主进程里。
+          if (bytes <= maxCacheBytes) {
+            while (cache.size >= 64 || cacheBytes + bytes > maxCacheBytes) {
+              const oldest = cache.keys().next().value
+              if (oldest === undefined) break
+              removeCached(oldest)
+            }
+            removeCached(key)
+            cache.set(key, { at: now(), body, bytes })
+            cacheBytes += bytes
+          }
           return body
         })
         .finally(() => {
@@ -317,6 +371,29 @@ export function makeStatsFetch(provider: UiStatsProvider): (request: Request) =>
     const url = new URL(request.url)
     const period = coercePeriod(url.searchParams.get('period'))
     const force = url.searchParams.get('refresh') === '1'
+    const dateRange = period === 'custom' ? {
+      since: url.searchParams.get('since') ?? '', until: url.searchParams.get('until') ?? '',
+    } : undefined
+    if (period === 'custom' && !validDateRange(dateRange)) {
+      return jsonResponse({ period, error: '请选择有效的开始和结束日期，开始日期不能晚于结束日期' })
+    }
+    const rawView = url.searchParams.get('view')
+    let selection: UiSelection | undefined
+    if (rawView !== null) {
+      if (rawView !== 'summary' && rawView !== 'detail') return jsonResponse({ period, error: '未知的用量视图' })
+      selection = { view: rawView }
+      if (rawView === 'detail') {
+        const by = url.searchParams.get('by') ?? 'provider-model'
+        const page = Number(url.searchParams.get('page') ?? '1')
+        const pageSize = Number(url.searchParams.get('pageSize') ?? UI_PAGE_SIZE)
+        if (!UI_GROUP_BY.includes(by as UiGroupBy) || !Number.isSafeInteger(page) || page < 1
+          || !Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > 100
+          || !Number.isSafeInteger((page - 1) * pageSize)) {
+          return jsonResponse({ period, error: '无效的明细分组或分页参数' })
+        }
+        selection = { view: rawView, by: by as UiGroupBy, page, pageSize }
+      }
+    }
 
     // ⚠️ 必须区分「没传 gen」与「gen=0」，也要拒绝空串：
     //   `Number(null)` 和 `Number('')` 都是 0 —— 少一个判断会让
@@ -327,9 +404,10 @@ export function makeStatsFetch(provider: UiStatsProvider): (request: Request) =>
       return unchangedResponse()
     }
 
-    return jsonResponse(await provider.get(period, force, period === 'custom' ? {
-      since: url.searchParams.get('since') ?? '', until: url.searchParams.get('until') ?? '',
-    } : undefined))
+    const body = await provider.get(period, force, dateRange, selection)
+    // 采集代次已变、但 TTL 内仍只拿到同一份快照时，不反复传输整包旧明细。
+    if (!force && probeGen !== undefined && Number.isInteger(probeGen) && 'gen' in body && body.gen === probeGen) return unchangedResponse()
+    return jsonResponse(body)
   }
 }
 

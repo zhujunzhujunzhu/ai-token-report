@@ -41,7 +41,7 @@
 
 import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { cleanChildEnv, resolveNodeBin } from '../../core/verify/lib/runtime.js'
@@ -158,6 +158,16 @@ check(
 )
 check('宿主半导出了默认插件条目', /export\s*\{[^}]*\bas\s+default\b|export\s+default/.test(hostText))
 
+// ★ 主入口能 import 不代表线程能启动：worker 必须作为独立文件进入实际发布清单。
+const workerPath = join(distDir, 'stats-worker.js')
+check('发布清单包含 stats-worker.js', manifest.files.includes('stats-worker.js'))
+check('统计 Worker 产物存在', existsSync(workerPath))
+if (existsSync(workerPath)) {
+  const workerText = await Bun.file(workerPath).text()
+  check('统计 Worker 没有顶层 bun: import', !/^[ \t]*import[^;\n]*from[ \t]*["']bun:/m.test(workerText))
+  check('统计 Worker 没有残留 workspace 包 import', !/^\s*import[^;\n]*from\s*["']@ai-token-report\//m.test(workerText))
+}
+
 // 发布清单里声明的 patch 路径必须真的指向 dist 里的文件
 const declaredPatch = manifest.dsh?.bundle?.patch
 check(
@@ -262,6 +272,84 @@ try {
     check('导出 queryUsage()（供服务/工具复用）', info['hasQueryUsage'] === true)
   }
 
+  // 真 Node + 实际发布目录 + 实际 Worker。单测里把线程替换成假对象，或只验证
+  // index.js 能 import，都发现不了 Worker 漏打包、相对 URL 错误及 Node SQLite 失败。
+  const workerProbe = `
+    import assert from 'node:assert/strict';
+    import { mkdirSync, writeFileSync } from 'node:fs';
+    import { join } from 'node:path';
+    import { zstdCompressSync } from 'node:zlib';
+    import { createRequire, syncBuiltinESMExports } from 'node:module';
+    const require = createRequire(import.meta.url);
+    const threads = require('node:worker_threads');
+    const RealWorker = threads.Worker;
+    const workers = [];
+    // 只记录真实线程的创建，完全保留 Node Worker 的执行、通信和退出行为。
+    threads.Worker = class extends RealWorker {
+      constructor(...args) { super(...args); workers.push(this); }
+    };
+    syncBuiltinESMExports();
+    try {
+      assert.equal(typeof Bun, 'undefined');
+      const { queryUsage } = await import(${JSON.stringify('file:///' + join(sandbox, 'index.js').replace(/\\/g, '/'))});
+      const root = join(${JSON.stringify(sandbox)}, 'worker-fixture');
+      const sessionsRoot = join(root, 'sessions');
+      mkdirSync(sessionsRoot, { recursive: true });
+      const ctx = { config: { localDb: true }, sessionsRoot, dbPath: join(root, 'usage.sqlite'), backgroundQueries: true };
+      const empty = await queryUsage(ctx, { summaryOnly: true });
+      assert.equal(empty.source, 'local-db');
+      assert.equal(empty.totals.calls, 0);
+      assert.equal(empty.totals.total, 0);
+      assert.equal(empty.sessions, 0);
+      assert.deepEqual(empty.groups, []);
+      const dir = join(sessionsRoot, 'synthetic-project', 'synthetic-session');
+      mkdirSync(dir, { recursive: true });
+      const rows = [
+        { type: 'session', version: 3, id: 'synthetic-session', createdAt: 1700000000000, cwd: 'D:/synthetic/worker-project' },
+        ...[
+          { inputTokens: 3, outputTokens: 7, cacheReadTokens: 11, cacheWriteTokens: 13, reasoningTokens: 2, totalTokens: 34 },
+          { inputTokens: 5, outputTokens: 17, cacheReadTokens: 19, cacheWriteTokens: 23, reasoningTokens: 3, totalTokens: 64 },
+        ].map((usage, i) => ({ type: 'assistant/message', seq: i + 1, time: 1700000000000 + i * 1000,
+          data: { turn: 1, step: i + 1, message: { source: { kind: 'model', provider: 'synthetic', model: 'worker-model' } }, usage } })),
+      ];
+      writeFileSync(join(dir, 'session.v3.jsonl.zstd'), zstdCompressSync(Buffer.from(rows.map(row => JSON.stringify(row)).join('\\n') + '\\n')));
+      const result = await queryUsage(ctx, { refresh: true, by: ['session', 'provider-model'], series: 'hour' });
+      assert.equal(result.source, 'local-db');
+      assert.equal(result.degradedReason, undefined);
+      assert.deepEqual(result.totals, { input: 8, output: 24, cacheRead: 30, cacheWrite: 36, reasoning: 5, total: 98, calls: 2 });
+      assert.equal(result.sessions, 1);
+      assert.equal(result.groups[0].rows[0].key, 'synthetic-session');
+      assert.equal(result.groups[1].rows[0].key, 'synthetic/worker-model');
+      assert.equal(result.series.length, 1);
+      assert.equal(result.series[0].total, 98);
+      const again = await queryUsage(ctx, { summaryOnly: true });
+      assert.deepEqual(again.totals, result.totals);
+      assert.equal(workers.length, 1, '同一数据库的后续查询必须复用真实线程');
+      assert.ok(workers[0].threadId > 0);
+      console.log(JSON.stringify({ node: process.version, workers: workers.length, threadId: workers[0].threadId, calls: result.totals.calls, total: result.totals.total }));
+    } finally {
+      await Promise.all(workers.map(worker => worker.terminate()));
+      threads.Worker = RealWorker;
+      syncBuiltinESMExports();
+    }
+  `
+  // Worker 会继承 execArgv；使用实际 .mjs 文件复刻 DSH 启动方式，避免 -e 的
+  // --input-type=module 被子线程继承后拒绝加载文件 URL。
+  const workerProbePath = join(sandbox, 'verify-stats-worker.mjs')
+  await Bun.write(workerProbePath, workerProbe)
+  const workerRun = Bun.spawnSync([nodeBin, workerProbePath], {
+    stdout: 'pipe', stderr: 'pipe', cwd: sandbox, env: cleanChildEnv(), timeout: 60_000,
+  })
+  const workerStdout = new TextDecoder().decode(workerRun.stdout).trim()
+  const workerStderr = new TextDecoder().decode(workerRun.stderr).trim()
+  if (workerRun.exitCode !== 0) {
+    check('真 Node 后台查询：空库、合成日志入库、线程复用', false, workerStderr.split('\n').slice(0, 8).join(' / '))
+  } else {
+    const info = JSON.parse(workerStdout.split('\n').pop() ?? '{}') as Record<string, unknown>
+    check('真 Node 后台查询：空库、合成日志入库、线程复用', true,
+      `node ${info['node']}, thread ${info['threadId']}, ${info['calls']} 条 / ${info['total']} tokens`)
+  }
+
   // 让「双份实例」这件事可观测：宿主那份 telemetry 与产物解析到的是否同一路径。
   // ⚠️ 这里只报告不断言 —— 真实安装布局由 DSH 决定，本脚本不替它做判断。
   const resolved = Bun.spawnSync(
@@ -280,6 +368,10 @@ try {
     )
   }
 } finally {
+  // Windows 清理前核对绝对目录，只删除本次 mkdtemp 创建的验证副本。
+  if (dirname(resolve(sandbox)) !== resolve(tmpdir()) || !basename(sandbox).startsWith('atr-plugin-pkg-')) {
+    throw new Error('发布验证清理目录越界')
+  }
   rmSync(sandbox, { recursive: true, force: true })
 }
 
