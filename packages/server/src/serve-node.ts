@@ -98,8 +98,9 @@ export async function serveWithNodeHttp(options: {
   // 🚨 动态 import，理由见文件头（静态 import 会让 Bun 上也在 import 期崩掉）
   const { createServer } = await import('node:http')
 
+  let listeningPort = port
   const server = createServer((req, res) => {
-    void handleNodeRequest(req, res, handler, host, port)
+    void handleNodeRequest(req, res, handler, host, listeningPort)
   })
 
   /**
@@ -113,9 +114,16 @@ export async function serveWithNodeHttp(options: {
   server.headersTimeout = options.idleTimeoutSeconds * 1000
 
   await listen(server, host, port)
+  const address = server.address()
+  if (address === null || typeof address === 'string') {
+    await closeServer(server)
+    throw new Error('HTTP 服务启动后未返回实际监听端口')
+  }
+  // 与 Bun 一样支持端口 0：返回值和没有 Host 头时的 URL 都要使用实际端口。
+  listeningPort = address.port
 
   return {
-    port,
+    port: listeningPort,
     stop: () => closeServer(server),
   }
 }

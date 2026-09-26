@@ -73,8 +73,14 @@ async function tryListen(
       // 见 IDLE_TIMEOUT_SECONDS 的注释：不设这个值，冷扫描必被掐断
       idleTimeout: IDLE_TIMEOUT_SECONDS,
     })
+    const listeningPort = server.port
+    if (listeningPort === undefined) {
+      await server.stop(true)
+      throw new Error('HTTP 服务启动后未返回实际监听端口')
+    }
     return {
-      port,
+      // 端口 0 由操作系统分配；必须回传真实端口，否则调用方得到不可连接的 URL。
+      port: listeningPort,
       stop: async () => {
         await server.stop(true)
       },
@@ -102,7 +108,7 @@ export async function serveWithPortRetry(
     const port = startPort + i
     try {
       const handle = await tryListen(host, port, handler)
-      return { handle, port, shifted: i > 0 }
+      return { handle, port: handle.port, shifted: i > 0 }
     } catch (err) {
       lastErr = err
       // 只有「端口占用」才重试；其他错误（如权限）应立即失败
