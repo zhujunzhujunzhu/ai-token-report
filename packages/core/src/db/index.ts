@@ -23,6 +23,7 @@ export * from './schema.js'
 export * from './ingest.js'
 export * from './query.js'
 export * from './stats.js'
+export * from './local-rollup.js'
 // ★ 上报库：部门看板的取数入口。与 `stats.js` 并列导出，
 //   因为两者服务的是**两个不同的库**（usage.sqlite vs portal.sqlite/MySQL），
 //   调用方必须显式选一个，不能靠「默认值」蒙对。

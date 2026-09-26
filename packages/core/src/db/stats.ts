@@ -48,6 +48,7 @@
  */
 
 import type { Database } from './driver.js'
+import { readLocalRollup, readLocalRollupSummary, type LocalRollupSnapshot } from './local-rollup.js'
 import { rmSync } from 'node:fs'
 
 import { aggregate, timeSeries, totalOf, type GroupDimension, type GroupRow } from '../aggregate.js'
@@ -87,8 +88,12 @@ export interface OpenStatsOptions {
   forceScan?: boolean
   /** 进度回调（长扫描时给终端反馈）。 */
   onProgress?: (done: number, total: number, file: string) => void
-  /** 只读模式：跳过 ingest，不写库（供验证脚本用）。 */
+  /** 跳过日志 ingest；显式启用 rollup 时仍可能补齐可重建的派生索引。 */
   readOnly?: boolean
+  /** 本机面板使用持久化小时/会话派生索引，旧调用方行为保持不变。 */
+  rollup?: boolean | 'summary'
+  /** 文件观察器提供的变化日志；缺省仍做完整对账。 */
+  changedFiles?: string[]
 }
 
 /**
@@ -115,6 +120,8 @@ export class StatsSession {
   #db: Database | null = null
   /** scan 路径下的全量记录。 */
   #records: UsageRecord[] | null = null
+  #rollup?: LocalRollupSnapshot
+  #summaryCounts?: TokenCounts
   #sessions: number
   #diagnostics: ScanDiagnostics | null
   #closed = false
@@ -137,6 +144,8 @@ export class StatsSession {
     records: UsageRecord[] | null
     sessions: number
     diagnostics: ScanDiagnostics | null
+    rollup?: LocalRollupSnapshot
+    summaryCounts?: TokenCounts
   }) {
     this.source = init.source
     this.scannedAt = init.scannedAt
@@ -151,6 +160,8 @@ export class StatsSession {
     this.#records = init.records
     this.#sessions = init.sessions
     this.#diagnostics = init.diagnostics
+    this.#rollup = init.rollup
+    this.#summaryCounts = init.summaryCounts
   }
 
   /** 查询过滤条件（子串匹配数组只在非空时带上）。 */
@@ -180,6 +191,8 @@ export class StatsSession {
 
   /** 总计（四项独立 + calls）。派生指标请用 `derive()`。 */
   totals(): TokenCounts {
+    if (this.#summaryCounts) return this.#summaryCounts
+    if (this.#rollup) return this.#rollup.counts
     if (this.#db) return queryTotals(this.#db, this.#filter())
     return totalOf(this.#records ?? [])
   }
@@ -191,6 +204,7 @@ export class StatsSession {
    * （时间维度升序、其余按用量降序）。
    */
   groups(dim: GroupDimension): GroupRow[] {
+    if (this.#rollup) return this.#rollup.groups(dim)
     if (this.#db) {
       return queryGroups(this.#db, dim, this.#filter()).map((r) => ({
         key: r.key,
@@ -214,6 +228,10 @@ export class StatsSession {
    *   而不是重写一遍 —— 否则会出现「命令行 30 个点、页面 4 个点」。
    */
   series(granularity: 'day' | 'hour', fillGaps = true): SeriesPointCounts[] {
+    if (this.#rollup) {
+      const points = this.#rollup.series(granularity)
+      return fillGaps ? renderSeriesGaps(points, granularity) : points
+    }
     if (this.#db) {
       const points = querySeries(this.#db, granularity, this.#filter())
       if (!fillGaps) return points
@@ -326,6 +344,7 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
         sessionsRoot: opts.sessionsRoot,
         dbPath: opts.dbPath,
         db,
+        ...(opts.changedFiles ? { changedFiles: opts.changedFiles } : {}),
         ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
       })
     }
@@ -337,6 +356,8 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
       ...(models.length > 0 ? { models } : {}),
     }
 
+    const summary = opts.rollup === 'summary' ? readLocalRollupSummary(db, filter) : undefined
+    const rollup = opts.rollup === true ? readLocalRollup(db, filter) : undefined
     return new StatsSession({
       source: 'sql',
       scannedAt: Date.now(),
@@ -348,7 +369,9 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
       models,
       db,
       records: null,
-      sessions: querySessionCount(db, filter),
+      sessions: summary?.sessions ?? rollup?.sessions ?? querySessionCount(db, filter),
+      ...(summary ? { summaryCounts: summary.counts } : {}),
+      ...(rollup ? { rollup } : {}),
       diagnostics: null,
     })
   } catch (err) {
