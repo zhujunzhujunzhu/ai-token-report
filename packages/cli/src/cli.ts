@@ -22,7 +22,7 @@ import {
 } from '@ai-token-report/core'
 import { createFileDeliverer, createHttpDeliverer } from './deliver.js'
 import { runReport, type RunReportResult } from './report.js'
-import { resetState, resolveStatePath } from '@ai-token-report/core'
+import { readIdentity, resetState, resolveStatePath } from '@ai-token-report/core'
 import {
   fmtCompact,
   fmtInt,
@@ -112,15 +112,18 @@ dsh-token-report —— DSH token 用量统计
 
   --dry-run        扫描并落盘 pending, 但不投递 (调试首选)
   --endpoint <url> 后台接收地址, 如 https://portal/api/v1/token-usage
-  --token <t>      鉴权 token (裸 token 或 'Bearer xxx')
+  --token <t>      鉴权 token；默认读取 DSH_REPORT_TOKEN 或共享 identity.json
   --out-file <f>   不联网, 把记录追加到本地 JSONL (端到端演练)
   --no-save        只看不改: 不写状态文件 (纯观察增量)
   --state <p>      状态文件路径 (默认 $DSH_HOME/token-report/state.json)
   --reset          清空水位线后退出, 下次全量重扫
   --timeout <ms>   单次请求超时 (默认 15000)
-  --user-id <id>   身份署名 (方案 A); 也可用 env DSH_REPORT_USER_ID
+  --user-id <id>   客户端标识（归属由服务端按 token 决定）
   --user-name <n>  显示名; 也可用 env DSH_REPORT_USER_NAME
   --dept <d>       部门; 也可用 env DSH_REPORT_DEPT
+
+  未署名时跳过采集和上报。可先在本地页面署名，或显式提供 token。
+  --dry-run / --no-save / --out-file 是主动的本地演练，无需署名。
 
 其他:
   --dsh-home <p>   指定 DSH home (默认 $DSH_HOME 或 ~/.dsh)
@@ -1058,11 +1061,22 @@ async function runReportCommand(opts: CliOptions, sessionsRoot: string): Promise
     return 0
   }
 
-  // 身份三级回退（docs/插件方案.md §9 方案 A）：显式参数 > 环境变量。
-  // 第三级（~/.dsh/token-report-user.json）留给安装脚本，此处只做前两级。
+  // ★ 与本地页 / DSH 插件共用身份；显式提供 token 也表示主动授权上报。
+  // 没有身份时必须在扫描及写 pending 之前退出，不能先收集再等服务端 401。
+  const identity = readIdentity(resolvePaths(opts.dshHome).identityPath)
+  const token = (r.token ?? process.env['DSH_REPORT_TOKEN'] ?? identity.identity?.token)?.trim()
+  const localRehearsal = r.dryRun || r.noSave || !!r.outFile
+  if (!localRehearsal && (!token || !token.replace(/^Bearer\s*/i, '').trim())) {
+    process.stdout.write(
+      (identity.error ? `身份文件无法使用：${identity.error}\n` : '') +
+      '未署名，已跳过采集和上报；不会创建或修改待上报记录。\n' +
+      '请先运行 dsh-token-report web --portal <部门地址> 填写署名，或提供 --token / DSH_REPORT_TOKEN。\n',
+    )
+    return 0
+  }
   const userId = r.userId ?? process.env['DSH_REPORT_USER_ID']
-  const userName = r.userName ?? process.env['DSH_REPORT_USER_NAME']
-  const dept = r.dept ?? process.env['DSH_REPORT_DEPT']
+  const userName = r.userName ?? process.env['DSH_REPORT_USER_NAME'] ?? identity.identity?.name
+  const dept = r.dept ?? process.env['DSH_REPORT_DEPT'] ?? identity.identity?.dept
 
   // 没有投递目标就等价于干跑：不会静默什么都不做
   const dryRun = r.dryRun || r.noSave || (!r.endpoint && !r.outFile)
@@ -1074,7 +1088,7 @@ async function runReportCommand(opts: CliOptions, sessionsRoot: string): Promise
     } else if (r.endpoint) {
       deliver = createHttpDeliverer({
         endpoint: r.endpoint,
-        token: r.token ?? process.env['DSH_REPORT_TOKEN'],
+        token,
         timeoutMs: r.timeoutMs,
         userId,
         userName,

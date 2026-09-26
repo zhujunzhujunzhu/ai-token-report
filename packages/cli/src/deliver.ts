@@ -22,7 +22,7 @@ export interface TokenUsagePayload {
   /** 客户端标识，便于后台区分来源与排查。 */
   client: {
     name: 'dsh-token-stats'
-    /** 机器标识。方案 A 的身份归属由服务端按 token 或此字段落库。 */
+    /** 客户端诊断标识；真实归属只由服务端按 token 决定。 */
     userId: string
     userName?: string
     dept?: string
