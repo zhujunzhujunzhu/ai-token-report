@@ -2,7 +2,7 @@
 
 在 DeepSeek Harness（DSH）里直接查看本机 token 用量：输入框摘要、趋势图、模型排行和自定义日期范围；需要团队汇总时，再配置身份与上报连接。
 
-**当前版本：0.3.0** · npm 包名：`dsh-plugin-token-report` · 仓内开发包名：`@ai-token-report/dsh-plugin`
+**当前版本：0.3.1** · npm 包名：`dsh-plugin-token-report` · 仓内开发包名：`@ai-token-report/dsh-plugin`
 
 ## 实际使用截图
 
@@ -20,15 +20,15 @@
 
 ![真实 DSH 插件日期选择](docs/screenshots/date-range.png)
 
-## 安装 0.3.0
+## 安装 0.3.1
 
 需要已经安装 DSH，并使用与插件兼容的宿主模块（`@deepseek-ai/cordis ^4.0.2`、`@deepseek-ai/dsh-session-telemetry ^0.1.5-rc.1`）。Node.js 要求 **22.15.0 或更新版本**。
 
 ```bash
-dsh plugin --profile web add dsh-plugin-token-report@0.3.0
+dsh plugin --profile web add dsh-plugin-token-report@0.3.1
 ```
 
-在 `~/.dsh/profiles/web/package.json` 的 `dsh.profile.bundles` 数组中加入 `dsh-plugin-token-report`，保留已有条目。依赖安装与 bundle 声明都需要具备；已经存在的条目不要重复添加。例如：
+`dsh plugin add` 会自动在 `~/.dsh/profiles/web/package.json` 的 `dsh.profile.bundles` 中登记发布包。检查它只出现一次，且没有旧源码包 `@ai-token-report/dsh-plugin`；**不要再手动 insert 插件**。正常列表例如：
 
 ```json
 {
@@ -129,7 +129,22 @@ dsh --profile web --no-open
 
 ## 升级与常见问题
 
-从旧版升级时，重新运行指定版本的安装命令，然后重启 DSH。若此前通过源码包 `@ai-token-report/dsh-plugin` 安装，请先把旧 bundle 与旧插件挂载条目替换成发布包，避免两个实例同时注册服务。
+从旧版升级时，重新运行指定版本的安装命令。若曾源码直挂或手动 `insert`，先执行下方离线修复，再重启 DSH。
+
+### 0.3.0 启动报 duplicate loader entry id: token-report
+
+插件树里重复挂载了相同 ID，Loader 在插件代码执行前就会失败。仅升级 JS 文件不能清理旧 profile。0.3.1 随包提供离线修复工具；先停止该 profile 的 DSH，再在 Windows PowerShell 运行：
+
+```powershell
+node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/repair-profile.mjs" --profile web
+node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/repair-profile.mjs" --profile web --apply
+```
+
+设置过 `DSH_HOME` 时，把上面的 `USERPROFILE/.dsh` 路径替换成实际 DSH_HOME。第一条只检查，需修复时退出码为 1；第二条先备份，再修改。工具去掉重复 bundle 和旧源码包依赖，把插件 `insert` 转成 ID 配置覆盖；保留其它插件、原配置与 `!!js` 表达式。YAML 注释在原文备份中保留。
+
+终端会打印备份目录（`$DSH_HOME/token-report/plugin-backups/repair-*`）。遇到配置冲突、其它插件占用 ID，或全局 `$DSH_HOME/cordis.patch.yml` 仍重复插入时拒绝写入，需人工合并。不要删除整个 profile、身份文件、数据库或 outbox。修复后重新运行 `dsh web`。
+
+尚未升级时，也可单独复制仓库构建出的 `repair-profile.mjs` 到故障电脑，用同样参数运行，无需启动 DSH。
 
 > **0.2.0 → 0.3.0 的行为变更（唯一一处）**：用量面板的默认位置改成
 > `ui.position: dock` —— 默认**只出现输入框上方那条用量条**，
@@ -179,8 +194,7 @@ dsh --profile web --no-open
 ```yaml
 # ~/.dsh/profiles/web/cordis.patch.yml
 - id: token-report
-  # ⚠️ 必须是**已发布的包名** —— loader 用它来 import
-  name: '@ai-token-report/dsh-plugin'
+  # 按正式插件 bundle 已提供的 ID 覆盖配置；不重复 insert，也不覆盖包名。
   config:
     # ── 全局配置 ────────────────────────────────────────────────
     name: dsh-token-report                      # 插件实例名，同时上报为 client.name
@@ -944,4 +958,3 @@ bun run packages/dsh-plugin/verify/diagnose-boot.ts web   # 逐个包试 import�
 | 会话日志解析 | `.agents/skills/dsh-session-log-parsing/SKILL.md` |
 | 工程约定 | `.agents/skills/repo-conventions/SKILL.md` |
 | 插件方案（历史） | `docs/插件方案.md` |
-

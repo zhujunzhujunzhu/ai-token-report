@@ -38,6 +38,8 @@
     "publish:plugin": "bun publish --cwd packages/dsh-plugin/dist",
     "publish:dry": "bun run publish:cli:dry && bun run publish:plugin:dry",
 
+    "repair:plugin": "bun run packages/dsh-plugin/scripts/repair-profile.ts",
+
     "server": "bun run --filter '@ai-token-report/server' start",
     "typecheck": "bun run --filter '*' typecheck",
     "test": "bun test"

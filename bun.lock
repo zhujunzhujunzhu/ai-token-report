@@ -39,7 +39,7 @@
     },
     "packages/dsh-plugin": {
       "name": "@ai-token-report/dsh-plugin",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "dependencies": {
         "@ai-token-report/core": "workspace:*",
         "@ai-token-report/shared": "workspace:*",

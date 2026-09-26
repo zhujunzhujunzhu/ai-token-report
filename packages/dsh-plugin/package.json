@@ -1,6 +1,6 @@
 {
   "name": "@ai-token-report/dsh-plugin",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "description": "DSH 插件：实时上报 token 用量 + 在 DSH 界面里直接看本机用量",
@@ -37,6 +37,7 @@
     "test": "bun test",
     "build:npm": "bun run scripts/build-npm.ts",
     "verify:npm": "bun run verify/verify-npm-package.ts",
+    "repair:profile": "bun run scripts/repair-profile.ts",
     "verify": "bun run verify/verify-plugin.ts"
   },
   "dependencies": {

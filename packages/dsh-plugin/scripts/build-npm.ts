@@ -136,6 +136,14 @@ if (currentId === PUBLISH_NAME) {
 }
 await writeFile(join(distDir, 'client.js'), clientText, 'utf8')
 
+// 离线修复必须能在 DSH 启动前执行，只依赖宿主已有的 YAML/配置模块。
+const repair = await Bun.build({
+  entrypoints: [join(pkgRoot, 'scripts', 'repair-profile.ts')],
+  target: 'node', format: 'esm', outdir: distDir,
+  naming: 'repair-profile.mjs',
+})
+if (!repair.success) fail(`修复工具构建失败：${repair.logs.join('\n')}`)
+
 // ── 6. 生成挂载声明（name 必须是发布名，见文件头约束 1）────────────────
 const patch = `# 本文件由 scripts/build-npm.ts 生成 —— 不要手改（改仓库根那份 cordis.patch.yml）。
 #
@@ -160,7 +168,8 @@ const manifest = {
     './client': { default: './client.js' },
     './package.json': './package.json',
   },
-  files: ['index.js', 'stats-worker.js', 'client.js', 'cordis.patch.yml', 'README.md', 'README.offline.md', 'screenshots'],
+  files: ['index.js', 'stats-worker.js', 'client.js', 'repair-profile.mjs', 'cordis.patch.yml', 'README.md', 'README.offline.md', 'screenshots'],
+  bin: { 'dsh-token-report-repair': './repair-profile.mjs' },
   // ★ 这两段是「能被 DSH 认成插件」的全部声明：bundle 决定配置树里有这一行，
   //   client 决定浏览器半挂到哪个平台、依赖哪个第一方客户端包。
   dsh: {

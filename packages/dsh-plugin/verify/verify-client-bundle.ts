@@ -30,7 +30,7 @@ import * as React from 'react'
 import * as ReactDOM from 'react-dom'
 import * as JSXRuntime from 'react/jsx-runtime'
 
-const pkgDir = join(import.meta.dir, '..')
+const pkgDir = process.env['ATR_PLUGIN_PACKAGE_DIR'] ?? join(import.meta.dir, '..')
 const pkg = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8')) as {
   name: string
   exports: Record<string, unknown>
@@ -121,7 +121,8 @@ check(
 
 // ── ③ 宿主半与浏览器半的路由路径必须一致 ────────────────────────────────
 console.log('\n── 双半一致性 ──')
-const host = (await import(join(pkgDir, 'lib', 'index.js'))) as {
+const hostExport = pkg.exports['.'] as { default: string }
+const host = (await import(join(pkgDir, hostExport.default))) as {
   UI_STATS_PATH?: string
   UI_CONFIG_PATH?: string
   UI_DEFAULT_POSITION?: string
