@@ -59,7 +59,7 @@ import type { Authentication } from './http/auth.js'
 import { authorize, authorizeDatabase } from './http/auth.js'
 import { IngestQueue, IngestQueueUnavailable } from './ingest-queue.js'
 import type { CredentialStore } from './credentials.js'
-import { readJsonBodyLenient, readJsonBodyStrict, requestBodyLimit } from './http/body.js'
+import { readIngestBody, readJsonBodyLenient, readJsonBodyStrict, requestBodyLimit } from './http/body.js'
 import { fail, json, methodNotAllowed as methodNotAllowedBody, msg, respond } from './http/envelope.js'
 import { serveIndexHtml, serveStatic } from './http/static.js'
 import type { IdentityRoute } from './identity-route.js'
@@ -231,8 +231,8 @@ export function createApp(deps: AppDeps): Hono {
   //   鉴权失败必须是 401/503（见 `ingest-route.ts`）：客户端把 2xx 当作
   //   「已投递」并清掉 pending，回 200 会让那批用量被永久丢掉。
   app.post('/api/v1/token-usage', async (c) => {
-    const parsed = await readJsonBodyStrict(c)
-    if ('error' in parsed) return fail(parsed.error, 400)
+    const parsed = await readIngestBody(c)
+    if ('error' in parsed) return fail(parsed.error, parsed.status)
     return respond(await deps.ingestRoute.submit(parsed.value, authOf(c)))
   })
 

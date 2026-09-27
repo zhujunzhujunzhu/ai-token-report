@@ -37,6 +37,10 @@ export const BODY_TOO_LARGE_REASON = '请求体过大（上限 32 MiB）'
 /** 非法 JSON 文案（同上）。 */
 export const BAD_JSON_REASON = '请求体不是合法 JSON'
 
+/** 只约束读取上传的时间，绝不用于中断已经开始的数据库事务。 */
+export const INGEST_BODY_TIMEOUT_MS = 10_000
+export const BODY_READ_TIMEOUT_REASON = '请求体读取超时，请重试'
+
 /**
  * 全局请求体上限中间件。
  *
@@ -50,19 +54,73 @@ export const BAD_JSON_REASON = '请求体不是合法 JSON'
  *   而前端拿它当 `reason` 展示 —— 这里用 `onError` 换回统一信封。
  */
 export function requestBodyLimit(): MiddlewareHandler {
-  return bodyLimit({
+  const limit = bodyLimit({
     maxSize: MAX_BODY_BYTES,
     onError: () => fail(BODY_TOO_LARGE_REASON, 413),
   })
+  return (c, next) => {
+    // 上报的专用读取器同时限制字节与总用时；提前在此读流会绕过它的截止时间。
+    if (c.req.method === 'POST' && c.req.path === '/api/v1/token-usage') return next()
+    return limit(c, next)
+  }
 }
 
 /** body 读取结果：`{ value }` 或 `{ error }`（而不是抛异常）。 */
 export type BodyRead = { value: unknown } | { error: string }
 
+export type IngestBodyRead = { value: unknown } | { error: string; status: 400 | 408 | 413 }
+
+/** 上报正文只允许占用消费者有限时间，断续发送也不会重置总截止时间。 */
+export async function readIngestBody(c: Context, timeoutMs = INGEST_BODY_TIMEOUT_MS): Promise<IngestBodyRead> {
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647) throw new Error('请求体读取时限必须为正整数毫秒')
+  if (Number(c.req.header('content-length') ?? 0) > MAX_BODY_BYTES) return { error: BODY_TOO_LARGE_REASON, status: 413 }
+  const body = c.req.raw.body
+  if (!body) return { error: BAD_JSON_REASON, status: 400 }
+  const reader = body.getReader()
+  const deadline = Date.now() + timeoutMs
+  const timedOut: IngestBodyRead = { error: BODY_READ_TIMEOUT_REASON, status: 408 }
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<IngestBodyRead>((resolve) => {
+    timer = setTimeout(() => resolve(timedOut), timeoutMs)
+  })
+  const read = async (): Promise<IngestBodyRead> => {
+    const decoder = new TextDecoder()
+    const parts: string[] = []
+    let size = 0
+    try {
+      while (true) {
+        if (Date.now() >= deadline) return timedOut
+        const { done, value } = await reader.read()
+        if (Date.now() >= deadline) return timedOut
+        if (done) break
+        size += value.byteLength
+        if (size > MAX_BODY_BYTES) return { error: BODY_TOO_LARGE_REASON, status: 413 }
+        parts.push(decoder.decode(value, { stream: true }))
+      }
+      parts.push(decoder.decode())
+      const text = parts.join('')
+      if (!text.trim()) return { error: BAD_JSON_REASON, status: 400 }
+      const parsed = parseJsonText(text)
+      return 'error' in parsed ? { ...parsed, status: 400 } : parsed
+    } catch {
+      return { error: BAD_JSON_REASON, status: 400 }
+    }
+  }
+  try {
+    // race 仅覆盖读取，不包住 next/submit；超时后不可能仍在后台提交同一批事件。
+    return await Promise.race([read(), timeout])
+  } finally {
+    clearTimeout(timer)
+    // releaseLock 会拒绝挂起的 read，使读取协程退出；cancel 会提前销毁 Node socket，
+    // 导致客户端收不到 408/413。未读字节交回运行时，Node 适配器在响应后有界排空。
+    reader.releaseLock()
+  }
+}
+
 /**
  * 严格读取：空 body 也算「不是合法 JSON」。
  *
- * 用于上报与本地署名 —— 这两个端点的请求体是**必需**的，
+ * 用于本地署名与登录 —— 这些端点的请求体是**必需**的；上报另走有总时限的读取器。
  * 空 body 是客户端 bug，必须当场说清楚（而不是在下游报一个
  * 让人以为「字段没填对」的形状错误）。
  */
