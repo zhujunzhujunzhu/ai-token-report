@@ -12,16 +12,17 @@ import { spawn } from 'node:child_process'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { createServer, DEFAULT_PORT, type ServerHandle } from '@ai-token-report/server'
+import type { ServerHandle } from '@ai-token-report/server'
 
 import {
   aggregate,
   crossTabRanked,
   timeSeries,
   type GroupDimension,
+  type GroupRow,
+  type SeriesPoint,
 } from '@ai-token-report/core'
-import { createFileDeliverer, createHttpDeliverer } from './deliver.js'
-import { runReport, type RunReportResult } from './report.js'
+import type { RunReportResult } from './report.js'
 import { readIdentity, resetState, resolveStatePath } from '@ai-token-report/core'
 import {
   fmtCompact,
@@ -456,8 +457,7 @@ function parseArgs(argv: string[]): CliOptions | null {
 }
 
 /** 渲染单维度表格。 */
-function renderDimension(records: UsageRecord[], dim: GroupDimension, top: number): string {
-  const rows = aggregate(records, dim)
+function renderDimension(rows: GroupRow[], dim: GroupDimension, top: number): string {
   const shown = top > 0 ? rows.slice(0, top) : rows
   const suffix = top > 0 && rows.length > top ? `（共 ${rows.length} 组，显示前 ${top}）` : ''
   const label = dimLabel(dim)
@@ -674,6 +674,7 @@ async function main(): Promise<number> {
   const session = await openStats({
     sessionsRoot: paths.sessionsRoot,
     dbPath: paths.dbPath,
+    rollup: true,
     ...(opts.period ? { period: opts.period } : {}),
     ...(range.sinceMs !== undefined ? { sinceMs: range.sinceMs } : {}),
     ...(range.untilMs !== undefined ? { untilMs: range.untilMs } : {}),
@@ -691,30 +692,43 @@ async function main(): Promise<number> {
   })
   if (!opts.quiet) process.stderr.write('\r' + ' '.repeat(40) + '\r')
 
+  // 普通统计直接复用压缩索引的分组，只有交叉表和 JSON 的 provider 趋势需要原始记录。
+  // 百万记录不能为了打印前 30 行而全部搬到 CLI 内存重新聚合。
+  let records: UsageRecord[] = []
+  const grouped = new Map<GroupDimension, GroupRow[]>()
+  let series: SeriesPoint[] = []
+  let total: ReturnType<typeof session.totals>
+  let dbStats: ReturnType<typeof session.dbDiagnostics>
+  try {
+    total = session.totals()
+    dbStats = session.dbDiagnostics()
+    const dims = opts.listProviders ? ['provider', 'provider-model'] as const : opts.by
+    for (const dim of dims) grouped.set(dim, session.groups(dim).map(r => ({ ...r, metrics: derive(r.counts) })))
+    if ((opts.cross && opts.format === 'table') || (opts.series && opts.format === 'json')) records = session.records()
+    if (opts.series) {
+      series = opts.format === 'json' ? timeSeries(records, opts.series, false)
+        : session.series(opts.series, opts.format === 'table').map(p => ({ ...p, metrics: derive(p.counts), byProvider: new Map() }))
+    }
+  } finally {
+    session.close()
+  }
   const elapsed = Date.now() - t0
-
-  // 取数完成后立刻物化，之后统一释放库连接 —— 避免把连接生命周期
-  // 拖到整个渲染流程（渲染里还有多轮 aggregate，早关早释放 WAL）
-  const records = session.records()
-  const total = session.totals()
   // SQL 路径没有「扫描诊断」（本轮的增量诊断在 session 里不含 eventTypes 等
   // 逐事件计数），用空诊断占位 —— 渲染层因此不必到处判空。
   const diagnostics = session.diagnostics ?? emptyDiagnostics()
   const degradedReason = session.degradedReason
   const source = session.source
-  const dbStats = session.dbDiagnostics()
-  session.close()
 
   // --list-providers：只报告发现的口径边界
   if (opts.listProviders) {
-    const provRows = aggregate(records, 'provider')
+    const provRows = grouped.get('provider')!
     process.stdout.write('\n=== 发现的所有 provider ===\n')
     for (const r of provRows) {
       process.stdout.write(
         `  ${r.key.padEnd(24)} 调用 ${fmtInt(r.counts.calls).padStart(8)}  总量 ${fmtCompact(r.counts.total).padStart(10)}\n`,
       )
     }
-    const modelRows = aggregate(records, 'provider-model')
+    const modelRows = grouped.get('provider-model')!
     process.stdout.write('\n=== 发现的所有 provider/model ===\n')
     for (const r of modelRows) {
       process.stdout.write(
@@ -730,7 +744,7 @@ async function main(): Promise<number> {
   if (opts.format === 'json') {
     const groups: Record<string, unknown> = {}
     for (const dim of opts.by) {
-      groups[dim] = aggregate(records, dim).map((r) => ({
+      groups[dim] = grouped.get(dim)!.map((r) => ({
         key: r.key,
         total: r.counts.total,
         input: r.counts.input,
@@ -770,7 +784,7 @@ async function main(): Promise<number> {
       },
       groups,
       series: opts.series
-        ? timeSeries(records, opts.series, false).map((p) => ({
+        ? series.map((p) => ({
             bucket: p.bucket,
             total: p.counts.total,
             input: p.counts.input,
@@ -813,14 +827,14 @@ async function main(): Promise<number> {
   if (opts.format === 'csv') {
     const chunks: string[] = []
     for (const dim of opts.by) {
-      const rows = topSlice(aggregate(records, dim), opts.top)
+      const rows = topSlice(grouped.get(dim)!, opts.top)
       if (opts.by.length > 1) chunks.push(`# dimension: ${dim}`)
       chunks.push(groupRowsToCsv(rows, dim))
     }
     if (opts.series) {
       if (opts.by.length > 1 || chunks.length) chunks.push('')
       chunks.push('# series')
-      chunks.push(seriesToCsv(timeSeries(records, opts.series, false)))
+      chunks.push(seriesToCsv(series))
     }
     const text = chunks.join('\n')
     if (opts.out) {
@@ -843,7 +857,7 @@ async function main(): Promise<number> {
   if (opts.models.length) out.push(`model 过滤: ${opts.models.join(', ')}`)
   out.push(`耗时 ${elapsed}ms`)
 
-  if (records.length === 0) {
+  if (total.calls === 0) {
     out.push('')
     out.push('未匹配到任何计费记录。')
     if (!opts.noDiag) {
@@ -854,7 +868,7 @@ async function main(): Promise<number> {
   }
 
   for (const dim of opts.by) {
-    out.push(renderDimension(records, dim, opts.top))
+    out.push(renderDimension(grouped.get(dim)!, dim, opts.top))
   }
 
   if (opts.cross) {
@@ -862,7 +876,7 @@ async function main(): Promise<number> {
   }
 
   if (opts.series) {
-    out.push(formatSeries(timeSeries(records, opts.series, true), `按${opts.series === 'day' ? '天' : '小时'}趋势`))
+    out.push(formatSeries(series, `按${opts.series === 'day' ? '天' : '小时'}趋势`))
   }
 
   if (!opts.noDiag) {
@@ -917,6 +931,8 @@ async function runWebCommand(opts: CliOptions, paths: ResolvedPaths): Promise<nu
     return 1
   }
 
+  // 普通统计和 --help 不应初始化 Web 路由、鉴权与上报依赖。
+  const { createServer, DEFAULT_PORT } = await import('@ai-token-report/server')
   let handle: ServerHandle
   try {
     handle = await createServer({
@@ -1081,6 +1097,8 @@ async function runReportCommand(opts: CliOptions, sessionsRoot: string): Promise
   // 没有投递目标就等价于干跑：不会静默什么都不做
   const dryRun = r.dryRun || r.noSave || (!r.endpoint && !r.outFile)
 
+  const { createFileDeliverer, createHttpDeliverer } = await import('./deliver.js')
+  const { runReport } = await import('./report.js')
   let deliver
   if (!dryRun) {
     if (r.outFile) {
