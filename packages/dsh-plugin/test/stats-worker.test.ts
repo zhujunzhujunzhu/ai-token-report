@@ -1,6 +1,6 @@
 /** 真线程验证：查询、刷新、外部写入和卸载不能依赖宿主线程里的数据库状态。 */
 import { test, expect } from 'bun:test'
-import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync, symlinkSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { zstdCompressSync } from 'node:zlib'
@@ -8,6 +8,34 @@ import { queryUsage, type StatsContext } from '../src/stats.js'
 import { closeStatsWorker } from '../src/stats-worker-client.js'
 import { openDatabaseForIngest, insertRecords } from '@ai-token-report/core/db'
 import { emptyCounts } from '@ai-token-report/core'
+
+test('会话根目录是联接时，监听真实目录但增量路径保持调用方目录', async () => {
+  const root = mkdtempSync(join(realpathSync.native(tmpdir()), 'atr-worker-alias-'))
+  const target = join(root, 'real-sessions')
+  const sessionsRoot = join(root, 'alias-sessions')
+  mkdirSync(target)
+  symlinkSync(target, sessionsRoot, process.platform === 'win32' ? 'junction' : 'dir')
+  const ctx: StatsContext = { config: { localDb: true }, sessionsRoot, dbPath: join(root, 'usage.sqlite'), backgroundQueries: true }
+  try {
+    expect((await queryUsage(ctx, { summaryOnly: true })).totals.calls).toBe(0)
+    const dir = join(target, 'project/session')
+    mkdirSync(dir, { recursive: true })
+    const file = join(dir, 'session.v3.jsonl.zstd')
+    const frame = (seq: number) => zstdCompressSync(Buffer.from(JSON.stringify({ type: 'assistant/message', seq, time: Date.now(),
+      data: { usage: { inputTokens: 3 }, message: { source: { provider: 'p', model: 'm' } } } }) + '\n'))
+    writeFileSync(file, frame(1))
+    await Bun.sleep(100)
+    expect((await queryUsage(ctx, { summaryOnly: true })).totals.calls).toBe(1)
+    appendFileSync(file, frame(2))
+    await Bun.sleep(100)
+    const added = await queryUsage(ctx, { summaryOnly: true })
+    expect(added.totals.calls).toBe(2)
+    expect(added.degradedReason).toBeUndefined()
+  } finally {
+    await closeStatsWorker(ctx.dbPath)
+    rmSync(root, { recursive: true, force: true })
+  }
+})
 
 test('真实 Worker 支持摘要、精确分页、手动追加刷新及外部写入，卸载释放线程', async () => {
   const root = mkdtempSync(join(tmpdir(), 'atr-worker-test-'))

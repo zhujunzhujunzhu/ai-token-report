@@ -1,6 +1,6 @@
 /** 重查询只在线程内运行；日志变更合并，短时间内多个周期共用一轮已完成的采集。 */
 import { parentPort } from 'node:worker_threads'
-import { watch, type FSWatcher } from 'node:fs'
+import { watch, realpathSync, type FSWatcher } from 'node:fs'
 import { resolve } from 'node:path'
 import { executeQuery, type StatsContext, type UsageQuery } from './stats.js'
 
@@ -19,7 +19,9 @@ function observe(sessionsRoot: string): void {
   root = sessionsRoot
   fullScanNeeded = true
   try {
-    watcher = watch(root, { recursive: true }, (_event, filename) => {
+    // Windows 的 8.3 短路径/目录联接可能让 libuv 的递归监听触发原生断言，
+    // 直接终止宿主，try/catch 无法恢复。监听前还原真实路径；变更路径仍用调用方根目录。
+    watcher = watch(realpathSync.native(root), { recursive: true }, (_event, filename) => {
       if (filename && /(?:^|[\\/])session[^\\/]*\.jsonl\.zstd$/.test(filename)) changedFiles.add(resolve(root, filename))
       else fullScanNeeded = true
     })
