@@ -140,6 +140,24 @@ describe('统计状态', () => {
     await useDashboardStore().activate('overview')
     expect(calls).toBe(0)
   })
+  test('后台刷新在前次查询未结束时不堆积请求', async () => {
+    signIn()
+    const first = deferred<Response>()
+    let calls = 0
+    respond((url) => {
+      calls++
+      return url.includes('overview') ? first.promise : json({ rows: [], points: [] })
+    })
+    const dashboard = useDashboardStore()
+    const initial = dashboard.activate('overview')
+    const before = calls
+    await dashboard.load(true)
+    expect(calls).toBe(before)
+    first.resolve(json(overview))
+    await initial
+    expect(dashboard.overview?.totalTokens).toBe(101)
+  })
+  })
   test('候选不含人员筛选；分页只取当前页面所需接口', async () => {
     signIn()
     const urls: URL[] = []

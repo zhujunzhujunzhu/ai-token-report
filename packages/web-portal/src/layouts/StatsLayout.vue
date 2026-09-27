@@ -20,6 +20,9 @@ const description = computed(
   () => descriptions[String(route.meta.section)] ?? '',
 )
 let timer: ReturnType<typeof setInterval> | undefined
+function refreshWhenVisible(): void {
+  if (!document.hidden) void dashboard.load(true)
+}
 watch(
   () => route.meta.section,
   (value) => {
@@ -30,10 +33,13 @@ watch(
 onMounted(() => {
   timer = setInterval(() => {
     void dashboard.load(true)
-  }, 30_000)
+  }, 5_000)
+  // 隐藏时 Store 会跳过轮询；返回页面后立即补一次，不必等下一个周期。
+  document.addEventListener('visibilitychange', refreshWhenVisible)
 })
 onUnmounted(() => {
   clearInterval(timer)
+  document.removeEventListener('visibilitychange', refreshWhenVisible)
   dashboard.deactivate()
 })
 </script>
@@ -59,7 +65,7 @@ onUnmounted(() => {
         ><el-icon><Clock /></el-icon
         >{{
           dashboard.fetchedAt
-            ? `更新于 ${formatFullDateTime(dashboard.fetchedAt)} · 每 30 秒自动刷新`
+            ? `更新于 ${formatFullDateTime(dashboard.fetchedAt)} · 每 5 秒自动刷新`
             : '等待获取数据'
         }}</span
       >
