@@ -60,6 +60,11 @@ const DEFAULT_PROBE_INTERVAL_MS = 3_000
  */
 const DEFAULT_FULL_INTERVAL_MS = 120_000
 
+/** 只加速用户切换，轮询与手动刷新仍真取数；页数与字节双限避免长期保留大明细。 */
+const SNAPSHOT_TTL_MS = 30_000
+const SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024
+const SNAPSHOT_MAX_ENTRIES = 32
+
 /**
  * 页面可见性。
  *
@@ -179,6 +184,15 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
   let detailBy: UiGroupBy = 'provider-model'
   let detailPage = 1
   let snapshotKey: string | undefined
+  const snapshots = new Map<string, { data: UiPayload; at: number; bytes: number }>()
+  let snapshotBytes = 0
+  let snapshotDay = ''
+  let latestGen: number | undefined
+  const clearSnapshots = (): void => { snapshots.clear(); snapshotBytes = 0 }
+  const forgetSnapshot = (key: string): void => {
+    snapshotBytes -= snapshots.get(key)?.bytes ?? 0
+    snapshots.delete(key)
+  }
   /**
    * 上一次**全量**取数的发起时刻。
    *
@@ -214,6 +228,7 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
     force: boolean,
     dateRange = state.dateRange,
     mode: LoadMode = 'full',
+    reuseSnapshot = false,
   ): Promise<void> => {
     if (disposed) return
     const mine = ++seq
@@ -232,14 +247,6 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
         || dateRange?.until !== state.dateRange?.until)) detailPage = 1
       const detail = detailSubscribers > 0 ? { by: detailBy, page: detailPage } : undefined
 
-      if (mode === 'full') {
-        lastFullAt = now()
-        // 切换期间保留上次成功内容与其范围标签，避免卡片/图表卸载造成弹框塌缩。
-        // 新结果到达后整体替换；失败时继续显示原范围，不冒充已切换成功。
-        patch({ period, dateRange, detail, loading: state.data === undefined,
-          refreshing: state.data !== undefined, error: undefined })
-      }
-
       const query = new URLSearchParams({ period })
       query.set('view', detail ? 'detail' : 'summary')
       if (detail) {
@@ -255,6 +262,29 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
       const snapshotParams = new URLSearchParams(query)
       snapshotParams.delete('refresh')
       const requestKey = snapshotParams.toString()
+      // 具名周期跨午夜会改变边界，不能把昨天的「今天」直接显示成今天。
+      const day = new Date(now()).toDateString()
+      if (force || day !== snapshotDay) clearSnapshots()
+      snapshotDay = day
+      const hit = snapshots.get(requestKey)
+      if (reuseSnapshot && !force && hit) {
+        const age = now() - hit.at
+        if (age >= 0 && age < SNAPSHOT_TTL_MS && hit.data.gen === latestGen) {
+          snapshots.delete(requestKey)
+          snapshots.set(requestKey, hit)
+          snapshotKey = requestKey
+          patch({ period, dateRange, detail, data: hit.data, fetchedAt: hit.at,
+            loading: false, refreshing: false, error: undefined })
+          return
+        }
+        forgetSnapshot(requestKey)
+      }
+      if (mode === 'full') {
+        lastFullAt = now()
+        // 没有当前范围缓存时保留上次成功内容及其标签，失败也不冒充切换成功。
+        patch({ period, dateRange, detail, loading: state.data === undefined,
+          refreshing: state.data !== undefined, error: undefined })
+      }
       // ★ 探针：告诉宿主「我手上是第几代」。代次没变宿主回 204，一个字节都不用传。
       const gen = state.data?.gen
       if (mode === 'probe' && gen !== undefined && snapshotKey === requestKey) query.set('gen', String(gen))
@@ -325,11 +355,26 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
       // 页码被宿主钳到最后一页时，后续探针应认这份实际返回的页面快照。
       if (detail) snapshotParams.set('page', String(detailPage))
       snapshotKey = snapshotParams.toString()
+      const fetchedAt = now()
+      if (parsed.payload.gen !== latestGen) clearSnapshots()
+      latestGen = parsed.payload.gen
+      // 老宿主可能不回代次或忽略范围；这类响应可以展示，但不能当作可复用快照。
+      if (parsed.payload.gen !== undefined && parsed.payload.period === period) {
+        const bytes = new TextEncoder().encode(JSON.stringify(parsed.payload)).byteLength
+        forgetSnapshot(snapshotKey)
+        if (bytes <= SNAPSHOT_MAX_BYTES) {
+          while (snapshots.size >= SNAPSHOT_MAX_ENTRIES || snapshotBytes + bytes > SNAPSHOT_MAX_BYTES) {
+            forgetSnapshot(snapshots.keys().next().value!)
+          }
+          snapshots.set(snapshotKey, { data: parsed.payload, at: fetchedAt, bytes })
+          snapshotBytes += bytes
+        }
+      }
       patch({
         loading: false,
         refreshing: false,
         data: parsed.payload,
-        fetchedAt: now(),
+        fetchedAt,
         error: undefined,
         ...(detail ? { detail: { by: detailBy, page: detailPage } } : {}),
       })
@@ -414,12 +459,12 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
     setPeriod(period) {
       if (period === 'custom' && !validDateRange(state.dateRange)) return
       if (period === state.period && state.data !== undefined && state.error === undefined) return
-      void load(period, false)
+      void load(period, false, state.dateRange, 'full', true)
     },
 
     setCustomRange(range) {
       if (!validDateRange(range)) return
-      void load('custom', false, { ...range })
+      void load('custom', false, { ...range }, 'full', true)
     },
 
     refresh() {
@@ -431,7 +476,7 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
       detailSubscribers++
       if (detailSubscribers === 1) {
         detailPage = 1
-        void load(state.period, false)
+        void load(state.period, false, state.dateRange, 'full', true)
       }
       let released = false
       return () => {
@@ -439,7 +484,7 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
         released = true
         detailSubscribers--
         if (detailSubscribers === 0 && !disposed) {
-          if (disposers > 0) void load(state.period, false)
+          if (disposers > 0) void load(state.period, false, state.dateRange, 'full', true)
           else patch({ detail: undefined, loading: state.data === undefined, refreshing: false })
         }
       }
@@ -450,7 +495,7 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
       if (by === detailBy && page === detailPage) return
       detailBy = by
       detailPage = page
-      if (detailSubscribers > 0) void load(state.period, false)
+      if (detailSubscribers > 0) void load(state.period, false, state.dateRange, 'full', true)
     },
 
     dispose() {
@@ -460,6 +505,7 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
       controller = undefined
       requestPending = false
       listeners.clear()
+      clearSnapshots()
     },
   }
 }

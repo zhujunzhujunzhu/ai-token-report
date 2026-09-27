@@ -12,5 +12,5 @@
     "jsx": "react-jsx",
     "types": ["bun"]
   },
-  "include": ["src/client/**/*.ts", "src/client/**/*.tsx", "test/client/**/*.ts", "test/client/**/*.tsx"]
+  "include": ["src/client/**/*.ts", "src/client/**/*.tsx", "test/client/**/*.ts", "test/client/**/*.tsx", "verify/verify-live-range-switch.ts"]
 }

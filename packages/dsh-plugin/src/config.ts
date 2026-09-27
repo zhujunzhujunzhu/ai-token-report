@@ -274,7 +274,7 @@ export function resolveConfig(raw: RawConfig = {}): EffectiveConfig {
       service: raw.features?.service ?? true,
       ui: raw.features?.ui ?? true,
     },
-    // ⚠️ 默认 false：宿主是 Node 时 `bun:sqlite` 不存在，开了会直接起不来
+    // Node/Bun 均已有原生 SQLite 驱动；关闭只用于排障，会让每个范围重新直扫日志。
     localDb: raw.localDb ?? envBool(ENV.localDb) ?? true,
     ui: {
       // 位置写错**回退默认值**而不是抛错；告警在 validateConfig 里（写错的配置

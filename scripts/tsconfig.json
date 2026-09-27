@@ -15,6 +15,7 @@
     "../packages/dsh-plugin/scripts/repair-profile.ts",
     "../packages/dsh-plugin/verify/verify-profile-boot.ts",
     "../packages/dsh-plugin/verify/verify-startup.ts",
+    "../packages/dsh-plugin/verify/verify-range-switch.ts",
     "../packages/cli/verify/verify-tarball.ts"
   ]
 }

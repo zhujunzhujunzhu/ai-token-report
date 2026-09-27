@@ -776,3 +776,135 @@ describe('按需详情与慢探针', () => {
     store.dispose()
   })
 })
+
+describe('范围快照：切回立即展示，失效后仍向宿主取数', () => {
+  function fixture(start = new Date(2026, 8, 27, 12).getTime()) {
+    let clock = start
+    let gen = 1
+    const { impl, urls } = fakeFetch(url => {
+      const params = new URL(`http://host${url}`).searchParams
+      const view = params.get('view')
+      return { body: payloadBody({ period: params.get('period'), rangeLabel: params.get('since') ?? params.get('period'),
+        gen, view, scannedAt: clock, ...(view === 'detail' ? {
+          pagination: { by: params.get('by'), page: Math.min(3, Number(params.get('page'))), pageSize: 10, totalRows: 30 },
+        } : {}) }) }
+    })
+    const store = createUsageStore({ fetch: impl, now: () => clock, intervalMs: 60_000 })
+    return { store, urls, advance: (ms: number) => { clock += ms }, nextGen: () => { gen++ } }
+  }
+
+  test('切回已看过的范围同步显示，取消在途请求且迟到结果不能覆盖', async () => {
+    let finish: (() => void) | undefined
+    let cancelled = false
+    let calls = 0
+    const store = createUsageStore({ fetch: async (url, init) => {
+      calls++
+      if (url.includes('period=year')) {
+        init?.signal?.addEventListener('abort', () => { cancelled = true }, { once: true })
+        await new Promise<void>(resolve => { finish = resolve })
+        return { ok: true, status: 200, json: async () => payloadBody({ period: 'year', gen: 2 }) }
+      }
+      return { ok: true, status: 200, json: async () => payloadBody() }
+    } })
+    try {
+      store.subscribe(() => {})
+      await settle()
+      const today = store.getSnapshot().data
+      store.setPeriod('year')
+      store.setPeriod('today')
+      expect(store.getSnapshot().data).toBe(today)
+      expect(store.getSnapshot().refreshing).toBe(false)
+      expect(cancelled).toBe(true)
+      expect(calls).toBe(2)
+      finish?.()
+      await settle()
+      expect(store.getSnapshot().data).toBe(today)
+    } finally { finish?.(); store.dispose() }
+  })
+
+  for (const reason of ['ttl', 'midnight', 'generation', 'refresh'] as const) {
+    test(`${reason} 失效后不复用旧范围快照`, async () => {
+      const f = fixture(reason === 'midnight' ? new Date(2026, 8, 27, 23, 59, 59).getTime() : undefined)
+      try {
+        f.store.subscribe(() => {})
+        await settle()
+        f.store.setPeriod('month')
+        await settle()
+        if (reason === 'ttl') f.advance(30_001)
+        if (reason === 'midnight') f.advance(2000)
+        if (reason === 'generation') {
+          f.nextGen()
+          f.store.setPeriod('year')
+          await settle()
+        }
+        if (reason === 'refresh') { f.store.refresh(); await settle() }
+        const before = f.urls.length
+        f.store.setPeriod('today')
+        expect(f.urls.length).toBe(before + 1)
+        expect(f.store.getSnapshot().refreshing).toBe(true)
+        await settle()
+        expect(f.store.getSnapshot().data?.period).toBe('today')
+      } finally { f.store.dispose() }
+    })
+  }
+
+  test('自定义范围、维度、页码分别缓存，宿主钳位后的实际页码可复用', async () => {
+    const f = fixture()
+    try {
+      f.store.subscribe(() => {})
+      await settle()
+      f.store.acquireDetails()
+      await settle()
+      f.store.setDetail('session', 99)
+      await settle()
+      f.store.setDetail('provider')
+      await settle()
+      const before = f.urls.length
+      f.store.setDetail('session', 3)
+      expect(f.urls.length).toBe(before)
+      expect(f.store.getSnapshot().data?.pagination).toEqual({ by: 'session', page: 3, pageSize: 10, totalRows: 30 })
+      f.store.setCustomRange({ since: '2026-09-01', until: '2026-09-05' })
+      await settle()
+      f.store.setCustomRange({ since: '2026-09-10', until: '2026-09-15' })
+      await settle()
+      const customCount = f.urls.length
+      f.store.setCustomRange({ since: '2026-09-01', until: '2026-09-05' })
+      expect(f.urls.length).toBe(customCount)
+      expect(f.store.getSnapshot().data?.rangeLabel).toBe('2026-09-01')
+      expect(f.store.getSnapshot().detail?.page).toBe(1)
+    } finally { f.store.dispose() }
+  })
+
+  test('连续查看大量自定义范围后淘汰旧快照，保留最近访问范围', async () => {
+    const f = fixture()
+    try {
+      for (let i = 0; i < 35; i++) {
+        const day = new Date(Date.UTC(2026, 0, i + 1)).toISOString().slice(0, 10)
+        f.store.setCustomRange({ since: day, until: day })
+        await settle()
+      }
+      const before = f.urls.length
+      f.store.setCustomRange({ since: '2026-02-03', until: '2026-02-03' })
+      expect(f.urls.length).toBe(before)
+      f.store.setCustomRange({ since: '2026-01-01', until: '2026-01-01' })
+      expect(f.urls.length).toBe(before + 1)
+    } finally { f.store.dispose() }
+  })
+
+  test('范围缓存不能推迟兜底查询，否则外部日志变更会一直不可见', async () => {
+    let clock = 1000
+    const { impl, urls } = fakeFetch(url => ({ body: payloadBody({ period: new URL(`http://host${url}`).searchParams.get('period') }) }))
+    const store = createUsageStore({ fetch: impl, now: () => clock, intervalMs: 5, fullIntervalMs: 100 })
+    try {
+      store.subscribe(() => {})
+      await settle()
+      store.setPeriod('month')
+      await settle()
+      clock += 101
+      store.setPeriod('today')
+      const before = urls.length
+      await Bun.sleep(20)
+      expect(urls.slice(before).some(url => !url.includes('gen='))).toBe(true)
+    } finally { store.dispose() }
+  })
+})
