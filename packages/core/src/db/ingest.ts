@@ -28,6 +28,7 @@
  */
 
 import type { Database } from './driver.js'
+import { Buffer } from 'node:buffer'
 import { basename, dirname } from 'node:path'
 
 import { scanIncremental, listSessionFiles, listSessionFilesFromPaths, sessionLogVersion, SESSION_SCAN_REVISION,
@@ -731,64 +732,88 @@ export async function insertAttributedRecordsInTransaction(
       throw new Error('MySQL 上报事务要求 STRICT_ALL_TABLES 或 STRICT_TRANS_TABLES，拒绝可能截断原始事件的写入')
     }
   }
-  const sql = `INSERT INTO ${EVENT_TABLE}
-     (event_id, session_id, seq, ts, provider, model, cwd,
-      user_id, user_name, dept,
-      input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-      reasoning_tokens, turn, step, member_id, department_id, report_token_id, received_at_ms)
-     VALUES ($eventId, $sessionId, $seq, $ts, $provider, $model, $cwd,
-             $userId, $userName, $dept,
-             $input, $output, $cacheRead, $cacheWrite,
-             $reasoning, $turn, $step, $memberId, $departmentId, $tokenId, $receivedAtMs)`
-
   let inserted = 0
   let duplicates = 0
-  // 归属在整批里是同一个值：先在事务外算好，避免每行重复 ?? 判断
-  const userId = owner.userId
-  const userName = owner.userName ?? owner.userId
-  const dept = owner.dept ?? null
+  const identity = [owner.userId, owner.userName ?? owner.userId, owner.dept ?? null]
+  const attribution = [owner.memberId ?? null, owner.departmentId ?? null,
+    owner.tokenId ?? null, owner.receivedAtMs ?? null]
 
-  // ★ 整批一个事务（与迁移前一致）：两种后端都支持事务，
-  //   半批写入会让客户端重试时多一次无谓的往返，也让「这一批到底进没进」
-  //   在排障时变得难以回答。
-  for (const rec of records) {
+  async function writeBatch(rows: AttributedValues[]): Promise<void> {
+    // 多行失败先撤销整个块，再逐条确认幂等。不能把「请求数 - changes」当重复，
+    // 也不能预查已有 event_id 后跳过 INSERT：那会绕过原有字段/FK/CHECK 的校验。
+    // 保存点覆盖 SQLite FAIL 触发器可能留下的前半块，避免重试误报为旧重复。
+    if (rows.length > 1) await store.exec('SAVEPOINT atr_usage_batch')
     try {
-      const result = await store.run(sql, {
-        $eventId: rec.event_id,
-        $sessionId: rec.session_id,
-        $seq: rec.seq,
-        $ts: rec.ts,
-        $provider: rec.provider,
-        $model: rec.model,
-        $cwd: rec.cwd,
-        $userId: userId,
-        $userName: userName,
-        $dept: dept,
-        $input: rec.input_tokens,
-        $output: rec.output_tokens,
-        $cacheRead: rec.cache_read_tokens,
-        $cacheWrite: rec.cache_write_tokens,
-        $reasoning: rec.reasoning_tokens,
-        $turn: rec.turn,
-        $step: rec.step,
-        $memberId: owner.memberId ?? null,
-        $departmentId: owner.departmentId ?? null,
-        $tokenId: owner.tokenId ?? null,
-        $receivedAtMs: owner.receivedAtMs ?? null,
-      })
-      if (result.changes !== 1) throw new Error('上报 INSERT 未写入恰好一条事件，拒绝确认投递')
-      inserted++
+      // 大块使用位置绑定，避免 SQLite 为数千个具名参数查索引及反复复制对象。
+      // undefined 仍由 driver.ts / mysql.ts 统一归一为 null，不能在这里另建规则。
+      const result = await store.run(attributedInsertSql(rows.length), rows.flat())
+      if (result.changes !== rows.length) throw new Error('上报 INSERT 写入事件数与请求数不符，拒绝确认投递')
+      if (rows.length > 1) await store.exec('RELEASE SAVEPOINT atr_usage_batch')
+      inserted += rows.length
     } catch (error) {
-        // 🚨 仅主键重投算幂等；IGNORE 会把外键/CHECK 失败也吞成成功投递。
-        const message = error instanceof Error ? error.message : String(error)
-        const detail = error as { errno?: number; code?: string }
-        const duplicate = store.kind === 'sqlite'
-          ? /UNIQUE constraint failed: usage_event\.event_id(?:$|\s)/.test(message)
-          : (detail.errno === 1062 || detail.code === 'ER_DUP_ENTRY' || /Duplicate entry/.test(message)) && /(?:usage_event\.)?PRIMARY['`]/.test(message)
-        if (!duplicate) throw error
-        duplicates++
+      if (rows.length > 1) {
+        // 回滚失败时直接上抛，由外层事务终止；不能在状态不明的连接上继续确认投递。
+        await store.exec('ROLLBACK TO SAVEPOINT atr_usage_batch')
+        await store.exec('RELEASE SAVEPOINT atr_usage_batch')
+      }
+      if (!isEventIdDuplicate(store, error)) throw error
+      if (rows.length === 1) { duplicates++; return }
+      // 只对含重复的块回退逐行。全量重投时二分会产生近 2N 次失败 INSERT，
+      // 逐行回退则只多一次块失败，避免 CLI/插件同时上报把幂等路径放大成瓶颈。
+      for (const row of rows) await writeBatch([row])
     }
   }
 
+  let rows: AttributedValues[] = []
+  let bytes = 0
+  // SQLite 无网络往返，使用小块保持兼容旧参数上限；MySQL 加大块减少往返。
+  const batchRows = store.kind === 'mysql' ? 200 : 40
+  for (const rec of records) {
+    const values: AttributedValues = [rec.event_id, rec.session_id, rec.seq, rec.ts,
+      rec.provider, rec.model, rec.cwd, ...identity,
+      rec.input_tokens, rec.output_tokens, rec.cache_read_tokens, rec.cache_write_tokens,
+      rec.reasoning_tokens, rec.turn, rec.step, ...attribution]
+    // 字符串按 UTF-8 字节计算，额外预留占位符和协议开销；只保留当前块的绑定值。
+    const rowBytes = values.reduce<number>((sum, value) =>
+      sum + (typeof value === 'string' ? Buffer.byteLength(value, 'utf8') : 8) + 24, 0)
+    if (rows.length > 0 && (rows.length >= batchRows || bytes + rowBytes > ATTRIBUTED_BATCH_BYTES)) {
+      await writeBatch(rows)
+      rows = []
+      bytes = 0
+    }
+    rows.push(values)
+    bytes += rowBytes
+  }
+  if (rows.length > 0) await writeBatch(rows)
+
   return { inserted, duplicates }
+}
+
+type AttributedValues = (string | number | null | undefined)[]
+const ATTRIBUTED_COLUMNS = ['event_id', 'session_id', 'seq', 'ts', 'provider', 'model', 'cwd',
+  'user_id', 'user_name', 'dept', 'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens',
+  'reasoning_tokens', 'turn', 'step', 'member_id', 'department_id', 'report_token_id', 'received_at_ms']
+// SQLite 每条最多 840 个参数（低于旧版 999），MySQL 最多 4,200（低于 65,535）。
+// 512 KiB 是批量目标而不是新接收上限：原协议允许的单条大记录独立写入，绝不截断。
+const ATTRIBUTED_BATCH_BYTES = 512 * 1024
+const attributedSqlCache = new Map<number, string>()
+
+function attributedInsertSql(rows: number): string {
+  let sql = attributedSqlCache.get(rows)
+  if (sql === undefined) {
+    const rowValues = `(${ATTRIBUTED_COLUMNS.map(() => '?').join(',')})`
+    const values = Array.from({ length: rows }, () => rowValues).join(',')
+    sql = `INSERT INTO ${EVENT_TABLE} (${ATTRIBUTED_COLUMNS.join(',')}) VALUES ${values}`
+    attributedSqlCache.set(rows, sql)
+  }
+  return sql
+}
+
+function isEventIdDuplicate(store: PortalStore, error: unknown): boolean {
+  // 🚨 仅主键重投算幂等；其他唯一键、外键、CHECK 和字段截断都必须导致整批回滚。
+  const message = error instanceof Error ? error.message : String(error)
+  const detail = error as { errno?: number; code?: string } | null
+  return store.kind === 'sqlite'
+    ? /UNIQUE constraint failed: usage_event\.event_id(?:$|\s)/.test(message)
+    : (detail?.errno === 1062 || detail?.code === 'ER_DUP_ENTRY' || /Duplicate entry/.test(message)) && /for key ['`](?:usage_event\.)?PRIMARY['`]\s*$/.test(message)
 }

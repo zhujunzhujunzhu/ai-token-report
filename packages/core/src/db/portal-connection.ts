@@ -11,7 +11,7 @@ export interface PortalStore {
   readonly label: string
   all<Row = unknown>(sql: string, params?: Record<string, unknown>): Promise<Row[]>
   get<Row = unknown>(sql: string, params?: Record<string, unknown>): Promise<Row | null>
-  run(sql: string, params?: Record<string, unknown>): Promise<{ changes: number }>
+  run(sql: string, params?: Record<string, unknown> | unknown[]): Promise<{ changes: number }>
   exec(sql: string): Promise<void>
   transaction<T>(fn: (tx: PortalStore) => Promise<T>): Promise<T>
   withConnection<T>(fn: (connection: PortalStore) => Promise<T>): Promise<T>
@@ -87,7 +87,7 @@ export class SqlitePortalStore implements PortalStore {
   get<Row>(sql: string, params?: Record<string, unknown>): Promise<Row | null> {
     return this.perform(() => this.db.query<Row>(sql).get(params as never) ?? null)
   }
-  run(sql: string, params?: Record<string, unknown>): Promise<{ changes: number }> {
+  run(sql: string, params?: Record<string, unknown> | unknown[]): Promise<{ changes: number }> {
     return this.perform(() => ({ changes: Number(this.db.query(sql).run(params as never).changes) }))
   }
   exec(sql: string): Promise<void> { return this.perform(() => this.db.exec(sql)) }
@@ -115,7 +115,7 @@ class MysqlPortalStore implements PortalStore {
   constructor(readonly backend: MysqlBackend, readonly label: string) {}
   all<Row>(sql: string, params?: Record<string, unknown>): Promise<Row[]> { return this.backend.all(sql, params as never) }
   get<Row>(sql: string, params?: Record<string, unknown>): Promise<Row | null> { return this.backend.get(sql, params as never) }
-  run(sql: string, params?: Record<string, unknown>): Promise<{ changes: number }> { return this.backend.run(sql, params as never) }
+  run(sql: string, params?: Record<string, unknown> | unknown[]): Promise<{ changes: number }> { return this.backend.run(sql, params as never) }
   exec(sql: string): Promise<void> { return this.backend.exec(sql) }
   transaction<T>(fn: (tx: PortalStore) => Promise<T>): Promise<T> {
     return this.backend.transaction((tx) => fn(new MysqlPortalStore(tx, this.label)))
