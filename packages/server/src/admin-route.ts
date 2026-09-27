@@ -10,6 +10,7 @@
  * | POST | `/api/v1/admin/members/update` | 改姓名 / 部门 / 角色（token 不变） |
  * | POST | `/api/v1/admin/members/rotate` | 重置 token（旧 token 立即失效） |
  * | POST | `/api/v1/admin/members/revoke` | 吊销（本人此后无法上报与看看板） |
+ * | POST | `/api/v1/admin/members/appkey` | ★ 签发 appKey（范围固定为上报 + 获取统计） |
  *
  * 响应结构来自 `shared/src/protocol.ts`，前端与之共用。
  * 请求体的**形状校验**来自 `shared/src/schemas.ts`（zod，走子路径
@@ -49,7 +50,7 @@ import {
   parsePortalBody,
   portalCreateMemberSchema, portalUpdateMemberSchema, portalMemberRolesSchema, portalMemberStatusSchema,
   portalLoginAccountSchema, portalLoginStatusSchema, portalIssueTokenSchema, portalTokenVersionSchema,
-  portalTokenScopesSchema, portalCreateDepartmentSchema, portalUpdateDepartmentSchema, portalDepartmentStatusSchema,
+  portalTokenScopesSchema, portalIssueAppKeySchema, portalCreateDepartmentSchema, portalUpdateDepartmentSchema, portalDepartmentStatusSchema,
 } from '@ai-token-report/shared/schemas'
 
 import type { CredentialStore } from './credentials.js'
@@ -219,6 +220,9 @@ export class DatabaseAdminRoute {
       'POST members/login/status': 'accounts:manage', 'GET members/tokens': 'tokens:manage',
       'POST members/tokens': 'tokens:manage', 'POST members/tokens/rotate': 'tokens:manage',
       'POST members/tokens/revoke': 'tokens:manage', 'POST members/tokens/scopes': 'tokens:manage',
+      // ★ appKey 的权限范围由服务端固定（见 `issueAppKey`），但它们仍然是
+      //   「签凭证」这件事，所以与其它签发动作共用同一个权限。
+      'POST members/appkey': 'tokens:manage',
       'GET roles': 'roles:read', 'GET departments': 'departments:read',
       'POST departments': 'departments:manage', 'POST departments/update': 'departments:manage',
       'POST departments/status': 'departments:manage', 'GET audit': 'audit:read', 'GET storage': 'members:read',
@@ -270,6 +274,7 @@ export class DatabaseAdminRoute {
         case 'POST members/login': return mutate(parsePortalBody(portalLoginAccountSchema, body), input => r.setLogin(actor, input))
         case 'POST members/login/status': return mutate(parsePortalBody(portalLoginStatusSchema, body), input => r.setLoginStatus(actor, input))
         case 'POST members/tokens': return mutate(parsePortalBody(portalIssueTokenSchema, body), input => r.issueToken(actor, input))
+        case 'POST members/appkey': return mutate(parsePortalBody(portalIssueAppKeySchema, body), input => r.issueAppKey(actor, input))
         case 'POST members/tokens/rotate': return mutate(parsePortalBody(portalTokenVersionSchema, body), input => r.rotateToken(actor, input))
         case 'POST members/tokens/revoke': return mutate(parsePortalBody(portalTokenVersionSchema, body), input => r.revokeToken(actor, input))
         case 'POST members/tokens/scopes': return mutate(parsePortalBody(portalTokenScopesSchema, body), input => r.setTokenScopes(actor, input))

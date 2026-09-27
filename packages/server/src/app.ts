@@ -270,7 +270,7 @@ export function createApp(deps: AppDeps): Hono {
     for (const path of [
       'members', 'members/update', 'members/roles', 'members/status', 'members/login',
       'members/login/status', 'members/tokens', 'members/tokens/rotate', 'members/tokens/revoke',
-      'members/tokens/scopes', 'departments', 'departments/update', 'departments/status',
+      'members/tokens/scopes', 'members/appkey', 'departments', 'departments/update', 'departments/status',
       'legacy-attributions/confirm',
     ]) app.post(`/api/v1/admin/${path}`, c => dispatch(c, path))
   } else if (deps.adminRoute) {

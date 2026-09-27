@@ -132,6 +132,21 @@ try {
   equal((await request(a, 'stats/overview?member_id=' + first.member_id)).status, 400, '新筛选不能隐式切换旧视图')
   equal((await request(a, 'stats/overview?identity_view=member&user=同名成员')).status, 400, '旧筛选不能混入新视图')
   equal((await request(a, 'stats/overview?identity_view=member&legacy_user=legacy:_w')).status, 400, '损坏UTF8历史键拒绝')
+  // ── ★ appKey：插件面板只填 baseUrl + appKey，权限只有「上报 + 获取统计」 ──
+  const appKeyMember = (await request(a, 'admin/members', adminToken, { name: 'appKey 成员', role_ids: [memberRole], department_id: dept.department_id })).data.member
+  const appKeyIssue = await request(a, 'admin/members/appkey', adminToken, { member_id: appKeyMember.member_id })
+  equal(appKeyIssue.status, 200, 'appKey 发放成功')
+  equal(appKeyIssue.data.token.scopes, ['stats:read', 'usage:write'], 'appKey 权限恰好是上报与取数两项')
+  equal(appKeyIssue.data.token.label, '上报 appKey', 'appKey 有固定的用途标签')
+  equal((await request(a, 'admin/members/appkey', adminToken, { member_id: appKeyMember.member_id, scopes: ['members:manage'] })).status, 400, 'appKey 不接受更宽的权限范围')
+  const appKeySecret = appKeyIssue.data.token_secret
+  const appKeyIdentity = (await request(b, 'identity/verify', appKeySecret, {})).data
+  equal([appKeyIdentity.ok, appKeyIdentity.name, appKeyIdentity.member_id, appKeyIdentity.role],
+    [true, 'appKey 成员', appKeyMember.member_id, 'member'], '插件只填 appKey 也能拿到服务端署名')
+  equal((await request(b, 'token-usage', appKeySecret, payload('v4:appkey'))).data, { accepted: 1, duplicates: 0, rejected: 0 }, 'appKey 可上报')
+  equal((await request(b, 'stats/overview?identity_view=member')).status, 200, 'appKey 可获取统计信息')
+  equal((await request(b, 'admin/members', appKeySecret)).status, 403, 'appKey 不能进管理面')
+  equal((await request(b, `admin/members/tokens?member_id=${appKeyMember.member_id}`, appKeySecret)).status, 403, 'appKey 不能查看或签发凭证')
   await a.stop()
   a = await start()
   equal((await request(a, 'identity/verify', secondIssue.data.token_secret, {})).data.member_id, second.member_id, '重启后凭证仍有效')

@@ -3,7 +3,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { openPortalStore, type PortalStore, type PortalTarget } from '@ai-token-report/core/db'
 import { hashPassword, normalizeUsername, passwordError, usernameError } from '../auth/password.js'
 import type { CredentialInput } from '../credentials.js'
-import type { PortalMember, PortalRole, PortalDepartment, PortalReportToken, PortalAuditResponse, PortalStorageResponse, PortalLegacyAttribution } from '@ai-token-report/shared'
+import { APP_KEY_LABEL, APP_KEY_SCOPES, type PortalMember, type PortalRole, type PortalDepartment, type PortalReportToken, type PortalAuditResponse, type PortalStorageResponse, type PortalLegacyAttribution } from '@ai-token-report/shared'
 import { ADMIN_ROLE_ID, MEMBER_ROLE_ID, DEFAULT_SCOPES, RECOVERY_PERMISSIONS, PERMISSIONS, IdentityError, requirePermission, subset, str, num, textField, idField, listField, displayName, type Principal, type Row, type MutationInput } from './types.js'
 
 export const digest = (value: string): string => createHash('sha256').update(value).digest('hex')
@@ -71,7 +71,16 @@ export class IdentityRepository {
     const registered = await this.isRegistered()
     if (!registered) return { ok: false, registered, reason: '服务端尚未配置任何凭证，请让管理员先发放 token' }
     const p = await this.resolveBearer(secret)
-    if (!p || !p.permissions.includes('identity:read')) return { ok: false, registered, reason: 'token 无效，请向管理员确认' }
+    // ★ 认的是「能署名的凭证」：`identity:read`（专门用来核对身份）
+    //   或 `usage:write`（上报凭证 appKey）。
+    //   ⚠️ 后者不是放宽边界：上报凭证按定义就是「以某人的名义写入用量」，
+    //      而本接口是**纯查询**且只回调用者自己的姓名/部门 ——
+    //      归属仍然只来自 token 在服务端的解析结果，客户端提交的姓名照旧被忽略。
+    //      反面理由同样硬：appKey 刻意只有「上报 + 统计」两项接口权限
+    //      （`APP_KEY_SCOPES`），若这里只认 `identity:read`，插件面板填完
+    //      appKey 就永远拿不到自己的署名，用户看到的是「Key 无效」。
+    const canVerify = p !== null && (p.permissions.includes('identity:read') || p.permissions.includes('usage:write'))
+    if (!canVerify) return { ok: false, registered, reason: 'token 无效，请向管理员确认' }
     return { ok: true, registered, name: p.name, member_id: p.memberId, role: p.roleCodes.includes('admin') ? 'admin' as const : 'member' as const, ...(p.dept ? { dept: p.dept } : {}) }
   }
   async getViewer(actor: Principal) {
@@ -401,11 +410,31 @@ export class IdentityRepository {
     const memberId = idField(input, 'member_id'), label = displayName(textField(input, 'label'), 128)
     const codes = input.scopes === undefined ? DEFAULT_SCOPES : listField(input, 'scopes')
     const expires = input.expires_at_ms ?? null
+    return this.issueWithScopes(actor, 'token.issue', memberId, label, codes, expires as number | null)
+  }
+
+  /**
+   * ★ 签发 appKey —— 供插件 / CLI 上报用的窄凭证。
+   *
+   * 🚨 **权限范围由服务端固定为 `APP_KEY_SCOPES`（上报 + 获取统计）**，
+   *   不从请求体读。若照 `issueToken` 那样接受 `scopes`，那么「页面上只能选两项」
+   *   就只是 UI 约定：一个手工请求就能签出带 `members:manage` 的 appKey，
+   *   而它在列表里长得和正常的 appKey 一模一样。
+   */
+  async issueAppKey(actor: Principal, input: MutationInput) {
+    const memberId = idField(input, 'member_id')
+    const label = input.label === undefined ? APP_KEY_LABEL : displayName(textField(input, 'label'), 128)
+    const expires = input.expires_at_ms ?? null
+    return this.issueWithScopes(actor, 'appkey.issue', memberId, label, [...APP_KEY_SCOPES], expires as number | null)
+  }
+
+  /** 签发共同路径：有效期校验 → 重鉴权与授权 → 写库 → 一次性返回明文。 */
+  private async issueWithScopes(actor: Principal, action: string, memberId: string, label: string, codes: string[], expires: number | null) {
     if (expires !== null && (!Number.isSafeInteger(expires) || Number(expires) <= this.now())) throw new IdentityError(400, '凭证有效期需要是未来时间')
-    return this.mutate(actor, 'tokens:manage', 'token.issue', 'member', memberId, async (tx, fresh) => {
+    return this.mutate(actor, 'tokens:manage', action, 'member', memberId, async (tx, fresh) => {
       await this.grantScopes(tx, fresh, memberId, codes)
       const secret = 'atr-' + randomSecret()
-      return { ok: true as const, token: await this.insertToken(tx, memberId, secret, label, codes, expires as number | null), token_secret: secret }
+      return { ok: true as const, token: await this.insertToken(tx, memberId, secret, label, codes, expires), token_secret: secret }
     })
   }
   private async checkedToken(tx: PortalStore, input: MutationInput): Promise<PortalReportToken> {

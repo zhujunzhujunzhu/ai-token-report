@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { IdentityRepository, ADMIN_ROLE_ID, MEMBER_ROLE_ID, PERMISSIONS, RECOVERY_PERMISSIONS, IdentityError, importCredentialFile, type Principal, type BootstrapOptions } from '../src/identity/index.js'
+import { APP_KEY_LABEL, APP_KEY_SCOPES } from '@ai-token-report/shared'
 import { DatabasePortalAuth } from '../src/identity/portal-auth.js'
 import { hashPassword } from '../src/auth/password.js'
 import { openDb, ensureSchema, migratePortalDatabase } from '@ai-token-report/core/db'
@@ -91,6 +92,27 @@ describe('数据库权威身份', () => {
     expect(await r.resolveBearer(token.token_secret)).toBeNull()
     expect((await r.resolveBearer(rotated.token_secret))?.memberId).toBe(a.member_id)
     expect((await r.verifyIdentity(rotated.token_secret)).name).toBe('新姓名')
+  })
+  test('★ appKey 只签发「上报 + 获取统计」两项权限，且仍能核对自己是谁', async () => {
+    const { repository: r, admin } = await fixture()
+    const a = await member(r, admin, '领 appKey 的人')
+    const issued = await r.issueAppKey(admin, { member_id: a.member_id })
+    // 范围由服务端固定（按权限码排序返回），请求体里给不出别的
+    expect(issued.token!.scopes).toEqual([...APP_KEY_SCOPES].sort())
+    expect(issued.token!.label).toBe(APP_KEY_LABEL)
+    const p = (await r.resolveBearer(issued.token_secret))!
+    expect(p.permissions).toEqual([...APP_KEY_SCOPES].sort())
+    // ★ 上报凭证按定义就是「以某人的名义写入用量」，所以它必须能问「我是谁」——
+    //   否则插件面板填完 appKey 只会看到「Key 无效」（appKey 里没有 identity:read）
+    expect(await r.verifyIdentity(issued.token_secret)).toMatchObject({ ok: true, name: '领 appKey 的人' })
+    // 但管理面照旧进不去：appKey 不是后台登录凭证
+    await expect(r.listMembers(p)).rejects.toMatchObject({ status: 403 })
+    await expect(r.listTokens(p, a.member_id)).rejects.toMatchObject({ status: 403 })
+    // 签发要 tokens:manage；普通成员自己的 appKey 也不行
+    const plain = await member(r, admin, '普通成员')
+    const plainToken = await r.issueToken(admin, { member_id: plain.member_id, label: '普通' })
+    await expect(r.issueAppKey((await r.resolveBearer(plainToken.token_secret))!, { member_id: plain.member_id }))
+      .rejects.toMatchObject({ status: 403 })
   })
   test('窄管理Token不能经签发、轮换、角色或密码绕过scope', async () => {
     const { repository: r, admin } = await fixture()
