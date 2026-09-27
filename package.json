@@ -1,7 +1,7 @@
 {
   "name": "ai-token-report",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "type": "module",
   "description": "DSH token 用量统计平台：CLI + 本地页面 + 部门看板 + DSH 插件",
   "workspaces": [
