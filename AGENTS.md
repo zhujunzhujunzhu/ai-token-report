@@ -95,7 +95,7 @@ bun run --filter '@ai-token-report/web-portal' verify
 | `packages/cli` | **命令入口**：`cli.ts` / `deliver.ts` / `report.ts` |
 | `packages/server` | 上报接收 + 本地直查 + 部门统计 + **数据库身份、账号、会话与人员管理** + 静态托管 |
 | `packages/web-local` | 本地页面（`/api/local/*`） |
-| `packages/web-portal` | 部门看板：人员排行 / 趋势 / 分布 / 明细 / 诊断 + **人员管理页（按权限）**，后台账号登录，数据来自 `/api/v1/stats/*` 与 `/api/v1/admin/members*` |
+| `packages/web-portal` | 部门看板：人员排行 / 趋势 / 分布 / 明细 / 诊断 + **人员管理页（按权限）** + **appKey 发放页**，后台账号登录，数据来自 `/api/v1/stats/*` 与 `/api/v1/admin/members*` |
 | `packages/dsh-plugin` | DSH 插件：实时上报 + `token_usage` 工具 + `ctx.tokenReport` 服务 + **界面用量面板（宿主半 + 浏览器半）**。见其 `README.md` |
 
 > 迁移期旧目录（`dsh-token-stats/`、`p0-verify/`）**已删除**。
@@ -186,6 +186,13 @@ bun run --filter '@ai-token-report/web-portal' verify
   绝不回显客户端提交的内容。改动此处等于打开冒用身份的口子。
 - **🚨 权限来自数据库角色关系；Bearer 权限还须与 Token scopes 取交集**。
   新上报 Token 默认仅 `identity:read` / `usage:write`，不是后台登录凭证。
+  **appKey（插件 / CLI 上报用）走独立端点 `POST /api/v1/admin/members/appkey`，
+  范围由服务端固定为 `APP_KEY_SCOPES` = `usage:write` + `stats:read`
+  （就是「上报」与「获取统计信息」两条），请求体里给不出更宽的范围**；
+  因为不含 `identity:read`，`verifyIdentity` 同时接受 `usage:write`，
+  使插件只填 appKey 就能拿到自己的服务端署名（仍然不回显客户端提交的姓名）。
+  平台「appKey 发放」页（web-portal `/appkeys`）只负责签发与**当场复制** ——
+  明文仅存于签发 / 轮换响应，库内只有摘要，关掉就找不回来。
   旧客户端兼容字段 `role: admin | member` 缺省 `member`。
   **绝不要用姓名白名单判断管理员** —— 姓名是可以随便改的显示值。
   消费方（页面 / 插件）拿到缺字段的校验响应时**必须按 `member` 处理**：

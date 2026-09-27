@@ -62,6 +62,23 @@ DSH 原生**故意匿名**：`~/.dsh/.anonymous-user-id` 是 `crypto.randomUUID(
 > ⚠️ `docs/插件方案.md` §9 里「以 `unknown` 上报并打 warning」是**已废弃的旧方案**，
 > 不要照它实现。
 
+### 两种填写面（终态：插件只填两栏）
+
+| 填写面 | 填什么 | 为什么 |
+|---|---|---|
+| **DSH 插件「上报连接」面板** | **服务端地址（baseUrl） + appKey** | 员工手上真正拿到的只有这两样；姓名/部门由服务端按 appKey 解析，上报路径由 baseUrl 推导 |
+| 本地页面（`dsh-token --web`） | 姓名 + Key + 部门（选填） | 本地页面还要兼容「显式提供 token」的 CLI 用法，暂未收敛 |
+
+- 插件面板的 appKey 就是 `identity.json` 里的 `token`（同一份文件、同一个凭证），
+  所以「在插件里填一次」对本地页与 CLI 上报同样生效。
+- 插件提交的是 `{ baseUrl, appKey }`；宿主把它换算成
+  `endpoint = baseUrl + /api/v1/token-usage`，再写回 `plugin-connection.json`
+  （`{ baseUrl, appKey }`，旧版只存 `endpoint` 的文件仍可读）。
+- **appKey 由平台「appKey 发放」页按人生成**，权限固定为
+  `usage:write` + `stats:read`（上报 + 获取统计），不含管理面。
+  正因为不含 `identity:read`，`verifyIdentity` 必须同时接受 `usage:write`
+  —— 否则插件填完 appKey 只会看到「Key 无效」。
+
 ## 身份文件
 
 ```
