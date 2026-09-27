@@ -16,7 +16,8 @@
     "start:node": "node dist/main.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "bun test",
-    "verify:mysql:node": "bun run verify/verify-mysql-node.ts"
+    "verify:mysql:node": "bun run verify/verify-mysql-node.ts",
+    "verify:ingest": "bun run verify/verify-ingest-performance.ts"
   },
   "dependencies": {
     "@ai-token-report/core": "workspace:*",

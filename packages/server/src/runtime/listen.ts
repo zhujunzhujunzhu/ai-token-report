@@ -82,7 +82,8 @@ async function tryListen(
       // 端口 0 由操作系统分配；必须回传真实端口，否则调用方得到不可连接的 URL。
       port: listeningPort,
       stop: async () => {
-        await server.stop(true)
+        // 队列已排空；继续等响应发送结束，不能 force 掐断已提交的上报确认。
+        await server.stop(false)
       },
     }
   }

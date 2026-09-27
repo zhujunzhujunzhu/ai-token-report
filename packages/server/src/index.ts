@@ -37,6 +37,7 @@ import { CredentialStore } from './credentials.js'
 import { IdentityRepository } from './identity/index.js'
 import { IdentityRoute } from './identity-route.js'
 import { IngestRoute } from './ingest-route.js'
+import { IngestQueue, type IngestQueueOptions } from './ingest-queue.js'
 import { CoreStatsProvider, LocalStatsRouter } from './local-api.js'
 import { serveWithPortRetry, type RequestHandler } from './runtime/listen.js'
 import { StatsRoute } from './stats-route.js'
@@ -45,6 +46,8 @@ export { DEFAULT_PORT, IDLE_TIMEOUT_SECONDS } from './runtime/listen.js'
 export { SERVER_VERSION } from './app.js'
 
 export interface ServerOptions {
+  /** 有界上报队列；生产默认 64 个请求（含执行中）、等待最多 5 秒。 */
+  ingestQueue?: IngestQueueOptions
   /** 后台公开源（HTTPS 反向代理时用于同源校验与 Secure Cookie）。 */
   portalOrigin?: string
   /** 首次部署的后台登录账号；密码只以哈希写入数据库。 */
@@ -157,6 +160,9 @@ export interface ServerHandle {
 
 /** 组装结果：`createServer` 与测试共用的「不起监听」那一半。 */
 export interface HandlerBundle {
+  ingestQueue: IngestQueue
+  /** 停止上报接入并排空当前队列；直接使用 handler 的调用方也应在退出时等待。 */
+  close(): Promise<void>
   /** Web 标准的请求处理器 —— 两个运行时的公共入口。 */
   handler: RequestHandler
   /** @deprecated 空兼容适配器，生产鉴权由 identityStore 完成。 */
@@ -182,6 +188,10 @@ export interface HandlerBundle {
  *   见 `test/http-contract.test.ts`。
  */
 export async function createHandlerFor(options: ServerOptions = {}): Promise<HandlerBundle> {
+  const ingestQueue = new IngestQueue({
+    maxRequests: options.ingestQueue?.maxRequests ?? envQueueInteger('ATR_INGEST_MAX_REQUESTS'),
+    maxWaitMs: options.ingestQueue?.maxWaitMs ?? envQueueInteger('ATR_INGEST_MAX_WAIT_MS'),
+  })
   const paths = resolvePaths(options.dshHome)
   const localOnly = options.enableLocalApi === true && !options.dbPath && !options.mysqlUrl && !options.adminToken && !options.adminUsername && !options.adminPassword
   if (!localOnly && options.credentialsPath) throw new Error('credentialsPath 已不再是运行时身份源，请先通过显式数据库迁移导入旧凭证文件')
@@ -234,6 +244,7 @@ export async function createHandlerFor(options: ServerOptions = {}): Promise<Han
     : null
 
   const app = createApp({
+    ingestQueue,
     portalOrigin: options.portalOrigin ?? process.env.ATR_PORTAL_ORIGIN,
     credentials,
     identityStore,
@@ -249,6 +260,8 @@ export async function createHandlerFor(options: ServerOptions = {}): Promise<Han
   })
 
   return {
+    ingestQueue,
+    close: () => ingestQueue.close(),
     // ★ 交给最外层服务器的就是这一个函数：Bun 与 Node 共用它
     //   （`Bun.serve({ fetch })` / `serve-node.ts` 的 node:http 桥接）。
     handler: (req: Request) => app.fetch(req),
@@ -282,8 +295,18 @@ export async function createServer(options: ServerOptions = {}): Promise<ServerH
     portalTargetLabel: bundle.portalTargetLabel,
     schemaVersion: bundle.identityStore ? 4 : 0,
     initialized: health?.initialized ?? false,
-    stop: () => handle.stop(),
+    stop: async () => {
+      await bundle.close()
+      await handle.stop()
+    },
   }
+}
+
+function envQueueInteger(name: string): number | undefined {
+  const value = process.env[name]
+  if (value === undefined) return undefined
+  if (!/^[1-9]\d*$/.test(value)) throw new Error(`${name} 必须是正整数`)
+  return Number(value)
 }
 
 /**

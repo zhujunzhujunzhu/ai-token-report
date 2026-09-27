@@ -56,6 +56,8 @@ import type { AdminRoute, DatabaseAdminRoute } from './admin-route.js'
 import { IdentityError, type IdentityRepository, type Principal } from './identity/index.js'
 import type { Credential } from './credentials.js'
 import type { Authentication } from './http/auth.js'
+import { authorize, authorizeDatabase } from './http/auth.js'
+import { IngestQueue, IngestQueueUnavailable } from './ingest-queue.js'
 import type { CredentialStore } from './credentials.js'
 import { readJsonBodyLenient, readJsonBodyStrict, requestBodyLimit } from './http/body.js'
 import { fail, json, methodNotAllowed as methodNotAllowedBody, msg, respond } from './http/envelope.js'
@@ -79,6 +81,7 @@ export interface AppDeps {
   credentials: CredentialStore
   identityRoute: IdentityRoute
   ingestRoute: IngestRoute
+  ingestQueue?: IngestQueue
   statsRoute: StatsRoute
   adminRoute?: AdminRoute
   /** 本地直查路由。`enableLocalApi` 为 false 时是 null。 */
@@ -97,6 +100,7 @@ export interface AppDeps {
 /** 构造应用（不起监听）。 */
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono()
+  const ingestQueue = deps.ingestQueue ?? new IngestQueue()
   const portalAuth = deps.portalAuth ?? (deps.identityStore
     ? new PortalAuth(deps.identityStore, { hmacKey: deps.captchaHmacKey })
     : new PortalAuth(deps.credentials))
@@ -134,6 +138,16 @@ export function createApp(deps: AppDeps): Hono {
   // 4) 安全响应头（默认不含 CSP，见 `secureHeaders()` 的默认值：
   //    它是一个静态 SPA，加上默认 CSP 会把内联样式/脚本挡住）
   app.use('*', secureHeaders())
+  // 必须在正文读取中间件和路由之前排队，避免 chunked 上传提前被完整读入。
+  // 等轮到消费才解析、鉴权、写入；超载的请求不持有解析后的大批事件或数据库连接。
+  app.use('/api/v1/token-usage', async (c, next) => {
+    if (c.req.method !== 'POST') return next()
+    try { await ingestQueue.run(next) }
+    catch (error) {
+      if (!(error instanceof IngestQueueUnavailable)) throw error
+      return c.json({ ok: false, reason: error.message }, 503, { 'Retry-After': '1' })
+    }
+  })
   // 5) 请求体上限：解析**之前**拦下，避免 32 MiB 的 body 先被读进内存
   app.use('*', requestBodyLimit())
   // 6) 压缩与协商缓存（S12.3）。★ 只对**非** `/api/*` 生效，理由见 `staticOnly()`。
@@ -220,6 +234,17 @@ export function createApp(deps: AppDeps): Hono {
     const parsed = await readJsonBodyStrict(c)
     if ('error' in parsed) return fail(parsed.error, 400)
     return respond(await deps.ingestRoute.submit(parsed.value, authOf(c)))
+  })
+
+  // 只暴露当前进程的计数/延迟，不返回载荷、姓名或凭证；管理权限同样与 Token scope 取交集。
+  app.get('/api/v1/admin/ingest-status', async (c) => {
+    const authentication = await portalAuthorization(c)
+    const messages = { unregistered: '服务端尚未配置身份', missingToken: '缺少身份凭证' }
+    const auth = deps.identityStore
+      ? await authorizeDatabase(deps.identityStore, authentication, 'members:read', messages)
+      : authorize(deps.credentials, typeof authentication === 'string' ? authentication : null, messages, { requireAdmin: true })
+    if (!auth.ok) return fail(auth.reason, auth.status)
+    return c.json(ingestQueue.snapshot())
   })
 
   // ── 身份校验（部门服务端）────────────────────────────────────

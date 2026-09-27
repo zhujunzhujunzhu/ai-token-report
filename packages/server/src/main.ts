@@ -115,6 +115,13 @@ ai-token-report 部门服务端
   旧 v3 库和 credentials.json 必须显式迁移，服务不会自动改写旧业务库。
   HTTPS 反向代理请配置 ATR_PORTAL_ORIGIN=https://你的域名。
   详见 docs/数据库部署与迁移.md。
+
+上报队列:
+  ATR_INGEST_MAX_REQUESTS  同时接收的上报请求数（含执行中，默认 64）。
+  ATR_INGEST_MAX_WAIT_MS   最长排队时间（毫秒，默认 5000）。
+  队列满/等待超时返回 503 + Retry-After；事务提交后才返回成功。
+  正文读取最多 10 秒、32 MiB，分别以 408/413 拒绝超限请求。
+  管理员可通过 GET /api/v1/admin/ingest-status 查看当前实例的队列状态。
 `
 
 async function main(): Promise<number> {

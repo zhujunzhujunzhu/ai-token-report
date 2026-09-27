@@ -249,6 +249,22 @@ export interface RecordsResponse {
   rows: RecordRow[]
 }
 
+/** 当前实例的入口队列观测；完成计数包含业务拒绝，不代表成功落库条数。 */
+export interface IngestQueueStatusResponse {
+  scope: 'process'
+  accepting: boolean
+  active_requests: number
+  waiting_requests: number
+  max_requests: number
+  max_wait_ms: number
+  oldest_wait_ms: number
+  completed_requests: number
+  rejected_requests: number
+  last_wait_ms: number
+  last_processing_ms: number
+  last_completed_at: number | null
+}
+
 /**
  * 数据质量诊断。
  *
