@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { zstdCompressSync } from 'node:zlib'
 
 import type { SessionTelemetryRecord } from '@deepseek-ai/dsh-session-telemetry'
 
@@ -141,6 +142,44 @@ function okResponse(accepted = 1): Response {
     headers: { 'Content-Type': 'application/json' },
   })
 }
+
+test('启用插件后自动补报未打开的历史会话，诊断可读且停机终止线程', async () => {
+  signIdentity()
+  const sessionDir = join(home, 'sessions', 'project', 'unopened-history')
+  mkdirSync(sessionDir, { recursive: true })
+  writeFileSync(join(sessionDir, 'session.v3.jsonl.zstd'), zstdCompressSync(Buffer.from(JSON.stringify({
+    type: 'assistant/message', seq: 7, time: 1_700_000_000_000,
+    data: { usage: { inputTokens: 3, outputTokens: 2, cacheReadTokens: 90, cacheWriteTokens: 5 },
+      message: { source: { provider: 'p', model: 'm' }, content: '不得上报的正文' } },
+  }) + '\n')))
+  const received: Record<string, unknown>[] = []
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, idleTimeout: 120,
+    async fetch(request) {
+      const body = await request.json() as { records: Record<string, unknown>[] }
+      received.push(...body.records)
+      return okResponse(body.records.length)
+    },
+  })
+  const fake = fakeCtx()
+  const { backend } = apply(fake.ctx, { dshHome: home, appKey: 'tok-abc',
+    endpoint: `http://127.0.0.1:${server.port}/api/v1/token-usage` })
+  try {
+    expect(backend).not.toBeNull()
+    const deadline = Date.now() + 8000
+    while (backend!.backfillStats().status !== 'complete' && Date.now() < deadline) await Bun.sleep(20)
+    expect(backend!.backfillStats().status).toBe('complete')
+    expect(backend!.backfillStats().confirmed).toBe(1)
+    expect(received).toHaveLength(1)
+    expect(received[0]).toMatchObject({ event_id: 'unopened-history:7', input_tokens: 3,
+      output_tokens: 2, cache_read_tokens: 90, cache_write_tokens: 5, total_tokens: 100 })
+    expect(JSON.stringify(received)).not.toContain('不得上报的正文')
+    expect(backend!.reporterStats.enqueued).toBe(0)
+  } finally {
+    await backend?.shutdown()
+    server.stop(true)
+  }
+  expect(backend!.backfillStats().status).toBe('stopped')
+}, 10_000)
 
 describe('★ 未署名 / 未配凭证 = 不上报', () => {
   test('未署名 + 配了 appKey → 不注册上报后端，也不发任何请求', async () => {

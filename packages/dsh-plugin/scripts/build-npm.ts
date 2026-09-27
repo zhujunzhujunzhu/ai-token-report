@@ -113,6 +113,7 @@ if (leaked.length > 0) {
 await writeFile(join(distDir, 'index.js'), hostText, 'utf8')
 // 与主入口同版本发布；线程内部已内联 core/shared，不依赖 workspace 包。
 await cp(join(libDir, 'stats-worker.js'), join(distDir, 'stats-worker.js'))
+await cp(join(libDir, 'backfill-worker.js'), join(distDir, 'backfill-worker.js'))
 
 // ── 5. 浏览器半：把信封 id 改成发布名 ───────────────────────────────────
 let clientText = await Bun.file(clientIn).text()
@@ -168,7 +169,7 @@ const manifest = {
     './client': { default: './client.js' },
     './package.json': './package.json',
   },
-  files: ['index.js', 'stats-worker.js', 'client.js', 'repair-profile.mjs', 'cordis.patch.yml', 'README.md', 'README.offline.md', 'screenshots'],
+  files: ['index.js', 'stats-worker.js', 'backfill-worker.js', 'client.js', 'repair-profile.mjs', 'cordis.patch.yml', 'README.md', 'README.offline.md', 'screenshots'],
   bin: { 'dsh-token-report-repair': './repair-profile.mjs' },
   // ★ 这两段是「能被 DSH 认成插件」的全部声明：bundle 决定配置树里有这一行，
   //   client 决定浏览器半挂到哪个平台、依赖哪个第一方客户端包。

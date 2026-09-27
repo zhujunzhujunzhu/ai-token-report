@@ -168,6 +168,15 @@ if (existsSync(workerPath)) {
   check('统计 Worker 没有残留 workspace 包 import', !/^\s*import[^;\n]*from\s*["']@ai-token-report\//m.test(workerText))
 }
 
+const backfillPath = join(distDir, 'backfill-worker.js')
+check('发布清单包含 backfill-worker.js', manifest.files.includes('backfill-worker.js'))
+check('历史补报 Worker 产物存在', existsSync(backfillPath))
+if (existsSync(backfillPath)) {
+  const workerText = await Bun.file(backfillPath).text()
+  check('历史补报 Worker 没有顶层 bun: import', !/^[ \t]*import[^;\n]*from[ \t]*["']bun:/m.test(workerText))
+  check('历史补报 Worker 没有残留 workspace 包 import', !/^\s*import[^;\n]*from\s*["']@ai-token-report\//m.test(workerText))
+}
+
 // 发布清单里声明的 patch 路径必须真的指向 dist 里的文件
 const declaredPatch = manifest.dsh?.bundle?.patch
 check(
@@ -349,6 +358,55 @@ try {
     check('真 Node 后台查询：空库、合成日志入库、线程复用', true,
       `node ${info['node']}, thread ${info['threadId']}, ${info['calls']} 条 / ${info['total']} tokens`)
   }
+
+  // 补报线程不依赖统计线程的 Bun 测试环境，必须用发布副本在真 Node 里走一次 HTTP。
+  const backfillProbe = `
+    import assert from 'node:assert/strict';
+    import { createServer } from 'node:http';
+    import { Worker } from 'node:worker_threads';
+    import { join } from 'node:path';
+    const home = join(${JSON.stringify(sandbox)}, 'worker-fixture');
+    const received = [];
+    const server = createServer(async (req, res) => {
+      let text = ''; for await (const chunk of req) text += chunk;
+      const body = JSON.parse(text); received.push(...body.records);
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ accepted: body.records.length, duplicates: 0, rejected: 0 }));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const worker = new Worker(new URL('./backfill-worker.js', import.meta.url), { workerData: {
+      sessionsRoot: join(home, 'sessions'),
+      config: { dshHome: home, name: 'verify-history', appKey: 'synthetic-token',
+        endpoint: 'http://127.0.0.1:' + server.address().port + '/api/v1/token-usage',
+        batch: { maxRecords: 1, flushIntervalMillis: 1000, timeoutMillis: 3000 },
+        outbox: { enabled: false, maxBytes: 1 }, features: { reporting: true } },
+      identity: { clientName: 'verify-history', claimedUserId: 'synthetic-user' },
+    }});
+    try {
+      const result = await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('历史补报线程超时')), 10000);
+        worker.on('error', error => { clearTimeout(timeout); reject(error); });
+        worker.on('message', stats => {
+          if (stats.status === 'complete') { clearTimeout(timeout); resolve(stats); }
+          if (stats.status === 'retrying') { clearTimeout(timeout); reject(new Error(stats.lastError)); }
+        });
+      });
+      assert.equal(result.confirmed, 2);
+      assert.deepEqual(received.map(r => [r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cache_write_tokens]), [[3,7,11,13],[5,17,19,23]]);
+      assert.ok(received.every(r => !('content' in r)));
+      console.log('历史补报 Node Worker → HTTP，四列逐位一致');
+    } finally {
+      await worker.terminate();
+      await new Promise(resolve => server.close(resolve));
+    }
+  `
+  const backfillProbePath = join(sandbox, 'verify-backfill-worker.mjs')
+  await Bun.write(backfillProbePath, backfillProbe)
+  const backfillRun = Bun.spawnSync([nodeBin, backfillProbePath], {
+    stdout: 'pipe', stderr: 'pipe', cwd: sandbox, env: cleanChildEnv(), timeout: 30_000,
+  })
+  check('真 Node 历史补报：独立 Worker → HTTP → 完整确认', backfillRun.exitCode === 0,
+    backfillRun.exitCode === 0 ? undefined : new TextDecoder().decode(backfillRun.stderr).split('\n').slice(0, 8).join(' / '))
 
   // 让「双份实例」这件事可观测：宿主那份 telemetry 与产物解析到的是否同一路径。
   // ⚠️ 这里只报告不断言 —— 真实安装布局由 DSH 决定，本脚本不替它做判断。

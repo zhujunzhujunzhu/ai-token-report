@@ -65,6 +65,8 @@ import {
 import { foldRecord, type FoldIdentity } from './fold.js'
 import { IdentityResolver, type IdentityState } from './identity.js'
 import { Reporter, type ReporterStats } from './reporter.js'
+import { createHistoryBackfill } from './backfill.js'
+import type { BackfillStats } from './backfill-runner.js'
 import { createSettingsHandler, withSavedConnection } from './settings.js'
 import { installUiRoute, type UiHostContext } from './ui-bridge.js'
 import type { UiRouteInstall } from './client/protocol.js'
@@ -288,6 +290,9 @@ export class TokenReportBackend extends SessionTelemetryBackend implements Backe
    */
   readonly reporterStats: (() => ReporterStats) & ReporterStats
 
+  /** 历史补报独立于实时队列；自有闭包入口可安全经 cordis 代理读取。 */
+  readonly backfillStats: () => BackfillStats
+
   /** 折叠时用的身份（自有属性，同样为了穿过代理）。 */
   readonly foldIdentity: FoldIdentity
 
@@ -326,12 +331,23 @@ export class TokenReportBackend extends SessionTelemetryBackend implements Backe
     // 把上报器的统计入口**原样**挂成自有属性（原因见上方字段注释）
     this.reporterStats = reporter.stats
 
+    const backfill = createHistoryBackfill({
+      config: options.config,
+      identity: this.foldIdentity,
+      sessionsRoot: resolvePaths(options.config.dshHome).sessionsRoot,
+      onLog: (level, message) => {
+        if (level === 'warn') ctx.logger.warn(message)
+        else ctx.logger.info(message)
+      },
+    })
+    this.backfillStats = backfill.stats
+
     // 装配捕获侧：本后端是热路径的唯一消费者。
     //
     // ⚠️ 三个回调都用**闭包里的 `reporter` / `foldIdentity`**，而不是
     //   `this.emit` / `this.#reporter` —— 因为 coordinator 拿到的是服务代理，
     //   走 `this.#x` 会炸（见字段注释）。
-    const runner = createSink(this.foldIdentity, reporter)
+    const runner = createSink(this.foldIdentity, reporter, backfill.stop)
     this.sink = runner
     new SessionTelemetryCoordinator(
       ctx as Context,
@@ -351,6 +367,12 @@ export class TokenReportBackend extends SessionTelemetryBackend implements Backe
     installRedaction(ctx)
 
     reporter.start()
+    // ★ coordinator 的 includeHistory 只回放已打开会话；磁盘全部历史由独立线程补齐。
+    // 卸载也必须停止线程，避免切换身份/上报连接后旧线程仍继续发送。
+    ctx.effect(() => {
+      backfill.start()
+      return () => { void runner.shutdown() }
+    })
     ctx.logger.info(
       `token-report: 已启用实时上报 → ${options.config.endpoint}` +
         `（身份 ${options.identity.name}，插件名 ${options.config.name}）`,
@@ -394,7 +416,7 @@ interface BackendSink {
  *   闭包捕获的状态天然免疫这个问题，而且顺带让热路径的调用链更短 ——
  *   `emit` 里只有一次纯函数折叠和一次数组 push，这正是我们想要的性质。
  */
-function createSink(foldIdentity: FoldIdentity, reporter: Reporter): BackendSink {
+function createSink(foldIdentity: FoldIdentity, reporter: Reporter, stopBackfill: () => Promise<void>): BackendSink {
   return {
     emit(record) {
       const billing = foldRecord(record, foldIdentity)
@@ -405,8 +427,8 @@ function createSink(foldIdentity: FoldIdentity, reporter: Reporter): BackendSink
     flush() {
       reporter.hintFlush()
     },
-    shutdown() {
-      return reporter.shutdown()
+    async shutdown() {
+      await Promise.all([stopBackfill(), reporter.shutdown()])
     },
   }
 }
@@ -717,6 +739,18 @@ function formatReporterDiagnostics(config: EffectiveConfig, backend: TokenReport
   if (stats.lastError) {
     lines.push(`  最近错误    ${stats.lastError}`)
   }
+  const history = backend.backfillStats()
+  const labels: Record<BackfillStats['status'], string> = {
+    idle: '等待扫描', running: '正在扫描补报', complete: '本轮已全部确认', retrying: '等待重试', stopped: '已停止',
+  }
+  lines.push('')
+  lines.push('=== 全量历史补报 ===')
+  lines.push(`  状态        ${labels[history.status]}`)
+  lines.push(`  文件进度    ${n(history.filesProcessed)} / ${n(history.filesTotal)}`)
+  lines.push(`  本进程确认  ${n(history.confirmed)} 条（新增 ${n(history.accepted)}，重复 ${n(history.duplicates)}）`)
+  lines.push(`  最近完成    ${history.lastCompletedAt ? new Date(history.lastCompletedAt).toLocaleString() : '尚未完成'}`)
+  if (history.lastError) lines.push(`  补报错误    ${history.lastError}`)
+  lines.push('  扫描全部历史会话；服务器确认后保存进度，失败自动重试。')
   return lines.join('\n')
 }
 
