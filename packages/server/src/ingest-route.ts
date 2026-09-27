@@ -49,8 +49,8 @@
  * ## 幂等：`event_id` 主键
  *
  * 同一批重发、插件与 CLI 同时上报同一条记录，都靠 `usage_event.event_id`
- * 主键 + **幂等插入**去重（SQLite `INSERT OR IGNORE` / MySQL `INSERT IGNORE`，
- * 由 `core/db/dialect.ts` 决定）—— 重复的计入 `duplicates` 而不是错误。
+ * 主键 + 普通批量 INSERT 去重；只有该主键冲突计入 `duplicates`，
+ * 其他约束错误回滚整批。不能用 IGNORE 吞掉外键/CHECK/截断等错误。
  * 这是「上报只需 at-least-once」的落点：上报方可以有很多个，不必互相协调。
  *
  * ## 两种后端
