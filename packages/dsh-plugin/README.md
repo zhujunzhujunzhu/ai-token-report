@@ -656,6 +656,11 @@ Windows 文件监听先解析真实路径，避免 8.3 短路径或目录联接�
 可在构建插件后运行 `bun run packages/dsh-plugin/verify/verify-performance.ts` 复现百万记录场景；
 `--records 100000 --sessions 100000` 可测高会话数量。脚本只创建隔离合成数据。
 
+首次扫描、CLI 初始化与 Windows 监听崩溃的修复记录见 [初始化验收](../../docs/初始化性能修复-2026-09-27.md)。
+构建发布产物后，`bun run packages/dsh-plugin/verify/verify-startup.ts` 会启动真实 DSH Web，
+验证首次取数、刷新、详情和统计期间的配置接口。可用 `--sessions-root <目录>` 显式测试
+已有日志的临时副本；不复制身份、不启用上报，结束后清理本次测试目录。
+
 #### 面板的失败模式（都是刻意不静默的）
 
 | 现象 | 原因 | 面板会显示 |
