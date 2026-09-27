@@ -140,6 +140,29 @@ describe('统计状态', () => {
     await useDashboardStore().activate('overview')
     expect(calls).toBe(0)
   })
+  test('全员排行复用候选请求，筛人后仍保留完整候选', async () => {
+    signIn()
+    const urls: URL[] = []
+    respond((raw) => {
+      const url = new URL(raw, 'http://test')
+      urls.push(url)
+      if (url.pathname.endsWith('overview')) return json(overview)
+      if (url.pathname.endsWith('series')) return json({ points: [] })
+      return json({ rows: url.searchParams.has('member_id')
+        ? [{ key: 'selected' }]
+        : [{ key: 'selected' }, { key: 'other' }] })
+    })
+    const dashboard = useDashboardStore()
+    await dashboard.activate('overview')
+    expect(urls).toHaveLength(3)
+    expect(urls.filter((url) => url.pathname.endsWith('breakdown'))).toHaveLength(1)
+    expect(dashboard.ranking).toEqual(dashboard.userOptions)
+    urls.length = 0
+    await dashboard.applyFilters({ ...dashboard.filters, users: ['selected'] })
+    expect(urls.filter((url) => url.pathname.endsWith('breakdown'))).toHaveLength(2)
+    expect(dashboard.ranking.map((row) => row.key)).toEqual(['selected'])
+    expect(dashboard.userOptions.map((row) => row.key)).toEqual(['selected', 'other'])
+  })
   test('后台刷新在前次查询未结束时不堆积请求', async () => {
     signIn()
     const first = deferred<Response>()

@@ -165,15 +165,23 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     pending = true
     if (!background) loading.value = true
     error.value = null
+    // 候选始终不带人员筛选；全员排行可复用同一请求，避免每轮重复聚合。
+    const candidates = fetchBreakdown(built.filter, 'user')
     const [ov, opts, se, rank, bd, rec, diag] = await Promise.all([
       fetchOverview(filter),
       // ★ 候选不能带人员筛选，否则选择一个人后再也选不到其他人。
-      fetchBreakdown(built.filter, 'user'),
+      candidates,
       active === 'overview' || active === 'analysis'
         ? fetchSeries(filter, granularity.value)
         : null,
-      active === 'overview' ? fetchBreakdown(filter, 'user') : null,
-      active === 'analysis' ? fetchBreakdown(filter, breakdownBy.value) : null,
+      active === 'overview'
+        ? filter.users.length ? fetchBreakdown(filter, 'user') : candidates
+        : null,
+      active === 'analysis'
+        ? breakdownBy.value === 'user' && !filter.users.length
+          ? candidates
+          : fetchBreakdown(filter, breakdownBy.value)
+        : null,
       active === 'records'
         ? fetchRecords(filter, {
             limit: PAGE_SIZE,
