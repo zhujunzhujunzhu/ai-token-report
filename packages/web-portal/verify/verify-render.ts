@@ -46,6 +46,10 @@ try {
       .provide(ID_INJECTION_KEY, { prefix: 100, current: 0 })
       .provide(ZINDEX_INJECTION_KEY, { current: 0 })
   }
+  async function render(path: string): Promise<string> {
+    const { default: component } = await server.ssrLoadModule(path)
+    return renderToString(createRenderApp(component))
+  }
   await router.push('/records')
   check('未登录访问明细回到登录页', router.currentRoute.value.name === 'login')
   check(
@@ -66,16 +70,56 @@ try {
   check('未登录无统计页面', !loginHtml.includes('人员排行'))
   check('未登录无人员数据', !loginHtml.includes('人员列表'))
 
-  session.identity = { name: '测试成员', username: 'member', role: 'member' }
+  const managementPages = [
+    { path: '/members', name: 'members', title: '人员管理' },
+    { path: '/roles', name: 'roles', title: '角色管理' },
+    { path: '/departments', name: 'departments', title: '部门管理' },
+  ]
+  for (const page of managementPages) {
+    await router.push(page.path)
+    check(`未登录访问${page.title}保留登录回跳`,
+      router.currentRoute.value.name === 'login' &&
+      router.currentRoute.value.query.redirect === page.path)
+    check(`${page.title}允许登录后回跳`, loginDestination(page.path) === page.path)
+  }
+  check('角色管理回跳保留本站查询参数', loginDestination('/roles?from=login') === '/roles?from=login')
+
+  // 目录查询权限不等于管理入口权限，尤其普通成员自带的部门只读权限。
+  const permissionCases = [
+    { label: '缺省权限成员', permissions: [], allowed: [] },
+    { label: '部门只读成员', permissions: ['departments:read'], allowed: [] },
+    { label: '人员查看者', permissions: ['members:read'], allowed: ['members'] },
+    { label: '角色查看者', permissions: ['roles:read'], allowed: ['roles'] },
+    { label: '部门管理者', permissions: ['departments:read', 'departments:manage'], allowed: ['departments'] },
+  ]
+  for (const entry of permissionCases) {
+    session.identity = { name: '测试成员', username: 'member', role: 'member', permissions: entry.permissions }
+    session.generation++
+    for (const page of managementPages) {
+      await router.push(page.path)
+      const allowed = entry.allowed.includes(page.name)
+      check(`${entry.label}${allowed ? '可进入' : '无法进入'}${page.title}`,
+        router.currentRoute.value.name === (allowed ? page.name : 'overview'))
+    }
+    const layoutHtml = await render('/src/layouts/PortalLayout.vue')
+    const navigationHtml = layoutHtml.match(/<aside\b[\s\S]*?<\/aside>/)?.[0] ?? ''
+    check(`${entry.label}管理导航遵循各自权限`, !!navigationHtml && managementPages.every((page) =>
+      navigationHtml.includes(page.title) === entry.allowed.includes(page.name)))
+  }
+  session.identity = { member_id: '00000000-0000-4000-8000-000000000001', name: '测试管理员', username: 'admin', role: 'admin', permissions: ['members:read', 'members:manage', 'departments:read', 'departments:manage', 'roles:read', 'roles:assign', 'tokens:manage'] }
   session.generation++
+  for (const page of managementPages) {
+    await router.push(page.path)
+    check(`管理员可进入${page.title}`, router.currentRoute.value.name === page.name)
+    check(`${page.title}使用独立页面标题`, router.currentRoute.value.meta.title === page.title)
+  }
   await router.push('/members')
-  check(
-    '普通成员直接访问管理页回总览',
-    router.currentRoute.value.name === 'overview',
-  )
-  session.identity = { member_id: '00000000-0000-4000-8000-000000000001', name: '测试管理员', username: 'admin', role: 'admin', permissions: ['members:read', 'members:manage', 'departments:read', 'departments:manage', 'roles:read'] }
-  await router.push('/members')
-  check('管理员可进入人员管理', router.currentRoute.value.name === 'members')
+  const layoutHtml = await render('/src/layouts/PortalLayout.vue')
+  const navigationHtml = layoutHtml.match(/<aside\b[\s\S]*?<\/aside>/)?.[0] ?? ''
+  check('管理导航依次为人员、角色、部门三个独立入口',
+    navigationHtml.indexOf('人员管理') >= 0 &&
+    navigationHtml.indexOf('人员管理') < navigationHtml.indexOf('角色管理') &&
+    navigationHtml.indexOf('角色管理') < navigationHtml.indexOf('部门管理'))
 
   const dashboard = useDashboardStore(pinia)
   dashboard.overview = {
@@ -102,10 +146,6 @@ try {
     earliestTs: null,
     latestTs: null,
     lastIngestAt: null,
-  }
-  async function render(path: string): Promise<string> {
-    const { default: component } = await server.ssrLoadModule(path)
-    return renderToString(createRenderApp(component))
   }
   const dashboardHtml = await render('/src/views/DashboardView.vue')
   for (const label of [
@@ -202,15 +242,28 @@ try {
     '管理页提供搜索与角色筛选',
     adminHtml.includes('搜索成员') && adminHtml.includes('筛选角色'),
   )
-  check('管理页连接数据库身份模型', adminHtml.includes('MySQL') && adminHtml.includes('部门目录'))
+  check('人员管理连接数据库身份模型', adminHtml.includes('MySQL'))
+  check('人员管理不混排部门与角色目录',
+    !adminHtml.includes('部门目录') && !adminHtml.includes('角色与权限目录') &&
+    !adminHtml.includes('部门列表') && !adminHtml.includes('角色列表'))
   check('管理页不再显示凭证文件或可恢复明文', !adminHtml.includes('credentials.json') && !adminHtml.includes('显示 Token'))
+  const rolesHtml = await render('/src/views/RolesView.vue')
+  check('角色管理独立展示列表、搜索与分配入口',
+    ['角色管理', '角色列表', '搜索角色', '分配角色'].every((label) => rolesHtml.includes(label)))
+  check('角色管理不混排人员或部门列表', !rolesHtml.includes('人员列表') && !rolesHtml.includes('部门列表'))
+  const departmentsHtml = await render('/src/views/DepartmentsView.vue')
+  check('部门管理独立展示列表、搜索、状态筛选与新增入口',
+    ['部门管理', '部门列表', '搜索部门', '筛选部门状态', '添加部门'].every((label) => departmentsHtml.includes(label)))
+  check('部门管理不混排人员或角色列表', !departmentsHtml.includes('人员列表') && !departmentsHtml.includes('角色列表'))
   const allHtml =
     loginHtml +
     dashboardHtml +
     analysisHtml +
     recordsHtml +
     diagnosticsHtml +
-    adminHtml
+    adminHtml +
+    rolesHtml +
+    departmentsHtml
   for (const term of ['消费金额', 'CNY', '¥', '充值余额', '80,642,909'])
     check(`不包含金额或旧 mock：${term}`, !allHtml.includes(term))
   session.expire()

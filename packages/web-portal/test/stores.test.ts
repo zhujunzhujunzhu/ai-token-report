@@ -4,7 +4,7 @@ import { createPinia, disposePinia, setActivePinia, type Pinia } from 'pinia'
 import { useSessionStore } from '../src/stores/session.js'
 import { buildFilter, useDashboardStore } from '../src/stores/dashboard.js'
 import { useMembersStore } from '../src/stores/members.js'
-import { issueMember } from '../src/api/admin.js'
+import { createDepartment, issueMember, updateRoles } from '../src/api/admin.js'
 
 const originalFetch = globalThis.fetch
 let pinia: Pinia
@@ -249,6 +249,87 @@ describe('统计状态', () => {
 })
 
 describe('人员管理状态', () => {
+  function directoryResponse(url: string): Response {
+    if (url.endsWith('/members')) return json({ members: [] })
+    if (url.endsWith('/roles')) return json({ roles: [] })
+    if (url.endsWith('/departments')) return json({ departments: [] })
+    return json({ kind: 'sqlite', available: true })
+  }
+  test('三个管理页各自请求所需目录，刷新沿用当前页，清理后回到人员页', async () => {
+    signIn('admin')
+    const calls: string[] = []
+    respond((url) => { calls.push(url); return directoryResponse(url) })
+    const admin = useMembersStore()
+    const memberRequests = ['/api/v1/admin/members', '/api/v1/admin/roles', '/api/v1/departments', '/api/v1/admin/storage']
+    await admin.load()
+    expect(calls).toEqual(memberRequests)
+    calls.length = 0
+    await admin.load('roles')
+    expect(calls).toEqual(['/api/v1/admin/members', '/api/v1/admin/roles'])
+    calls.length = 0
+    await admin.load()
+    expect(calls).toEqual(['/api/v1/admin/members', '/api/v1/admin/roles'])
+    calls.length = 0
+    await admin.load('departments')
+    expect(calls).toEqual(['/api/v1/departments'])
+    calls.length = 0
+    admin.clear()
+    await admin.load()
+    expect(calls).toEqual(memberRequests)
+  })
+  test('目录只读权限不会额外请求无权访问的人员、角色、部门或数据库状态', async () => {
+    const scenarios = [
+      { section: 'members', permission: 'members:read', urls: ['/api/v1/admin/members', '/api/v1/admin/storage'] },
+      { section: 'roles', permission: 'roles:read', urls: ['/api/v1/admin/roles'] },
+      { section: 'departments', permission: 'departments:read', urls: ['/api/v1/departments'] },
+    ] as const
+    for (const scenario of scenarios) {
+      signIn('admin')
+      useSessionStore().identity!.permissions = [scenario.permission]
+      const calls: string[] = []
+      respond((url) => { calls.push(url); return directoryResponse(url) })
+      await useMembersStore().load(scenario.section)
+      expect(calls).toEqual([...scenario.urls])
+      expect(useMembersStore().error).toBeNull()
+    }
+  })
+  test('目录变更成功只刷新当前角色页或部门页', async () => {
+    signIn('admin')
+    const calls: string[] = []
+    respond((url, init) => {
+      calls.push(`${init?.method} ${url}`)
+      return init?.method === 'POST' ? json({ ok: true }) : directoryResponse(url)
+    })
+    const admin = useMembersStore()
+    await admin.load('roles')
+    calls.length = 0
+    await admin.mutate(() => updateRoles({ member_id: 'person', expected_version: 1, role_ids: ['member'] }), 'person')
+    expect(calls).toEqual(['POST /api/v1/admin/members/roles', 'GET /api/v1/admin/members', 'GET /api/v1/admin/roles'])
+    await admin.load('departments')
+    calls.length = 0
+    await admin.mutate(() => createDepartment('研发部'), 'new-department')
+    expect(calls).toEqual(['POST /api/v1/admin/departments', 'GET /api/v1/departments'])
+  })
+  test('切换管理页后旧人员查询不能覆盖新页数据', async () => {
+    signIn('admin')
+    const old = deferred<Response>()
+    let memberReads = 0
+    respond((url) => {
+      if (url.endsWith('/members')) {
+        memberReads++
+        return memberReads === 1 ? old.promise : json({ members: [{ member_id: 'fresh', name: '当前成员' }] })
+      }
+      return directoryResponse(url)
+    })
+    const admin = useMembersStore()
+    const pending = admin.load('members')
+    await admin.load('roles')
+    old.resolve(json({ members: [{ member_id: 'old', name: '旧成员' }] }))
+    await pending
+    expect(admin.members.map((member) => member.member_id)).toEqual(['fresh'])
+    expect(admin.storage).toBeNull()
+    expect(admin.loading).toBe(false)
+  })
   test('普通成员不会请求人员列表', async () => {
     signIn()
     let calls = 0

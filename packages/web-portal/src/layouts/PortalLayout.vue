@@ -21,6 +21,8 @@ import {
   Document,
   FirstAidKit,
   User,
+  Key,
+  OfficeBuilding,
   Fold,
   Expand,
   ArrowDown,
@@ -37,8 +39,14 @@ const navigation = computed(() => [
   { path: '/analysis', label: '用量分析', icon: DataLine },
   { path: '/records', label: '调用明细', icon: Document },
   { path: '/diagnostics', label: '采集诊断', icon: FirstAidKit },
-  ...(session.isAdmin
+  ...(session.can('members:read')
     ? [{ path: '/members', label: '人员管理', icon: User }]
+    : []),
+  ...(session.can('roles:read')
+    ? [{ path: '/roles', label: '角色管理', icon: Key }]
+    : []),
+  ...(session.can('departments:manage')
+    ? [{ path: '/departments', label: '部门管理', icon: OfficeBuilding }]
     : []),
 ])
 watch(

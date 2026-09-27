@@ -9,6 +9,8 @@ import * as api from '../api/admin.js'
 import type { ApiResult } from '../api/request.js'
 import { useSessionStore } from './session.js'
 
+export type ManagementSection = 'members' | 'roles' | 'departments'
+
 export const useMembersStore = defineStore('portal-members', () => {
   const session = useSessionStore()
   const members = ref<PortalMember[]>([])
@@ -26,12 +28,14 @@ export const useMembersStore = defineStore('portal-members', () => {
   let revision = 0
   let loadSeq = 0
   let tokenSeq = 0
+  let activeSection: ManagementSection = 'members'
   function dismissSecret(): void { issuedSecret.value = null }
   function clear(): void {
     revision++; loadSeq++; tokenSeq++
     members.value = []; roles.value = []; departments.value = []; tokens.value = []; audits.value = []
     tokenMemberId.value = null; storage.value = null; loading.value = false
     busyId.value = null; error.value = null; forbidden.value = null; dismissSecret()
+    activeSection = 'members'
   }
   function failure(result: { status: number; error: string }): void {
     if (result.status === 401) session.expire('登录已失效，请重新登录')
@@ -40,22 +44,33 @@ export const useMembersStore = defineStore('portal-members', () => {
       if (result.status === 403) forbidden.value = result.error
     }
   }
-  async function load(): Promise<void> {
-    if (!session.can('members:read')) return
+  async function load(section: ManagementSection = activeSection): Promise<void> {
+    activeSection = section
     const current = revision, seq = ++loadSeq
+    // 每页只读自身所需目录；独立查看角色或部门不应触发人员、数据库权限校验。
+    if (!session.can(`${section}:read`)) { loading.value = false; return }
+    const readMembers = section !== 'departments' && session.can('members:read')
+    const readRoles = section !== 'departments' && session.can('roles:read')
+    const readDepartments = section !== 'roles' && session.can('departments:read')
+    const readStorage = section === 'members' && session.can('members:read')
     loading.value = true
-    const results = await Promise.all([api.fetchMembers(), api.fetchRoles(), api.fetchDepartments(), api.fetchStorage()])
+    const results = await Promise.all([
+      readMembers ? api.fetchMembers() : null,
+      readRoles ? api.fetchRoles() : null,
+      readDepartments ? api.fetchDepartments() : null,
+      readStorage ? api.fetchStorage() : null,
+    ])
     if (current !== revision || seq !== loadSeq) return
     loading.value = false
     const [people, catalog, depts, db] = results
     // 并发接口中任意一个发现会话失效，就丢弃这一轮全部数据，不能在清理后又回填名单。
-    const expired = results.find((result) => !result.ok && result.status === 401)
+    const expired = results.find((result) => result && !result.ok && result.status === 401)
     if (expired && !expired.ok) { failure(expired); return }
-    for (const result of results) if (!result.ok) failure(result)
-    if (people.ok) members.value = people.data.members
-    if (catalog.ok) roles.value = catalog.data.roles
-    if (depts.ok) departments.value = depts.data.departments
-    if (db.ok) storage.value = db.data
+    for (const result of results) if (result && !result.ok) failure(result)
+    if (people?.ok) members.value = people.data.members
+    if (catalog?.ok) roles.value = catalog.data.roles
+    if (depts?.ok) departments.value = depts.data.departments
+    if (db?.ok) storage.value = db.data
   }
   async function loadTokens(memberId: string): Promise<void> {
     const current = revision, seq = ++tokenSeq

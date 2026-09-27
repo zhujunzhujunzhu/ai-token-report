@@ -61,7 +61,19 @@ export function createPortalRouter(
             path: 'members',
             name: 'members',
             component: () => import('../views/AdminView.vue'),
-            meta: { title: '人员管理', adminOnly: true },
+            meta: { title: '人员管理', requiredPermission: 'members:read' },
+          },
+          {
+            path: 'roles',
+            name: 'roles',
+            component: () => import('../views/RolesView.vue'),
+            meta: { title: '角色管理', requiredPermission: 'roles:read' },
+          },
+          {
+            path: 'departments',
+            name: 'departments',
+            component: () => import('../views/DepartmentsView.vue'),
+            meta: { title: '部门管理', requiredPermission: 'departments:manage' },
           },
         ],
       },
@@ -73,7 +85,8 @@ export function createPortalRouter(
     await session.restore()
     if (to.meta.requiresAuth && !session.signedIn)
       return { name: 'login', query: { redirect: to.fullPath } }
-    if (to.meta.adminOnly && !session.isAdmin) return { name: 'overview' }
+    if (typeof to.meta.requiredPermission === 'string' && !session.can(to.meta.requiredPermission))
+      return { name: 'overview' }
     if (to.name === 'login' && session.signedIn) return { name: 'overview' }
   })
   router.afterEach((to) => {
@@ -86,7 +99,7 @@ export function createPortalRouter(
 /** 回跳只接受本站已知页面，避免把登录参数当作外部跳转地址。 */
 export function loginDestination(value: unknown): string {
   return typeof value === 'string' &&
-    /^\/(overview|analysis|records|diagnostics|members)(\?.*)?$/.test(value)
+    /^\/(overview|analysis|records|diagnostics|members|roles|departments)(\?.*)?$/.test(value)
     ? value
     : '/overview'
 }

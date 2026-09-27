@@ -707,9 +707,17 @@ code {
   display: flex;
   align-items: center;
 }
+.permission-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 0;
+}
 .issued-card {
   background: #f0faf7;
-  border-color: #cee9df;
+  border: 1px solid #cee9df;
+  border-radius: 10px;
+  padding: 16px 18px;
 }
 .issued-row {
   display: flex;

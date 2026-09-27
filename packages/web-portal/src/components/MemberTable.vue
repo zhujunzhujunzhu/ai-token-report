@@ -4,7 +4,7 @@ import { ElAvatar, ElButton, ElTable, ElTableColumn, ElTag } from 'element-plus'
 import type { PortalMember } from '@ai-token-report/shared'
 const props = defineProps<{ members: PortalMember[]; currentId: string | null; busy: boolean; permissions: string[] }>()
 const emit = defineEmits<{
-  edit: [member: PortalMember]; roles: [member: PortalMember]; login: [member: PortalMember]
+  edit: [member: PortalMember]; login: [member: PortalMember]
   tokens: [member: PortalMember]; status: [member: PortalMember]; loginStatus: [member: PortalMember]
 }>()
 const can = (permission: string) => props.permissions.includes(permission)
@@ -22,7 +22,6 @@ const can = (permission: string) => props.permissions.includes(permission)
     <el-table-column prop="active_token_count" label="有效凭证" width="95" />
     <el-table-column label="操作" min-width="370"><template #default="{ row }"><div class="row-actions">
       <el-button v-if="can('members:manage')" link :disabled="busy" @click="emit('edit', row)">编辑资料</el-button>
-      <el-button v-if="can('roles:assign')" link :disabled="busy" @click="emit('roles', row)">角色</el-button>
       <el-button v-if="can('accounts:manage')" link :disabled="busy || row.status !== 'active'" @click="emit('login', row)">{{ row.account ? '重置密码' : '开通登录' }}</el-button>
       <el-button v-if="can('accounts:manage') && row.account" link :disabled="busy || row.status !== 'active'" @click="emit('loginStatus', row)">{{ row.account.enabled ? '停用登录' : '恢复登录' }}</el-button>
       <el-button v-if="can('tokens:manage')" link type="primary" :disabled="busy" @click="emit('tokens', row)">上报凭证</el-button>
