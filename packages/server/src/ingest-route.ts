@@ -102,10 +102,9 @@ export interface IngestRouteOptions {
 /**
  * 上报接收路由。
  *
- * ⚠️ 每个请求**独立开关**一次库连接。批量上报是低频动作（插件按批次、
- *   CLI 每 10 分钟），开一个 SQLite 连接是亚毫秒级，而长持连接要额外处理
- *   WAL 回收与生命周期 —— 不值得。这与 `local-api.ts` 的取舍一致。
- *   MySQL 下 `close()` 是空操作（连接来自进程内共享池），调用形状不变。
+ * HTTP 入口经 `ingest-queue.ts` 有界排队后调用此领域路由，事务提交后才能返回成功。
+ * 数据库身份仍按请求读取，写入在锁内重验；不得缓存身份来绕过撤权。
+ * MySQL 下 `close()` 是空操作（共享连接池），SQLite 请求结束释放句柄。
  */
 export class IngestRoute {
   readonly #credentials: CredentialStore | undefined
