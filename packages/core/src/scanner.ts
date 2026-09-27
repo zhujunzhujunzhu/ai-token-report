@@ -160,19 +160,17 @@ export async function scanSessionFile(
 
   diagnostics.filesScanned++
 
-  let text: string
+  const state: ParseState = { cwd: null }
+  const collector = eventCollector(meta, state, diagnostics, records)
   try {
-    const decoded = await decodeFramedZstd(buf)
-    text = decoded.text
+    const decoded = await decodeFramedZstd(buf, collector.push)
+    collector.finish()
     diagnostics.framesOk += decoded.framesOk
     diagnostics.framesFailed += decoded.framesFailed
   } catch {
     diagnostics.filesFailed++
     return { meta, records }
   }
-
-  const state: ParseState = { cwd: null }
-  collectEvents(text, meta, state, diagnostics, records)
 
   meta.cwd = state.cwd
   return { meta, records }
@@ -181,6 +179,21 @@ export async function scanSessionFile(
 /** 跨事件行累积的解析状态（`cwd` 来自 `session` 首行，供后续事件继承）。 */
 interface ParseState {
   cwd: string | null
+}
+
+/** 帧不等于 JSONL 行：保留跨帧的尾行，其余文本解析完立即释放。 */
+function eventCollector(meta: SessionMeta, state: ParseState, diagnostics: ScanDiagnostics, records: UsageRecord[]) {
+  let pending = ''
+  return {
+    push(chunk: string) {
+      const text = pending + chunk
+      const end = text.lastIndexOf('\n')
+      if (end < 0) { pending = text; return }
+      collectEvents(text.slice(0, end + 1), meta, state, diagnostics, records)
+      pending = text.slice(end + 1)
+    },
+    finish() { if (pending) collectEvents(pending, meta, state, diagnostics, records) },
+  }
 }
 
 /**
@@ -514,10 +527,6 @@ export async function scanIncremental(
     // 旧版光标把尾部半帧也计入帧数，首次升级多重读最后一帧，L3 会去掉已消费事件。
     const fromFrame = tail.offset > 0 || reset || cursor !== undefined ? 0 : Math.max(0, prevFrames - 1)
 
-    const decoded = decodeFramedZstdFrom(tail.buf, fromFrame)
-    diagnostics.framesOk += decoded.framesOk
-    diagnostics.framesFailed += decoded.framesFailed
-
     const parseState: ParseState = {
       cwd:
         cwdBySession.get(meta.sessionId) ??
@@ -527,7 +536,11 @@ export async function scanIncremental(
     }
 
     const before = records.length
-    collectEvents(decoded.text, meta, parseState, diagnostics, records)
+    const collector = eventCollector(meta, parseState, diagnostics, records)
+    const decoded = decodeFramedZstdFrom(tail.buf, fromFrame, collector.push)
+    collector.finish()
+    diagnostics.framesOk += decoded.framesOk
+    diagnostics.framesFailed += decoded.framesFailed
     cwdBySession.set(meta.sessionId, parseState.cwd)
     meta.cwd = parseState.cwd
 

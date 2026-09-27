@@ -174,10 +174,14 @@ function completeFrameSize(frame: Buffer): number | null {
  * 帧之间并发解压，但仍按原始顺序拼接以保证事件顺序。
  * 与同步版共用帧完整性检查，跨运行时行为一致。
  */
-export async function decodeFramedZstd(buf: Buffer): Promise<DecodeResult> {
+export async function decodeFramedZstd(buf: Buffer, onText?: (text: string) => void): Promise<DecodeResult> {
   const frames = splitFrames(buf)
-  const results = await Promise.all(
-    frames.map(async (frame) => {
+  // 每轮最多四帧，避免长会话同时创建数万解压任务和原生上下文。
+  let text = ''
+  let framesOk = 0
+  let framesFailed = 0
+  for (let offset = 0; offset < frames.length; offset += 4) {
+    const results = await Promise.all(frames.slice(offset, offset + 4).map(async (frame) => {
       const completeSize = completeFrameSize(frame)
       if (completeSize === null) {
         return { ok: false as const, text: '' }
@@ -192,18 +196,15 @@ export async function decodeFramedZstd(buf: Buffer): Promise<DecodeResult> {
       } catch {
         return { ok: false as const, text: '' }
       }
-    }),
-  )
-
-  let text = ''
-  let framesOk = 0
-  let framesFailed = 0
-  for (const r of results) {
-    if (r.ok) {
-      text += r.text
-      framesOk++
-    } else {
-      framesFailed++
+    }))
+    for (const r of results) {
+      if (r.ok) {
+        if (onText) onText(r.text)
+        else text += r.text
+        framesOk++
+      } else {
+        framesFailed++
+      }
     }
   }
   return { text, framesOk, framesFailed }
@@ -246,6 +247,8 @@ export function* parseJsonl(text: string): Generator<Record<string, unknown>> {
 export function decodeFramedZstdFrom(
   buf: Buffer,
   fromFrame: number,
+  /** 扫描器逐帧消费文本，避免把整份解压日志拼成超大字符串。 */
+  onText?: (text: string) => void,
 ): IncrementalDecodeResult {
   const offsets = findFrameOffsets(buf)
   const frameCount = offsets.length
@@ -270,14 +273,19 @@ export function decodeFramedZstdFrom(
       framesFailed++
       continue
     }
+    let chunk: string
     try {
-      text += zstdDecompressSync(frame.subarray(0, completeSize)).toString('utf8')
-      framesOk++
-      consumedFrameCount = i + 1
-      byteOffset = offset + completeSize
+      chunk = zstdDecompressSync(frame.subarray(0, completeSize)).toString('utf8')
     } catch {
       framesFailed++
+      continue
     }
+    // 消费者异常必须抛出，不能误报为坏帧后继续推进水位线。
+    if (onText) onText(chunk)
+    else text += chunk
+    framesOk++
+    consumedFrameCount = i + 1
+    byteOffset = offset + completeSize
   }
 
   return { text, framesOk, framesFailed, frameCount, consumedFrameCount, byteOffset }

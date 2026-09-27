@@ -8,7 +8,7 @@ import { decodeFramedZstd, decodeFramedZstdFrom, decodeFramedZstdSync, isComplet
 import { ingest, openDatabaseForIngest, readWatermarks } from '../src/db/ingest.js'
 import { queryRecords } from '../src/db/query.js'
 import type { Database } from '../src/db/driver.js'
-import { sessionFilesFromPaths } from '../src/scanner.js'
+import { sessionFilesFromPaths, scanAll } from '../src/scanner.js'
 
 let root: string
 let sessionsRoot: string
@@ -38,6 +38,32 @@ function makeFile(contents: Buffer): string {
   return path
 }
 const cycle = () => ingest({ sessionsRoot, dbPath, db })
+
+test('逐帧消费保留跨帧 JSON 行和无末尾换行的记录，全量与入库一致', async () => {
+  const text = metadata + '\n' + usage(1) + '\n' + usage(2)
+  const split = metadata.length + 17
+  const chunks = [text.slice(0, split), text.slice(split, split + 30), text.slice(split + 30)]
+  const buf = Buffer.concat(chunks.map(c => zstdCompressSync(Buffer.from(c))))
+  makeFile(buf)
+  const consumed: string[] = []
+  const decoded = decodeFramedZstdFrom(buf, 0, c => consumed.push(c))
+  expect(decoded.text).toBe('')
+  expect(consumed.join('')).toBe(text)
+  expect(decoded.byteOffset).toBe(buf.length)
+  const asyncChunks: string[] = []
+  const asyncDecoded = await decodeFramedZstd(buf, c => asyncChunks.push(c))
+  expect(asyncDecoded.text).toBe('')
+  expect(asyncChunks.join('')).toBe(text)
+  expect((await cycle()).inserted).toBe(2)
+  const scan = await scanAll(sessionsRoot)
+  expect(scan.records).toEqual(queryRecords(db))
+  expect(scan.diagnostics.framesOk).toBe(3)
+})
+
+test('逐帧消费者失败必须中止，不能伪装成坏帧继续推进水位线', () => {
+  expect(() => decodeFramedZstdFrom(frame(usage(1), usage(2)), 0, () => { throw new Error('consumer failed') }))
+    .toThrow('consumer failed')
+})
 
 test('长会话追加一帧只读取该帧，光标在重新打开数据库后仍生效', async () => {
   const oldFrame = frame(metadata, usage(1))
