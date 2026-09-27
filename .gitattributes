@@ -1,0 +1,2 @@
+# 运行时模板字符串使用 LF，DDL 对账文件在 Windows 上也保留相同字节。
+docs/database-v4/*.sql text eol=lf
