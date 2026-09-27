@@ -108,6 +108,7 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
   let requestSeq = 0
   let detailSeq = 0
   let pending = false
+  let detailPending = false
   let dataKey = ''
 
   function clearData(): void {
@@ -122,6 +123,7 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
   }
   function closeUser(): void {
     ++detailSeq
+    detailPending = false
     detail.value = null
     detailLoading.value = false
     detailError.value = null
@@ -213,6 +215,8 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     }
     if (diag?.ok) diagnostics.value = diag.data
     fetchedAt.value = Date.now()
+    // 抽屉继续继承同一筛选窗口，不能停留在第一次打开时的旧快照。
+    if (detail.value) await openUser(detail.value.userId, true)
   }
 
   async function applyFilters(next: DashboardFilters): Promise<boolean> {
@@ -247,15 +251,20 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     closeUser()
   }
 
-  async function openUser(userId: string): Promise<void> {
+  async function openUser(userId: string, background = false): Promise<void> {
     const built = buildFilter(filters.value)
     if (!session.signedIn || built.error) return
+    if (background && detailPending) return
     const seq = ++detailSeq
     const generation = session.generation
     const candidate = userOptions.value.find((row) => row.key === userId)
     const label = candidate ? identityLabel(candidate) : userLabel(userId)
-    detail.value = { userId, label, overview: null, series: null, models: [] }
-    detailLoading.value = true
+    // 后台刷新保留已展示的数据，避免每五秒闪回骨架屏。
+    if (!background) {
+      detail.value = { userId, label, overview: null, series: null, models: [] }
+      detailLoading.value = true
+    }
+    detailPending = true
     detailError.value = null
     const filter = { ...built.filter, users: [userId] }
     const [ov, se, bd] = await Promise.all([
@@ -264,6 +273,7 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
       fetchBreakdown(filter, 'provider-model'),
     ])
     if (seq !== detailSeq || generation !== session.generation) return
+    detailPending = false
     detailLoading.value = false
     for (const result of [ov, se, bd]) {
       if (!result.ok) {

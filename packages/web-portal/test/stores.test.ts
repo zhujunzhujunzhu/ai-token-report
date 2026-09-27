@@ -180,6 +180,53 @@ describe('统计状态', () => {
     await initial
     expect(dashboard.overview?.totalTokens).toBe(101)
   })
+  test('看板刷新同步更新打开的人员详情并保留服务端数值', async () => {
+    signIn()
+    let totalTokens = 101
+    respond((url) => url.includes('overview')
+      ? json({ ...overview, totalTokens })
+      : json({ rows: [], points: [] }))
+    const dashboard = useDashboardStore()
+    await dashboard.activate('overview')
+    await dashboard.openUser('selected')
+    expect(dashboard.detail?.overview?.totalTokens).toBe(101)
+    totalTokens = 303
+    await dashboard.load(true)
+    expect(dashboard.overview?.totalTokens).toBe(303)
+    expect(dashboard.detail?.overview?.totalTokens).toBe(303)
+    expect(dashboard.detailLoading).toBe(false)
+  })
+  test('详情后台刷新保留旧数据、不重叠，关闭后拒绝迟到响应', async () => {
+    signIn()
+    respond((url) => url.includes('overview') ? json(overview) : json({ rows: [], points: [] }))
+    const dashboard = useDashboardStore()
+    await dashboard.activate('overview')
+    await dashboard.openUser('selected')
+    const waiting = deferred<Response>()
+    const started = deferred<void>()
+    let detailCalls = 0
+    respond((raw) => {
+      const url = new URL(raw, 'http://test')
+      if (url.searchParams.has('member_id')) {
+        detailCalls++
+        if (url.pathname.endsWith('overview')) {
+          started.resolve()
+          return waiting.promise
+        }
+      }
+      return url.pathname.endsWith('overview') ? json(overview) : json({ rows: [], points: [] })
+    })
+    const pending = dashboard.load(true)
+    await started.promise
+    expect(dashboard.detail?.overview?.totalTokens).toBe(101)
+    expect(dashboard.detailLoading).toBe(false)
+    await dashboard.load(true)
+    expect(detailCalls).toBe(3)
+    dashboard.closeUser()
+    waiting.resolve(json({ ...overview, totalTokens: 404 }))
+    await pending
+    expect(dashboard.detail).toBeNull()
+    expect(dashboard.detailLoading).toBe(false)
   })
   test('候选不含人员筛选；分页只取当前页面所需接口', async () => {
     signIn()

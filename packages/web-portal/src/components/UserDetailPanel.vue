@@ -22,13 +22,14 @@ const detail = computed(() => dashboard.detail)
     <div v-if="detail" class="page-stack">
       <el-skeleton v-if="dashboard.detailLoading" :rows="8" animated />
       <el-alert
-        v-else-if="dashboard.detailError"
+        v-if="dashboard.detailError"
         :title="dashboard.detailError"
+        :description="detail.overview ? '当前展示上一次成功获取的数据，稍后自动重试。' : undefined"
         type="error"
         :closable="false"
         show-icon
       />
-      <template v-else>
+      <template v-if="!dashboard.detailLoading && detail.overview">
         <p class="muted">
           {{ detail.overview?.range.label }} · 继承当前时间、厂商与模型筛选
         </p>
