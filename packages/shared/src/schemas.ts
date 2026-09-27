@@ -285,6 +285,18 @@ export const portalIssueTokenSchema = z.strictObject({
   member_id: portalId, label: z.string().trim().min(1).max(128), scopes: scopes.optional(),
   expires_at_ms: z.int().positive().nullable().optional(),
 })
+/**
+ * 签发 appKey。
+ *
+ * ⚠️ `strictObject` 在这里是**安全边界**：请求体里多写一个 `scopes`
+ *   会被判 400，而不是被静默忽略 —— 否则「页面传了更宽的范围但没生效」
+ *   与「页面传了更宽的范围且生效了」在日志上长得一模一样。
+ *   权限范围由服务端固定（`APP_KEY_SCOPES`），这里连字段都不给。
+ */
+export const portalIssueAppKeySchema = z.strictObject({
+  member_id: portalId, label: z.string().trim().min(1).max(128).optional(),
+  expires_at_ms: z.int().positive().nullable().optional(),
+})
 export const portalTokenVersionSchema = z.strictObject(tokenVersion)
 export const portalTokenScopesSchema = z.strictObject({ ...tokenVersion, scopes })
 export const portalCreateDepartmentSchema = z.strictObject({ name: departmentName })

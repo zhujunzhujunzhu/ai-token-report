@@ -50,6 +50,39 @@ export interface PortalReportToken {
   revoked_at_ms: number | null
 }
 
+/**
+ * ★ appKey（插件/CLI 上报凭证）的权限**只有这两个接口**。
+ *
+ * | scope | 对应接口 | 用途 |
+ * |---|---|---|
+ * | `usage:write` | `POST /api/v1/token-usage` | 上报用量 |
+ * | `stats:read` | `GET /api/v1/stats/*` | 获取统计信息 |
+ *
+ * 🚨 **常量而不是 UI 选项**：签发端点按它写库，页面拿它展示。
+ *   若把范围交给请求体，就等于「页面写对了才有权限限制」——
+ *   一个改过的请求就能签出带 `members:manage` 的 appKey。
+ *
+ * ⚠️ 刻意**不含** `identity:read`：appKey 的用途就是上报与取数，
+ *   而 `/api/v1/identity/verify` 的校验同时接受 `usage:write`
+ *   （见服务端 `verifyIdentity`），所以插件只填 appKey 也能拿到自己的署名。
+ */
+export const APP_KEY_SCOPES = ['usage:write', 'stats:read'] as const
+
+/** appKey 在凭证列表里的缺省用途标签。 */
+export const APP_KEY_LABEL = '上报 appKey'
+
+/**
+ * 签发 appKey。
+ *
+ * ⚠️ **没有 `scopes` 字段** —— 范围由服务端固定为 `APP_KEY_SCOPES`，
+ *   调用方无法申请更宽的权限（与 `PortalIssueTokenRequest` 刻意区分开）。
+ */
+export interface PortalIssueAppKeyRequest {
+  member_id: string
+  label?: string
+  expires_at_ms?: number | null
+}
+
 export interface PortalMutationResult {
   ok: boolean
   reason?: string

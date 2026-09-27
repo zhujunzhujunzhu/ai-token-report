@@ -24,6 +24,9 @@ import {
   parseAdminTokenBody,
   parseAdminUpdateBody,
   parseIngestEnvelope,
+  parsePortalBody,
+  portalIssueAppKeySchema,
+  portalIssueTokenSchema,
   type ShapeResult,
 } from '../src/schemas.js'
 
@@ -322,5 +325,51 @@ describe('parseAdminLoginBody（开通后台账号）', () => {
   test('★ 定位 token 缺失时先报 token（顺序即优先级）', () => {
     expect(reasonOf(parseAdminLoginBody({}))).toBe('缺少 token（要操作哪个人）')
     expect(reasonOf(parseAdminLoginBody(null))).toBe('请求体需要是一个对象')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────
+// appKey：权限范围由服务端固定，请求体里给不出更宽的范围
+// ─────────────────────────────────────────────────────────────
+describe('parsePortalBody(portalIssueAppKeySchema)', () => {
+  const id = '00000000-0000-4000-8000-000000000002'
+  test('合法请求体通过：label / 到期时间可选，其余一律没有', () => {
+    const r = parsePortalBody(portalIssueAppKeySchema, { member_id: id })
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.value).toEqual({ member_id: id })
+    const withLabel = parsePortalBody(portalIssueAppKeySchema, { member_id: id, label: '  工作电脑  ' })
+    expect(withLabel.ok).toBe(true)
+    if (withLabel.ok) expect(withLabel.value.label).toBe('工作电脑')
+  })
+
+  test('🚨 请求体里多写一个 scopes 直接失败 —— 否则「只能两项权限」就只是 UI 约定', () => {
+    // 这一条比文案重要：范围要么由服务端固定，要么由调用方决定，不能两者都算
+    expect(parsePortalBody(portalIssueAppKeySchema, { member_id: id, scopes: ['members:manage'] }).ok).toBe(false)
+    expect(parsePortalBody(portalIssueAppKeySchema, { member_id: id, scopes: [] }).ok).toBe(false)
+  })
+
+  test('member_id 非 UUID → 失败，提示指向刷新页面', () => {
+    const r = parsePortalBody(portalIssueAppKeySchema, { member_id: 'x' })
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toContain('需要有效的对象 ID')
+  })
+
+  test('非对象 → 与其它管理接口给出同一条文案（不为新接口另立一套）', () => {
+    // ⚠️ 这里断言的是**一致性**而不是某个具体字符串：文案来自 zod 的兜底，
+    //    四个 portal schema 都一样；新接口若自成一派，前端就会多出一句
+    //    谁也没见过的提示。
+    for (const bad of [null, undefined, 5, 'x', []]) {
+      const appKey = parsePortalBody(portalIssueAppKeySchema, bad)
+      const token = parsePortalBody(portalIssueTokenSchema, bad)
+      expect(appKey.ok).toBe(false)
+      if (!appKey.ok && !token.ok) expect(appKey.reason).toBe(token.reason)
+    }
+  })
+
+  test('★ 新上报 Token 的默认范围没有被 appKey 改掉（两件事，别合并）', () => {
+    const r = parsePortalBody(portalIssueTokenSchema, { member_id: id, label: 'x' })
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.value.scopes).toBeUndefined()
   })
 })
