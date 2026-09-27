@@ -12,6 +12,7 @@ import { insertAttributedRecords, insertAttributedRecordsInTransaction, type Ing
 import { PORTAL_MYSQL_V4_SQL, PORTAL_SQLITE_V4_SQL, PORTAL_MYSQL_INGEST_SQL, portalSchemaStatements } from '../src/db/portal-schema-v4.js'
 import { closeAllMysqlBackends, openMysqlBackend } from '../src/db/mysql.js'
 import { canonicalCheck } from '../src/db/portal-catalog.js'
+import { ensurePortalReady } from '../src/db/portal-migrations.js'
 
 const root = mkdtempSync(join(tmpdir(), 'atr-runtime-v4-'))
 afterAll(async () => { await closeAllMysqlBackends(); rmSync(root, { recursive: true, force: true }) })
@@ -93,6 +94,43 @@ test('SQLite 多连接同时首次启动只初始化一次', async () => {
   const t=target()
   const prepared=await Promise.all(Array.from({length:6},()=>preparePortalDatabase(t)))
   expect(prepared.every(result=>result.status==='current')).toBe(true)
+})
+test('业务版本闸门不扫描事件历史，显式检查仍返回真实条数且不缓存迁移状态', async () => {
+  const t = target(), store = await openPortalStore(t)
+  try {
+    await insertAttributedRecords(store, [record('gate:1'), record('gate:2')], { userId: '姓名' })
+    // 在真实数据库上阻断历史扫描，避免依赖机器速度的计时断言掩盖复杂度回退。
+    const guarded = new Proxy(store, {
+      get(current, key) {
+        const value: unknown = Reflect.get(current, key)
+        if (typeof value !== 'function') return value
+        return (...args: unknown[]) => {
+          const sql = args[0]
+          if (typeof sql === 'string' && (/\bFROM\s+usage_event\b/i.test(sql) || /PRAGMA\s+foreign_key_check/i.test(sql))) {
+            throw new Error('业务版本闸门不能扫描用量历史')
+          }
+          return Reflect.apply(value, current, args)
+        }
+      },
+    })
+    await ensurePortalReady(guarded)
+    expect((await inspectPortalDatabase(t)).eventCount).toBe(2)
+    expect((await preparePortalDatabase(t)).eventCount).toBe(2)
+    await store.exec("UPDATE portal_schema_migrations SET status='failed',completed_at_ms=NULL")
+    await expect(ensurePortalReady(guarded)).rejects.toThrow('incomplete')
+  } finally { await store.close() }
+})
+test('启动与显式迁移仍拒绝历史外键损坏，业务新写入仍强制外键', async () => {
+  const t = target(), store = await openPortalStore(t)
+  try {
+    await expect(insertAttributedRecords(store, [record('invalid:new')], { userId: '姓名', memberId: randomUUID() })).rejects.toThrow()
+    // 仅在随机测试库模拟外部工具关闭外键后留下的历史坏引用。
+    await store.exec('PRAGMA foreign_keys=OFF')
+    await store.run("INSERT INTO usage_event (event_id,session_id,seq,ts,provider,model,member_id) VALUES ('invalid:historical','历史',1,1,'','',$member)", { $member: randomUUID() })
+  } finally { await store.close() }
+  await expect(preparePortalDatabase(t)).rejects.toThrow('外键不一致')
+  await expect(migratePortalDatabase(t)).rejects.toThrow('外键不一致')
+  expect((await inspectPortalDatabase(t)).eventCount).toBe(1)
 })
 test('SQLite v3 默认拒绝，显式备份迁移保持事件/待确认历史映射', async () => {
   const t = target(); await createLegacy(t)

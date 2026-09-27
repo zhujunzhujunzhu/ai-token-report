@@ -39,21 +39,26 @@ async function tablesOf(store: PortalStore): Promise<string[]> {
     : await store.all<{ name: string }>('SELECT table_name AS name FROM information_schema.tables WHERE table_schema=DATABASE() ORDER BY table_name')
   return rows.map(row => row.name)
 }
-async function inspectStore(store: PortalStore): Promise<PortalInspection> {
+/** 业务版本闸门只读目录与迁移账本，不能随历史事件数增长而扫描整张事实表。 */
+async function readPortalState(store: PortalStore): Promise<Omit<PortalInspection, 'eventCount'>> {
   const tables = await tablesOf(store)
   const version = store.kind === 'sqlite'
     ? Number((await store.get<{ user_version: number }>('PRAGMA user_version'))?.user_version ?? 0)
     : tables.includes('portal_meta') ? Number((await store.get<{ schema_version: number }>('SELECT schema_version FROM portal_meta WHERE id=1'))?.schema_version ?? 0) : 0
   const migration = tables.includes('portal_schema_migrations')
     ? await store.get<MigrationRow>('SELECT version,checksum,status,last_completed_step,checkpoint_json FROM portal_schema_migrations WHERE version=4') : null
-  const eventCount = tables.includes('usage_event') ? Number((await store.get<{ count: number }>('SELECT COUNT(*) AS count FROM usage_event'))?.count ?? 0) : 0
   let status: PortalInspection['status'] = 'unsupported'
   if (tables.length === 0 && version === 0) status = 'empty'
   else if (version === 0 && tables.length === 1 && tables[0] === 'portal_schema_migrations' && !migration) status = 'incomplete'
   else if (migration && migration.status !== 'completed') status = 'incomplete'
   else if (version === PORTAL_SCHEMA_VERSION && migration?.status === 'completed' && migration.checksum === portalSchemaChecksum(store.kind)) status = 'current'
   else if (version === 3 && tables.includes('usage_event') && !migration) status = 'legacy'
-  return { kind: store.kind, label: store.label, version, status, tables, eventCount, migration }
+  return { kind: store.kind, label: store.label, version, status, tables, migration }
+}
+async function inspectStore(store: PortalStore): Promise<PortalInspection> {
+  const state = await readPortalState(store)
+  const eventCount = state.tables.includes('usage_event') ? Number((await store.get<{ count: number }>('SELECT COUNT(*) AS count FROM usage_event'))?.count ?? 0) : 0
+  return { ...state, eventCount }
 }
 export async function inspectPortalDatabase(target: PortalTarget): Promise<PortalInspection> {
   if (!target.mysqlUrl && !existsSync(target.sqlitePath)) return { kind: 'sqlite', label: target.sqlitePath, version: 0, status: 'empty', tables: [], eventCount: 0, migration: null }
@@ -142,7 +147,7 @@ function legacySqliteTriggers(): string[] {
   for (const event of ['INSERT','UPDATE']) triggers.push(`CREATE TRIGGER usage_v4_values_${event.toLowerCase()} BEFORE ${event} ON usage_event WHEN NEW.event_id IS NULL OR NOT (${checks.map(check=>`(${check})`).join(' AND ')}) BEGIN SELECT RAISE(ABORT,'usage_event v4 value constraint'); END`)
   return triggers
 }
-async function verifyCurrent(store: PortalStore): Promise<void> {
+async function verifyCurrent(store: PortalStore, checkHistory = true): Promise<void> {
   const tables = await tablesOf(store)
   for (const sql of portalSchemaStatements(store.kind)) {
     const match = /^CREATE TABLE (\w+) \(/.exec(sql)
@@ -168,6 +173,11 @@ async function verifyCurrent(store: PortalStore): Promise<void> {
     const migration = await store.get<MigrationRow>('SELECT checkpoint_json FROM portal_schema_migrations WHERE version=4')
     await verifySqliteUsageConstraints(store, migration ? checkpointOf(migration).sourceVersion === 3 : false)
   }
+  // 每条业务连接已启用外键，新增写入由数据库逐行拒绝无效引用。
+  // 全历史检查留在启动和显式迁移；每次鉴权都扫一次会让上报随历史积累退化。
+  if (checkHistory) await verifyHistoricalReferences(store)
+}
+async function verifyHistoricalReferences(store: PortalStore): Promise<void> {
   if (store.kind === 'sqlite' && (await store.all('PRAGMA foreign_key_check')).length) throw gate('检测到外键不一致。')
 }
 
@@ -207,12 +217,13 @@ async function withMigrationLock<T>(store: PortalStore, fn: (connection: PortalS
   })
 }
 export async function ensurePortalReady(store: PortalStore): Promise<void> {
-  const initial = await inspectStore(store)
-  if (initial.status === 'current') { await verifyCurrent(store); return }
+  const initial = await readPortalState(store)
+  // 每次都重读真实结构，不缓存版本或约束，因此运行中缺表、篡改 CHECK 和半迁移仍立即拒绝。
+  if (initial.status === 'current') { await verifyCurrent(store, false); return }
   if (initial.status !== 'empty' && initial.status !== 'incomplete') throw gate(`上报库状态 ${initial.status}，版本 ${initial.version}。`)
   await withMigrationLock(store, async connection => {
-    const state = await inspectStore(connection)
-    if (state.status === 'current') return verifyCurrent(connection)
+    const state = await readPortalState(connection)
+    if (state.status === 'current') return verifyCurrent(connection, false)
     // 若另一进程正在初始化，先等迁移锁再看结果；崩溃遗留仍须显式 resume。
     if (state.status !== 'empty') throw gate(`上报库状态 ${state.status}，请显式恢复。`)
     if (store.kind === 'sqlite') await connection.transaction(tx => executePlan(tx, { sourceVersion: 0, historyHash: '', historyCount: 0 }))
@@ -222,7 +233,12 @@ export async function ensurePortalReady(store: PortalStore): Promise<void> {
 export async function preparePortalDatabase(target: PortalTarget, options: PortalMigrationOptions & { migrate?: boolean } = {}): Promise<PortalInspection> {
   if (options.migrate) return migratePortalDatabase(target, options)
   const store = await openRawPortalStore(target)
-  try { await ensurePortalReady(store); return await inspectStore(store) } finally { await store.close() }
+  try {
+    await ensurePortalReady(store)
+    // 启动时保留历史完整性检查；不可把业务热路径减负变成启动时接受坏库。
+    await verifyHistoricalReferences(store)
+    return await inspectStore(store)
+  } finally { await store.close() }
 }
 
 async function historyFingerprint(store: PortalStore): Promise<{ hash: string; count: number }> {
