@@ -37,6 +37,28 @@ test('会话根目录是联接时，监听真实目录但增量路径保持调�
   }
 })
 
+test('Worker 超时拒绝排队请求，下一次查询可以重建线程', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'atr-worker-timeout-'))
+  const ctx: StatsContext = { config: { localDb: true }, sessionsRoot: join(root, 'sessions'),
+    dbPath: join(root, 'usage.sqlite'), backgroundQueries: true, queryTimeoutMs: 1 }
+  try {
+    const pending = await Promise.allSettled([
+      queryUsage(ctx, { summaryOnly: true }),
+      queryUsage({ ...ctx, queryTimeoutMs: 5000 }, { summaryOnly: true }),
+    ])
+    for (const result of pending) {
+      expect(result.status).toBe('rejected')
+      if (result.status === 'rejected') expect(result.reason.message).toContain('统计查询超时')
+    }
+    const recovered = await queryUsage({ ...ctx, queryTimeoutMs: 5000 }, { summaryOnly: true })
+    expect(recovered.source).toBe('local-db')
+    expect(recovered.totals.calls).toBe(0)
+  } finally {
+    await closeStatsWorker(ctx.dbPath)
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('真实 Worker 支持摘要、精确分页、手动追加刷新及外部写入，卸载释放线程', async () => {
   const root = mkdtempSync(join(tmpdir(), 'atr-worker-test-'))
   const sessionsRoot = join(root, 'sessions')

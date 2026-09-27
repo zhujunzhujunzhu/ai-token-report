@@ -89,6 +89,8 @@ export interface UsageStoreDeps {
   intervalMs?: number
   /** 兜底全量取数周期（毫秒）。默认 {@link DEFAULT_FULL_INTERVAL_MS}。 */
   fullIntervalMs?: number
+  /** 比宿主的查询上限略长，网络或响应体失联时也要退出加载状态。 */
+  requestTimeoutMs?: number
   /** 页面可见性来源。缺省用 `document`；没有 `document`（纯逻辑测试）时视为始终可见。 */
   visibility?: VisibilitySource
 }
@@ -219,6 +221,11 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
     const own = new AbortController()
     controller = own
     requestPending = true
+    let timedOut = false
+    const timeout = setTimeout(() => {
+      timedOut = true
+      own.abort()
+    }, deps.requestTimeoutMs ?? 125_000)
 
     try {
       if (mode === 'full' && (period !== state.period || dateRange?.since !== state.dateRange?.since
@@ -263,6 +270,7 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
           try {
             body = await res.json()
           } catch {
+            if (own.signal.aborted) throw new Error('响应读取已取消')
             // 非 JSON（例如 HTML 兜底页）：交给下面统一翻译
             body = undefined
           }
@@ -275,7 +283,8 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
         patch({
           loading: false,
           refreshing: false,
-          error: `请求失败：${err instanceof Error ? err.message : String(err)}`,
+          error: timedOut ? '统计请求超时，请点击刷新重试；如持续失败，请检查 DSH 启动日志。'
+            : `请求失败：${err instanceof Error ? err.message : String(err)}`,
         })
         return
       }
@@ -325,6 +334,7 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
         ...(detail ? { detail: { by: detailBy, page: detailPage } } : {}),
       })
     } finally {
+      clearTimeout(timeout)
       // 探针保持界面安静，但在途状态必须独立记录，否则下一个 tick 会取消慢查询。
       if (mine === seq) requestPending = false
     }

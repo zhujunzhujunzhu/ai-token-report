@@ -131,6 +131,8 @@ export interface StatsContext {
   dbPath: string
   /** DSH 宿主启用独立线程，直接调用方仍可使用当前线程。 */
   backgroundQueries?: boolean
+  /** 查询等待上限（含排队）；默认两分钟，异常线程不能让宿主无限等待。 */
+  queryTimeoutMs?: number
 }
 
 /** 把分组结果转成输出行（派生指标交给 `shared`）。 */

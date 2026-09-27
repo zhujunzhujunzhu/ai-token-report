@@ -64,6 +64,31 @@ async function settle(): Promise<void> {
   for (let i = 0; i < 5; i++) await Bun.sleep(1)
 }
 
+for (const phase of ['fetch', 'body'] as const) {
+  test(`请求在 ${phase} 阶段失联时退出加载并提示重试`, async () => {
+    let succeed = false
+    const store = createUsageStore({ requestTimeoutMs: 10, fetch: async (_url, init) => {
+      const hang = () => new Promise<never>((_resolve, reject) => {
+        init!.signal!.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+      })
+      if (succeed) return { ok: true, status: 200, json: async () => payloadBody() }
+      if (phase === 'fetch') return hang()
+      return { ok: true, status: 200, json: hang }
+    } })
+    const unsubscribe = store.subscribe(() => {})
+    try {
+      await Bun.sleep(50)
+      expect(store.getSnapshot().loading).toBe(false)
+      expect(store.getSnapshot().error).toContain('统计请求超时')
+      succeed = true
+      store.refresh()
+      await settle()
+      expect(store.getSnapshot().data).toBeDefined()
+      expect(store.getSnapshot().error).toBeUndefined()
+    } finally { unsubscribe(); store.dispose() }
+  })
+}
+
 describe('取数：成功路径', () => {
   test('首次订阅触发取数，状态从 loading 变 ready', async () => {
     const { impl, urls } = fakeFetch(() => ({ body: payloadBody() }))
