@@ -13,13 +13,12 @@
  *   的实现，而它与 Bun 那套必然随时间漂移 —— 这类分叉不会报错，
  *   只会让某个端点在某个运行时上悄悄返回不一样的东西。
  *
- * ## 为什么把请求体整个读进内存
+ * ## 请求体必须保留流式背压
  *
- * 本服务的请求体都是小 JSON（署名、token 校验、一批上报），几百字节到几 MB 量级；
- * 而提交 `ReadableStream` 作为 `Request` 的 body 需要额外处理 Node 的
- * `duplex: 'half'` 约束，容易在边界上出错。用内存换确定性是划算的。
- * ⚠️ 上报接口另有一个 32 MiB 的 `Content-Length` 上限（见 `index.ts`），
- *   将来要支持更大的上传必须改成流式，不能沿用现在的写法。
+ * 请求头到达就交给处理器，由共享路由决定是否入队以及何时读取正文。
+ * 先 Buffer.concat 全文会绕过队列容量与正文上限，尤其 chunked 上传不能靠头判断大小。
+ * Web 流不预读，Node 流保留自身背压；提前拒绝时先写完 503/413，再关闭未消费的上传，
+ * 不能为排空异常正文一直占着连接，也不能先销毁请求导致错误响应变成 ECONNRESET。
  *
  * ## 🚨 `node:http` 必须**动态** import
  *
@@ -40,6 +39,7 @@
  */
 
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
+import { Readable } from 'node:stream'
 
 /** 一个已启动的 HTTP 服务（两个运行时的公共形状）。 */
 export interface ServeHandle {
@@ -136,15 +136,29 @@ async function handleNodeRequest(
   host: string,
   port: number,
 ): Promise<void> {
+  const expectsBody = req.headers['transfer-encoding'] !== undefined || Number(req.headers['content-length'] ?? 0) > 0
+  const hasUnreadBody = (): boolean => expectsBody && !req.readableEnded
+  const finishUnreadBody = (headers: Record<string, string | string[]>): void => {
+    if (!hasUnreadBody()) return
+    const socket = req.socket
+    // 处理器已返回，后续正文只丢弃；移除桥接的 data 监听，避免排空又进入 Web 队列。
+    req.removeAllListeners('data')
+    req.resume()
+    // Node 的 Connection: close 会 destroySoon；Windows 上有在途上传时会发 RST，
+    // 连已写出的 503/413 也可能丢失。先走普通响应完成路径，再半关闭写端发送 FIN。
+    res.shouldKeepAlive = true
+    headers.connection = 'keep-alive'
+    res.once('finish', () => {
+      socket.end()
+      // 对端收到 FIN 后通常立刻关闭；异常上传只允许继续丢弃一秒，且始终不存正文。
+      const timer = setTimeout(() => socket.destroy(), 1000)
+      timer.unref()
+      socket.once('close', () => clearTimeout(timer))
+    })
+  }
   try {
     const method = req.method ?? 'GET'
-
-    // 把请求体读完再构造 Request（见文件头「为什么把请求体整个读进内存」）
-    const chunks: Buffer[] = []
-    for await (const chunk of req) {
-      chunks.push(chunk as Buffer)
-    }
-    const hasBody = chunks.length > 0 && method !== 'GET' && method !== 'HEAD'
+    const hasBody = expectsBody && method !== 'GET' && method !== 'HEAD'
 
     // 用 Host 头拼绝对 URL，这样 `new URL(req.url)` 在处理器里拿到的主机名
     // 与客户端请求的一致（回调地址、日志排障都要靠它）。
@@ -158,11 +172,16 @@ async function handleNodeRequest(
       else headers.set(key, value)
     }
 
-    const request = new Request(url, {
+    const init: RequestInit & { duplex?: 'half' } = {
       method,
       headers,
-      ...(hasBody ? { body: Buffer.concat(chunks) } : {}),
-    })
+    }
+    if (hasBody) {
+      // 默认策略按块计数，会把 Node 的字节水位误当成块数；零预读避免排队请求积攒正文。
+      init.body = Readable.toWeb(req, { strategy: { highWaterMark: 0 } }) as ReadableStream<Uint8Array>
+      init.duplex = 'half'
+    }
+    const request = new Request(url, init)
 
     const response = await handler(request)
 
@@ -178,13 +197,16 @@ async function handleNodeRequest(
     // 两个运行时的 Response 都支持 arrayBuffer()，用它统一取值，
     // 避免依赖 Node 特有的 Readable.fromWeb 桥接。
     const body = Buffer.from(await response.arrayBuffer())
+    finishUnreadBody(outHeaders)
     res.writeHead(response.status, outHeaders)
     res.end(body)
   } catch (err) {
     // 兜底：任何未捕获异常都返回 JSON 而不是让连接挂断 ——
     // 与 `index.ts` 处理器内的兜底保持同一策略，前端才能拿到结构化错误。
     if (!res.headersSent) {
-      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' })
+      const headers: Record<string, string | string[]> = { 'Content-Type': 'application/json; charset=utf-8' }
+      finishUnreadBody(headers)
+      res.writeHead(500, headers)
     }
     res.end(
       JSON.stringify({
