@@ -64,6 +64,13 @@ export function createPortalRouter(
             meta: { title: '人员管理', requiredPermission: 'members:read' },
           },
           {
+            path: 'appkeys',
+            name: 'appkeys',
+            component: () => import('../views/AppKeyView.vue'),
+            // 发放动作本身要 tokens:manage；页面主体是成员名单，因此读权限按名单来。
+            meta: { title: 'appKey 发放', requiredPermission: 'members:read' },
+          },
+          {
             path: 'roles',
             name: 'roles',
             component: () => import('../views/RolesView.vue'),
@@ -99,7 +106,7 @@ export function createPortalRouter(
 /** 回跳只接受本站已知页面，避免把登录参数当作外部跳转地址。 */
 export function loginDestination(value: unknown): string {
   return typeof value === 'string' &&
-    /^\/(overview|analysis|records|diagnostics|members|roles|departments)(\?.*)?$/.test(value)
+    /^\/(overview|analysis|records|diagnostics|members|appkeys|roles|departments)(\?.*)?$/.test(value)
     ? value
     : '/overview'
 }

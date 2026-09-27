@@ -4,6 +4,7 @@ import type {
   PortalAuditResponse, PortalCreateMemberRequest, PortalUpdateMemberRequest, PortalMemberRolesRequest,
   PortalMemberStatusRequest, PortalLoginAccountRequest, PortalLoginStatusRequest,
   PortalIssueTokenRequest, PortalTokenVersionRequest, PortalTokenScopesRequest,
+  PortalIssueAppKeyRequest,
   PortalMemberResult, PortalTokenResult, PortalDepartmentResult, PortalDepartmentVersionRequest,
   PortalLegacyAttribution, PortalConfirmLegacyRequest, PortalLegacyResult,
 } from '@ai-token-report/shared'
@@ -28,6 +29,13 @@ export const updateMemberStatus = (input: PortalMemberStatusRequest) => post<Por
 export const setLoginAccount = (input: PortalLoginAccountRequest) => post<PortalMemberResult>(members + '/login', input)
 export const setLoginStatus = (input: PortalLoginStatusRequest) => post<PortalMemberResult>(members + '/login/status', input)
 export const issueToken = (input: PortalIssueTokenRequest) => post<PortalTokenResult>(members + '/tokens', input)
+/**
+ * 签发 appKey。
+ *
+ * ★ 走独立端点而不是 `issueToken`：appKey 的权限范围**由服务端固定**为
+ *   「上报 + 获取统计」，请求体里给不出更宽的范围（见 `APP_KEY_SCOPES`）。
+ */
+export const issueAppKey = (input: PortalIssueAppKeyRequest) => post<PortalTokenResult>(members + '/appkey', input)
 export const rotateToken = (input: PortalTokenVersionRequest) => post<PortalTokenResult>(members + '/tokens/rotate', input)
 export const revokeToken = (input: PortalTokenVersionRequest) => post<PortalTokenResult>(members + '/tokens/revoke', input)
 export const updateTokenScopes = (input: PortalTokenScopesRequest) => post<PortalTokenResult>(members + '/tokens/scopes', input)

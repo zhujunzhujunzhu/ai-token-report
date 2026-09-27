@@ -72,6 +72,7 @@ try {
 
   const managementPages = [
     { path: '/members', name: 'members', title: '人员管理' },
+    { path: '/appkeys', name: 'appkeys', title: 'appKey 发放' },
     { path: '/roles', name: 'roles', title: '角色管理' },
     { path: '/departments', name: 'departments', title: '部门管理' },
   ]
@@ -88,7 +89,9 @@ try {
   const permissionCases = [
     { label: '缺省权限成员', permissions: [], allowed: [] },
     { label: '部门只读成员', permissions: ['departments:read'], allowed: [] },
-    { label: '人员查看者', permissions: ['members:read'], allowed: ['members'] },
+    // appKey 发放页的主体是成员名单，所以与人员管理共用读权限；
+    // 真正的签发按钮另按 tokens:manage 置灰。
+    { label: '人员查看者', permissions: ['members:read'], allowed: ['members', 'appkeys'] },
     { label: '角色查看者', permissions: ['roles:read'], allowed: ['roles'] },
     { label: '部门管理者', permissions: ['departments:read', 'departments:manage'], allowed: ['departments'] },
   ]
@@ -116,9 +119,10 @@ try {
   await router.push('/members')
   const layoutHtml = await render('/src/layouts/PortalLayout.vue')
   const navigationHtml = layoutHtml.match(/<aside\b[\s\S]*?<\/aside>/)?.[0] ?? ''
-  check('管理导航依次为人员、角色、部门三个独立入口',
+  check('管理导航依次为人员、appKey、角色、部门四个独立入口',
     navigationHtml.indexOf('人员管理') >= 0 &&
-    navigationHtml.indexOf('人员管理') < navigationHtml.indexOf('角色管理') &&
+    navigationHtml.indexOf('人员管理') < navigationHtml.indexOf('appKey 发放') &&
+    navigationHtml.indexOf('appKey 发放') < navigationHtml.indexOf('角色管理') &&
     navigationHtml.indexOf('角色管理') < navigationHtml.indexOf('部门管理'))
 
   const dashboard = useDashboardStore(pinia)
@@ -247,6 +251,17 @@ try {
     !adminHtml.includes('部门目录') && !adminHtml.includes('角色与权限目录') &&
     !adminHtml.includes('部门列表') && !adminHtml.includes('角色列表'))
   check('管理页不再显示凭证文件或可恢复明文', !adminHtml.includes('credentials.json') && !adminHtml.includes('显示 Token'))
+  const appKeyHtml = await render('/src/views/AppKeyView.vue')
+  check('appKey 发放页写明两项固定权限',
+    appKeyHtml.includes('appKey 发放') && appKeyHtml.includes('上报用量') &&
+    appKeyHtml.includes('获取统计信息') && appKeyHtml.includes('usage:write + stats:read'))
+  check('appKey 不能进入管理面', appKeyHtml.includes('不能进入管理页面'))
+  members.issuedSecret = 'atr-演示凭证'
+  const issuedHtml = await render('/src/views/AppKeyView.vue')
+  check('签发后当场提供完整 appKey 与复制入口',
+    issuedHtml.includes('id="issued-appkey"') && issuedHtml.includes('atr-演示凭证') && issuedHtml.includes('复制 appKey'))
+  check('appKey 明文只显示这一次', issuedHtml.includes('只显示这一次'))
+  members.dismissSecret()
   const rolesHtml = await render('/src/views/RolesView.vue')
   check('角色管理独立展示列表、搜索与分配入口',
     ['角色管理', '角色列表', '搜索角色', '分配角色'].every((label) => rolesHtml.includes(label)))
@@ -262,6 +277,8 @@ try {
     recordsHtml +
     diagnosticsHtml +
     adminHtml +
+    appKeyHtml +
+    issuedHtml +
     rolesHtml +
     departmentsHtml
   for (const term of ['消费金额', 'CNY', '¥', '充值余额', '80,642,909'])

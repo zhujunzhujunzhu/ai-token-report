@@ -22,6 +22,7 @@ import {
   FirstAidKit,
   User,
   Key,
+  Ticket,
   OfficeBuilding,
   Fold,
   Expand,
@@ -41,6 +42,11 @@ const navigation = computed(() => [
   { path: '/diagnostics', label: '采集诊断', icon: FirstAidKit },
   ...(session.can('members:read')
     ? [{ path: '/members', label: '人员管理', icon: User }]
+    : []),
+  // ★ 与「人员管理」共用读权限：这一页的主体是成员名单，
+  //   真正的签发按钮另按 tokens:manage 置灰（见 AppKeyView）。
+  ...(session.can('members:read')
+    ? [{ path: '/appkeys', label: 'appKey 发放', icon: Ticket }]
     : []),
   ...(session.can('roles:read')
     ? [{ path: '/roles', label: '角色管理', icon: Key }]

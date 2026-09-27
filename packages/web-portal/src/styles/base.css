@@ -733,6 +733,23 @@ code {
   font-size: 15px;
   user-select: all;
 }
+/* appKey 发放页：把「插件该填哪个地址」讲清楚，别让人回去翻文档。 */
+.issued-hint {
+  margin: 14px 0 0;
+  color: var(--c-text-secondary);
+  font-size: 13px;
+  line-height: 1.7;
+}
+.issued-hint code {
+  background: #fff;
+  padding: 2px 6px;
+  border-radius: 4px;
+  user-select: all;
+}
+.scope-text {
+  color: var(--c-text-secondary);
+  font-size: 13px;
+}
 .storage-info {
   --el-collapse-header-bg-color: transparent;
   --el-collapse-content-bg-color: transparent;
