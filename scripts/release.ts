@@ -22,7 +22,16 @@ const env = cleanChildEnv()
 const node = resolveNodeBin()
 if (!node) throw new Error('发布需要真正的 Node；设置 ATR_NODE_BIN 后重试')
 env['ATR_NODE_BIN'] = node
-type Step = { label: string; args: string[]; cwd?: string; env?: Record<string, string>; timeout?: number }
+type Step = { label: string; args: string[]; cwd?: string; env?: Record<string, string>; timeout?: number; liveOutput?: boolean }
+async function collectOutput(stream: ReadableStream<Uint8Array>, sink?: NodeJS.WriteStream): Promise<string> {
+  const decoder = new TextDecoder()
+  let text = ''
+  for await (const chunk of stream) {
+    sink?.write(chunk)
+    text += decoder.decode(chunk, { stream: true })
+  }
+  return text + decoder.decode()
+}
 async function run(step: Step) {
   const index = report.steps.length + 1
   console.log(`[${index}] ${step.label}`)
@@ -31,7 +40,12 @@ async function run(step: Step) {
     cwd: step.cwd ?? root, env: { ...env, ...step.env }, stdout: 'pipe', stderr: 'pipe',
   })
   const timer = setTimeout(() => child.kill(), step.timeout ?? 300_000)
-  const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited])
+  // npm 的浏览器认证链接必须立即可见，不能等发布进程结束后才显示；日志仍完整保留。
+  const [stdout, stderr, code] = await Promise.all([
+    collectOutput(child.stdout, step.liveOutput ? process.stdout : undefined),
+    collectOutput(child.stderr, step.liveOutput ? process.stderr : undefined),
+    child.exited,
+  ])
   clearTimeout(timer)
   const log = join(output, `${String(index).padStart(2, '0')}.log`)
   writeFileSync(log, stdout + stderr)
@@ -91,7 +105,7 @@ try {
     const tarball = tarballs.get(target)!
     const original = report.artifacts.find((a) => a.file === tarball)!
     if (createHash('sha256').update(readFileSync(tarball)).digest('hex') !== original.sha256) throw new Error('已验证 tarball 被修改，拒绝发布')
-    await run({ label: `${target} ${options.publish ? '发布' : 'dry-run'} (${options.tag})`, args: ['publish', tarball, '--tag', options.tag, ...(options.publish ? [] : ['--dry-run'])] })
+    await run({ label: `${target} ${options.publish ? '发布' : 'dry-run'} (${options.tag})`, args: ['publish', tarball, '--tag', options.tag, ...(options.publish ? [] : ['--dry-run'])], liveOutput: options.publish })
   }
   report.status = options.publish ? 'published' : 'verified-dry-run'
   save()
