@@ -2,7 +2,7 @@
 
 在 DeepSeek Harness（DSH）里直接查看本机 token 用量：输入框摘要、趋势图、模型排行和自定义日期范围；需要团队汇总时，再配置身份与上报连接。
 
-**当前版本：0.3.1** · npm 包名：`dsh-plugin-token-report` · 仓内开发包名：`@ai-token-report/dsh-plugin`
+npm 包名：`dsh-plugin-token-report` · 仓内开发包名：`@ai-token-report/dsh-plugin`
 
 ## 实际使用截图
 
@@ -20,12 +20,12 @@
 
 ![真实 DSH 插件日期选择](docs/screenshots/date-range.png)
 
-## 安装 0.3.1
+## 安装最新稳定版
 
 需要已经安装 DSH，并使用与插件兼容的宿主模块（`@deepseek-ai/cordis ^4.0.2`、`@deepseek-ai/dsh-session-telemetry ^0.1.5-rc.1`）。Node.js 要求 **22.15.0 或更新版本**。
 
 ```bash
-dsh plugin --profile web add dsh-plugin-token-report@0.3.1
+dsh plugin --profile web add dsh-plugin-token-report@latest
 ```
 
 `dsh plugin add` 会自动在 `~/.dsh/profiles/web/package.json` 的 `dsh.profile.bundles` 中登记发布包。检查它只出现一次，且没有旧源码包 `@ai-token-report/dsh-plugin`；**不要再手动 insert 插件**。正常列表例如：
@@ -95,11 +95,17 @@ dsh --profile web --no-open
 
 ### 开启团队上报
 
-在详情面板右上角点击齿轮「配置」，填写管理员提供的姓名、身份 Key 和完整上报地址，例如 `https://portal.example.com/api/v1/token-usage`。如果团队使用独立 appKey，也可以一并填写；留空使用本次身份 Key。
+在详情面板右上角点击齿轮「配置」，只填两项：**服务端地址**（部门平台根地址，例如 `https://portal.example.com`，或本机自建的 `http://127.0.0.1:8787`）与**管理员发放的 appKey**。上报地址由服务端地址推导（`<地址>/api/v1/token-usage`），不需要自己拼路径。
 
-点击「验证并保存」后，插件先向对应服务端校验身份，姓名与部门以服务端返回值为准。**保存后重启 DSH**，新的署名与连接才会用于上报。已保存的 Key 不回显。
+点击「验证并保存」后，插件用这个 appKey 向对应服务端的 `/api/v1/identity/verify` 校验身份，**姓名与部门以服务端返回值为准**（面板不再询问姓名 —— 它由 appKey 在服务端绑定的人决定）。**保存后重启 DSH**，新的上报连接才会生效。已保存的 appKey 不回显。
 
 身份与连接保存在 `$DSH_HOME/token-report/` 下；默认 DSH_HOME 为 `~/.dsh`。插件与本地 Web 共用身份文件。部署侧固定了身份时，页面会提示配置由管理员管理。
+
+启用上报后，插件会在后台扫描 `$DSH_HOME/sessions` 下的**全部历史会话**，分批补报用量，直到服务器全部确认收到；不需要逐个打开旧会话。实时新用量同时上报，服务端按事件 ID 去重。断网或退出后，下次启动会继续；更换服务端地址或 appKey 后，会向新连接重新全量补报。
+
+历史补报只发送 token 数值、模型和会话归属等统计字段，不发送对话正文。`token_usage_diagnostics` 会显示历史扫描进度、服务器确认数、重试错误和最近完成时间。对照本地与部门看板时，请选择相同时间范围并筛选 appKey 对应人员。
+
+DSH 升级会保留旧格式日志作为备份；同一会话存在多个规范格式版本时，统计与补报都只读取最高版本，与 DSH 自身一致，避免事件重编号后重复计费。历史补报不会自动删除服务器上的旧数据；已由旧版本重复上报的记录需先对账、备份，再单独修复。
 
 ### 让 Agent 查询
 
@@ -113,7 +119,7 @@ dsh --profile web --no-open
 
 工具注册需要宿主提供对应能力并启用 `features.tools`。查询工具只读本机日志，本身不产生上报。
 
-## 0.3.0 功能说明
+## 功能说明
 
 | 能力 | 使用方式 |
 |---|---|
@@ -121,15 +127,16 @@ dsh --profile web --no-open
 | 时间分析 | 预设周期、双月日历、自定义范围、趋势切换 |
 | 明细分析 | 模型 / 服务商 / 项目 / 会话分组，展开与分页 |
 | 本地增量查询 | SQLite 增量索引；库不可用时自动回退日志扫描并提示 |
-| 身份配置 | 面板内验证署名与上报连接，重启后生效 |
+| 上报连接 | 面板内填服务端地址 + appKey，验证后重启生效 |
 | 实时上报 | 异步批量发送、磁盘 outbox、失败保留、重启重放 |
+| 历史补报 | 独立后台线程扫描全部历史，服务器确认后保存进度，失败持续重试 |
 | Agent 与插件集成 | `token_usage`、`token_usage_diagnostics`、`ctx.tokenReport` |
 
 只展示 token 数，不展示金额。只采集用量相关字段（包含模型名、工作目录、轮次等），不采集对话内容。上报失败不会阻塞 DSH 的会话循环；服务端按事件 ID 去重。
 
 ## 升级与常见问题
 
-从旧版升级时，重新运行指定版本的安装命令。若曾源码直挂或手动 `insert`，先执行下方离线修复，再重启 DSH。
+从旧版升级时，重新运行上方带 `@latest` 的安装命令即可安装最新稳定版。若曾源码直挂或手动 `insert`，先执行下方离线修复，再重启 DSH。
 
 ### 0.3.0 启动报 duplicate loader entry id: token-report
 
@@ -604,10 +611,10 @@ DSH 的 web 服务器**不做任何鉴权**（`dsh-host-webserver` 的文档明�
 点击明细行展开四项 token 与会话数；明细每页展示 10 行，超过一页时显示翻页与总条数，切换分组或时间范围回到第一页。明细保留全部数据，短周期趋势保留最多 31 点，今年和自定义范围保留完整序列。
 切换时间时保留已有内容与范围标签，结果返回后整体更新；图表复用实例，弹框保持稳定高度。底部不再展示数据来源、耗时与读取时间，仅在查询失败或降级时提示原因。
 
-「配置」页填写姓名、身份 Key、完整上报地址与可选的独立 appKey。
-保存前向该地址对应的 `/api/v1/identity/verify` 校验身份，姓名与部门只认服务端返回值。
-未署名时仍可看本机统计，但不采集、不上报；已保存的 Key 不回显。
-署名与本地 Web 共用 `$DSH_HOME/token-report/identity.json`，
+「配置」页只填两项：服务端地址与 appKey（管理员在平台「appKey 发放」页生成并复制）。
+保存前向 `<服务端地址>/api/v1/identity/verify` 校验 appKey，姓名与部门只认服务端返回值。
+未填 appKey 时仍可看本机统计，但不采集、不上报；已保存的 appKey 不回显。
+署名与本地 Web 共用 `$DSH_HOME/token-report/identity.json`（`token` 就是这串 appKey），
 连接保存到同目录的 `plugin-connection.json`（原子写入、0600）。
 用户保存的连接优先于部署默认连接；配置了固定 `user` 时页面只读。
 
