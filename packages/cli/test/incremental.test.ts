@@ -92,6 +92,7 @@ function lookupFrom(state: ReturnType<typeof emptyState>) {
   return {
     sizeOf: (p: string) => state.files[p]?.size,
     frameCountOf: (p: string) => state.files[p]?.frameCount,
+    cursorOf: (p: string) => state.files[p]?.cursor,
     lastSeqOf: (s: string) => state.lastSeqBySession[s],
   }
 }
@@ -190,7 +191,7 @@ test('scanIncremental：首次扫描产出全部记录，二次扫描产出 0 �
 
   // 落盘水位线
   for (const f of first.files) {
-    state.files[f.filePath] = { size: f.size, frameCount: f.frameCount, mtimeMs: f.mtimeMs, firstSeenMs: 0 }
+    state.files[f.filePath] = { size: f.size, frameCount: f.frameCount, mtimeMs: f.mtimeMs, firstSeenMs: 0, cursor: f.cursor }
   }
   stageRecords(state, first.records)
 
@@ -210,7 +211,7 @@ test('scanIncremental：追加新帧后只产出新增记录', tracked(async () 
   const first = await scanIncremental(join(home, 'sessions'), { watermarks: lookupFrom(state) })
   assert.equal(first.records.length, 1)
   for (const f of first.files) {
-    state.files[f.filePath] = { size: f.size, frameCount: f.frameCount, mtimeMs: f.mtimeMs, firstSeenMs: 0 }
+    state.files[f.filePath] = { size: f.size, frameCount: f.frameCount, mtimeMs: f.mtimeMs, firstSeenMs: 0, cursor: f.cursor }
   }
   stageRecords(state, first.records)
 
@@ -233,7 +234,7 @@ test('scanIncremental：增量块缺 session 行时仍保留 cwd（继承水印�
   const first = await scanIncremental(join(home, 'sessions'), { watermarks: lookupFrom(state) })
   assert.equal(first.records[0]!.cwd, 'D:\\proj')
   for (const f of first.files) {
-    state.files[f.filePath] = { size: f.size, frameCount: f.frameCount, mtimeMs: f.mtimeMs, firstSeenMs: 0 }
+    state.files[f.filePath] = { size: f.size, frameCount: f.frameCount, mtimeMs: f.mtimeMs, firstSeenMs: 0, cursor: f.cursor }
   }
   stageRecords(state, first.records)
   assert.equal(state.cwdBySession['sess-1'], 'D:\\proj', 'stage 应记住 cwd')
@@ -302,8 +303,8 @@ test('scanIncremental：文件被截断时回退重扫该文件', tracked(async 
 
   const second = await scanIncremental(join(home, 'sessions'), { watermarks: lookupFrom(state) })
   assert.equal(second.diagnostics.filesScanned, 1, '截断文件必须被重扫，不能静默跳过')
-  // L3 仍会挡住已上报的 seq=1
-  assert.equal(second.records.length, 0, 'L3 水位线挡住重复的 seq')
+  // 标准日志可能经升级重编号，截断重扫宁可重发，不能用旧格式最大 seq 漏掉新格式。
+  assert.equal(second.records.length, 1, '重扫标准日志的重复记录交给服务端主键幂等处理')
 }))
 
 // ── 状态与崩溃安全 ──────────────────────────────────────────────────────────

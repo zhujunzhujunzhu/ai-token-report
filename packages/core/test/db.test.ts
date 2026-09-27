@@ -193,7 +193,7 @@ test('重复帧与跨文件重放：直扫和 SQLite 都按 event_id 首次出�
   const first = usageLine(1, { provider: 'first', input: 12, output: 3, cacheRead: 45, cacheWrite: 6 })
   const file = makeSession('project', 'session-replay', [sessionLine('session-replay', '/project'), first])
   appendFrame(file, [first, usageLine(2)])
-  writeFileSync(join(sessionsRoot, 'project', 'session-replay', 'session.v4.jsonl.zstd'),
+  writeFileSync(join(sessionsRoot, 'project', 'session-replay', 'session.v3.part-2.jsonl.zstd'),
     zstdCompressSync(Buffer.from([sessionLine('session-replay', '/project'), usageLine(1, { provider: 'later', input: 999 }), usageLine(2)].join('\n') + '\n')))
   for (const providers of [undefined, ['first'], ['later']]) {
     const { sql, scan } = await comparePaths(providers ? { providers } : {})
@@ -404,10 +404,9 @@ describe('db 入库', () => {
 
     const second = await ingest({ sessionsRoot, dbPath })
     expect(second.filesScanned).toBe(1, )
-    // 截断文件被全量重扫，但 L3（session_state.last_seq）仍挡住 seq=1，
-    // 因此既没新插入、也没有产生主键冲突 —— 与 state.ts 的语义一致。
+    // 标准日志截断后安全重发，由 event_id 主键吸收；不信可能来自旧格式的最大 seq。
     expect(second.inserted).toBe(0, )
-    expect(second.duplicates).toBe(0, )
+    expect(second.duplicates).toBe(1, )
 
     const db = openDatabaseForIngest(dbPath)
     expect(countEvents(db)).toBe(2, )
@@ -429,13 +428,11 @@ describe('db 入库', () => {
     db0.close()
 
     const second = await ingest({ sessionsRoot, dbPath })
-    // ⚠️ L3 仍在（session_state 未被清），所以先被 L3 挡住
+    // 标准日志不用可能来自旧格式的 L3，重扫重复行由主键吸收。
     expect(second.inserted).toBe(0, )
+    expect(second.duplicates).toBe(2)
 
-    // 清掉全部水位线，才能真正走到「靠主键去重」这条路径。
-    // ⚠️ 光清 file_watermark 不够：文件字节数没变会让 L1 直接跳过整个文件，
-    //    根本不会解压出记录，也就验证不到主键去重。
-    //    这里同时把 session_state 清掉，让 L1 失效、L3 也无从判断。
+    // 清掉全部水位线时同样必须保持幂等，不能依赖任何扫描状态避免重复。
     const dbMid = openDatabaseForIngest(dbPath)
     dbMid.exec('DELETE FROM file_watermark')
     dbMid.exec('DELETE FROM session_state')

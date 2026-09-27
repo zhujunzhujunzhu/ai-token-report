@@ -5,7 +5,7 @@
 
 import { open, readFile, readdir, stat } from 'node:fs/promises'
 import type { Dirent, Stats } from 'node:fs'
-import { isAbsolute, join, relative, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 import { decodeFramedZstd, decodeFramedZstdFrom, parseJsonl } from './decode.js'
 import {
@@ -36,14 +36,35 @@ export interface ScanOptions {
   onProgress?: (done: number, total: number, file: string) => void
 }
 
+/** 扫描来源的语义版本；本地缓存与补报光标必须随来源选择规则重新生成。 */
+export const SESSION_SCAN_REVISION = 2
+
+/** 只有精确标准文件名才是格式代际；session.part-2 等分段绝不能被当成旧副本。 */
+export function sessionLogVersion(name: string): number | null {
+  const match = /^session(?:\.v([1-9]\d*))?\.jsonl\.zstd$/.exec(name)
+  if (!match) return null
+  const version = match[1] === undefined ? 0 : Number(match[1])
+  return Number.isSafeInteger(version) ? version : null
+}
+
+/** DSH 升级会保留旧文件，但新格式会重编号 seq；同会话只能读最高格式的标准日志。 */
+export function selectSessionLogFiles(entries: readonly string[]): string[] {
+  let highest = -1
+  for (const entry of entries) highest = Math.max(highest, sessionLogVersion(entry) ?? -1)
+  return entries.filter(entry => entry.startsWith('session') && entry.endsWith('.jsonl.zstd') &&
+    (sessionLogVersion(entry) === null || sessionLogVersion(entry) === highest))
+}
+
 /** 列出 sessions 根目录下所有会话日志文件。 */
-export async function listSessionFiles(sessionsRoot: string): Promise<SessionMeta[]> {
+export async function listSessionFiles(sessionsRoot: string, options: { strictErrors?: boolean } = {}): Promise<SessionMeta[]> {
   const out: SessionMeta[] = []
 
   let projects: Dirent[]
   try {
     projects = await readdir(sessionsRoot, { withFileTypes: true })
-  } catch {
+  } catch (error) {
+    // 全量补报不能把不可读目录伪装成空历史；交互统计仍保留既有容错行为。
+    if (options.strictErrors) throw error
     return out
   }
 
@@ -52,14 +73,16 @@ export async function listSessionFiles(sessionsRoot: string): Promise<SessionMet
     const projPath = join(sessionsRoot, projectDir)
     try {
       if (!project.isDirectory() && !(project.isSymbolicLink() && (await stat(projPath)).isDirectory())) continue
-    } catch {
+    } catch (error) {
+      if (options.strictErrors) throw error
       continue
     }
 
     let sessionIds: Dirent[]
     try {
       sessionIds = await readdir(projPath, { withFileTypes: true })
-    } catch {
+    } catch (error) {
+      if (options.strictErrors) throw error
       continue
     }
 
@@ -68,20 +91,21 @@ export async function listSessionFiles(sessionsRoot: string): Promise<SessionMet
       const sessPath = join(projPath, sessionId)
       try {
         if (!session.isDirectory() && !(session.isSymbolicLink() && (await stat(sessPath)).isDirectory())) continue
-      } catch {
+      } catch (error) {
+        if (options.strictErrors) throw error
         continue
       }
 
-      // 日志文件名带格式版本（session.v3.jsonl.zstd），做前缀匹配以兼容升级
+      // 旧格式是迁移前的只读副本，不能与重编号后的新格式一起统计。
       let entries: string[]
       try {
         entries = await readdir(sessPath)
-      } catch {
+      } catch (error) {
+        if (options.strictErrors) throw error
         continue
       }
 
-      for (const entry of entries) {
-        if (!entry.startsWith('session') || !entry.endsWith('.jsonl.zstd')) continue
+      for (const entry of selectSessionLogFiles(entries)) {
         out.push({
           sessionId,
           cwd: null,
@@ -113,6 +137,34 @@ export function sessionFilesFromPaths(sessionsRoot: string, paths: readonly stri
     files.set(filePath, { sessionId: sessionId!, projectDir: projectDir!, filePath, cwd: null, createdAt: null })
   }
   return [...files.values()]
+}
+
+/** 定向扫描也核对同目录的标准格式；监听到旧副本时只刷新当前格式，不把旧记录带回来。 */
+export async function listSessionFilesFromPaths(sessionsRoot: string, paths: readonly string[]): Promise<SessionMeta[]> {
+  const requested = sessionFilesFromPaths(sessionsRoot, paths)
+  const groups = new Map<string, SessionMeta[]>()
+  for (const meta of requested) {
+    const dir = dirname(meta.filePath)
+    const group = groups.get(dir) ?? []
+    group.push(meta)
+    groups.set(dir, group)
+  }
+  const result: SessionMeta[] = []
+  for (const [dir, group] of groups) {
+    let entries: string[]
+    try { entries = await readdir(dir) } catch {
+      // 保留原路径让扫描器报告 filesFailed，不能把读取失败当成“无变化”。
+      result.push(...group)
+      continue
+    }
+    const wanted = new Set(group.map(meta => basename(meta.filePath)))
+    for (const entry of selectSessionLogFiles(entries)) {
+      // 标准日志总是带上，以便发现运行中升级；分段仍只扫描监听器指定的文件。
+      if (!wanted.has(entry) && sessionLogVersion(entry) === null) continue
+      result.push({ ...group[0]!, filePath: join(dir, entry) })
+    }
+  }
+  return result
 }
 
 function matchAny(value: string, patterns: string[] | undefined): boolean {
@@ -397,6 +449,8 @@ export interface IncrementalScanOptions {
   onProgress?: (done: number, total: number, file: string) => void
   /** 仅扫描监听器报告的具体日志路径；undefined 完整对账，空数组不扫描。 */
   changedFiles?: string[]
+  /** 已按本模块来源策略发现的文件；入库需要同一份目录快照检测格式切换。 */
+  sessionFiles?: SessionMeta[]
 }
 
 function fileIdentity(st: Stats): string {
@@ -452,9 +506,9 @@ export async function scanIncremental(
   options: IncrementalScanOptions,
 ): Promise<IncrementalScanResult> {
   const diagnostics = emptyDiagnostics()
-  const files = options.changedFiles === undefined
+  const files = options.sessionFiles ?? (options.changedFiles === undefined
     ? await listSessionFiles(sessionsRoot)
-    : sessionFilesFromPaths(sessionsRoot, options.changedFiles)
+    : await listSessionFilesFromPaths(sessionsRoot, options.changedFiles))
   const records: UsageRecord[] = []
   const fileResults: IncrementalFileResult[] = []
   let skippedUnchanged = 0
@@ -546,7 +600,10 @@ export async function scanIncremental(
 
     // L3：事件级兜底过滤
     let kept = 0
-    const lastSeq = options.watermarks.lastSeqOf(meta.sessionId)
+    // 标准日志升级会重编号，旧格式遗留的会话最大 seq 不能过滤新格式及其后续追加。
+    // 文件光标负责增量；必要的重发由 event_id 主键去重，分段保留原有 L3 语义。
+    const lastSeq = sessionLogVersion(basename(meta.filePath)) === null
+      ? options.watermarks.lastSeqOf(meta.sessionId) : undefined
     if (records.length > before) {
       let next = before
       for (let i = before; i < records.length; i++) {

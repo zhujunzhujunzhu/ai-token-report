@@ -245,7 +245,8 @@ test('定向入库只处理指定文件，水位线查询也限定到这些文�
   expect(changed.inserted).toBe(1)
   expect(changed.skippedUnchanged).toBe(0)
   expect(changed.bytesRead).toBe(tail.length)
-  expect(reads.filter((sql) => sql.includes('FROM file_watermark')).every((sql) => sql.includes('WHERE f.file_path IN (?)'))).toBe(true)
+  expect(reads.filter((sql) => sql.includes('FROM file_watermark')).every((sql) =>
+    sql.includes('WHERE f.file_path IN (?)') || sql.includes('WHERE f.session_id IN (?)'))).toBe(true)
   expect(reads.filter((sql) => sql.includes('FROM session_state')).every((sql) => sql.includes('WHERE session_id IN (?)'))).toBe(true)
   expect((await ingest({ sessionsRoot, dbPath, db, changedFiles: [] })).bytesRead).toBe(0)
   // 完整对账会补上另一个文件，不能让定向扫描冒充全目录已更新。
@@ -264,7 +265,7 @@ test('定向扫描对大量路径分批查水位线，新文件仍继承同会�
   }
   expect((await ingest({ sessionsRoot, dbPath, db, changedFiles: paths })).inserted).toBe(205)
   expect((await ingest({ sessionsRoot, dbPath, db, changedFiles: paths })).skippedUnchanged).toBe(205)
-  const split = join(sessionsRoot, 'project', 'session-0', 'session.v4.jsonl.zstd')
+  const split = join(sessionsRoot, 'project', 'session-0', 'session.part-2.jsonl.zstd')
   writeFileSync(split, frame(usage(1), usage(2)))
   expect((await ingest({ sessionsRoot, dbPath, db, changedFiles: [split] })).inserted).toBe(1)
   expect(queryRecords(db).find((r) => r.sessionId === 'session-0' && r.seq === 2)?.cwd).toBe('/cursor-project')
@@ -280,7 +281,7 @@ test('定向扫描拒绝相对路径、外部路径及目录路径', () => {
 test('首文件只有元信息时，新分段文件定向扫描继承 cwd 且不漏 seq=0', async () => {
   makeFile(frame(metadata))
   await cycle()
-  const split = join(sessionsRoot, 'project', 'session', 'session.v4.jsonl.zstd')
+  const split = join(sessionsRoot, 'project', 'session', 'session.part-2.jsonl.zstd')
   writeFileSync(split, frame(usage(0)))
   expect((await ingest({ sessionsRoot, dbPath, db, changedFiles: [split] })).inserted).toBe(1)
   expect(queryRecords(db)[0]?.cwd).toBe('/cursor-project')

@@ -28,12 +28,14 @@
  */
 
 import type { Database } from './driver.js'
+import { basename, dirname } from 'node:path'
 
-import { scanIncremental, sessionFilesFromPaths, type ScanOptions, type FileCursor, type WatermarkLookup } from '../scanner.js'
+import { scanIncremental, listSessionFiles, listSessionFilesFromPaths, sessionLogVersion, SESSION_SCAN_REVISION,
+  type ScanOptions, type FileCursor, type WatermarkLookup } from '../scanner.js'
 import type { ScanDiagnostics, SessionMeta, UsageRecord } from '../types.js'
 import type { WireTokenRecord } from '@ai-token-report/shared'
 import { portalDialect, type PortalStore } from './portal-db.js'
-import { openDb, ensureSchema, needsRebuild, rebuildSchema, EVENT_TABLE } from './schema.js'
+import { openDb, ensureSchema, needsRebuild, rebuildSchema, EVENT_TABLE, DB_SCHEMA_VERSION } from './schema.js'
 
 /** 一次 ingest 的结果。 */
 export interface IngestResult {
@@ -89,20 +91,42 @@ export async function ingest(options: IngestOptions): Promise<IngestResult> {
   const db = options.db ?? openDatabaseForIngest(options.dbPath)
 
   try {
+    // 本地扫描策略更新只允许重建日志的派生库，不能误触 portal 的唯一副本。
+    if (db.query<{ user_version: number }>('PRAGMA user_version').get()?.user_version !== DB_SCHEMA_VERSION) {
+      throw new Error('日志增量采集只接受本地 v3 数据库，拒绝修改上报库')
+    }
     ensureLocalCursorSchema(db)
-    const scopedFiles = options.changedFiles === undefined
-      ? undefined : sessionFilesFromPaths(options.sessionsRoot, options.changedFiles)
-    const watermarks = readWatermarks(db, scopedFiles)
+    ensureLocalScanSchema(db)
+    let files = options.changedFiles === undefined
+      ? await listSessionFiles(options.sessionsRoot)
+      : await listSessionFilesFromPaths(options.sessionsRoot, options.changedFiles)
+    const revisionChanged = db.query<{ revision: number }>('SELECT revision FROM local_scan_meta WHERE id = 1').get()?.revision !== SESSION_SCAN_REVISION
+    let sources = changedScanSources(db, files)
+    const reset = (revisionChanged && (countEvents(db) > 0 ||
+      db.query('SELECT 1 FROM file_watermark LIMIT 1').get() != null)) || sources.some(source => source.previous !== undefined)
+    if (reset) {
+      // 先完整解析、后在写事务里替换。扫描失败时旧缓存仍在，不留下半重建的数字。
+      files = await listSessionFiles(options.sessionsRoot, { strictErrors: true })
+      sources = scanSources(files).map(source => ({ ...source, previous: undefined }))
+    }
+    const watermarks: WatermarkLookup = reset ? {
+      sizeOf: () => undefined, frameCountOf: () => undefined, lastSeqOf: () => undefined,
+    } : readWatermarks(db, options.changedFiles === undefined ? undefined : files)
 
     const scan = await scanIncremental(options.sessionsRoot, {
       watermarks,
-      ...(options.changedFiles !== undefined ? { changedFiles: options.changedFiles } : {}),
+      sessionFiles: files,
       ...(options.onProgress ? { onProgress: options.onProgress } : {}),
     })
+    if (reset && (scan.diagnostics.filesFailed > 0 || scan.diagnostics.framesFailed > 0 ||
+      scan.files.some(file => file.cursor?.byteOffset !== file.size))) {
+      throw new Error('日志尚未完整读取，本地统计缓存重建已延后，原缓存保留')
+    }
 
     // 完全未变化时不产生任何写事务，也不改诊断时间戳。
     // 读取本地快照不应导致跨进程缓存误判为「又有了新数据」。
-    if (scan.records.length === 0 && !scan.files.some((f) => f.changed) && scan.diagnostics.filesFailed === 0) {
+    if (!reset && !revisionChanged && sources.length === 0 && scan.records.length === 0 &&
+      !scan.files.some((f) => f.changed) && scan.diagnostics.filesFailed === 0) {
       return { inserted: 0, duplicates: 0, filesScanned: 0, skippedUnchanged: scan.skippedUnchanged,
         diagnostics: scan.diagnostics, elapsedMs: Date.now() - started, ingestedAt: Date.now(), bytesRead: scan.bytesRead }
     }
@@ -163,6 +187,12 @@ export async function ingest(options: IngestOptions): Promise<IngestResult> {
     }
 
     const commit = () => db.transaction(() => {
+      if (reset) {
+        // 不转换旧 seq：旧格式与新格式并非同一编号空间，只能从权威日志重建。
+        // DELETE 会使本地 rollup 触发器失效，下一次汇总会完整重算附属索引。
+        db.exec(`DELETE FROM ${EVENT_TABLE}; DELETE FROM file_watermark; DELETE FROM session_state;
+          DELETE FROM ingest_run; DELETE FROM local_file_cursor; DELETE FROM local_scan_source`)
+      }
       for (const rec of scan.records) {
         // bun:sqlite 的 run() 返回 { changes, lastInsertRowid }，
         // changes=0 即被主键冲突忽略 —— 这是去重的唯一判据。
@@ -224,6 +254,10 @@ export async function ingest(options: IngestOptions): Promise<IngestResult> {
         insertedTotal: countEvents(db),
         diagnostics: scan.diagnostics,
       })
+      if (revisionChanged) db.query('INSERT OR REPLACE INTO local_scan_meta (id, revision) VALUES (1, ?)').run([SESSION_SCAN_REVISION])
+      for (const source of sources) {
+        db.query('INSERT OR REPLACE INTO local_scan_source (session_dir, file_path) VALUES (?, ?)').run([source.dir, source.filePath])
+      }
     })
 
     try {
@@ -262,6 +296,18 @@ export async function ingest(options: IngestOptions): Promise<IngestResult> {
  */
 export function openDatabaseForIngest(dbPath: string): Database {
   const db = openDb(dbPath)
+  let portal: boolean
+  try {
+    portal = db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'portal_identity_state'").get() != null
+  } catch (error) {
+    db.close()
+    throw error
+  }
+  // 必须在版本自愈及其 catch 外拒绝；先重建再检查版本已经来不及保护唯一副本。
+  if (portal) {
+    db.close()
+    throw new Error('本地日志采集拒绝打开部门上报库；上报库是唯一副本，不可重建')
+  }
   try {
     if (needsRebuild(db)) rebuildSchema(db)
     else ensureSchema(db)
@@ -378,6 +424,43 @@ function ensureLocalCursorSchema(db: Database): void {
     cwd TEXT,
     watermark_updated_at_ms INTEGER NOT NULL
   )`)
+}
+
+/** 来源策略是本地派生状态，不修改共享 schema 的 user_version，更不会在 portal 建表。 */
+function ensureLocalScanSchema(db: Database): void {
+  db.exec(`CREATE TABLE IF NOT EXISTS local_scan_meta (id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS local_scan_source (session_dir TEXT PRIMARY KEY, file_path TEXT NOT NULL)`)
+}
+
+function scanSources(files: readonly SessionMeta[]): { dir: string; filePath: string }[] {
+  return files.filter(file => sessionLogVersion(basename(file.filePath)) !== null)
+    .map(file => ({ dir: dirname(file.filePath), filePath: file.filePath }))
+}
+
+/** 只读受影响会话的来源标记；升级重编号时不能继续使用旧事件和旧会话最大 seq。 */
+function changedScanSources(db: Database, files: readonly SessionMeta[]) {
+  const sources = scanSources(files)
+  const previous = new Map<string, string>()
+  for (const dirs of watermarkBatches(sources.map(source => source.dir))) {
+    for (const row of db.query<{ session_dir: string; file_path: string }>(
+      `SELECT session_dir, file_path FROM local_scan_source WHERE session_dir IN (${dirs!.map(() => '?').join(',')})`,
+    ).all(dirs)) previous.set(row.session_dir, row.file_path)
+  }
+  const selected = new Map(sources.map(source => [source.dir, source.filePath]))
+  const obsolete = new Map<string, string>()
+  for (const ids of watermarkBatches(files.map(file => file.sessionId))) {
+    for (const row of db.query<{ file_path: string }>(
+      `SELECT f.file_path FROM file_watermark f WHERE f.session_id IN (${ids!.map(() => '?').join(',')})`,
+    ).all(ids)) {
+      const dir = dirname(row.file_path)
+      if (sessionLogVersion(basename(row.file_path)) !== null && selected.has(dir) && selected.get(dir) !== row.file_path) {
+        obsolete.set(dir, row.file_path)
+      }
+    }
+  }
+  // 旧 CLI 不认识 local_scan_source，仍可能重新写入旧格式。实际文件水位线也是来源证据。
+  return sources.filter(source => previous.get(source.dir) !== source.filePath || obsolete.has(source.dir))
+    .map(source => ({ ...source, previous: obsolete.get(source.dir) ?? previous.get(source.dir) }))
 }
 
 /**
