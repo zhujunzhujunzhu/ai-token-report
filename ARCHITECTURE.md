@@ -532,6 +532,10 @@ Authorization: Bearer <token>
 
 ### 5.2 服务端上报（② 插件 & ④ CLI 共用）
 
+2026-09-27：HTTP 入口增加有界异步 FIFO，等待时不解析正文，事务提交后才返回 200；
+数据库写入使用有界多行 INSERT，普通版本闸门不再扫描历史事件。
+容量配置、故障语义、看板 5 秒刷新与隔离压测结果见 [上报性能与队列方案](docs/上报性能与队列方案.md)。
+
 ```http
 POST /api/v1/token-usage
 Authorization: Bearer <DSH_REPORT_TOKEN>
