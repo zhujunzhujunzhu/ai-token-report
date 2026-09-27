@@ -169,7 +169,7 @@ export function UsageDetail(props: { state: UsageState; store: UsageStore; onClo
       createElement('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
         createElement('path', { d: 'M20 7v5h-5M4 17v-5h5M6.1 6.1A8 8 0 0 1 19.5 9M4.5 15a8 8 0 0 0 13.4 2.9' })),
     ),
-    createElement('button', { type: 'button', className: 'atr-btn atr-icon-btn atr-settings-btn', onClick: () => setSettings(true), title: '署名与上报配置', 'aria-label': '配置' },
+    createElement('button', { type: 'button', className: 'atr-btn atr-icon-btn atr-settings-btn', onClick: () => setSettings(true), title: '上报连接配置（服务端地址与 appKey）', 'aria-label': '配置' },
       createElement('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
         createElement('path', { d: 'M9.5 3h5l.6 2.5 1.3.8 2.5-.7 2.5 4.3-1.9 1.8v1.6l1.9 1.8-2.5 4.3-2.5-.7-1.3.8-.6 2.5h-5l-.6-2.5-1.3-.8-2.5.7-2.5-4.3 1.9-1.8v-1.6L2.6 9.9l2.5-4.3 2.5.7 1.3-.8L9.5 3Z' }),
         createElement('circle', { cx: 12, cy: 12.5, r: 3 }))),

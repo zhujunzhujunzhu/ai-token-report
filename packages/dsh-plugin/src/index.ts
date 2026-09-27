@@ -181,8 +181,9 @@ export function describeDisabled(status: PluginStatus, resolver: IdentityResolve
       '⚠ token 上报未启用：未配置上报凭证 appKey。',
       '  ★ 在你完成配置之前，本插件不采集、也不上报任何数据。',
       '  配置方式（任选其一）：',
-      '    1. 插件 config 里写 appKey: <管理员发放的凭证>',
-      '    2. 设置环境变量 DSH_TOKEN_REPORT_APP_KEY',
+      '    1. 在用量面板右上角点齿轮「配置」，填服务端地址与管理员发放的 appKey',
+      '    2. 插件 config 里写 appKey: <管理员发放的凭证>',
+      '    3. 设置环境变量 DSH_TOKEN_REPORT_APP_KEY',
     ].join('\n')
   }
 
