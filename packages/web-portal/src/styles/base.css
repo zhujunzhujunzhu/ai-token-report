@@ -818,6 +818,12 @@ code {
   font-size: 13px;
   line-height: 1.7;
 }
+/* ★ 弹框正文的第一行不顶 16px：弹框自带 padding，而交付信息里那句警告条
+   去掉之后，首个元素直接就是正文（明文时是 `dl`，只有摘要时是提示句），
+   再顶一段会让弹框上面空一块。 */
+.appkey-delivery > :first-child {
+  margin-top: 0;
+}
 .delivery-list {
   display: grid;
   gap: 10px;
