@@ -657,37 +657,26 @@ code {
 .record-details {
   padding: 16px 32px;
 }
-.diagnostic-cards,
-.member-summary {
+.diagnostic-cards {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 18px;
 }
-.diagnostic-cards span,
-.member-summary span {
+.diagnostic-cards span {
   color: #8290a5;
   font-size: 12px;
 }
-.diagnostic-cards strong,
-.member-summary strong {
+.diagnostic-cards strong {
   display: block;
   font-size: 28px;
   margin-top: 14px;
   font-weight: 600;
 }
-.diagnostic-cards small,
-.member-summary small {
+.diagnostic-cards small {
   font-size: 11px;
   font-weight: 400;
   margin-left: 8px;
   color: #99a5b5;
-}
-.member-summary {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-}
-.member-summary .storage-status {
-  font-size: 21px;
-  color: #22a18b;
 }
 .member-filters {
   display: flex;
@@ -1225,18 +1214,6 @@ code {
   .diagnostic-cards {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 12px;
-  }
-  .member-summary {
-    gap: 9px;
-  }
-  .member-summary .el-card__body {
-    padding: 16px 12px;
-  }
-  .member-summary strong {
-    font-size: 24px;
-  }
-  .member-summary .storage-status {
-    font-size: 17px;
   }
   .member-filters .el-input {
     width: 100%;
