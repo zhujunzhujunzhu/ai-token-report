@@ -50,9 +50,9 @@ afterEach(() => {
 
 /** 三个人：张三 / 张三丰 用于验证按人筛选是精确匹配而不是子串匹配。 */
 const STORE = CredentialStore.from([
-  { token: 'tok-zhang', name: '张三', dept: '研发一部' },
-  { token: 'tok-zhangsf', name: '张三丰', dept: '研发一部' },
-  { token: 'tok-li', name: '李四', dept: '研发二部' },
+  { token: 'tok-zhang', name: '张三', group: '研发一部' },
+  { token: 'tok-zhangsf', name: '张三丰', group: '研发一部' },
+  { token: 'tok-li', name: '李四', group: '研发二部' },
 ])
 
 function stats(store: CredentialStore = STORE): StatsRoute {

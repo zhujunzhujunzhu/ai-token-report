@@ -12,7 +12,7 @@ function option(name: string): string | undefined {
   return value
 }
 async function main(): Promise<void> {
-  if (!['inspect','migrate','resume'].includes(command)) throw new Error('用法：migrate-db.ts inspect|migrate|resume --db <portal.sqlite>；MySQL 使用 ATR_MYSQL_URL。旧库迁移必须 --confirm-offline。')
+  if (!['inspect','migrate','resume'].includes(command)) throw new Error('用法：migrate-db.ts inspect|migrate|resume --db <portal.sqlite>；MySQL 使用 ATR_MYSQL_URL。旧库迁移必须 --confirm-offline。上报库当前版本是 v5：v4 库需要显式迁移，v3 库需先迁到 v4（v4 是冻结基线）再迁 v5。')
   const db = option('--db')
   const mysqlUrl = process.env.ATR_MYSQL_URL
   if (!db && !mysqlUrl) throw new Error('必须显式指定 --db 或 ATR_MYSQL_URL，防止误迁移默认库。')
@@ -28,6 +28,7 @@ async function main(): Promise<void> {
   console.log(JSON.stringify(result, null, 2))
   if (command === 'inspect' && result.status === 'legacy') {
     console.log(`停止旧服务后运行 migrate --confirm-offline。目标：${describePortalTarget(target)}`)
+    console.log('上报库当前版本是 v5（多对多分组）：v4 库会被这一步直接迁到 v5；v3 库先迁到 v4 再迁 v5，两步都不会改写任何事件原值。')
     console.log(mysqlUrl ? 'MySQL 必须提供真实备份文件 --backup、--backup-sha256 和与上方完全一致的 --backup-target。' : 'SQLite 会先生成 VACUUM INTO 一致性备份与 SHA256 清单；可用 --backup 指定新路径。')
   }
 }

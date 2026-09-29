@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
-import { openDb, ensureSchema, inspectPortalDatabase } from '@ai-token-report/core/db'
+import { openDb, ensureSchema, inspectPortalDatabase, PORTAL_SCHEMA_VERSION } from '@ai-token-report/core/db'
 import { cleanChildEnv, resolveNodeBin } from '../../core/verify/lib/runtime.js'
 import { hashPassword } from '../src/auth/password.js'
 import { IdentityRepository } from '../src/identity/index.js'
@@ -43,9 +43,9 @@ try {
   check(run('import-credentials', importArgs).code === 1, 'Node 身份导入拒绝未升级 v3')
   check(run('migrate-db', ['migrate', '--db', target.sqlitePath]).code === 1, 'Node 迁移必须显式离线确认')
   const migrated = run('migrate-db', ['migrate', '--db', target.sqlitePath, '--confirm-offline'])
-  check(migrated.code === 0 && migrated.output.includes('"status": "current"'), 'Node 完成一致性备份及 v3→v4 迁移')
+  check(migrated.code === 0 && migrated.output.includes('"status": "current"'), 'Node 完成一致性备份及 v3→v5 迁移')
   const current = run('migrate-db', ['inspect', '--db', target.sqlitePath])
-  check(current.code === 0 && current.output.includes('"version": 4'), 'Node inspect 复核 v4')
+  check(current.code === 0 && current.output.includes(`"version": ${PORTAL_SCHEMA_VERSION}`), `Node inspect 复核 v${PORTAL_SCHEMA_VERSION}`)
   const imported = run('import-credentials', importArgs)
   check(imported.code === 0, 'Node 真实凭证导入成功')
   check(!imported.output.includes('node-entrypoints-legacy-secret') && !imported.output.includes(encoded), 'Node 导入输出不含凭证与密码哈希')
@@ -60,7 +60,7 @@ try {
   const event = await repository.read(tx => tx.get<Record<string, unknown>>('SELECT input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,user_id,member_id FROM usage_event'))
   check(JSON.stringify(event) === JSON.stringify({ input_tokens: 2, output_tokens: 3, cache_read_tokens: 5, cache_write_tokens: 7, user_id: '旧管理员', member_id: null }), '旧历史四列不变且不凭同名自动归属')
   check(readFileSync(file, 'utf8') === raw, '源凭证文件逐字不变')
-  console.log(`真实 Node 三入口验证通过（${checks} 项，独立 SQLite v3 副本→备份→v4→身份导入）`)
+  console.log(`真实 Node 三入口验证通过（${checks} 项，独立 SQLite v3 副本→备份→v5→身份导入）`)
 } finally {
   if (!resolve(dir).startsWith(join(resolve(tmpdir()), 'atr-node-entrypoints-'))) throw new Error('临时目录超出范围')
   rmSync(dir, { recursive: true, force: true })

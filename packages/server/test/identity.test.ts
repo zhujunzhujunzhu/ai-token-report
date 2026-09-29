@@ -50,13 +50,13 @@ function fakePortal(
 describe('凭证表', () => {
   test('数组格式', () => {
     const store = CredentialStore.from([
-      { token: 'tok-zhang', name: '张三', dept: '研发一部' },
+      { token: 'tok-zhang', name: '张三', group: '研发一部' },
       { token: 'tok-li', name: '李四' },
     ])
     expect(store.size).toBe(2)
     expect(store.verify('tok-zhang').name).toBe('张三')
-    expect(store.verify('tok-zhang').dept).toBe('研发一部')
-    expect(store.verify('tok-li').dept).toBeUndefined()
+    expect(store.verify('tok-zhang').group).toBe('研发一部')
+    expect(store.verify('tok-li').group).toBeUndefined()
   })
 
   test('未知 token 被拒绝', () => {
@@ -131,13 +131,13 @@ describe('Authorization 头解析', () => {
 })
 
 describe('verifyToken —— 身份不可冒用', () => {
-  const store = CredentialStore.from([{ token: 'tok-zhang', name: '张三', dept: '研发一部' }])
+  const store = CredentialStore.from([{ token: 'tok-zhang', name: '张三', group: '研发一部' }])
 
   test('正确 token → 返回凭证表里的姓名', () => {
     const r = verifyToken(store, { authorization: 'Bearer tok-zhang' })
     expect(r.ok).toBe(true)
     expect(r.name).toBe('张三')
-    expect(r.dept).toBe('研发一部')
+    expect(r.group).toBe('研发一部')
   })
 
   test('★ 即使 body 里塞了别人的名字，也以凭证表为准', () => {
@@ -213,7 +213,7 @@ describe('IdentityRoute —— 引导页读写', () => {
       dshHome: home,
       portalUrl: 'http://portal.test',
       // 用户填「张三三」，服务端认定「张三」
-      fetchImpl: fakePortal({ ok: true, registered: true, name: '张三', dept: '研发一部' }),
+      fetchImpl: fakePortal({ ok: true, registered: true, name: '张三', group: '研发一部' }),
     })
 
     const r = await route.submit({ name: '张三三', token: 'tok-abc' })
@@ -222,7 +222,7 @@ describe('IdentityRoute —— 引导页读写', () => {
 
     const stored = readIdentity(identityPath(home)).identity
     expect(stored?.name).toBe('张三')
-    expect(stored?.dept).toBe('研发一部')
+    expect(stored?.group).toBe('研发一部')
     expect(stored?.token).toBe('tok-abc')
   })
 

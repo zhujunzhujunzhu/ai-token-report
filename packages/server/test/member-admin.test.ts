@@ -64,7 +64,7 @@ function setup(options: { envAdmin?: boolean } = {}): {
 } {
   writeCredentials([
     { token: 'tok-boss', name: '李经理', role: 'admin' },
-    { token: 'tok-zhang', name: '张三', dept: '研发一部' },
+    { token: 'tok-zhang', name: '张三', group: '研发一部' },
   ])
   const { admin, store } = loadMembers({
     credentialsPath,
@@ -88,7 +88,7 @@ describe('凭证表：角色与来源', () => {
   test('非法 role 值降级为 member，而不是让整份文件解析失败', () => {
     writeCredentials([{ token: 'tok-a', name: '甲', role: 'root' }])
     const { store } = loadMembers({ credentialsPath })
-    // 一个人写错 role 不该让全部门的 token 集体失效
+    // 一个人写错 role 不该让全员（同一次铺开）的 token 集体失效
     expect(store.registered).toBe(true)
     expect(store.verify('tok-a').role).toBe(ROLE_MEMBER)
   })
@@ -114,18 +114,18 @@ describe('凭证表：角色与来源', () => {
 })
 
 describe('★ 签发 token', () => {
-  test('列表：管理员在前，成员带部门，来源标明', () => {
+  test('列表：管理员在前，成员带分组，来源标明', () => {
     const { admin } = setup()
     const members = admin.list()
     expect(members.map((m) => m.name)).toEqual(['李经理', '张三'])
     expect(members[0]!.role).toBe(ROLE_ADMIN)
-    expect(members[1]!.dept).toBe('研发一部')
+    expect(members[1]!.group).toBe('研发一部')
     expect(members[1]!.source).toBe('file')
   })
 
   test('★ 新 token 立刻可用于校验（不必重启服务端）', () => {
     const { admin, store } = setup()
-    const res = admin.issue({ name: '王五', dept: '研发二部' })
+    const res = admin.issue({ name: '王五', group: '研发二部' })
     expect(res.ok).toBe(true)
     const token = res.member!.token
 
@@ -135,7 +135,7 @@ describe('★ 签发 token', () => {
     expect(verified.ok).toBe(true)
     expect(verified.name).toBe('王五')
     expect(verified.role).toBe(ROLE_MEMBER)
-    expect(verified.dept).toBe('研发二部')
+    expect(verified.group).toBe('研发二部')
   })
 
   test('落盘：数组格式，成员不写 role 字段，带 createdAt', () => {
@@ -176,11 +176,11 @@ describe('★ 签发 token', () => {
     expect(res.reason).toContain('未署名')
   })
 
-  test('空姓名 / 超长姓名 / 超长部门由 shared 的校验拦住', () => {
+  test('空姓名 / 超长姓名 / 超长分组由 shared 的校验拦住', () => {
     const { admin } = setup()
     expect(admin.issue({ name: '   ' }).ok).toBe(false)
     expect(admin.issue({ name: 'x'.repeat(64) }).ok).toBe(false)
-    expect(admin.issue({ name: '甲', dept: 'x'.repeat(200) }).ok).toBe(false)
+    expect(admin.issue({ name: '甲', group: 'x'.repeat(200) }).ok).toBe(false)
   })
 
   test('未知角色值拒绝（而不是静默当成成员）', () => {
@@ -268,7 +268,7 @@ describe('★ 环境变量注入的管理员不可在页面维护', () => {
 })
 
 describe('修改人员', () => {
-  test('改名 / 换部门 / 清空部门', () => {
+  test('改名 / 换分组 / 清空分组', () => {
     const { admin, store } = setup()
 
     const renamed = admin.update({ token: 'tok-zhang', name: '张三丰' })
@@ -277,8 +277,8 @@ describe('修改人员', () => {
     // token 不变：改姓名不该让本人重填 token
     expect(renamed.member!.token).toBe('tok-zhang')
 
-    expect(admin.update({ token: 'tok-zhang', dept: '研发三部' }).member!.dept).toBe('研发三部')
-    expect(admin.update({ token: 'tok-zhang', dept: '' }).member!.dept).toBeNull()
+    expect(admin.update({ token: 'tok-zhang', group: '研发三部' }).member!.group).toBe('研发三部')
+    expect(admin.update({ token: 'tok-zhang', group: '' }).member!.group).toBeNull()
   })
 
   test('改成别人的名字被拒绝', () => {
@@ -290,7 +290,7 @@ describe('修改人员', () => {
 
   test('改成自己原来的名字不算冲突', () => {
     const { admin } = setup()
-    expect(admin.update({ token: 'tok-zhang', name: '张三', dept: '研发一部' }).ok).toBe(true)
+    expect(admin.update({ token: 'tok-zhang', name: '张三', group: '研发一部' }).ok).toBe(true)
   })
 })
 
@@ -390,7 +390,7 @@ describe('管理路由：鉴权三类分开', () => {
 
   test('签发走路由：200 + ok:true + 新 token', () => {
     const { route } = setup()
-    const res = route.issue('Bearer tok-boss', { name: '王五', dept: '研发二部' })
+    const res = route.issue('Bearer tok-boss', { name: '王五', group: '研发二部' })
     expect(res.status).toBe(200)
     const body = res.body as { ok: boolean; member?: { token: string; name: string } }
     expect(body.ok).toBe(true)
@@ -418,8 +418,8 @@ describe('管理路由：鉴权三类分开', () => {
     const { route, store } = setup()
     const auth = 'Bearer tok-boss'
 
-    expect(route.update(auth, { token: 'tok-zhang', dept: '研发二部' }).status).toBe(200)
-    expect(store.findByToken('tok-zhang')?.dept).toBe('研发二部')
+    expect(route.update(auth, { token: 'tok-zhang', group: '研发二部' }).status).toBe(200)
+    expect(store.findByToken('tok-zhang')?.group).toBe('研发二部')
 
     const rotated = route.rotate(auth, { token: 'tok-zhang' })
     const fresh = (rotated.body as { member: { token: string } }).member.token

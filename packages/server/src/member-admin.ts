@@ -64,8 +64,8 @@ const TOKEN_PREFIX = 'atr-'
 const TOKEN_RANDOM_BYTES = 8
 /** 生成 token 时允许的重试次数。撞上 20 次说明随机源坏了，不是运气问题。 */
 const TOKEN_ATTEMPTS = 20
-/** 部门名长度上限（比姓名宽松，但要拦住误粘贴整段文本）。 */
-const DEPT_MAX_LENGTH = 64
+/** 分组名长度上限（比姓名宽松，但要拦住误粘贴整段文本）。 */
+const GROUP_MAX_LENGTH = 64
 
 /** 环境变量注入管理员用的变量名。 */
 export const ENV_ADMIN_TOKEN = 'ATR_ADMIN_TOKEN'
@@ -209,7 +209,7 @@ export class MemberAdmin {
   }
 
   /** 签发一个新 token。 */
-  issue(input: { name: string; dept?: string; role?: UserRole }): MemberResult {
+  issue(input: { name: string; group?: string; role?: UserRole }): MemberResult {
     const name = input.name.trim()
     const nameCheck = validateName(name)
     if (!nameCheck.ok) return { ok: false, reason: nameCheck.reason }
@@ -228,8 +228,8 @@ export class MemberAdmin {
       }
     }
 
-    const dept = checkDept(input.dept)
-    if ('error' in dept) return { ok: false, reason: dept.error }
+    const group = checkGroup(input.group)
+    if ('error' in group) return { ok: false, reason: group.error }
 
     const role = normalizeRole(input.role)
     if ('error' in role) return { ok: false, reason: role.error }
@@ -240,7 +240,7 @@ export class MemberAdmin {
     const entry: CredentialInput = {
       token,
       name,
-      ...(dept.value ? { dept: dept.value } : {}),
+      ...(group.value ? { group: group.value } : {}),
       role: role.value,
       createdAt: Date.now(),
       source: 'file',
@@ -252,11 +252,11 @@ export class MemberAdmin {
     return { ok: true, member: toAdminMember(this.#store.findByToken(token)!) }
   }
 
-  /** 修改姓名 / 部门 / 角色。token 不变（改姓名不该让本人重填 token）。 */
+  /** 修改姓名 / 分组 / 角色。token 不变（改姓名不该让本人重填 token）。 */
   update(input: {
     token: string
     name?: string
-    dept?: string
+    group?: string
     role?: UserRole
   }): MemberResult {
     const located = this.#locate(input.token)
@@ -281,11 +281,11 @@ export class MemberAdmin {
       }
     }
 
-    let dept = entry.dept
-    if (input.dept !== undefined) {
-      const checked = checkDept(input.dept)
+    let group = entry.group
+    if (input.group !== undefined) {
+      const checked = checkGroup(input.group)
       if ('error' in checked) return { ok: false, reason: checked.error }
-      dept = checked.value
+      group = checked.value
     }
 
     let role = entry.role ?? ROLE_MEMBER
@@ -307,12 +307,12 @@ export class MemberAdmin {
     next[index] = {
       ...entry,
       name,
-      ...(dept ? { dept } : {}),
+      ...(group ? { group } : {}),
       role,
       source: 'file',
     }
-    // dept 传空串 = 清除，必须显式删掉旧字段（展开 `...entry` 会把它带回来）
-    if (!dept) delete (next[index] as { dept?: string }).dept
+    // group 传空串 = 清除分组，必须显式删掉旧字段（展开 `...entry` 会把它带回来）
+    if (!group) delete (next[index] as { group?: string }).group
 
     const saved = this.#persist(next)
     if (!saved.ok) return { ok: false, reason: saved.reason }
@@ -324,7 +324,7 @@ export class MemberAdmin {
    * 重置 token：同一个人的新凭证，旧 token 立即失效。
    *
    * 用途是「token 可能泄露了」与「本人换机器重填失败」。
-   * 姓名/部门/角色全部保留 —— 重置的是凭证，不是身份。
+   * 姓名/分组/角色全部保留 —— 重置的是凭证，不是身份。
    */
   rotate(input: { token: string }): MemberResult {
     const located = this.#locate(input.token)
@@ -467,23 +467,23 @@ function toAdminMember(c: Credential): AdminMember {
     login_enabled: !!(c.username && c.passwordHash),
     token: c.token,
     name: c.name,
-    dept: c.dept ?? null,
+    group: c.group ?? null,
     role: c.role,
     createdAt: c.createdAt ?? null,
     source: c.source,
   }
 }
 
-/** 校验部门名。返回 `{ value }`（空串表示清除）或 `{ error }`。 */
-function checkDept(raw: string | undefined): { value: string } | { error: string } {
-  const dept = raw?.trim() ?? ''
-  if (dept.length > DEPT_MAX_LENGTH) {
-    return { error: `部门名过长（最多 ${DEPT_MAX_LENGTH} 个字符）` }
+/** 校验分组名。返回 `{ value }`（空串表示清除）或 `{ error }`。 */
+function checkGroup(raw: string | undefined): { value: string } | { error: string } {
+  const group = raw?.trim() ?? ''
+  if (group.length > GROUP_MAX_LENGTH) {
+    return { error: `分组名过长（最多 ${GROUP_MAX_LENGTH} 个字符）` }
   }
   if (/[\r\n\t]/.test(raw ?? '')) {
-    return { error: '部门名不能包含换行或制表符' }
+    return { error: '分组名不能包含换行或制表符' }
   }
-  return { value: dept }
+  return { value: group }
 }
 
 /** 校验角色。缺省 = 普通成员（**绝不能**缺省成管理员）。 */
@@ -504,11 +504,11 @@ function serializeCredentials(entries: CredentialInput[]): string {
   const out = entries.map((e) => {
     const token = e.token.trim()
     const name = e.name.trim()
-    const dept = e.dept?.trim()
+    const group = e.group?.trim()
     return {
       token,
       name,
-      ...(dept ? { dept } : {}),
+      ...(group ? { group } : {}),
       ...(e.role === ROLE_ADMIN ? { role: ROLE_ADMIN } : {}),
       ...(typeof e.createdAt === 'number' ? { createdAt: e.createdAt } : {}),
       ...(e.username ? { username: e.username } : {}),

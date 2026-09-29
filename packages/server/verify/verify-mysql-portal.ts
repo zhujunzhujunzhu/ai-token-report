@@ -32,7 +32,7 @@
  * 而启动日志经常被贴进工单）。手工装配会绕过这两处，正是「脚本全绿但线上配不上」
  * 的经典盲区。
  *
- * 每次创建随机 atr_http_v4_* 隔离库，显式导入夹具身份；结束后删除该隔离库。
+ * 每次创建随机 atr_http_v5_* 隔离库，显式导入夹具身份；结束后删除该隔离库。
  * 管理连接取 ATR_V4_TEST_MYSQL_URL 或本机开发容器，不打开现有业务库。
  */
 
@@ -110,8 +110,8 @@ writeFileSync(
   credPath,
   JSON.stringify(
     [
-      { token: TOKENS.zhang, name: '张三', dept: '研发一部' },
-      { token: TOKENS.li, name: '李四', dept: '研发二部' },
+      { token: TOKENS.zhang, name: '张三', group: '研发一部' },
+      { token: TOKENS.li, name: '李四', group: '研发二部' },
     ],
     null,
     2,
@@ -220,7 +220,8 @@ const EXPECTED = {
 function payload(records: WireRecord[], userName: string): unknown {
   return {
     schemaVersion: 1,
-    // ⚠️ 客户端自称的名字必须被服务端忽略（归属只信 token）
+    // ⚠️ 客户端自称的名字必须被服务端忽略（归属只信 token）；分组快照同样只是自称，
+    //   这里刻意用旧字段名 dept，顺带钉住「旧客户端仍能被接受」。
     client: { name: 'dsh-token-report', userId: 'someone-else', userName, dept: '研发九部' },
     generatedAt: new Date().toISOString(),
     records,
@@ -244,8 +245,8 @@ async function startServer(opts: {
   mysqlUrl?: string
 }): Promise<RunningServer> {
   await seedDatabaseIdentity({ sqlitePath: opts.dbPath, ...(opts.mysqlUrl ? { mysqlUrl: opts.mysqlUrl } : {}) }, [
-    { token: TOKENS.zhang, name: '张三', dept: '研发一部' },
-    { token: TOKENS.li, name: '李四', dept: '研发二部' },
+    { token: TOKENS.zhang, name: '张三', group: '研发一部' },
+    { token: TOKENS.li, name: '李四', group: '研发二部' },
   ])
   // ★ 生产入口：凭证表、三条路由、应用装配、端口重试全在里面。
   //   `credentialsPath` 由 `dshHome` 推导（`<home>/token-report/credentials.json`），
@@ -418,7 +419,7 @@ try {
     ),
     JSON.stringify(colNames),
   )
-  check('usage_event 带 user_id / user_name / dept 三列', ['user_id', 'user_name', 'dept'].every((c) => colNames.includes(c)), JSON.stringify(colNames))
+  check('usage_event 带 user_id / user_name / group_name 三列', ['user_id', 'user_name', 'group_name'].every((c) => colNames.includes(c)), JSON.stringify(colNames))
 
   // ── 5. 逐位对照看板接口 ──────────────────────────────────────────────────
   console.log('\n【5】★ 看板接口逐位对照（这是防方言/驱动漂移的核心断言）')

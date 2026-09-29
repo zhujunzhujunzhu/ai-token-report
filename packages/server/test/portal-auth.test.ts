@@ -341,7 +341,7 @@ describe('登录账号持久化与迁移', () => {
     expect(data.ok).toBe(true)
     expect(JSON.stringify(data)).not.toContain('passwordHash')
     expect((await f.login('new.user')).response.status).toBe(200)
-    f.admin.update({ token: member.token, dept: '研发' })
+    f.admin.update({ token: member.token, group: '研发' })
     const rotated = f.admin.rotate({ token: member.token }).member!
     const loaded = CredentialStore.load(f.path).store.findByToken(
       rotated.token,

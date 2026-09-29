@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { createServer } from '../src/index.js'
+import { PORTAL_SCHEMA_VERSION } from '@ai-token-report/core/db'
 import { seedDatabaseIdentity } from './database-fixture.js'
 
 const home = mkdtempSync(join(tmpdir(), 'atr-e2e-'))
@@ -25,11 +26,11 @@ mkdirSync(join(home, 'token-report'), { recursive: true })
 const credPath = join(home, 'token-report', 'credentials.json')
 writeFileSync(
   credPath,
-  JSON.stringify([{ token: 'atr-zhangsan-9f3c', name: '张三', dept: '研发一部' }]),
+  JSON.stringify([{ token: 'atr-zhangsan-9f3c', name: '张三', group: '研发一部' }]),
   'utf8',
 )
 await seedDatabaseIdentity({ sqlitePath: join(home, 'token-report', 'portal.sqlite') }, [
-  { token: 'atr-zhangsan-9f3c', name: '张三', dept: '研发一部' },
+  { token: 'atr-zhangsan-9f3c', name: '张三', group: '研发一部' },
 ])
 
 let passed = 0
@@ -58,7 +59,9 @@ console.log(`  部门服务端: ${portal.url}`)
 
 const health = await (await fetch(`${portal.url}/api/health`)).json()
 check('健康检查返回身份已入库', health.initialized === true)
-check('schema为v4', health.schema_version === 4)
+// ★ 跟常量走而不是写死数字：写死 4 会让每次部署都误报「上报库 schema 版本不一致」，
+//   而 `deploy-server.mjs` 正是拿这个字段和本地代码期望的版本比对。
+check(`schema为v${PORTAL_SCHEMA_VERSION}`, health.schema_version === PORTAL_SCHEMA_VERSION)
 
 // ── 2. 直接验证校验端点 ─────────────────────────────────────
 console.log('\n【2】部门服务端的校验端点')
@@ -71,7 +74,10 @@ const okRes = await (
 ).json()
 check('正确 token → ok', okRes.ok === true)
 check('返回姓名来自凭证表', okRes.name === '张三', JSON.stringify(okRes))
-check('返回部门', okRes.dept === '研发一部')
+check('返回分组', okRes.group === '研发一部')
+// ★ `dept` 是刻意保留的兼容别名：已部署的旧插件 / 旧 CLI 读的是它。
+//   两者必须**同值**，否则同一份响应里会出现两个互相矛盾的分组名。
+check('★ 旧字段名 dept 仍返回且与 group 同值（兼容旧插件）', okRes.dept === '研发一部' && okRes.dept === okRes.group)
 
 const badRes = await (
   await fetch(`${portal.url}/api/v1/identity/verify`, {
@@ -131,12 +137,12 @@ const goodSubmit = await (
 ).json()
 check('正确 token 提交 → ok=true', goodSubmit.ok === true)
 check('★ 姓名以服务端认定为准，而非用户输入', goodSubmit.name === '张三', String(goodSubmit.name))
-check('部门来自凭证表', goodSubmit.dept === '研发一部')
+check('分组来自凭证表', goodSubmit.group === '研发一部')
 
 // 4.4 落盘内容验证
 const stored = JSON.parse(readFileSync(join(home, 'token-report', 'identity.json'), 'utf8'))
 check('落盘姓名 = 张三', stored.name === '张三')
-check('落盘部门 = 研发一部', stored.dept === '研发一部')
+check('落盘分组 = 研发一部（只写新字段 group）', stored.group === '研发一部' && !('dept' in stored))
 check('落盘 token', stored.token === 'atr-zhangsan-9f3c')
 check('落盘含 createdAt', typeof stored.createdAt === 'number')
 

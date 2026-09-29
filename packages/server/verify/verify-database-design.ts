@@ -1,5 +1,5 @@
 /**
- * Portal v4 数据库设计原型：执行两份 DDL 并验证真实约束、事务和历史引用。
+ * Portal v5 数据库设计原型：执行两份 DDL 并验证真实约束、事务和历史引用。
  * 这不是应用 E2E，也不是生产迁移。只建随机隔离 SQLite / MySQL schema。
  * MySQL 不可连接或无建库权限时明确失败；不进入配置 URL 原来指定的业务库。
  * 用法：bun run packages/server/verify/verify-database-design.ts
@@ -22,9 +22,9 @@ interface Db {
   close(): Promise<void>
 }
 const root = resolve(import.meta.dir, '../../..')
-const artifactDir = mkdtempSync(join(tmpdir(), 'atr-database-v4-'))
-const mysqlSchema = `atr_v4_verify_${Date.now()}_${randomBytes(5).toString('hex')}`
-assert.match(mysqlSchema, /^atr_v4_verify_[0-9]+_[a-f0-9]{10}$/)
+const artifactDir = mkdtempSync(join(tmpdir(), 'atr-database-v5-'))
+const mysqlSchema = `atr_v5_verify_${Date.now()}_${randomBytes(5).toString('hex')}`
+assert.match(mysqlSchema, /^atr_v5_verify_[0-9]+_[a-f0-9]{10}$/)
 const mysqlConnection = process.env['ATR_MYSQL_URL']?.trim()
 if (!mysqlConnection) throw new Error('请显式设置 ATR_MYSQL_URL 为可创建隔离测试库的连接')
 const mysqlUrl = new URL(mysqlConnection)
@@ -36,7 +36,7 @@ mysqlUrl.hash = ''
 const sha = (value: string | Uint8Array): string => createHash('sha256').update(value).digest('hex')
 const seedAdmin = '00000000-0000-4000-8000-000000000001'
 const seedMember = '00000000-0000-4000-8000-000000000002'
-const tableNames = ['departments','members','roles','permissions','member_roles','role_permissions','login_accounts','report_tokens','report_token_scopes','auth_sessions','auth_challenges','auth_rate_limit_buckets','admin_audit_log','legacy_attribution_map','portal_identity_state','portal_schema_migrations','usage_event']
+const tableNames = ['member_groups','member_group_assignments','members','roles','permissions','member_roles','role_permissions','login_accounts','report_tokens','report_token_scopes','auth_sessions','auth_challenges','auth_rate_limit_buckets','admin_audit_log','legacy_attribution_map','portal_identity_state','portal_schema_migrations','usage_event']
 const results: { backend: string; checks: string[]; error?: string }[] = []
 const ddlHashes: Record<string, string> = {}
 const versions: Record<string,string>={runtime:`Bun ${Bun.version}`}
@@ -106,38 +106,53 @@ async function verify(db: Db, kind: 'sqlite' | 'mysql', second: () => Promise<Db
   }
   const scalar = async (sql: string, params?: Params) => Number((await db.get<{ n: unknown }>(sql, params))?.n)
   try {
-    const ddl = readFileSync(join(root, `docs/database-v4/schema.${kind}.sql`), 'utf8')
+    const ddl = readFileSync(join(root, `docs/database-v5/schema.${kind}.sql`), 'utf8')
     ddlHashes[kind] = sha(ddl)
     assert.ok(!/^\s*(ALTER|DROP)\s/im.test(ddl), 'DDL 只允许创建新库结构')
     await db.exec(ddl)
-    check('17 张表可真实创建', (await Promise.all(tableNames.map(t=>scalar(`SELECT COUNT(*) AS n FROM ${t}`)))).every(Number.isFinite))
+    check('18 张表可真实创建', (await Promise.all(tableNames.map(t=>scalar(`SELECT COUNT(*) AS n FROM ${t}`)))).every(Number.isFinite))
     check('12 个权限与两个内置角色', await scalar('SELECT COUNT(*) AS n FROM permissions')===12 && await scalar('SELECT COUNT(*) AS n FROM roles')===2)
     check('admin 有 12 项、member 有 4 项权限', await scalar('SELECT COUNT(*) AS n FROM role_permissions WHERE role_id=$id', {$id:seedAdmin})===12 && await scalar('SELECT COUNT(*) AS n FROM role_permissions WHERE role_id=$id', {$id:seedMember})===4)
     check('DDL 没伪造迁移完成或初始化管理员', await scalar('SELECT COUNT(*) AS n FROM portal_schema_migrations')===0 && await scalar('SELECT COUNT(*) AS n FROM login_accounts')===0)
     const migrationId = randomUUID()
-    await insert('portal_schema_migrations', {migration_id:migrationId,version:4,checksum:sha(ddl),status:'started',last_completed_step:1,checkpoint_json:JSON.stringify({verified_tables:tableNames}),started_at_ms:1})
-    check('独立 v4 迁移步骤可记录为未完成', Number((await db.get('SELECT version FROM portal_schema_migrations'))?.version)===4 && (await db.get('SELECT completed_at_ms FROM portal_schema_migrations'))?.completed_at_ms===null)
+    await insert('portal_schema_migrations', {migration_id:migrationId,version:5,checksum:sha(ddl),status:'started',last_completed_step:1,checkpoint_json:JSON.stringify({verified_tables:tableNames}),started_at_ms:1})
+    // ⚠️ 这里只验「迁移步骤自身的状态机」：v5 的 DDL 不伪造完成证据，
+    //   真实迁移由 core 的 v4→v5 步骤按 checksum 核实后写入。
+    check('独立 v5 迁移步骤可记录为未完成', Number((await db.get('SELECT version FROM portal_schema_migrations'))?.version)===5 && (await db.get('SELECT completed_at_ms FROM portal_schema_migrations'))?.completed_at_ms===null)
     await rejected('迁移未填完成时间不能标成功', ()=>db.run("UPDATE portal_schema_migrations SET status='completed'"))
-    if(kind==='sqlite') check('本地 user_version 未被提升为 v4', Number((await db.get('PRAGMA user_version'))?.user_version)===0)
-    const departmentId=randomUUID(), memberId=randomUUID(), otherId=randomUUID(), accountId=randomUUID(), tokenId=randomUUID()
-    const member = (id:string,name:string,dept:string|null=departmentId):Params => ({member_id:id,display_name:name,department_id:dept,created_at_ms:10,updated_at_ms:10})
-    await insert('departments',{department_id:departmentId,name:'研发',created_at_ms:10,updated_at_ms:10})
+    if(kind==='sqlite') check('本地 user_version 未被提升为 v5', Number((await db.get('PRAGMA user_version'))?.user_version)===0)
+    const groupId=randomUUID(), memberId=randomUUID(), otherId=randomUUID(), accountId=randomUUID(), tokenId=randomUUID()
+    // ⚠️ v5 的 `members` 上**没有**分组列：归属只存在关联表里（多对多）。
+    const member = (id:string,name:string):Params => ({member_id:id,display_name:name,created_at_ms:10,updated_at_ms:10})
+    await insert('member_groups',{group_id:groupId,name:'研发',created_at_ms:10,updated_at_ms:10})
     await insert('members',member(memberId,'张三'))
     await insert('members',member(otherId,'张三'))
     check('同名人员可存在且 UUID 不同', await scalar("SELECT COUNT(*) AS n FROM members WHERE display_name='张三'")===2)
     await rejected('UUID 格式约束执行',()=>insert('members',member('not-uuid','错误')))
-    await rejected('人员部门外键拒绝悬空引用',()=>insert('members',member(randomUUID(),'不存在部门',randomUUID())))
-    await rejected('部门名称唯一',()=>insert('departments',{department_id:randomUUID(),name:'研发',created_at_ms:10,updated_at_ms:10}))
+    // 归属的唯一权威是关联表：挂到不存在的分组上必须被外键挡住
+    await rejected('分组关联拒绝悬空引用',()=>insert('member_group_assignments',{member_id:memberId,group_id:randomUUID(),created_at_ms:10}))
+    await rejected('分组名称唯一',()=>insert('member_groups',{group_id:randomUUID(),name:'研发',created_at_ms:10,updated_at_ms:10}))
+    // ★ 多对多：同一个人可以同时属于两个分组（v4 的单值列在结构上做不到这件事）
+    const secondGroupId=randomUUID()
+    await insert('member_groups',{group_id:secondGroupId,name:'平台',created_at_ms:10,updated_at_ms:10})
+    await insert('member_group_assignments',{member_id:memberId,group_id:groupId,created_at_ms:10})
+    await insert('member_group_assignments',{member_id:memberId,group_id:secondGroupId,created_at_ms:11})
+    check('一个人可以同时属于多个分组', await scalar('SELECT COUNT(*) AS n FROM member_group_assignments WHERE member_id=$id',{$id:memberId})===2)
+    await rejected('同一个人与同一个分组只能有一条关联',()=>insert('member_group_assignments',{member_id:memberId,group_id:groupId,created_at_ms:12}))
+    // ⚠️ 停用分组不等于解除归属：关联行还在，历史按分组筛选的结果不该被一次启停改写
+    await db.run("UPDATE member_groups SET status='disabled' WHERE group_id=$id",{$id:secondGroupId})
+    check('停用分组不解除已有归属', await scalar('SELECT COUNT(*) AS n FROM member_group_assignments WHERE member_id=$id',{$id:memberId})===2)
+    await db.run("UPDATE member_groups SET status='active' WHERE group_id=$id",{$id:secondGroupId})
     await rejected('状态 CHECK 真实执行',()=>db.run("UPDATE members SET status='root' WHERE member_id=$id",{$id:memberId}))
     for(const [label,unit] of [['中文','汉'],['emoji','😀']] as const) {
       const id=randomUUID()
       await insert('members',member(id,unit.repeat(32)))
       check(`${label}姓名 32 Unicode 字符容量一致`,(await db.get('SELECT display_name FROM members WHERE member_id=$id',{$id:id}))?.display_name===unit.repeat(32))
       await rejected(`${label}姓名超过 32 字符被拒绝`,()=>insert('members',member(randomUUID(),unit.repeat(33))))
-      const dept=randomUUID()
-      await insert('departments',{department_id:dept,name:unit.repeat(64),created_at_ms:10,updated_at_ms:10})
-      check(`${label}部门 64 字符容量一致`,(await db.get('SELECT name FROM departments WHERE department_id=$id',{$id:dept}))?.name===unit.repeat(64))
-      await rejected(`${label}部门超过 64 字符被拒绝`,()=>insert('departments',{department_id:randomUUID(),name:unit.repeat(65),created_at_ms:10,updated_at_ms:10}))
+      const group=randomUUID()
+      await insert('member_groups',{group_id:group,name:unit.repeat(64),created_at_ms:10,updated_at_ms:10})
+      check(`${label}分组名 64 字符容量一致`,(await db.get('SELECT name FROM member_groups WHERE group_id=$id',{$id:group}))?.name===unit.repeat(64))
+      await rejected(`${label}分组名超过 64 字符被拒绝`,()=>insert('member_groups',{group_id:randomUUID(),name:unit.repeat(65),created_at_ms:10,updated_at_ms:10}))
     }
     await insert('member_roles',{member_id:memberId,role_id:seedAdmin,granted_at_ms:10})
     await insert('member_roles',{member_id:otherId,role_id:seedMember,granted_at_ms:10})
@@ -174,7 +189,7 @@ async function verify(db: Db, kind: 'sqlite' | 'mysql', second: () => Promise<Db
     const subjectHash=sha('qa-account-subject')
     await insert('auth_rate_limit_buckets',{bucket_id:randomUUID(),scope:'login:account',subject_hash:subjectHash,window_started_at_ms:10,expires_at_ms:100})
     await rejected('同 scope/subject 只有一个限流桶',()=>insert('auth_rate_limit_buckets',{bucket_id:randomUUID(),scope:'login:account',subject_hash:subjectHash,window_started_at_ms:10,expires_at_ms:100}))
-    const event=(id:string):Params=>({event_id:id,session_id:'qa-session',seq:1,ts:10,provider:'provider',model:'model',user_id:'旧姓名',user_name:'旧姓名',dept:'旧部门',input_tokens:11,output_tokens:22,cache_read_tokens:333,cache_write_tokens:44,reasoning_tokens:7,member_id:memberId,department_id:departmentId,report_token_id:tokenId,received_at_ms:20})
+    const event=(id:string):Params=>({event_id:id,session_id:'qa-session',seq:1,ts:10,provider:'provider',model:'model',user_id:'旧姓名',user_name:'旧姓名',group_name:'旧分组',input_tokens:11,output_tokens:22,cache_read_tokens:333,cache_write_tokens:44,reasoning_tokens:7,member_id:memberId,report_token_id:tokenId,received_at_ms:20})
     await insert('usage_event',event('qa-session:1'))
     const before=await db.get('SELECT * FROM usage_event WHERE event_id=$id',{$id:'qa-session:1'})
     await rejected('重复 event_id 主键拒绝第二次写入',()=>insert('usage_event',{...event('qa-session:1'),input_tokens:999,member_id:otherId,report_token_id:memberToken}))
@@ -210,10 +225,10 @@ async function verify(db: Db, kind: 'sqlite' | 'mysql', second: () => Promise<Db
     check('业务与成功审计同事务回滚',await scalar('SELECT COUNT(*) AS n FROM members WHERE member_id=$id',{$id:rollbackId})===0 && await scalar('SELECT COUNT(*) AS n FROM admin_audit_log WHERE audit_id=$id',{$id:rollbackAudit})===0)
     await rejected('不能删除被历史事件引用的人员',()=>db.run('DELETE FROM members WHERE member_id=$id',{$id:memberId}))
     await rejected('不能删除被历史引用的 Token',()=>db.run('DELETE FROM report_tokens WHERE token_id=$id',{$id:tokenId}))
-    await rejected('不能删除被引用部门',()=>db.run('DELETE FROM departments WHERE department_id=$id',{$id:departmentId}))
+    await rejected('不能删除被成员引用的分组',()=>db.run('DELETE FROM member_groups WHERE group_id=$id',{$id:groupId}))
     const mappingId=randomUUID()
     await insert('legacy_attribution_map',{mapping_id:mappingId,legacy_user_id:'张三',status:'pending',source_import_ref:'qa-legacy-file',created_at_ms:10})
-    await insert('usage_event',{...event('legacy:1'),user_id:'张三',user_name:'张三',member_id:null,department_id:null,report_token_id:null,received_at_ms:null})
+    await insert('usage_event',{...event('legacy:1'),user_id:'张三',user_name:'张三',member_id:null,report_token_id:null,received_at_ms:null})
     check('存在同名人员也不会自动归并 pending 历史',(await db.get('SELECT member_id FROM legacy_attribution_map WHERE mapping_id=$id',{$id:mappingId}))?.member_id===null && (await db.get('SELECT member_id FROM usage_event WHERE event_id=$id',{$id:'legacy:1'}))?.member_id===null)
     await rejected('映射不能无依据标为 mapped',()=>db.run("UPDATE legacy_attribution_map SET status='mapped' WHERE mapping_id=$id",{$id:mappingId}))
     await rejected('身份锁不能出现第二个单例',()=>insert('portal_identity_state',{state_id:randomUUID(),singleton_key:1,updated_at_ms:0}))
@@ -236,17 +251,17 @@ async function verify(db: Db, kind: 'sqlite' | 'mysql', second: () => Promise<Db
       check('两连接并发降级由数据库锁保留一个管理员',outcomes.filter(Boolean).length===1 && await scalar('SELECT COUNT(*) AS n FROM member_roles WHERE role_id=$role',{$role:seedAdmin})===1)
     } finally { await other.close() }
     // 校验 catalog 后才标记这个隔离原型的建表记录完成；不是生产迁移完成。
-    await db.run("UPDATE portal_schema_migrations SET last_completed_step=17,checkpoint_json=$json,status='completed',completed_at_ms=40 WHERE migration_id=$id",{$json:JSON.stringify({verified_tables:tableNames,scope:'isolated-design-prototype'}),$id:migrationId})
+    await db.run("UPDATE portal_schema_migrations SET last_completed_step=18,checkpoint_json=$json,status='completed',completed_at_ms=40 WHERE migration_id=$id",{$json:JSON.stringify({verified_tables:tableNames,scope:'isolated-design-prototype'}),$id:migrationId})
     check('隔离原型记录可完成且保留真实 DDL checksum',(await db.get('SELECT checksum,status FROM portal_schema_migrations WHERE migration_id=$id',{$id:migrationId}))?.checksum===sha(ddl))
   } catch(error) {
     throw new Error(`${kind} / ${active}: ${safeError(error)}`)
   }
 }
 
-console.log('Portal v4 真实数据库设计验证；不是应用 E2E，不修改业务库。')
+console.log('Portal v5 真实数据库设计验证（多对多分组）；不是应用 E2E，不修改业务库。')
 let controller: MysqlBackend|undefined, mysql: MysqlBackend|undefined, created=false
 let failure: string|undefined
-const sqlitePath=join(artifactDir,'portal-v4.sqlite')
+const sqlitePath=join(artifactDir,'portal-v5.sqlite')
 const local=sqlite(sqlitePath)
 try {
   versions.sqlite=String((await local.get('SELECT sqlite_version() AS version'))?.version)
@@ -271,7 +286,7 @@ try {
   try {if(mysql) {await mysql.close();cleanup.mysqlClosed=true}} catch(error) {cleanup.errors.push(`mysql close: ${safeError(error)}`)}
   if(created && controller) {
     // 删除目标是本脚本成功 CREATE 的随机 schema；绝不使用输入 URL 的库名。
-    assert.match(mysqlSchema,/^atr_v4_verify_[0-9]+_[a-f0-9]{10}$/)
+    assert.match(mysqlSchema,/^atr_v5_verify_[0-9]+_[a-f0-9]{10}$/)
     try {await controller.exec(`DROP DATABASE \`${mysqlSchema}\``);cleanup.mysqlSchemaDropped=true} catch(error) {cleanup.errors.push(`schema cleanup: ${safeError(error)}`)}
   }
   try {if(controller) {await controller.close();cleanup.controllerClosed=true}} catch(error) {cleanup.errors.push(`controller close: ${safeError(error)}`)}

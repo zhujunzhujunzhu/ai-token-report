@@ -21,7 +21,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { EVENT_TABLE, openDb } from '@ai-token-report/core/db'
+import { EVENT_TABLE, openDb, PORTAL_SCHEMA_VERSION } from '@ai-token-report/core/db'
 import type { IngestPayload, IngestResponse } from '@ai-token-report/shared'
 
 import { createServer } from '../src/index.js'
@@ -36,14 +36,14 @@ const dbPath = join(home, 'token-report', 'portal.sqlite')
 writeFileSync(
   credPath,
   JSON.stringify([
-    { token: 'atr-zhangsan-9f3c', name: '张三', dept: '研发一部' },
-    { token: 'atr-lisi-a17b', name: '李四', dept: '研发二部' },
+    { token: 'atr-zhangsan-9f3c', name: '张三', group: '研发一部' },
+    { token: 'atr-lisi-a17b', name: '李四', group: '研发二部' },
   ]),
   'utf8',
 )
 await seedDatabaseIdentity({ sqlitePath: dbPath }, [
-  { token: 'atr-zhangsan-9f3c', name: '张三', dept: '研发一部' },
-  { token: 'atr-lisi-a17b', name: '李四', dept: '研发二部' },
+  { token: 'atr-zhangsan-9f3c', name: '张三', group: '研发一部' },
+  { token: 'atr-lisi-a17b', name: '李四', group: '研发二部' },
 ])
 
 let passed = 0
@@ -86,7 +86,7 @@ function cliPayload(records: unknown[]): IngestPayload {
   return {
     schemaVersion: 1,
     // ⚠️ client 里的名字是**客户端自称**，服务端必须忽略它
-    client: { name: 'dsh-token-stats', userId: 'zhangsan', userName: '张三', dept: '研发一部' },
+    client: { name: 'dsh-token-stats', userId: 'zhangsan', userName: '张三', group: '研发一部' },
     generatedAt: new Date().toISOString(),
     records: records as IngestPayload['records'],
   }
@@ -96,6 +96,9 @@ function cliPayload(records: unknown[]): IngestPayload {
 function pluginPayload(records: unknown[]): IngestPayload {
   return {
     schemaVersion: 1,
+    // ⚠️ 这里刻意沿用**旧字段名 `dept`**：已部署的旧插件发的就是它。
+    //   服务端按 `client.group ?? client.dept` 落进 `usage_event.group_name`，
+    //   丢掉这条兼容不会有任何报错，只会让这些机器的分组快照永久变成 NULL。
     client: { name: 'dsh-token-report', userId: '张三', userName: '张三', dept: '研发一部' },
     generatedAt: new Date().toISOString(),
     records: records as IngestPayload['records'],
@@ -165,7 +168,9 @@ console.log(`  服务端: ${portal.url}`)
 
 const health = await (await fetch(`${portal.url}/api/health`)).json()
 check('健康检查：身份已入库', health.initialized === true)
-check('健康检查：schema v4', health.schema_version === 4)
+// ★ 跟常量走：写死版本号会在上报库升版后一直「通过」，而这个字段正是部署脚本
+  //   用来判断「服务器上的库和本地代码是不是同一版」的依据 —— 断言错了等于护栏失灵。
+  check(`健康检查：schema v${PORTAL_SCHEMA_VERSION}`, health.schema_version === PORTAL_SCHEMA_VERSION)
 check('健康检查：未启用本地 API（部门形态）', health.localApi === false)
 
 // ── 2. 正常上报（CLI 形态）──────────────────────────────────────────────────
@@ -236,14 +241,17 @@ try {
     .map((c) => c.name)
   check('★ 四个 token 是四个独立列', ['input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens'].every((c) => cols.includes(c)))
   check('★ 库里没有 total 列（派生口径不落库）', !cols.includes('total_tokens'))
-  check('归属三列存在', ['user_id', 'user_name', 'dept'].every((c) => cols.includes(c)))
+  check('归属列存在（分组列是文本快照 group_name）', ['user_id', 'user_name', 'group_name'].every((c) => cols.includes(c)))
+  // v5 删掉了事件上的分组 ID 列：一个事件属于哪些分组，由它的 member_id 从关联表展开 ——
+  // 单值列在结构上表达不了「同时属于两个分组」。
+  check('★ 事件里不再存分组 ID（归属由 member_group_assignments 展开）', !cols.includes('department_id'))
 
   const row = db
     .query<
       {
         user_id: string
         user_name: string
-        dept: string
+        group_name: string
         input_tokens: number
         output_tokens: number
         cache_read_tokens: number
@@ -252,18 +260,30 @@ try {
       },
       [string]
     >(
-      `SELECT user_id, user_name, dept, input_tokens, output_tokens,
+      `SELECT user_id, user_name, group_name, input_tokens, output_tokens,
               cache_read_tokens, cache_write_tokens, cwd
        FROM ${EVENT_TABLE} WHERE event_id = ?`,
     )
     .get(['session-a:1'])
-  check('归属 = 张三 / 研发一部', row?.user_name === '张三' && row?.dept === '研发一部', JSON.stringify(row))
+  check('归属 = 张三 / 研发一部', row?.user_name === '张三' && row?.group_name === '研发一部', JSON.stringify(row))
   check(
     '四项 token 与上报值逐位一致',
     row?.input_tokens === 10_882 && row?.output_tokens === 1 && row?.cache_read_tokens === 1024 && row?.cache_write_tokens === 0,
     JSON.stringify(row),
   )
   check('cwd 保留（项目归属）', row?.cwd === 'D:\\Coding\\ai-token-report')
+  // ★ 这一行来自**插件形状**的载荷（它发的还是旧字段 `dept`）：
+  //   兼容路径必须真的把值写进新列名 group_name，而不是静默丢成 NULL。
+  const legacy = db
+    .query<{ user_name: string; group_name: string | null }, [string]>(
+      `SELECT user_name, group_name FROM ${EVENT_TABLE} WHERE event_id = ?`,
+    )
+    .get(['session-c:17'])
+  check(
+    '★ 旧客户端的 client.dept 仍落进 group_name（刻意保留的兼容）',
+    legacy?.user_name === '李四' && legacy?.group_name === '研发一部',
+    JSON.stringify(legacy),
+  )
 } finally {
   db.close()
 }
@@ -274,7 +294,7 @@ check('两条通路各自入库（张三 3 条 + 李四 1 条）', countByUser('
 // ── 8. 本地形态同样收上报 ───────────────────────────────────────────────────
 console.log('\n【8】单机形态（enableLocalApi）也注册上报接口')
 await seedDatabaseIdentity({ sqlitePath: join(home, 'token-report', 'portal-local.sqlite') }, [
-  { token: 'atr-zhangsan-9f3c', name: '张三', dept: '研发一部' },
+  { token: 'atr-zhangsan-9f3c', name: '张三', group: '研发一部' },
 ])
 const local = await createServer({
   port: PORT + 1,

@@ -145,11 +145,12 @@ export class IngestRoute {
     }
 
     // ── 3. 落库（幂等）─────────────────────────────────────────
-    // 归属取服务端认定的姓名；`dept` 只在凭证登记了部门时才有值。
+    // 归属取服务端认定的姓名；`group_name` 只是客户端自称的分组**快照**
+    // （见 `clientGroupSnapshot` 的注释：归属不由它决定）。
     const owner: EventOwner = {
       userId: auth.viewer.name,
       userName: auth.viewer.name,
-      dept: auth.viewer.dept ?? null,
+      groupName: clientGroupSnapshot(payload),
     }
 
     let stored: { inserted: number; duplicates: number }
@@ -178,10 +179,15 @@ export class IngestRoute {
     const parsed = parseIngestPayload(payload)
     if (!parsed.ok) return { status: 400, body: { ok: false, reason: parsed.reason } }
     try {
+      // ★ 快照在解析之后取：整批 400 的请求不会留下任何痕迹。
+      const groupName = clientGroupSnapshot(payload)
       const stored = await repository.withWrite(auth.viewer, 'usage:write', async (tx, fresh) => {
         const result = await insertAttributedRecordsInTransaction(tx, parsed.records, {
-          userId: fresh.name, userName: fresh.name, dept: fresh.dept ?? null,
-          memberId: fresh.memberId, departmentId: fresh.departmentId,
+          userId: fresh.name, userName: fresh.name, groupName,
+          // ⚠️ 事件里**不再存分组 ID**（v5 删掉了 `usage_event.department_id`）：
+          //   归属由 `member_group_assignments` 按 memberId 关联展开，
+          //   所以这里只留稳定 ID 与接收时刻。
+          memberId: fresh.memberId,
           tokenId: fresh.auth.kind === 'token' ? fresh.auth.tokenId : null,
           receivedAtMs: Date.now(),
         })
@@ -275,6 +281,34 @@ export function parseIngestPayload(value: unknown): ParseIngestPayloadResult {
 export function parseIngestRecord(value: unknown): IngestRecord | null {
   const parsed = ingestRecordSchema.safeParse(value)
   return parsed.success ? parsed.data : null
+}
+
+/**
+ * 从上报体里取「上报当时客户端自己填的分组」—— `usage_event.group_name` 的**唯一来源**。
+ *
+ * 🚨 这里的 `dept` 兼容是**刻意保留的，不要删**：已部署的旧插件 / 旧 CLI
+ *   发的字段名是 `dept`（那时这个实体还叫「部门」）。去掉它，那些机器此后上报的
+ *   记录在 `group_name` 上全是 NULL —— token 数一个不差，但「当时他填的是哪个分组」
+ *   这条线索永久丢失，而且**没有任何东西会报错**。
+ *
+ * ⚠️ 它**只写快照列，不参与归属**：谁属于哪些分组只由 `member_group_assignments`
+ *   决定（见 shared 的 `WireClientIdentity.group` 与 core 的 `EventOwner.groupName`）。
+ *   归属仍只信服务端按 token 解析出的 `member_id`。
+ * ⚠️ 刻意**不放进 zod schema**：`ingestEnvelopeSchema` 会丢掉整个 `client` 块
+ *   （「归属只信服务端」的落点），把它收进 schema 会让人误以为它能影响归属。
+ * ⚠️ 超长 / 带换行的自称降级成 NULL 而不是拒收整批：`usage_event.group_name`
+ *   上有 1..255 的 CHECK，一个 300 字符的自称会让**整批**回滚、客户端无限重试 ——
+ *   快照是元数据，元数据不该有能力挡住 token 数落库（与 `cwd`/`turn`/`step` 同一条处理原则）。
+ */
+export function clientGroupSnapshot(payload: unknown): string | null {
+  if (!payload || typeof payload !== 'object') return null
+  const client = (payload as { client?: unknown }).client
+  if (!client || typeof client !== 'object') return null
+  const c = client as { group?: unknown; dept?: unknown }
+  const raw = typeof c.group === 'string' ? c.group : typeof c.dept === 'string' ? c.dept : null
+  if (raw === null) return null
+  const group = raw.trim()
+  return group && group.length <= 255 && !/[\r\n\t]/.test(raw) ? group : null
 }
 
 function msg(err: unknown): string {

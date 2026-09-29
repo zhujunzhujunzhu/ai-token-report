@@ -1,10 +1,10 @@
-/** 部门身份的数据库真值；与用量写入共用连接、锁顺序和提交边界。 */
+/** 人员 / 分组身份的数据库真值；与用量写入共用连接、锁顺序和提交边界。 */
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { openPortalStore, type PortalStore, type PortalTarget } from '@ai-token-report/core/db'
+import { openPortalStore, PORTAL_SCHEMA_VERSION, type PortalStore, type PortalTarget } from '@ai-token-report/core/db'
 import { hashPassword, normalizeUsername, passwordError, usernameError } from '../auth/password.js'
 import type { CredentialInput } from '../credentials.js'
-import { APP_KEY_LABEL, APP_KEY_SCOPES, type PortalMember, type PortalRole, type PortalDepartment, type PortalReportToken, type PortalAuditResponse, type PortalStorageResponse, type PortalLegacyAttribution } from '@ai-token-report/shared'
-import { ADMIN_ROLE_ID, MEMBER_ROLE_ID, DEFAULT_SCOPES, RECOVERY_PERMISSIONS, PERMISSIONS, IdentityError, requirePermission, subset, str, num, textField, idField, listField, displayName, type Principal, type Row, type MutationInput } from './types.js'
+import { APP_KEY_LABEL, APP_KEY_SCOPES, type PortalAppKeyEntry, type PortalAppKeyOwner, type PortalMember, type PortalMemberGroupRef, type PortalRole, type PortalGroup, type PortalReportToken, type PortalAuditResponse, type PortalStorageResponse, type PortalLegacyAttribution } from '@ai-token-report/shared'
+import { ADMIN_ROLE_ID, MEMBER_ROLE_ID, DEFAULT_SCOPES, RECOVERY_PERMISSIONS, PERMISSIONS, IdentityError, requirePermission, subset, str, num, textField, idField, listField, displayName, roleCode, type Principal, type Row, type MutationInput } from './types.js'
 
 export const digest = (value: string): string => createHash('sha256').update(value).digest('hex')
 export const randomSecret = (): string => randomBytes(32).toString('base64url')
@@ -81,7 +81,11 @@ export class IdentityRepository {
     //      appKey 就永远拿不到自己的署名，用户看到的是「Key 无效」。
     const canVerify = p !== null && (p.permissions.includes('identity:read') || p.permissions.includes('usage:write'))
     if (!canVerify) return { ok: false, registered, reason: 'token 无效，请向管理员确认' }
-    return { ok: true, registered, name: p.name, member_id: p.memberId, role: p.roleCodes.includes('admin') ? 'admin' as const : 'member' as const, ...(p.dept ? { dept: p.dept } : {}) }
+    // ★ `dept` 是**刻意的兼容别名**（与 `group` 同值）：已部署的旧插件 / 旧 CLI
+    //   读的是 `dept`，去掉它会让那些客户端把「服务端返回了署名但字段不认识」
+    //   显示成「Key 无效」。新代码一律读 `group`。
+    const group = p.groupNames[0]
+    return { ok: true, registered, name: p.name, member_id: p.memberId, role: p.roleCodes.includes('admin') ? 'admin' as const : 'member' as const, ...(group ? { group, dept: group } : {}) }
   }
   async getViewer(actor: Principal) {
     return this.read(async (tx) => {
@@ -89,21 +93,82 @@ export class IdentityRepository {
       if (!p) throw new IdentityError(401, '登录已失效，请重新登录')
       const account = await tx.get<Row>('SELECT username_normalized FROM login_accounts WHERE member_id = $id', { $id: p.memberId })
       const roles = await this.memberRoles(tx, p.memberId)
-      return { member_id: p.memberId, name: p.name, username: account ? str(account, 'username_normalized') : '', role: p.roleCodes.includes('admin') ? 'admin' as const : 'member' as const, roles, permissions: p.permissions, department_id: p.departmentId ?? null, department_name: p.dept ?? null, ...(p.dept ? { dept: p.dept } : {}) }
+      // ⚠️ `group` 是兼容别名（与第一个分组名同值），页面新代码读 `group_names`。
+      return { member_id: p.memberId, name: p.name, username: account ? str(account, 'username_normalized') : '', role: p.roleCodes.includes('admin') ? 'admin' as const : 'member' as const, roles, permissions: p.permissions, group_ids: p.groupIds, group_names: p.groupNames, ...(p.groupNames[0] ? { group: p.groupNames[0] } : {}) }
     })
   }
   private async memberRoles(tx: PortalStore, memberId: string): Promise<PortalRole[]> {
-    const rows = await tx.all<Row>('SELECT r.role_id,r.code,r.name FROM roles r JOIN member_roles mr ON mr.role_id = r.role_id WHERE mr.member_id = $id AND r.status = $status ORDER BY r.code', { $id: memberId, $status: 'active' })
-    return Promise.all(rows.map(async (r) => ({ role_id: str(r, 'role_id'), code: str(r, 'code'), name: str(r, 'name'), permissions: await this.permissionsForRole(tx, str(r, 'role_id')) })))
+    const rows = await tx.all<Row>('SELECT r.role_id,r.code,r.name,r.is_builtin,r.status,r.version FROM roles r JOIN member_roles mr ON mr.role_id = r.role_id WHERE mr.member_id = $id AND r.status = $status ORDER BY r.code', { $id: memberId, $status: 'active' })
+    return Promise.all(rows.map((r) => this.roleView(tx, r)))
+  }
+  /**
+   * 角色行 → 契约对象。
+   *
+   * ★ 人员身上的角色与角色目录共用这一个映射：两处各写一遍的结果是
+   *   「列表里能看到内置标记，人员详情里看不到」，而页面会因此多出一个编辑入口。
+   * ⚠️ 权限单独查一次，不用 `group_concat` 拼串 —— 拼接规则会变成第二处
+   *   「权限怎么解析」的实现，而它在 SQLite 与 MySQL 上还不一样。
+   */
+  private async roleView(tx: PortalStore, row: Row): Promise<PortalRole> {
+    const roleId = str(row, 'role_id')
+    return {
+      role_id: roleId, code: str(row, 'code'), name: str(row, 'name'),
+      is_builtin: num(row, 'is_builtin') === 1,
+      status: str(row, 'status') as PortalRole['status'],
+      version: num(row, 'version'),
+      permissions: await this.permissionsForRole(tx, roleId),
+    }
   }
   private async rolePermissions(tx: PortalStore, memberId: string): Promise<string[]> {
     const rows = await tx.all<Row>('SELECT DISTINCT p.code FROM permissions p JOIN role_permissions rp ON rp.permission_id = p.permission_id JOIN roles r ON r.role_id = rp.role_id JOIN member_roles mr ON mr.role_id = r.role_id WHERE mr.member_id = $id AND r.status = $status ORDER BY p.code', { $id: memberId, $status: 'active' })
     return rows.map((r) => str(r, 'code'))
   }
+  /**
+   * 查一个人当前所属的全部分组。
+   *
+   * ★ 归属的**唯一权威**是 `member_group_assignments`：
+   *   `usage_event.group_name` 只是上报当时的文本快照，不能拿来判归属
+   *   （人换了分组、改了名，快照都不会跟着变）。
+   * ⚠️ 用 JOIN 一次取回 ID + 名称，按 name 排序：排序规则写在这里，
+   *   列表与详情才不会是两种顺序。
+   */
+  private async memberGroups(tx: PortalStore, memberId: string): Promise<PortalMemberGroupRef[]> {
+    const rows = await tx.all<Row>('SELECT g.group_id,g.name FROM member_group_assignments a JOIN member_groups g ON g.group_id = a.group_id WHERE a.member_id = $id ORDER BY g.name,g.group_id', { $id: memberId })
+    return rows.map((r) => ({ group_id: str(r, 'group_id'), name: str(r, 'name') }))
+  }
+  /**
+   * 批量查「哪些人属于哪些分组」，供**列表**场景使用。
+   *
+   * 🚨 必须批量：人员列表若逐人查一次，就是 N+1 条查询 ——
+   *   50 个人 = 51 次库往返，而响应体里看不出任何异常，只表现为「页面慢」。
+   * ⚠️ 结果按 member_id 归并，同一个人多条关联只出现一次（列表按 name 排序）。
+   */
+  private async memberGroupsByMember(tx: PortalStore, memberIds: string[]): Promise<Map<string, PortalMemberGroupRef[]>> {
+    const grouped = new Map<string, PortalMemberGroupRef[]>()
+    if (!memberIds.length) return grouped
+    // 参数数量有上限（历史上 SQLite 是 999），分批查；一批 200 个 ID 足够且不会触碰任何后端上限。
+    for (let i = 0; i < memberIds.length; i += 200) {
+      const batch = memberIds.slice(i, i + 200)
+      const params: Row = {}
+      const placeholders = batch.map((id, index) => { params[`$m${index}`] = id; return `$m${index}` })
+      const rows = await tx.all<Row>(
+        `SELECT a.member_id,g.group_id,g.name FROM member_group_assignments a JOIN member_groups g ON g.group_id = a.group_id WHERE a.member_id IN (${placeholders.join(',')}) ORDER BY g.name,g.group_id`,
+        params,
+      )
+      for (const r of rows) {
+        const id = str(r, 'member_id')
+        const list = grouped.get(id) ?? []
+        list.push({ group_id: str(r, 'group_id'), name: str(r, 'name') })
+        grouped.set(id, list)
+      }
+    }
+    return grouped
+  }
   private async principal(tx: PortalStore, memberId: string, auth: Principal['auth']): Promise<Principal | null> {
-    const row = await tx.get<Row>('SELECT m.*, d.name AS department_name FROM members m LEFT JOIN departments d ON m.department_id = d.department_id WHERE m.member_id = $id AND m.status = $status', { $id: memberId, $status: 'active' })
+    const row = await tx.get<Row>('SELECT * FROM members WHERE member_id = $id AND status = $status', { $id: memberId, $status: 'active' })
     if (!row) return null
-    return { memberId, name: str(row, 'display_name'), departmentId: row.department_id ? str(row, 'department_id') : null, ...(row.department_id ? { dept: str(row, 'department_name') } : {}), roleCodes: (await this.memberRoles(tx, memberId)).map((r) => r.code), permissions: await this.rolePermissions(tx, memberId), auth }
+    const groups = await this.memberGroups(tx, memberId)
+    return { memberId, name: str(row, 'display_name'), groupIds: groups.map((g) => g.group_id), groupNames: groups.map((g) => g.name), roleCodes: (await this.memberRoles(tx, memberId)).map((r) => r.code), permissions: await this.rolePermissions(tx, memberId), auth }
   }
   private async tokenPrincipal(tx: PortalStore, tokenId: string): Promise<Principal | null> {
     const row = await tx.get<Row>('SELECT * FROM report_tokens WHERE token_id = $id AND status = $status AND (expires_at_ms IS NULL OR expires_at_ms > $now)', { $id: tokenId, $status: 'active', $now: this.now() })
@@ -148,7 +213,7 @@ export class IdentityRepository {
       }
       displayName(e.name)
       if (e.role !== undefined && e.role !== 'admin' && e.role !== 'member') throw new IdentityError(400, '导入包含未知角色')
-      if (e.dept) displayName(e.dept, 64)
+      if (e.group) displayName(e.group, 64)
       if (!!e.username !== !!e.passwordHash) throw new IdentityError(400, '导入账号与密码哈希不完整')
       if (e.loginEnabled !== undefined && typeof e.loginEnabled !== 'boolean') throw new IdentityError(400, '导入登录启用状态无效')
       if (e.username) {
@@ -173,20 +238,24 @@ export class IdentityRepository {
       const now = this.now()
       let firstAdmin: string | null = null
       for (const entry of entries) {
-        let departmentId: string | null = null
-        if (entry.dept?.trim()) {
-          const name = displayName(entry.dept, 64)
-          const d = await tx.get<Row>('SELECT department_id FROM departments WHERE name = $name', { $name: name })
-          departmentId = d ? str(d, 'department_id') : randomUUID()
-          if (!d) await tx.run('INSERT INTO departments (department_id,name,created_at_ms,updated_at_ms) VALUES ($id,$name,$now,$now)', { $id: departmentId, $name: name, $now: now })
+        // ★ 一个人可以有多个分组，但凭证文件里只能写一个名字 ——
+        //   这里按「名字 → 分组」逐个建关联（导入是显式离线动作，重复名字复用同一行）。
+        let groupId: string | null = null
+        if (entry.group?.trim()) {
+          const name = displayName(entry.group, 64)
+          const g = await tx.get<Row>('SELECT group_id FROM member_groups WHERE name = $name', { $name: name })
+          groupId = g ? str(g, 'group_id') : randomUUID()
+          if (!g) await tx.run('INSERT INTO member_groups (group_id,name,created_at_ms,updated_at_ms) VALUES ($id,$name,$now,$now)', { $id: groupId, $name: name, $now: now })
         }
         const memberId = randomUUID()
-        await tx.run('INSERT INTO members (member_id,display_name,department_id,created_at_ms,updated_at_ms) VALUES ($id,$name,$dept,$now,$now)', { $id: memberId, $name: displayName(entry.name), $dept: departmentId, $now: now })
+        await tx.run('INSERT INTO members (member_id,display_name,created_at_ms,updated_at_ms) VALUES ($id,$name,$now,$now)', { $id: memberId, $name: displayName(entry.name), $now: now })
+        // 归属写进关联表（权威），事件快照列不参与归属。
+        if (groupId) await tx.run('INSERT INTO member_group_assignments (member_id,group_id,created_at_ms) VALUES ($member,$group,$now)', { $member: memberId, $group: groupId, $now: now })
         const admin = entry.role === 'admin'
         await tx.run('INSERT INTO member_roles (member_id,role_id,granted_at_ms) VALUES ($id,$role,$now)', { $id: memberId, $role: admin ? ADMIN_ROLE_ID : MEMBER_ROLE_ID, $now: now })
         if (admin && !firstAdmin) firstAdmin = memberId
         if (entry.username) await tx.run('INSERT INTO login_accounts (account_id,member_id,username_normalized,password_hash,enabled,created_at_ms,updated_at_ms) VALUES ($id,$member,$username,$hash,$enabled,$now,$now)', { $id: randomUUID(), $member: memberId, $username: normalizeUsername(entry.username), $hash: entry.passwordHash!, $enabled: entry.loginEnabled === false ? 0 : 1, $now: now })
-        if (!accountOnlyBootstrap) await this.insertToken(tx, memberId, entry.token.trim(), '迁移凭证', admin ? PERMISSIONS : ['identity:read', 'usage:write', 'stats:read', 'departments:read'], null)
+        if (!accountOnlyBootstrap) await this.insertToken(tx, memberId, entry.token.trim(), '迁移凭证', admin ? PERMISSIONS : ['identity:read', 'usage:write', 'stats:read', 'groups:read'], null)
       }
       await this.ensureRecovery(tx)
       await tx.run('UPDATE portal_identity_state SET initialized_at_ms = $now, initialized_by_member_id = $member, updated_at_ms = $now, revision = revision + 1 WHERE singleton_key = 1', { $now: now, $member: firstAdmin })
@@ -202,12 +271,18 @@ export class IdentityRepository {
   private async permissionsForRole(tx: PortalStore, roleId: string): Promise<string[]> {
     return (await tx.all<Row>('SELECT p.code FROM permissions p JOIN role_permissions rp ON rp.permission_id = p.permission_id WHERE rp.role_id = $id ORDER BY p.code', { $id: roleId })).map((r) => str(r, 'code'))
   }
-  private async member(tx: PortalStore, id: string): Promise<PortalMember> {
-    const r = await tx.get<Row>('SELECT m.*,d.name AS department_name FROM members m LEFT JOIN departments d ON d.department_id = m.department_id WHERE m.member_id = $id', { $id: id })
+  /**
+   * 人员行 → 契约对象。
+   *
+   * ★ `groups` 可以由调用方**预先批量查好**传进来（列表场景），缺省才单人查一次。
+   *   这就是「列表不要 N+1」的落点：查询规则只有这一份，批量与单查的结果必然一致。
+   */
+  private async member(tx: PortalStore, id: string, groups?: PortalMemberGroupRef[]): Promise<PortalMember> {
+    const r = await tx.get<Row>('SELECT * FROM members WHERE member_id = $id', { $id: id })
     if (!r) throw new IdentityError(404, '人员不存在')
     const a = await tx.get<Row>('SELECT username_normalized,enabled FROM login_accounts WHERE member_id = $id', { $id: id })
     const count = await tx.get<Row>('SELECT COUNT(*) AS c FROM report_tokens WHERE member_id = $id AND status = $active AND (expires_at_ms IS NULL OR expires_at_ms > $now)', { $id: id, $active: 'active', $now: this.now() })
-    return { member_id: id, name: str(r, 'display_name'), status: str(r, 'status') as PortalMember['status'], department_id: r.department_id == null ? null : str(r, 'department_id'), department_name: r.department_name == null ? null : str(r, 'department_name'), roles: await this.memberRoles(tx, id), account: a ? { username: str(a, 'username_normalized'), enabled: num(a, 'enabled') === 1 } : null, active_token_count: num(count ?? {}, 'c'), version: num(r, 'version'), created_at_ms: num(r, 'created_at_ms'), updated_at_ms: num(r, 'updated_at_ms') }
+    return { member_id: id, name: str(r, 'display_name'), status: str(r, 'status') as PortalMember['status'], groups: groups ?? await this.memberGroups(tx, id), roles: await this.memberRoles(tx, id), account: a ? { username: str(a, 'username_normalized'), enabled: num(a, 'enabled') === 1 } : null, active_token_count: num(count ?? {}, 'c'), version: num(r, 'version'), created_at_ms: num(r, 'created_at_ms'), updated_at_ms: num(r, 'updated_at_ms') }
   }
   private async checkedMember(tx: PortalStore, input: MutationInput): Promise<PortalMember> {
     const m = await this.member(tx, idField(input, 'member_id'))
@@ -264,17 +339,124 @@ export class IdentityRepository {
     return this.read(async (tx) => ({ initialized: (await tx.get<Row>('SELECT initialized_at_ms FROM portal_identity_state WHERE singleton_key = 1'))?.initialized_at_ms != null, member_count: num((await tx.get<Row>('SELECT COUNT(*) AS c FROM members')) ?? {}, 'c'), token_count: num((await tx.get<Row>('SELECT COUNT(*) AS c FROM report_tokens WHERE status = $active AND (expires_at_ms IS NULL OR expires_at_ms > $now)', { $active: 'active', $now: this.now() })) ?? {}, 'c'), admin_count: await this.recoveryCount(tx) }))
   }
   async storage(actor: Principal): Promise<PortalStorageResponse> {
-    return this.securedRead(actor, 'members:read', async (tx) => ({ kind: tx.kind, schema_version: 4, available: true, initialized: (await tx.get<Row>('SELECT initialized_at_ms FROM portal_identity_state WHERE singleton_key = 1'))?.initialized_at_ms != null }))
+    return this.securedRead(actor, 'members:read', async (tx) => ({ kind: tx.kind, schema_version: PORTAL_SCHEMA_VERSION, available: true, initialized: (await tx.get<Row>('SELECT initialized_at_ms FROM portal_identity_state WHERE singleton_key = 1'))?.initialized_at_ms != null }))
   }
   async listMembers(actor: Principal) {
     return this.securedRead(actor, 'members:read', async (tx) => {
+      const rows = await tx.all<Row>('SELECT member_id FROM members ORDER BY display_name,member_id')
+      // ★ 分组一次批量查完再在内存里归并（见 memberGroupsByMember 的注释）。
+      const groupsByMember = await this.memberGroupsByMember(tx, rows.map((r) => str(r, 'member_id')))
       const members: PortalMember[] = []
-      for (const row of await tx.all<Row>('SELECT member_id FROM members ORDER BY display_name,member_id')) members.push(await this.member(tx, str(row, 'member_id')))
+      for (const row of rows) {
+        const id = str(row, 'member_id')
+        members.push(await this.member(tx, id, groupsByMember.get(id) ?? []))
+      }
       return { members }
     })
   }
+  /**
+   * ★ 角色目录 + 权限目录（角色管理页的唯一读取口）。
+   *
+   * ⚠️ **包含已停用角色**：页面要能看见并重新启用它们；若这里过滤掉，
+   *   停用就变成「角色凭空消失」，管理员再也找不到它。
+   *   代价是「分配角色」的下拉必须自己按 `status === 'active'` 过滤 ——
+   *   服务端 `setRoleRows` 会拒绝停用角色，所以那只是把必然失败藏起来。
+   * ★ 权限目录随角色一起下发：勾选清单必须来自 `permissions` 表，
+   *   页面自己写一份就会漏掉数据库里真实存在的权限，而它看起来「就这些」。
+   */
   async listRoles(actor: Principal) {
-    return this.securedRead(actor, 'roles:read', async (tx) => ({ roles: await Promise.all((await tx.all<Row>('SELECT role_id,code,name FROM roles WHERE status = $active ORDER BY code', { $active: 'active' })).map(async (r): Promise<PortalRole> => ({ role_id: str(r, 'role_id'), code: str(r, 'code'), name: str(r, 'name'), permissions: await this.permissionsForRole(tx, str(r, 'role_id')) }))) }))
+    return this.securedRead(actor, 'roles:read', async (tx) => ({
+      roles: await Promise.all((await tx.all<Row>('SELECT role_id,code,name,is_builtin,status,version FROM roles ORDER BY is_builtin DESC,code')).map((r) => this.roleView(tx, r))),
+      permissions: (await tx.all<Row>('SELECT code,description FROM permissions ORDER BY code')).map((r) => ({ code: str(r, 'code'), description: str(r, 'description') })),
+    }))
+  }
+  private async role(tx: PortalStore, id: string): Promise<PortalRole> {
+    const row = await tx.get<Row>('SELECT role_id,code,name,is_builtin,status,version FROM roles WHERE role_id = $id', { $id: id })
+    if (!row) throw new IdentityError(404, '角色不存在')
+    return this.roleView(tx, row)
+  }
+  /**
+   * 🚨 内置角色（`admin` / `member`）不接受任何改写。
+   *
+   *   理由不是「保守」：`admin` 是兼容字段 `role: 'admin' | 'member'` 的来源，
+   *   也是 `RECOVERY_PERMISSIONS` 与「最后一个管理员」护栏所依托的恒满角色。
+   *   一旦它可被改写，一次误操作就能把整套管理权限删干净 ——
+   *   而那时**没有任何界面还能把它改回来**。
+   */
+  private assertEditableRole(role: PortalRole): void {
+    if (role.is_builtin) throw new IdentityError(409, '系统内置角色由服务端维护，不能改名、改权限或停用', 'builtin_role')
+  }
+  /**
+   * 整组替换角色的权限集合。
+   *
+   * ★ 两道约束缺一不可：权限码必须真实存在（否则写进 `role_permissions` 的
+   *   外键会失败，错误信息还看不出是哪个码），且**必须是操作者本次有效权限的子集**
+   *   —— 否则一枚只有 `roles:assign` 的窄凭证就能给自己造一个高权限角色。
+   */
+  private async setRolePermissions(tx: PortalStore, actor: Principal, roleId: string, codes: string[]): Promise<void> {
+    // ⚠️ 先查存在性、再查子集：未知权限码对**任何人**都不在自己权限里，
+    //   若先查子集，使用者看到的是「超出你本次身份权限」，而真正的原因是「这个码不存在」。
+    const permissionIds: string[] = []
+    // 去重：`role_permissions` 主键是 (role_id, permission_id)，重复码会在写库时炸成 500。
+    for (const code of [...new Set(codes)]) {
+      const row = await tx.get<Row>('SELECT permission_id FROM permissions WHERE code = $code', { $code: code })
+      if (!row) throw new IdentityError(400, `未知权限：${code}`)
+      permissionIds.push(str(row, 'permission_id'))
+    }
+    subset(codes, actor.permissions)
+    await tx.run('DELETE FROM role_permissions WHERE role_id = $id', { $id: roleId })
+    for (const permissionId of permissionIds) await tx.run('INSERT INTO role_permissions (role_id,permission_id) VALUES ($id,$permission)', { $id: roleId, $permission: permissionId })
+  }
+  async createRole(actor: Principal, input: MutationInput) {
+    const code = roleCode(textField(input, 'code')), name = displayName(textField(input, 'name'), 128)
+    const codes = listField(input, 'permission_codes'), id = randomUUID()
+    return this.mutate(actor, 'roles:assign', 'role.create', 'role', id, async (tx, fresh) => {
+      if (await tx.get<Row>('SELECT role_id FROM roles WHERE code = $code', { $code: code })) throw new IdentityError(409, '角色标识已存在，请换一个')
+      const now = this.now()
+      // ★ 固定 is_builtin = 0：内置标记只能由 schema seed 产生。
+      //   若它来自请求体，页面就能造出一个「系统内置、谁都改不动」的角色。
+      await tx.run('INSERT INTO roles (role_id,code,name,is_builtin,status,version,created_at_ms,updated_at_ms) VALUES ($id,$code,$name,0,$status,1,$now,$now)', { $id: id, $code: code, $name: name, $status: 'active', $now: now })
+      await this.setRolePermissions(tx, fresh, id, codes)
+      return { ok: true as const, role: await this.role(tx, id) }
+    })
+  }
+  async updateRole(actor: Principal, input: MutationInput) {
+    const roleId = idField(input, 'role_id')
+    return this.mutate(actor, 'roles:assign', 'role.update', 'role', roleId, async (tx, fresh) => {
+      const current = await this.role(tx, roleId)
+      this.assertEditableRole(current)
+      this.checkVersion(input, current.version)
+      const name = input.name === undefined ? current.name : displayName(textField(input, 'name'), 128)
+      await tx.run('UPDATE roles SET name = $name,version = version + 1,updated_at_ms = $now WHERE role_id = $id', { $name: name, $now: this.now(), $id: current.role_id })
+      if (input.permission_codes !== undefined) await this.setRolePermissions(tx, fresh, current.role_id, listField(input, 'permission_codes'))
+      return { ok: true as const, role: await this.role(tx, current.role_id) }
+    })
+  }
+  /**
+   * 停用 / 启用角色。
+   *
+   * ★ 这里只做软删除（`status`）：`member_roles` 与 `role_permissions` 都是
+   *   RESTRICT 外键，物理删除本来就会被数据库拒绝，而硬删还会抹掉
+   *   「这个人曾经是什么角色」的历史。
+   * 🚨 停用前必须确认没有在职成员还持有它：`setRoleRows` 只挡得住**分配那一刻**，
+   *   停用发生在它之后，于是会出现「零角色人员」—— 他能登录，却什么权限都没有，
+   *   而页面上看不出原因。
+   */
+  async setRoleStatus(actor: Principal, input: MutationInput) {
+    const status = textField(input, 'status')
+    if (!['active', 'disabled'].includes(status)) throw new IdentityError(400, '角色状态无效')
+    const roleId = idField(input, 'role_id')
+    return this.mutate(actor, 'roles:assign', 'role.status', 'role', roleId, async (tx) => {
+      const current = await this.role(tx, roleId)
+      this.assertEditableRole(current)
+      this.checkVersion(input, current.version)
+      if (status === 'disabled') {
+        const used = await tx.get<Row>("SELECT COUNT(*) AS c FROM member_roles mr JOIN members m ON m.member_id = mr.member_id WHERE mr.role_id = $id AND m.status = 'active'", { $id: current.role_id })
+        if (num(used ?? {}, 'c') > 0) throw new IdentityError(409, `仍有 ${num(used ?? {}, 'c')} 名在职成员使用该角色，请先为他们调整角色`)
+      }
+      await tx.run('UPDATE roles SET status = $status,version = version + 1,updated_at_ms = $now WHERE role_id = $id', { $status: status, $now: this.now(), $id: current.role_id })
+      return { ok: true as const, role: await this.role(tx, current.role_id) }
+    })
   }
   private async setRoleRows(tx: PortalStore, actor: Principal, id: string, roles: string[]): Promise<void> {
     requirePermission(actor, 'roles:assign')
@@ -287,17 +469,51 @@ export class IdentityRepository {
     await tx.run('DELETE FROM member_roles WHERE member_id = $id', { $id: id })
     for (const role of roles) await tx.run('INSERT INTO member_roles (member_id,role_id,granted_at_ms) VALUES ($id,$role,$now)', { $id: id, $role: role, $now: this.now() })
   }
-  private async departmentId(tx: PortalStore, input: MutationInput): Promise<string | null> {
-    if (input.department_id == null) return null
-    const id = idField(input, 'department_id')
-    if (!await tx.get<Row>('SELECT department_id FROM departments WHERE department_id = $id AND status = $active', { $id: id, $active: 'active' })) throw new IdentityError(400, '部门不存在或已停用')
-    return id
+  /**
+   * 校验并归一化请求体里的 `group_ids`。
+   *
+   * ## 🚨 `undefined` 与 `[]` 必须分开
+   *
+   * - `undefined` = 「本次请求**不动**分组」
+   * - `[]` = 「**清空**分组」
+   *
+   * 两者若归一成同一个值，页面上「只改姓名」会静默把人的分组清空 ——
+   * 而响应看起来完全成功（`member.groups` 变成 `[]`），没人会发现。
+   *
+   * ⚠️ 多对多是**全量替换**语义：给了列表就是把关联集合设成它，
+   *   没有「追加 / 移除某一个」的增量语义（增量与「没给全」在请求体里长得一样）。
+   * ⚠️ 不存在或已停用的分组直接 400：静默丢掉非法 ID 会让调用方
+   *   以为「挂上了」，而人员列表里那行永远是空的。
+   */
+  private async groupIds(tx: PortalStore, input: MutationInput): Promise<string[] | undefined> {
+    if (input.group_ids === undefined) return undefined
+    const ids = listField(input, 'group_ids')
+    for (const id of ids) {
+      const row = await tx.get<Row>('SELECT group_id FROM member_groups WHERE group_id = $id AND status = $active', { $id: id, $active: 'active' })
+      if (!row) throw new IdentityError(400, '分组不存在或已停用')
+    }
+    return ids
+  }
+  /**
+   * 整组替换某人的分组关联（差异增删，不整表删除再重建）。
+   *
+   * ★ 只删「不在新列表里」的、只插「原来没有的」：整删整插会把未变动的
+   *   `created_at_ms` 全部刷新成现在，让「他什么时候进这个组的」永久失真。
+   */
+  private async setMemberGroups(tx: PortalStore, memberId: string, groupIds: string[]): Promise<void> {
+    const now = this.now()
+    const current = (await tx.all<Row>('SELECT group_id FROM member_group_assignments WHERE member_id = $id', { $id: memberId })).map((r) => str(r, 'group_id'))
+    const existing = new Set(current), wanted = new Set(groupIds)
+    for (const id of current) if (!wanted.has(id)) await tx.run('DELETE FROM member_group_assignments WHERE member_id = $member AND group_id = $group', { $member: memberId, $group: id })
+    for (const id of groupIds) if (!existing.has(id)) await tx.run('INSERT INTO member_group_assignments (member_id,group_id,created_at_ms) VALUES ($member,$group,$now)', { $member: memberId, $group: id, $now: now })
   }
   async createMember(actor: Principal, input: MutationInput) {
     const name = displayName(textField(input, 'name')), roles = listField(input, 'role_ids'), id = randomUUID()
     return this.mutate(actor, 'members:manage', 'member.create', 'member', id, async (tx, fresh) => {
-      const dept = await this.departmentId(tx, input), now = this.now()
-      await tx.run('INSERT INTO members (member_id,display_name,department_id,created_at_ms,updated_at_ms) VALUES ($id,$name,$dept,$now,$now)', { $id: id, $name: name, $dept: dept, $now: now })
+      // 建人时不给分组就是「未分组」——不是错误，页面允许先建人不分组。
+      const groups = await this.groupIds(tx, input) ?? [], now = this.now()
+      await tx.run('INSERT INTO members (member_id,display_name,created_at_ms,updated_at_ms) VALUES ($id,$name,$now,$now)', { $id: id, $name: name, $now: now })
+      await this.setMemberGroups(tx, id, groups)
       await this.setRoleRows(tx, fresh, id, roles)
       return { ok: true as const, member: await this.member(tx, id) }
     })
@@ -305,9 +521,11 @@ export class IdentityRepository {
   async updateMember(actor: Principal, input: MutationInput) {
     return this.mutate(actor, 'members:manage', 'member.update', 'member', idField(input, 'member_id'), async (tx) => {
       const m = await this.checkedMember(tx, input)
+      // 先校验再写：非法 group_ids 不该在执行到一半时才失败（虽然事务会回滚）。
+      const groups = await this.groupIds(tx, input)
       const name = input.name === undefined ? m.name : displayName(textField(input, 'name'))
-      const dept = input.department_id === undefined ? m.department_id : await this.departmentId(tx, input)
-      await tx.run('UPDATE members SET display_name = $name, department_id = $dept WHERE member_id = $id', { $name: name, $dept: dept, $id: m.member_id })
+      await tx.run('UPDATE members SET display_name = $name WHERE member_id = $id', { $name: name, $id: m.member_id })
+      if (groups !== undefined) await this.setMemberGroups(tx, m.member_id, groups)
       await this.touchMember(tx, m.member_id)
       return { ok: true as const, member: await this.member(tx, m.member_id) }
     })
@@ -387,7 +605,12 @@ export class IdentityRepository {
   }
   private async insertToken(tx: PortalStore, memberId: string, secret: string, label: string, codes: string[], expires: number | null): Promise<PortalReportToken> {
     const id = randomUUID()
-    await tx.run('INSERT INTO report_tokens (token_id,member_id,token_hash,token_prefix,label,created_at_ms,expires_at_ms) VALUES ($id,$member,$hash,$prefix,$label,$now,$expires)', { $id: id, $member: memberId, $hash: digest(secret), $prefix: '…' + digest(secret).slice(0, 12), $label: label, $now: this.now(), $expires: expires })
+    // ⚠️ 存的是**裸摘要前缀**（12 位十六进制），刻意不带「…」：
+    //   「这串被截断了」是展示提示，由页面按中间省略号渲染
+    //   （`web-portal/src/utils/credential.ts` 的 `tokenHint`）。
+    //   把展示符号写进库，等于让「列表里那一列长什么样」变成一次存储决定，
+    //   以后改版还得迁移数据。历史行里带 `…` 的旧格式由展示层先剥掉再重排。
+    await tx.run('INSERT INTO report_tokens (token_id,member_id,token_hash,token_prefix,label,created_at_ms,expires_at_ms) VALUES ($id,$member,$hash,$prefix,$label,$now,$expires)', { $id: id, $member: memberId, $hash: digest(secret), $prefix: digest(secret).slice(0, 12), $label: label, $now: this.now(), $expires: expires })
     await this.scopes(tx, id, codes)
     return this.token(tx, id)
   }
@@ -406,6 +629,39 @@ export class IdentityRepository {
       return { tokens }
     })
   }
+
+  /**
+   * ★ 列出全部上报凭证 —— appKey 管理页的主体列表。
+   *
+   * 页面要回答的第一个问题是「这把 key 发给了谁」，而归属只能来自
+   * `report_tokens.member_id` 这条数据库关系：`label` 是自由文本，
+   * 人员改名也不该让历史凭证失去归属。
+   *
+   * ⚠️ 权限用 `tokens:manage` 而不是 `members:read`：响应体里带
+   *   `token_prefix` 与 `scopes`，属于凭证管理面。能读人员名单的人
+   *   未必该看到谁手里有哪些凭证（人员页已不再展示凭证）。
+   */
+  async listAppKeys(actor: Principal) {
+    return this.securedRead(actor, 'tokens:manage', async (tx) => {
+      const rows = await tx.all<Row>(
+        'SELECT t.token_id,m.member_id,m.display_name,m.status AS member_status FROM report_tokens t JOIN members m ON m.member_id = t.member_id ORDER BY t.created_at_ms DESC,t.token_id',
+      )
+      // ★ 归属按人员批量查出（同一人可能持多把 key，去重后只查一次）。
+      const groupsByMember = await this.memberGroupsByMember(tx, [...new Set(rows.map((row) => str(row, 'member_id')))])
+      const appkeys: PortalAppKeyEntry[] = []
+      for (const row of rows) {
+        const owner: PortalAppKeyOwner = {
+          member_id: str(row, 'member_id'),
+          name: str(row, 'display_name'),
+          status: str(row, 'member_status') as PortalAppKeyOwner['status'],
+          groups: groupsByMember.get(str(row, 'member_id')) ?? [],
+        }
+        appkeys.push({ token: await this.token(tx, str(row, 'token_id')), member: owner })
+      }
+      return { appkeys }
+    })
+  }
+
   async issueToken(actor: Principal, input: MutationInput) {
     const memberId = idField(input, 'member_id'), label = displayName(textField(input, 'label'), 128)
     const codes = input.scopes === undefined ? DEFAULT_SCOPES : listField(input, 'scopes')
@@ -470,39 +726,75 @@ export class IdentityRepository {
       return { ok: true as const, token: await this.token(tx, t.token_id) }
     })
   }
-  private async department(tx: PortalStore, id: string): Promise<PortalDepartment> {
-    const r = await tx.get<Row>('SELECT * FROM departments WHERE department_id = $id', { $id: id })
-    if (!r) throw new IdentityError(404, '部门不存在')
-    return { department_id: id, name: str(r, 'name'), status: str(r, 'status') as PortalDepartment['status'], version: num(r, 'version'), created_at_ms: num(r, 'created_at_ms'), updated_at_ms: num(r, 'updated_at_ms') }
+  /**
+   * ★ 改已有凭证的有效期（`null` = 长期有效）。
+   *
+   * 与签发共用同一条校验：**只能是未来时刻或长期有效**。不能把有效期设成
+   * 过去，否则「设一个过去的时间」就成了另一种形式的吊销 —— 而吊销有它
+   * 自己的动作、审计与护栏（到期不是吊销，历史用量也照旧保留）。
+   * 表上本来也有 `CHECK (expires_at_ms IS NULL OR expires_at_ms > created_at_ms)`：
+   * 「已过期」只能是时间往前走出来的结果，改不出来。
+   *
+   * ⚠️ `expires_at_ms` **必须显式给**（可以是 `null`）。缺字段按「没说要改成
+   *   什么」拒绝，而不是当成「清空到期时间」—— 后者会把一把短效 key 悄悄
+   *   变成长效 key，而调用方以为自己只是发了个不完整的请求。
+   *
+   * ⚠️ `checkedToken` 只拒已吊销的凭证，到期只是时间比较，所以**过期 key
+   *   可以在这里续期**（这正是页面要「修改有效期」的原因之一）。
+   * ⚠️ 最后管理入口护栏照常生效：`mutate` 提交前会重算可恢复管理员，
+   *   把唯一那把长期管理凭证改成会过期会被 409 挡下并整体回滚。
+   */
+  async setTokenExpiry(actor: Principal, input: MutationInput) {
+    if (!('expires_at_ms' in input)) throw new IdentityError(400, '缺少 expires_at_ms，无法判断是长期有效还是具体到期时间')
+    const raw = input.expires_at_ms
+    const expires = raw === null ? null : Number(raw)
+    if (expires !== null && (!Number.isSafeInteger(expires) || expires <= this.now())) throw new IdentityError(400, '凭证有效期需要是未来时间')
+    return this.mutate(actor, 'tokens:manage', 'token.expiry', 'token', idField(input, 'token_id'), async (tx) => {
+      const t = await this.checkedToken(tx, input)
+      await tx.run('UPDATE report_tokens SET expires_at_ms = $expires,version = version + 1 WHERE token_id = $id', { $expires: expires, $id: t.token_id })
+      return { ok: true as const, token: await this.token(tx, t.token_id) }
+    })
   }
-  async listDepartments(actor: Principal) {
-    return this.securedRead(actor, 'departments:read', async (tx) => ({ departments: await Promise.all((await tx.all<Row>('SELECT department_id FROM departments ORDER BY name,department_id')).map((r) => this.department(tx, str(r, 'department_id')))) }))
+  private async group(tx: PortalStore, id: string): Promise<PortalGroup> {
+    const r = await tx.get<Row>('SELECT * FROM member_groups WHERE group_id = $id', { $id: id })
+    if (!r) throw new IdentityError(404, '分组不存在')
+    return { group_id: id, name: str(r, 'name'), status: str(r, 'status') as PortalGroup['status'], version: num(r, 'version'), created_at_ms: num(r, 'created_at_ms'), updated_at_ms: num(r, 'updated_at_ms') }
   }
-  async createDepartment(actor: Principal, input: MutationInput) {
+  async listGroups(actor: Principal) {
+    return this.securedRead(actor, 'groups:read', async (tx) => ({ groups: await Promise.all((await tx.all<Row>('SELECT group_id FROM member_groups ORDER BY name,group_id')).map((r) => this.group(tx, str(r, 'group_id')))) }))
+  }
+  async createGroup(actor: Principal, input: MutationInput) {
     const id = randomUUID(), name = displayName(textField(input, 'name'), 64)
-    return this.mutate(actor, 'departments:manage', 'department.create', 'department', id, async (tx) => {
-      if (await tx.get<Row>('SELECT department_id FROM departments WHERE name = $name', { $name: name })) throw new IdentityError(409, '部门名称已存在')
-      await tx.run('INSERT INTO departments (department_id,name,created_at_ms,updated_at_ms) VALUES ($id,$name,$now,$now)', { $id: id, $name: name, $now: this.now() })
-      return { ok: true as const, department: await this.department(tx, id) }
+    return this.mutate(actor, 'groups:manage', 'group.create', 'group', id, async (tx) => {
+      if (await tx.get<Row>('SELECT group_id FROM member_groups WHERE name = $name', { $name: name })) throw new IdentityError(409, '分组名称已存在')
+      await tx.run('INSERT INTO member_groups (group_id,name,created_at_ms,updated_at_ms) VALUES ($id,$name,$now,$now)', { $id: id, $name: name, $now: this.now() })
+      return { ok: true as const, group: await this.group(tx, id) }
     })
   }
-  async updateDepartment(actor: Principal, input: MutationInput) {
-    const id = idField(input, 'department_id'), name = displayName(textField(input, 'name'), 64)
-    return this.mutate(actor, 'departments:manage', 'department.update', 'department', id, async (tx) => {
-      const d = await this.department(tx, id); this.checkVersion(input, d.version)
-      const conflict = await tx.get<Row>('SELECT department_id FROM departments WHERE name = $name', { $name: name })
-      if (conflict && str(conflict, 'department_id') !== id) throw new IdentityError(409, '部门名称已存在')
-      await tx.run('UPDATE departments SET name = $name,version = version + 1,updated_at_ms = $now WHERE department_id = $id', { $name: name, $now: this.now(), $id: id })
-      return { ok: true as const, department: await this.department(tx, id) }
+  async updateGroup(actor: Principal, input: MutationInput) {
+    const id = idField(input, 'group_id'), name = displayName(textField(input, 'name'), 64)
+    return this.mutate(actor, 'groups:manage', 'group.update', 'group', id, async (tx) => {
+      const g = await this.group(tx, id); this.checkVersion(input, g.version)
+      const conflict = await tx.get<Row>('SELECT group_id FROM member_groups WHERE name = $name', { $name: name })
+      if (conflict && str(conflict, 'group_id') !== id) throw new IdentityError(409, '分组名称已存在')
+      await tx.run('UPDATE member_groups SET name = $name,version = version + 1,updated_at_ms = $now WHERE group_id = $id', { $name: name, $now: this.now(), $id: id })
+      return { ok: true as const, group: await this.group(tx, id) }
     })
   }
-  async setDepartmentStatus(actor: Principal, input: MutationInput) {
-    const id = idField(input, 'department_id'), status = textField(input, 'status')
-    if (!['active', 'disabled'].includes(status)) throw new IdentityError(400, '部门状态无效')
-    return this.mutate(actor, 'departments:manage', 'department.status', 'department', id, async (tx) => {
-      this.checkVersion(input, (await this.department(tx, id)).version)
-      await tx.run('UPDATE departments SET status = $status,version = version + 1,updated_at_ms = $now WHERE department_id = $id', { $status: status, $now: this.now(), $id: id })
-      return { ok: true as const, department: await this.department(tx, id) }
+  /**
+   * 停用 / 启用分组。
+   *
+   * ⚠️ **不解除人员关联**：停用是「不再往这里挂新人」，
+   *   不是「把这些人移出去」。关联一旦被删，历史按分组筛选的结果会
+   *   立刻变化 —— 那是数据被改写，而不是一次启停。
+   */
+  async setGroupStatus(actor: Principal, input: MutationInput) {
+    const id = idField(input, 'group_id'), status = textField(input, 'status')
+    if (!['active', 'disabled'].includes(status)) throw new IdentityError(400, '分组状态无效')
+    return this.mutate(actor, 'groups:manage', 'group.status', 'group', id, async (tx) => {
+      this.checkVersion(input, (await this.group(tx, id)).version)
+      await tx.run('UPDATE member_groups SET status = $status,version = version + 1,updated_at_ms = $now WHERE group_id = $id', { $status: status, $now: this.now(), $id: id })
+      return { ok: true as const, group: await this.group(tx, id) }
     })
   }
   async listAudit(actor: Principal, input: MutationInput = {}): Promise<PortalAuditResponse> {

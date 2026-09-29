@@ -15,8 +15,8 @@ export async function createIsolatedMysql() {
     url.password = password
     adminUrl = url.href
   }
-  const schema = `atr_http_v4_${Date.now()}_${randomUUID().slice(0, 8)}`
-  if (!/^atr_http_v4_\d+_[a-f0-9]{8}$/.test(schema)) throw new Error('隔离库名无效')
+  const schema = `atr_http_v5_${Date.now()}_${randomUUID().slice(0, 8)}`
+  if (!/^atr_http_v5_\d+_[a-f0-9]{8}$/.test(schema)) throw new Error('隔离库名无效')
   const admin = await openMysqlBackend(adminUrl)
   await admin.exec(`CREATE DATABASE ${schema} CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin`)
   const url = new URL(adminUrl)

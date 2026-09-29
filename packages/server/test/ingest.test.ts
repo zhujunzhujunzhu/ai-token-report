@@ -47,8 +47,8 @@ afterEach(() => {
 
 /** 两个已登记的人：张三（研发一部）与李四（研发二部）。 */
 const STORE = CredentialStore.from([
-  { token: 'tok-zhang', name: '张三', dept: '研发一部' },
-  { token: 'tok-li', name: '李四', dept: '研发二部' },
+  { token: 'tok-zhang', name: '张三', group: '研发一部' },
+  { token: 'tok-li', name: '李四', group: '研发二部' },
 ])
 
 function route(store: CredentialStore = STORE): IngestRoute {
@@ -84,7 +84,10 @@ function payload(
 ): Record<string, unknown> {
   return {
     schemaVersion: 1,
-    client: { name: 'dsh-token-report', userId: '李四', userName: '李四', dept: '研发二部' },
+    // ⚠️ `group` 是上报当时客户端的**自称快照**，只落进 `usage_event.group_name`，
+    //   不参与归属（归属由 token 决定）。这里刻意与 token 的主人不同分组，
+    //   好让「归属不跟着自称走」这件事在断言里看得见。
+    client: { name: 'dsh-token-report', userId: '李四', userName: '李四', group: '研发二部' },
     generatedAt: '2026-09-25T10:00:00Z',
     records,
     ...over,
@@ -100,7 +103,7 @@ function readRow(eventId: string) {
         {
           user_id: string | null
           user_name: string | null
-          dept: string | null
+          group_name: string | null
           session_id: string
           input_tokens: number
           output_tokens: number
@@ -109,7 +112,7 @@ function readRow(eventId: string) {
         },
         [string]
       >(
-        `SELECT user_id, user_name, dept, session_id,
+        `SELECT user_id, user_name, group_name, session_id,
                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
          FROM ${EVENT_TABLE} WHERE event_id = ?`,
       )
@@ -142,7 +145,10 @@ describe('上报接收：正常路径', () => {
     expect(readRow('s:1')).toEqual({
       user_id: '张三',
       user_name: '张三',
-      dept: '研发一部',
+      // ★ 归属取服务端认定的「张三」，而分组列只是**上报当时客户端的自称**：
+      //   它写的是「研发二部」（李四的分组）—— 刻意不跟着 token 的主人走，
+      //   因此它永远只是线索，不能拿来判「这个人属于哪个分组」。
+      group_name: '研发二部',
       session_id: 'session-1',
       input_tokens: 10_882,
       output_tokens: 1,
@@ -159,7 +165,20 @@ describe('上报接收：正常路径', () => {
     // 若这里变成「李四」，就等于任何人改一下本地配置都能冒用他人身份上报
     expect(readRow('s:1')?.user_name).toBe('张三')
     expect(readRow('s:1')?.user_id).toBe('张三')
-    expect(readRow('s:1')?.dept).toBe('研发一部')
+  })
+
+  test('★ 旧客户端的 client.dept 仍写进 group_name（刻意保留的兼容）', async () => {
+    // 已部署的旧插件 / 旧 CLI 发的字段名是 `dept`。丢掉这条兼容，
+    // 那些机器此后上报的记录在 group_name 上全是 NULL，而且不会有任何报错。
+    const legacy = payload([rec('s:1')], {
+      client: { name: 'dsh-token-report', userId: '张三', userName: '张三', dept: '研发一部' },
+    })
+    const res = await route().submit(legacy, 'Bearer tok-zhang')
+
+    expect(res.status).toBe(200)
+    expect(readRow('s:1')?.group_name).toBe('研发一部')
+    // 姓名仍然只信服务端
+    expect(readRow('s:1')?.user_name).toBe('张三')
   })
 
   test('裸 token（无 Bearer 前缀）同样接受', async () => {
@@ -175,10 +194,15 @@ describe('上报接收：正常路径', () => {
     expect(existsSync(dbPath)).toBe(false)
   })
 
-  test('凭证没登记部门时 dept 落成 NULL', async () => {
-    const store = CredentialStore.from([{ token: 'tok-x', name: '王五' }])
-    await route(store).submit(payload([rec('s:1')]), 'Bearer tok-x')
-    expect(readRow('s:1')?.dept).toBeNull()
+  test('上报体没带分组自称时 group_name 落成 NULL', async () => {
+    // ⚠️ 凭证里登记了分组（研发一部）也**不会**被当成快照写进去：
+    //   快照列的语义就是「上报当时客户端自己填的文本」，服务端不替它编一个值。
+    const store = CredentialStore.from([{ token: 'tok-x', name: '王五', group: '研发一部' }])
+    const noGroup = payload([rec('s:1')], {
+      client: { name: 'dsh-token-report', userId: '王五', userName: '王五' },
+    })
+    await route(store).submit(noGroup, 'Bearer tok-x')
+    expect(readRow('s:1')?.group_name).toBeNull()
     expect(readRow('s:1')?.user_name).toBe('王五')
   })
 })

@@ -206,7 +206,11 @@ export function viewerOf(c: Credential): PortalViewer {
     name: c.name,
     username: c.username!,
     role: c.role,
-    ...(c.dept ? { dept: c.dept } : {}),
+    // ⚠️ 凭证文件里只能写一个分组名，所以这里最多给出一项。
+    //   `group` 是**兼容别名**（与第一个分组名同值，仅供旧页面显示），
+    //   新代码读 `group_names`（未分组 = 空数组，不是缺字段）。
+    group_names: c.group ? [c.group] : [],
+    ...(c.group ? { group: c.group } : {}),
   }
 }
 function secret(): string {

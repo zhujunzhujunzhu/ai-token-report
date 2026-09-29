@@ -25,7 +25,7 @@
  * ```jsonc
  * // credentials.json —— 推荐：一 token 一人
  * [
- *   { "token": "atr-zhangsan-9f3c", "name": "张三", "dept": "研发一部" },
+ *   { "token": "atr-zhangsan-9f3c", "name": "张三", "group": "研发一部" },
  *   { "token": "atr-lisi-a17b", "name": "李四", "role": "admin" }
  * ]
  * ```
@@ -83,7 +83,13 @@ export interface CredentialInput {
   /** 后台登录账号与哈希；缺失时仍可上报，但不能密码登录。 */
   username?: string
   passwordHash?: string
-  dept?: string
+  /**
+   * 凭证文件里登记的分组名（旧文件的 `dept` 也读到这里）。
+   *
+   * ⚠️ 它只是**兼容期的显示值**：真正的归属是 `member_group_assignments`
+   *   （多对多），文件里写不出「一个人属于多个分组」，所以它不参与归属判定。
+   */
+  group?: string
   /** 缺省 = {@link ROLE_MEMBER}。 */
   role?: UserRole
   /** token 发放时刻（epoch ms）。 */
@@ -98,7 +104,7 @@ export interface Credential {
   name: string
   username?: string
   passwordHash?: string
-  dept?: string
+  group?: string
   role: UserRole
   createdAt?: number
   source: CredentialSource
@@ -109,7 +115,8 @@ export interface VerifyResult {
   ok: boolean
   /** token 对应的姓名。**由服务端决定，客户端不可覆盖**。 */
   name?: string
-  dept?: string
+  /** 凭证登记的分组名（新字段名；消费方在响应里另加 `dept` 兼容别名）。 */
+  group?: string
   /**
    * token 对应的角色。校验失败时不返回 —— 调用方据此判断「这个人能不能进管理页」。
    *
@@ -197,7 +204,7 @@ export class CredentialStore {
       registered: true,
       name: cred.name,
       role: cred.role,
-      ...(cred.dept ? { dept: cred.dept } : {}),
+      ...(cred.group ? { group: cred.group } : {}),
     }
   }
 
@@ -273,13 +280,13 @@ export class CredentialStore {
 
 /** 归一化：补上 role / source，并丢弃字段不全的条目。 */
 function normalizeCredential(input: CredentialInput, defaultSource: CredentialSource): Credential {
-  const dept = input.dept?.trim()
+  const group = input.group?.trim()
   return {
     token: input.token.trim(),
     name: input.name.trim(),
     ...(input.username ? { username: input.username.trim().toLowerCase() } : {}),
     ...(input.passwordHash ? { passwordHash: input.passwordHash } : {}),
-    ...(dept ? { dept } : {}),
+    ...(group ? { group } : {}),
     role: isUserRole(input.role) ? input.role : ROLE_MEMBER,
     ...(typeof input.createdAt === 'number' && Number.isFinite(input.createdAt)
       ? { createdAt: input.createdAt }
@@ -324,7 +331,7 @@ export function parseCredentialFile(path: string): ParsedCredentialFile {
     return {
       entries: [],
       exists: true,
-      error: '凭证文件格式不对：应为 [{token,name,dept,role}] 数组，或 {姓名: token} 映射',
+      error: '凭证文件格式不对：应为 [{token,name,group,role}] 数组，或 {姓名: token} 映射',
     }
   }
 
@@ -342,7 +349,12 @@ function parseCredentials(value: unknown): CredentialInput[] | null {
       const token = typeof o['token'] === 'string' ? o['token'].trim() : ''
       const name = typeof o['name'] === 'string' ? o['name'].trim() : ''
       if (!token || !name) return null
-      const dept = typeof o['dept'] === 'string' && o['dept'].trim() ? o['dept'].trim() : undefined
+      // ⚠️ `dept` 是**旧字段名的读取兼容，刻意保留，不要删**：
+      //   已部署的 credentials.json 里写的是 `dept`（那时实体叫「部门」），
+      //   离线导入源是人工维护的文件，删掉兼容等于让这些机器的分组归属静默清空。
+      //   写入侧只写 `group`（见 member-admin.ts 的序列化）。
+      const raw = typeof o['group'] === 'string' && o['group'].trim() ? o['group'] : o['dept']
+      const group = typeof raw === 'string' && raw.trim() ? raw.trim() : undefined
       // ⚠️ 非法角色值**降级为 member**而不是整份文件解析失败：
       //   一个人写错 role 不该让全部门的 token 集体失效。
       const role = isUserRole(o['role']) ? o['role'] : undefined
@@ -350,7 +362,7 @@ function parseCredentials(value: unknown): CredentialInput[] | null {
       out.push({
         token,
         name,
-        ...(dept ? { dept } : {}),
+        ...(group ? { group } : {}),
         ...(role ? { role } : {}),
         ...(createdAt ? { createdAt } : {}),
         ...(typeof o['username'] === 'string' ? { username: o['username'].trim().toLowerCase() } : {}),

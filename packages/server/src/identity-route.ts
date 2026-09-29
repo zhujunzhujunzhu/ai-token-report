@@ -75,12 +75,13 @@ export class IdentityRoute {
   get(): LocalIdentityResponse {
     const { identity } = readIdentity(this.#path)
     if (!identity) {
-      return { signed: false, name: null, dept: null, createdAt: null, hint: UNSIGNED_HINT }
+      return { signed: false, name: null, group: null, createdAt: null, hint: UNSIGNED_HINT }
     }
     return {
       signed: true,
       name: identity.name,
-      dept: identity.dept ?? null,
+      // ⚠️ 旧 `identity.json` 里写的是 `dept`：按 `group ?? dept` 取值（同 shared/identity.ts 的 toAssertion）。
+      group: identity.group ?? identity.dept ?? null,
       createdAt: identity.createdAt,
       hint: null,
     }
@@ -94,7 +95,7 @@ export class IdentityRoute {
   async submit(input: LocalIdentitySubmit): Promise<LocalIdentitySubmitResponse> {
     const name = typeof input?.name === 'string' ? input.name.trim() : ''
     const token = typeof input?.token === 'string' ? input.token.trim() : ''
-    const dept = typeof input?.dept === 'string' ? input.dept.trim() : ''
+    const group = typeof input?.group === 'string' ? input.group.trim() : ''
 
     // 形式校验先走一遍，能挡掉明显的误操作（省一次网络往返）
     if (!name) return { ok: false, reason: '请填写你的姓名' }
@@ -129,12 +130,14 @@ export class IdentityRoute {
     //   name 不一致通常是员工打字差异（「张三 」vs「张三」），
     //   这里直接以服务端为准，不打断流程，但可以让用户看到最终生效的姓名。
     const finalName = verify.name ?? name
-    const finalDept = verify.dept ?? (dept || undefined)
+    const finalGroup = verify.group ?? (group || undefined)
 
     const written = writeIdentity(this.#path, {
       name: finalName,
       token,
-      ...(finalDept ? { dept: finalDept } : {}),
+      // ★ 只写 `group`：core 的 writeIdentity 读的时候两者都认、写的时候只写新字段
+      //   （旧 `dept` 只在读旧文件时兼容）。
+      ...(finalGroup ? { group: finalGroup } : {}),
     })
     if (!written.ok) {
       return { ok: false, reason: written.reason }
@@ -143,7 +146,7 @@ export class IdentityRoute {
     return {
       ok: true,
       name: finalName,
-      ...(finalDept ? { dept: finalDept } : {}),
+      ...(finalGroup ? { group: finalGroup } : {}),
     }
   }
 

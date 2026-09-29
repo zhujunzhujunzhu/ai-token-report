@@ -7,8 +7,9 @@
  * |---|---|
  * | `/api/v1/stats/overview` | 部门总览卡片（含**未归属占比**） |
  * | `/api/v1/stats/series?bucket=day\|hour` | 部门趋势 |
- * | `/api/v1/stats/breakdown?by=user\|model\|provider\|project\|…` | ★ **人员排行** |
+ * | `/api/v1/stats/breakdown?by=user\|group\|model\|provider\|project\|…` | ★ **人员排行 / 分组排行** |
  * | `/api/v1/stats/records?limit&offset` | 明细（分页） |
+ * | `/api/v1/stats/groups` | ★ **分组候选项**（筛选下拉用） |
  * | `/api/v1/stats/diagnostics` | 覆盖率 / 未归属 / 数据边界 |
  *
  * 响应结构全部来自 `shared/src/protocol.ts`，前端与之共用 —— 字段对不上时
@@ -35,9 +36,11 @@
 
 import {
   openPortalStats,
+  openPortalStore,
   resolvePortalTarget,
   type PortalRecordRow,
   type PortalStatsSession,
+  type PortalStore,
   type PortalTarget,
   type QueryFilter,
 } from '@ai-token-report/core/db'
@@ -55,6 +58,8 @@ import {
   type RecordRow,
   type RecordsResponse,
   type SeriesResponse,
+  type StatsGroupOption,
+  type StatsGroupsResponse,
 } from '@ai-token-report/shared'
 
 import type { CredentialStore } from './credentials.js'
@@ -73,6 +78,9 @@ const GROUP_BYS: readonly GroupBy[] = [
   'model',
   'provider-model',
   'user',
+  // ★ `group` 是**多对多维度**：一条事件计入它的人员所属的每个分组，
+  //   所以各分组之和 > 总量是定义（见 core/db/portal.ts 的注释）。
+  'group',
   'project',
   'day',
   'hour',
@@ -148,6 +156,11 @@ export class StatsRoute {
     if (!KNOWN_SUBS.includes(sub)) {
       return { status: 404, body: { ok: false, reason: `未找到 /api/v1/stats/${sub}` } }
     }
+
+    // ★ 分组候选项与时间窗、人员筛选全都无关（它回答「库里有哪些分组」），
+    //   所以放在开统计会话之前：一个筛选下拉不该顺带开一次统计会话。
+    //   鉴权已经在上面做完了，401/503 的语义与其它子路径完全一致。
+    if (sub === 'groups') return await this.#groups()
 
     // ── 2. 参数（时间窗在服务端解析，前端不做日期换算）──────────────
     const window = parseWindow(params)
@@ -235,7 +248,9 @@ export class StatsRoute {
       ...(row.attributionStatus ? {
         label: row.label,
         member_id: row.memberId ?? null,
-        department_name: row.departmentName ?? null,
+        // ★ 人员排行里带上他**当前**所属的全部分组名（多对多，未分组 = 空数组）。
+        //   只有人员维度有此字段：`by=group` 的行本身就是分组，不需要再列一遍。
+        ...(row.groupNames ? { group_names: row.groupNames } : {}),
         attribution_status: row.attributionStatus,
       } : {}),
       totalTokens: row.counts.total,
@@ -284,6 +299,57 @@ export class StatsRoute {
     }
     return { status: 200, body }
   }
+
+  /**
+   * `GET /api/v1/stats/groups` —— 看板的分组候选项。
+   *
+   * ★ 权限是 `stats:read`（与其它看板接口同一道门，见 `handle()` 的鉴权），
+   *   而不是管理接口的 `groups:read` / `groups:manage`。
+   *   理由：页面上的筛选下拉只需要知道「有哪些分组」，让一个下拉列表
+   *   具备分组管理权限等于把分组目录变成看板的副作用。
+   *
+   * 🚨 **只读**，而且只碰 `member_groups` + `member_group_assignments` 两张表：
+   *   `usage_event.group_name` 是客户端**自称**的文本快照（可以随便填），
+   *   拿它当候选项等于让页面按错别字筛选 —— 候选必须来自权威的分组目录。
+   *
+   * ⚠️ `member_count` 是**当前**关联人数，与时间窗无关（窗口只在查用量时才用）。
+   *   因此本方法**刻意不收 `ParsedWindow`**：那样会让人以为这个数是按窗口算的。
+   */
+  async #groups(): Promise<StatsRouteResult> {
+    let store: PortalStore
+    try {
+      store = await openPortalStore(this.#target)
+    } catch (err) {
+      // 与其它子路径同一套错误风格：数据库身份形态下回 503，其它形态回 500。
+      if (this.#identityStore) return { status: 503, body: { ok: false, reason: '统计数据库暂时不可用，请稍后重试' } }
+      return { status: 500, body: { ok: false, reason: `上报库不可用: ${msg(err)}` } }
+    }
+
+    try {
+      // ⚠️ 关联计数写成相关子查询而不是 LEFT JOIN + GROUP BY：
+      //   两个后端上都不会因为「一个分组多人」而产生重复行，
+      //   也不需要 `COUNT(DISTINCT ...)`（MySQL 下 `SUM`/`COUNT` 的返回类型还不一样）。
+      const rows = await store.all<{ group_id: string; name: string; status: string; member_count: unknown }>(
+        `SELECT g.group_id, g.name, g.status,
+           (SELECT COUNT(*) FROM member_group_assignments a WHERE a.group_id = g.group_id) AS member_count
+         FROM member_groups g ORDER BY g.name, g.group_id`,
+      )
+      const groups: StatsGroupOption[] = rows.map((row) => ({
+        group_id: String(row.group_id),
+        name: String(row.name),
+        status: String(row.status) as StatsGroupOption['status'],
+        // ⚠️ MySQL 下 COUNT 经驱动可能是字符串，`Number()` 在口径边界上归一（同 portal.ts 的 num()）。
+        member_count: Number(row.member_count),
+      }))
+      const body: StatsGroupsResponse = { groups }
+      return { status: 200, body }
+    } catch (err) {
+      if (this.#identityStore) return { status: 503, body: { ok: false, reason: '统计数据库暂时不可用，请稍后重试' } }
+      return { status: 500, body: { ok: false, reason: `查询失败: ${msg(err)}` } }
+    } finally {
+      await store.close()
+    }
+  }
 }
 
 /** 已实现的子路径。写成常量而不是散落的 if，便于一处看清「有哪些接口」。 */
@@ -292,6 +358,7 @@ const KNOWN_SUBS: readonly string[] = [
   'series',
   'breakdown',
   'records',
+  'groups',
   'diagnostics',
 ] as const
 
@@ -370,8 +437,10 @@ function toRecordRow(row: PortalRecordRow): RecordRow {
     ...(row.attributionStatus ? {
       member_id: row.memberId ?? null,
       user_name_snapshot: row.userNameSnapshot ?? null,
-      department_id: row.departmentId ?? null,
-      dept_snapshot: row.deptSnapshot ?? null,
+      // ★ 两个不同的东西，别混：`group_ids` 是这个人**当前**所属的分组（关联表），
+      //   `group_name_snapshot` 是上报当时客户端自己填的文本（只是线索，不参与归属）。
+      group_ids: row.groupIds ?? [],
+      group_name_snapshot: row.groupNameSnapshot ?? null,
       attribution_status: row.attributionStatus,
     } : {}),
     provider: row.provider,
@@ -436,6 +505,11 @@ function parseWindow(params: URLSearchParams): ParsedWindow | { error: string } 
   const users = splitList(params.get('user'))
   const providers = splitList(params.get('provider'))
   const models = splitList(params.get('model'))
+  // ★ 分组筛选：`group_id` 是多选（逗号分隔），与人员一样是**精确匹配**。
+  //   同时接受重复的同名参数（`?group_id=a&group_id=b`）—— 两种写法在
+  //   真实前端里都会出现，而「只认其中一种」的表现是「筛了一个分组却像没筛」。
+  //   ⚠️ 它筛的是**归属关联**（谁属于哪些分组），不是 `group_name` 快照文本。
+  const groupIds = [...new Set(splitList(params.getAll('group_id').join(',')))]
   const identityView = params.get('identity_view') ?? 'legacy'
   if (identityView !== 'member' && identityView !== 'legacy') return { error: 'identity_view 只支持 member 或 legacy' }
   const hasSelectors = ['member_id', 'legacy_user', 'unattributed'].some(key => params.has(key))
@@ -466,6 +540,7 @@ function parseWindow(params: URLSearchParams): ParsedWindow | { error: string } 
       ...(providers.length > 0 ? { providers } : {}),
       ...(models.length > 0 ? { models } : {}),
       ...(users.length > 0 ? { userIds: users } : {}),
+      ...(groupIds.length > 0 ? { groupIds } : {}),
       identityView,
       ...(memberIds.length ? { memberIds } : {}),
       ...(legacyUserIds.length ? { legacyUserIds } : {}),

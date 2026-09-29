@@ -7,7 +7,7 @@
  * POST /api/v1/identity/verify
  * Authorization: Bearer <token>
  * { "token": "<token>" }
- * → { "ok": true, "name": "张三", "dept": "研发一部", "registered": true }
+ * → { "ok": true, "name": "张三", "group": "研发一部", "dept": "研发一部", "registered": true }
  * ```
  *
  * ## 为什么同时接受 header 和 body 里的 token
@@ -63,16 +63,22 @@ export const VIEWER_AUTH_MESSAGES = {
  *   两处里只要有一处写成 `?? 'admin'`，「服务端少返回一个字段」
  *   就变成「人人可发 token」。这类默认值必须只有一个落点。
  */
-function viewerFrom(verified: { name?: string; role?: UserRole; dept?: string }): {
+function viewerFrom(verified: { name?: string; role?: UserRole; group?: string }): {
   name: string
   role: UserRole
+  group?: string
   dept?: string
 } {
+  const group = verified.group
   return {
     name: verified.name!,
     // ★ 角色只可能来自凭证表；缺省（老客户端/字段改名）一律按普通成员处理
     role: verified.role ?? ROLE_MEMBER,
-    ...(verified.dept ? { dept: verified.dept } : {}),
+    // 🚨 `dept` 是**刻意的兼容别名，不要删**：与 `group` 同值，
+    //   只为让已部署的旧插件 / 旧 CLI（它们读 `dept`）继续能显示归属。
+    //   新代码一律读 `group`。两者同值而不是各算一次，才不会出现
+    //   「同一份响应里两个字段不一样」这种无法解释的分叉。
+    ...(group ? { group, dept: group } : {}),
   }
 }
 
@@ -174,7 +180,7 @@ export function resolveViewerIdentity(
 
 /** 身份解析结果。失败时 `registered` 区分「没配凭证」与「token 不对」。 */
 export type IdentityResolution =
-  | { ok: true; name: string; dept?: string; role: UserRole }
+  | { ok: true; name: string; group?: string; dept?: string; role: UserRole }
   | { ok: false; reason: string; registered: boolean }
 
 /**

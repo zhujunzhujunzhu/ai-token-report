@@ -16,10 +16,23 @@ export async function importCredentialFile(repository: IdentityRepository, path:
       const r = item as Record<string, unknown>
       if (typeof r.token !== 'string' || !r.token.trim() || typeof r.name !== 'string' || !r.name.trim()) throw new IdentityError(400, '凭证姓名或 Token 缺失')
       if (r.role !== undefined && r.role !== 'admin' && r.role !== 'member') throw new IdentityError(400, '凭证文件包含未知角色，未修改数据库')
-      for (const key of ['dept', 'username', 'passwordHash']) if (r[key] !== undefined && typeof r[key] !== 'string') throw new IdentityError(400, `凭证字段 ${key} 格式无效`)
+      // ⚠️ `dept` 是**旧字段名的读取兼容，刻意保留，不要删**：已部署的
+      //   credentials.json 写的是 `dept`，删掉兼容会让这些机器导入后全员未分组。
+      //   写入侧只写 `group`（见 member-admin.ts 的 serializeCredentials）。
+      for (const key of ['group', 'dept', 'username', 'passwordHash']) if (r[key] !== undefined && typeof r[key] !== 'string') throw new IdentityError(400, `凭证字段 ${key} 格式无效`)
       if (r.loginEnabled !== undefined && typeof r.loginEnabled !== 'boolean') throw new IdentityError(400, '凭证文件登录启用状态无效')
       if (r.createdAt !== undefined && (!Number.isSafeInteger(r.createdAt) || Number(r.createdAt) < 0)) throw new IdentityError(400, '凭证签发时间无效')
-      entries.push({ token: r.token.trim(), name: r.name.trim(), ...(r.role !== undefined ? { role: r.role as 'admin' | 'member' } : {}), ...(r.dept !== undefined ? { dept: r.dept as string } : {}), ...(r.username !== undefined ? { username: r.username as string } : {}), ...(r.passwordHash !== undefined ? { passwordHash: r.passwordHash as string } : {}), ...(r.loginEnabled !== undefined ? { loginEnabled: r.loginEnabled as boolean } : {}), ...(r.createdAt !== undefined ? { createdAt: Number(r.createdAt) } : {}) })
+      const group = typeof r.group === 'string' && r.group.trim() ? r.group : typeof r.dept === 'string' ? r.dept : undefined
+      entries.push({
+        token: r.token.trim(),
+        name: r.name.trim(),
+        ...(r.role !== undefined ? { role: r.role as 'admin' | 'member' } : {}),
+        ...(group !== undefined ? { group } : {}),
+        ...(r.username !== undefined ? { username: r.username as string } : {}),
+        ...(r.passwordHash !== undefined ? { passwordHash: r.passwordHash as string } : {}),
+        ...(r.loginEnabled !== undefined ? { loginEnabled: r.loginEnabled as boolean } : {}),
+        ...(r.createdAt !== undefined ? { createdAt: Number(r.createdAt) } : {}),
+      })
     }
   } else if (value && typeof value === 'object') {
     for (const [name, token] of Object.entries(value)) {

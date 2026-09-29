@@ -39,6 +39,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
 
+import { PORTAL_SCHEMA_VERSION } from '@ai-token-report/core/db'
 import { createHandlerFor, type HandlerBundle } from '../src/index.js'
 import { seedDatabaseIdentity } from './database-fixture.js'
 
@@ -54,7 +55,7 @@ function tempRoot(tag: string): string {
 
 const CREDENTIALS = JSON.stringify(
   [
-    { token: 'atr-zhangsan-9f3c', name: '张三', dept: '研发一部' },
+    { token: 'atr-zhangsan-9f3c', name: '张三', group: '研发一部' },
     { token: 'atr-admin-0001', name: '李经理', role: 'admin' },
   ],
   null,
@@ -258,7 +259,9 @@ describe('现状契约：健康检查', () => {
     const b = r.body as Record<string, unknown>
     expect(b.ok).toBe(true)
     expect(b.initialized).toBe(true)
-    expect(b.schema_version).toBe(4)
+    // ★ 跟常量走：`scripts/deploy-server.mjs` 正是拿这个字段和本地代码期望的版本比对，
+//   写死成旧数字会让每次部署都误报「上报库 schema 版本不一致」。
+    expect(b.schema_version).toBe(PORTAL_SCHEMA_VERSION)
     expect(b.identity_storage).toBe('database')
     expect(b.localApi).toBe(false)
   })
@@ -445,6 +448,67 @@ describe('现状契约：/api/v1/admin/members*', () => {
     const b = r.body as Record<string, unknown>
     expect(b.ok).toBe(true)
     expect((b.member as { member_id: string }).member_id).toMatch(/^[0-9a-f-]{36}$/)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────
+describe('现状契约：/api/v1/groups 与 /api/v1/admin/groups*', () => {
+  test('缺 Authorization → 401（读目录与写目录都要身份）', async () => {
+    expect((await call(dept, 'GET', '/api/v1/groups')).status).toBe(401)
+    expect((await call(dept, 'POST', '/api/v1/admin/groups', { headers: JSON_HEADERS, body: '{}' })).status).toBe(401)
+  })
+
+  test('★ member token 读分组目录 → 200，但响应里只有目录（不含凭证或名单）', async () => {
+    // 闸门是「权限码 ∩ Token scope」两把锁（见 http/auth.ts）：离线导入的普通
+    // 成员凭证带着 `groups:read`（页面上的分组筛选要用），所以这里读得到。
+    // ⚠️ 缺这一条 scope 的凭证（例如 appKey）会拿到 403 —— 那一条在
+    //   `identity-database.test.ts` 里用 appKey 钉着。
+    const r = await call(dept, 'GET', '/api/v1/groups', { headers: MEMBER })
+    expect(r.status).toBe(200)
+    expect(r.text).not.toContain('atr-')
+  })
+
+  test('admin token → 200，返回分组目录与稳定 ID', async () => {
+    const r = await call(dept, 'GET', '/api/v1/groups', { headers: ADMIN })
+    expect(r.status).toBe(200)
+    const groups = (r.body as { groups: { group_id: string; name: string }[] }).groups
+    expect(groups.map((g) => g.name)).toEqual(['研发一部'])
+    expect(groups[0]!.group_id).toMatch(/^[0-9a-f-]{36}$/)
+  })
+
+  test('★ 旧路径 /api/v1/departments 不再存在（改名没有留第二套路径）', async () => {
+    // 留一个「旧路径也还能用」的后门，等于让页面同时依赖两套路径名，
+    // 而这两套名字迟早会漂移；本接口的消费方只有本仓的页面，改名必须一次到位。
+    expect((await call(dept, 'GET', '/api/v1/departments', { headers: ADMIN })).status).toBe(404)
+  })
+
+  test('POST /admin/groups 建组：重名 409、缺 name 400', async () => {
+    const body = JSON.stringify({ name: '平台组' })
+    const created = await call(dept, 'POST', '/api/v1/admin/groups', { headers: { ...JSON_HEADERS, ...ADMIN }, body })
+    expect(created.status).toBe(200)
+    expect((created.body as { group: { name: string } }).group.name).toBe('平台组')
+
+    const duplicate = await call(dept, 'POST', '/api/v1/admin/groups', { headers: { ...JSON_HEADERS, ...ADMIN }, body })
+    expect(duplicate.status).toBe(409)
+
+    const missing = await call(dept, 'POST', '/api/v1/admin/groups', { headers: { ...JSON_HEADERS, ...ADMIN }, body: '{}' })
+    expect(missing.status).toBe(400)
+  })
+
+  test('GET /admin/groups/status → 405 且 Allow 恰好是 POST', async () => {
+    const r = await call(dept, 'GET', '/api/v1/admin/groups/status')
+    expect(r.status).toBe(405)
+    expect(r.allow).toBe('POST')
+  })
+
+  test('★ GET /api/v1/stats/groups 是看板接口（stats:read），不属于分组管理权限', async () => {
+    const r = await call(dept, 'GET', '/api/v1/stats/groups', { headers: ADMIN })
+    expect(r.status).toBe(200)
+    const groups = (r.body as { groups: { name: string; status: string; member_count: number }[] }).groups
+    expect(groups.map((g) => g.name)).toContain('研发一部')
+    // member_count 是「当前关联人数」，不是事件数：下拉列表要能解释「这个组里有几个人」
+    expect(groups.find((g) => g.name === '研发一部')!.member_count).toBeGreaterThan(0)
+    expect(groups.find((g) => g.name === '研发一部')!.status).toBe('active')
   })
 })
 

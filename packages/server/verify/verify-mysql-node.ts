@@ -59,7 +59,7 @@
  *   「`node_modules/mysql2` 是 junction」完全正常（pnpm 的布局正是后者）。
  *   两种布局都实测过（`atr-jB` 失败 / `atr-jE` 成功并真的连上了库）。
  *
- * 每次由编排进程创建随机 atr_http_v4_* 隔离库；Node 子进程只允许这个目标，
+ * 每次由编排进程创建随机 atr_http_v5_* 隔离库；Node 子进程只允许这个目标，
  * 完成后编排进程删除该隔离库，不访问既有业务库。
  */
 
@@ -96,7 +96,7 @@ import {
  */
 const isolation = process.env.ATR_MYSQL_NODE_VERIFY_CHILD === '1' ? null : await createIsolatedMysql()
 const MYSQL_URL = isolation?.url ?? process.env.ATR_MYSQL_URL!
-if (!MYSQL_URL || !/^\/atr_http_v4_\d+_[a-f0-9]{8}$/.test(new URL(MYSQL_URL).pathname)) throw new Error('只允许本次创建的隔离测试库')
+if (!MYSQL_URL || !/^\/atr_http_v5_\d+_[a-f0-9]{8}$/.test(new URL(MYSQL_URL).pathname)) throw new Error('只允许本次创建的隔离测试库')
 
 /** 只用于断言「门面描述里绝不出现密码」。⚠️ 别把它打印出来。 */
 const PASSWORD = /\/\/[^:/?#]+:([^@]*)@/.exec(MYSQL_URL)?.[1] ?? ''
@@ -536,8 +536,8 @@ async function runAssertions(): Promise<number> {
     // ★ 用真实的方言层拼语句，不在脚本里另写一份 SQL
     const insertSql =
       `${MYSQL_DIALECT.insertIgnore('usage_event')} ` +
-      '(event_id, session_id, seq, ts, provider, model, cwd, user_id, user_name, dept, input_tokens) ' +
-      'VALUES ($eventId, $sessionId, $seq, $ts, $provider, $model, $cwd, $userId, $userName, $dept, $input)'
+      '(event_id, session_id, seq, ts, provider, model, cwd, user_id, user_name, group_name, input_tokens) ' +
+      'VALUES ($eventId, $sessionId, $seq, $ts, $provider, $model, $cwd, $userId, $userName, $groupName, $input)'
     check(
       '幂等前缀是 INSERT IGNORE INTO（不是 SQLite 的 INSERT OR IGNORE）',
       insertSql.startsWith('INSERT IGNORE INTO'),
@@ -559,7 +559,7 @@ async function runAssertions(): Promise<number> {
       ...dedupBase,
       $userId: 'u-1',
       $userName: '张三',
-      $dept: '研发一部',
+      $groupName: '研发一部',
     })
     check('首插 changes=1', first.changes === 1, String(first.changes))
 
@@ -567,18 +567,18 @@ async function runAssertions(): Promise<number> {
       ...dedupBase,
       $userId: 'u-9',
       $userName: '李四',
-      $dept: '研发二部',
+      $groupName: '研发二部',
       $input: 999_999,
     })
     check('★ 重插 changes=0（这就是去重判据，与 Bun 侧一致）', dup.changes === 0, String(dup.changes))
 
-    const kept = await store.get<{ user_name: unknown; dept: unknown; input_tokens: unknown }>(
-      'SELECT user_name, dept, input_tokens FROM usage_event WHERE event_id = $id',
+    const kept = await store.get<{ user_name: unknown; group_name: unknown; input_tokens: unknown }>(
+      'SELECT user_name, group_name, input_tokens FROM usage_event WHERE event_id = $id',
       { $id: dedupEvent },
     )
     check(
       '★ 归属以先到的为准（没被李四覆盖）',
-      kept?.user_name === '张三' && kept?.dept === '研发一部',
+      kept?.user_name === '张三' && kept?.group_name === '研发一部',
       JSON.stringify(kept),
     )
     check('token 数也没被覆盖', Number(kept?.input_tokens) === 1000, JSON.stringify(kept))
@@ -592,7 +592,7 @@ async function runAssertions(): Promise<number> {
       $input: 2000,
       $userId: 'u-1',
       $userName: '张三',
-      $dept: '研发一部',
+      $groupName: '研发一部',
     })
     const agg = await store.get<{ calls: unknown; input: unknown }>(
       `SELECT COUNT(*) AS calls, SUM(input_tokens) AS input
@@ -648,7 +648,7 @@ async function runAssertions(): Promise<number> {
         $input: 10 * seq,
         $userId: 'u-1',
         $userName: '张三',
-        $dept: '研发一部',
+        $groupName: '研发一部',
       })
     }
     const grouped = await store.all<{ grp_key: string; calls: unknown }>(
@@ -675,10 +675,10 @@ async function runAssertions(): Promise<number> {
       table: 'usage_event',
       columns: [
         'event_id', 'session_id', 'seq', 'ts', 'provider', 'model',
-        'cwd', 'user_id', 'user_name', 'dept', 'input_tokens',
+        'cwd', 'user_id', 'user_name', 'group_name', 'input_tokens',
       ],
       values:
-        '$eventId, $sessionId, $seq, $ts, $provider, $model, $cwd, $userId, $userName, $dept, $input',
+        '$eventId, $sessionId, $seq, $ts, $provider, $model, $cwd, $userId, $userName, $groupName, $input',
       keyColumn: 'event_id',
       assignments: [
         `input_tokens = ${MYSQL_DIALECT.scalarMax(
@@ -709,7 +709,7 @@ async function runAssertions(): Promise<number> {
       $model: 'qwen-max',
       $userId: 'u-1',
       $userName: '张三',
-      $dept: '研发一部',
+      $groupName: '研发一部',
     }
     const upFirst = await store.run(upsert, { ...upsertBase, $cwd: 'D:\\first', $input: 500 })
     check('首次 upsert 是插入（changes=1）', upFirst.changes === 1, String(upFirst.changes))
@@ -783,7 +783,7 @@ async function runAssertions(): Promise<number> {
       $sessionId: `${SESSION_PREFIX}-tx`,
       $userId: 'u-1',
       $userName: '张三',
-      $dept: '研发一部',
+      $groupName: '研发一部',
       $input: 1,
     }
     const thrown = await store

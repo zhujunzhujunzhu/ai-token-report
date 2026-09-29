@@ -11,7 +11,7 @@
  * | `/api/v1/identity/verify` | 本地服务代用户校验 | 凭证表 | Bearer |
  * | `/api/v1/token-usage` | 插件 & CLI 上报 | 写入**上报库**（`portal.sqlite`） | Bearer |
  * | `/api/v1/stats/*` | 部门看板页面 | 读上报库（只读） | Bearer |
- * | `/api/v1/admin/*` | 部门看板管理页 | 数据库人员、部门、账号、凭证 | Principal + 当前权限 |
+ * | `/api/v1/admin/*` | 部门看板管理页 | 数据库人员、分组、账号、凭证 | Principal + 当前权限 |
  * | `/api/health` | 运维探活 | 无 | 无 |
  *
  * ⚠️ **`/api/v1/token-usage` 在两个形态下都注册**（不管 `enableLocalApi`）：
@@ -43,6 +43,7 @@
  */
 
 import { Hono, type Context, type MiddlewareHandler } from 'hono'
+import { PORTAL_SCHEMA_VERSION } from '@ai-token-report/core/db'
 import { compress } from 'hono/compress'
 import { etag } from 'hono/etag'
 import { logger } from 'hono/logger'
@@ -211,7 +212,11 @@ export function createApp(deps: AppDeps): Hono {
   app.all('/api/health', async () => {
     if (deps.identityStore) return json({
       ok: true, version: SERVER_VERSION, localApi: deps.enableLocalApi,
-      schema_version: 4, initialized: await deps.identityStore.isRegistered(),
+      // ★ 必须是**当前**上报库版本常量，不能写死数字：部署脚本
+      //   （`scripts/deploy-server.mjs`）正是拿这个字段和本地代码期望的版本比对，
+      //   写死一个过期数字会让每次部署都误报「版本不一致」，
+      //   而运维看到告警后会去怀疑库没迁移 —— 排查方向整个跑偏。
+      schema_version: PORTAL_SCHEMA_VERSION, initialized: await deps.identityStore.isRegistered(),
       identity_storage: 'database',
     })
     return json({
@@ -288,14 +293,15 @@ export function createApp(deps: AppDeps): Hono {
       if ('error' in parsed) return fail(parsed.error, 400)
       return respond(await route.handle(c.req.method, action, await portalAuthorization(c), parsed.value, new URL(c.req.url).searchParams))
     }
-    for (const path of ['members', 'members/tokens', 'roles', 'audit', 'storage', 'legacy-attributions']) {
+    for (const path of ['members', 'members/tokens', 'appkeys', 'roles', 'audit', 'storage', 'legacy-attributions']) {
       app.get(`/api/v1/admin/${path}`, c => dispatch(c, path))
     }
-    app.get('/api/v1/departments', c => dispatch(c, 'departments'))
+    app.get('/api/v1/groups', c => dispatch(c, 'groups'))
     for (const path of [
       'members', 'members/update', 'members/roles', 'members/status', 'members/login',
       'members/login/status', 'members/tokens', 'members/tokens/rotate', 'members/tokens/revoke',
-      'members/tokens/scopes', 'members/appkey', 'departments', 'departments/update', 'departments/status',
+      'members/tokens/scopes', 'members/tokens/expiry', 'members/appkey', 'groups', 'groups/update', 'groups/status',
+      'roles', 'roles/update', 'roles/status',
       'legacy-attributions/confirm',
     ]) app.post(`/api/v1/admin/${path}`, c => dispatch(c, path))
   } else if (deps.adminRoute) {
@@ -347,7 +353,7 @@ export function createApp(deps: AppDeps): Hono {
       if ('error' in parsed) return fail(parsed.error, 400)
       // 形状校验在 `IdentityRoute.submit` 内部（那里才有完整的业务上下文）
       const result = await deps.identityRoute.submit(
-        parsed.value as { name: string; token: string; dept?: string },
+        parsed.value as { name: string; token: string; group?: string },
       )
       // 同样用 200 表达业务失败：这是「填的 token 不对」，不是 HTTP 错误
       return json(result)
