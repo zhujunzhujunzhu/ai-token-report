@@ -6,13 +6,34 @@ export type ApiResult<T> =
   | { ok: true; data: T }
   | { ok: false; error: string; status: number }
 
+/**
+ * 把接口路径接到部署前缀上。
+ *
+ * 页面挂在反向代理子路径（如 `/ai-token/`）时，`fetch('/api/v1/...')` 会打到
+ * **站点根**，而根路径通常属于同实例上别的应用 —— 表现为「后端返回了非 JSON
+ * 响应」，实际是请求根本没到本服务。
+ *
+ * 前缀由 Vite 的 `base` 决定（`import.meta.env.BASE_URL`），与产物里静态资源
+ * 用的是同一个值，因此两者不可能漂移。根路径部署时它是 `/`，拼接后与原来
+ * 逐字相同，行为不变。
+ *
+ * ⚠️ 只在此处拼接：各 api 模块继续写 `/api/v1/...` 的**根相对路径**，
+ *    这样调用方不必知道自己被部署在哪个子路径下。
+ */
+function withBase(path: string): string {
+  const base = import.meta.env.BASE_URL || '/'
+  if (base === '/') return path
+  // base 以 `/` 结尾、path 以 `/` 开头，去掉一个斜杠避免出现 `//`
+  return base.replace(/\/$/, '') + path
+}
+
 async function send<T>(
   path: string,
   method: 'GET' | 'POST',
   body?: unknown,
 ): Promise<ApiResult<T>> {
   try {
-    const response = await fetch(path, {
+    const response = await fetch(withBase(path), {
       method,
       signal: AbortSignal.timeout(20_000),
       cache: 'no-store',
