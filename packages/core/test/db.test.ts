@@ -235,10 +235,31 @@ describe('db schema', () => {
 
     // ★ 三列都必须存在，且**必须可空**：本机增量入库（ingest.ts）根本不写它们，
     //   若哪天被改成 NOT NULL，本地库会立刻写不进去（而服务端库才有值）。
+    // ⚠️ 本地库仍是 schema v3，文本快照列**沿用历史的 `dept`**（承载的语义已是分组）：
+    //   改名要升版本 + 重建整库，而这里的数据全部可从日志重扫，不值当。
+    //   上报库那一列才叫 `group_name`（见下一条断言与 db/schema.ts 的版本表）。
     for (const name of ['user_id', 'user_name', 'dept']) {
       expect(byName.has(name)).toBe(true)
       expect(byName.get(name)?.notnull).toBe(0)
     }
+    db.close()
+  })
+
+  test('上报库 v5：文本快照列改名 group_name，部门列已删除且同样可空', () => {
+    // ⚠️ 必须开在**另一个库文件**上：同一路径既建 v3 又建 v5 会被版本闸门拒绝。
+    const db = openPortalDb(join(home, 'token-report', 'portal.sqlite'))
+    const cols = db
+      .query<{ name: string; notnull: number }, []>(`PRAGMA table_info(${EVENT_TABLE})`)
+      .all()
+    const byName = new Map(cols.map((c) => [c.name, c]))
+
+    for (const name of ['user_id', 'user_name', 'group_name']) {
+      expect(byName.has(name)).toBe(true)
+      expect(byName.get(name)?.notnull).toBe(0)
+    }
+    // v5 删掉了两处部门列：人员的单值归属改由 member_group_assignments 承载
+    expect(byName.has('dept')).toBe(false)
+    expect(byName.has('department_id')).toBe(false)
     db.close()
   })
 
@@ -524,11 +545,26 @@ function makeIngestRecord(eventId: string, over: Partial<IngestRecord> = {}): In
   }
 }
 
-/** 读一行归属，用于断言「谁上报的」。 */
+/** 读一行**上报库 v5** 的归属快照，用于断言「谁上报的」。 */
 function ownerOf(db: ReturnType<typeof openDb>, eventId: string) {
   // ⚠️ 位置参数必须包成数组：驱动按「数组 = 位置参数 / 对象 = 具名参数」分流，
   //   直接传字符串会被当成具名参数对象（Object.entries('s:1') → 三个键），
   //   结果是 `?` 没被绑定、查不到任何行。
+  return db
+    .query<{ user_id: string | null; user_name: string | null; group_name: string | null }, [string]>(
+      `SELECT user_id, user_name, group_name FROM ${EVENT_TABLE} WHERE event_id = ?`,
+    )
+    .get([eventId])
+}
+
+/**
+ * 读一行**本机库（schema v3）**的归属快照。
+ *
+ * ⚠️ 两个库的文本快照列名不同：本机库沿用历史的 `dept`，上报库 v5 叫 `group_name`
+ *   （见 db/schema.ts 的版本表）。写死任何一个都会在另一侧抛
+ *   「no such column」——这正是本机路径与上报路径不能混用的一个具体表现。
+ */
+function localOwnerOf(db: ReturnType<typeof openDb>, eventId: string) {
   return db
     .query<{ user_id: string | null; user_name: string | null; dept: string | null }, [string]>(
       `SELECT user_id, user_name, dept FROM ${EVENT_TABLE} WHERE event_id = ?`,
@@ -544,7 +580,7 @@ describe('上报落库（服务端）', () => {
     const r = await insertAttributedRecords(store, [makeIngestRecord('s:1')], {
       userId: '张三',
       userName: '张三',
-      dept: '研发一部',
+      groupName: '研发一部',
     })
     await store.close()
 
@@ -555,7 +591,7 @@ describe('上报落库（服务端）', () => {
     expect(ownerOf(db, 's:1')).toEqual({
       user_id: '张三',
       user_name: '张三',
-      dept: '研发一部',
+      group_name: '研发一部',
     })
 
     // ★ 铁律 1：四个 token 是四个独立列
@@ -589,9 +625,9 @@ describe('上报落库（服务端）', () => {
     const store = await openPortalStore({ sqlitePath: dbPath })
     const rec = makeIngestRecord('s:1')
 
-    await insertAttributedRecords(store, [rec], { userId: '张三', userName: '张三', dept: '研发一部' })
+    await insertAttributedRecords(store, [rec], { userId: '张三', userName: '张三', groupName: '研发一部' })
     // 同一条记录被另一个人重发（如换了 token 的同一台机器）
-    await insertAttributedRecords(store, [rec], { userId: '李四', userName: '李四', dept: '研发二部' })
+    await insertAttributedRecords(store, [rec], { userId: '李四', userName: '李四', groupName: '研发二部' })
     await store.close()
 
     const db = openPortalDb(dbPath)
@@ -599,13 +635,13 @@ describe('上报落库（服务端）', () => {
     db.close()
   })
 
-  test('userName 缺省时回落到 userId；无部门时 dept 为 NULL', async () => {
+  test('userName 缺省时回落到 userId；无分组时 group_name 为 NULL', async () => {
     const store = await openPortalStore({ sqlitePath: dbPath })
     await insertAttributedRecords(store, [makeIngestRecord('s:1')], { userId: '张三' })
     await store.close()
 
     const db = openPortalDb(dbPath)
-    expect(ownerOf(db, 's:1')).toEqual({ user_id: '张三', user_name: '张三', dept: null })
+    expect(ownerOf(db, 's:1')).toEqual({ user_id: '张三', user_name: '张三', group_name: null })
     db.close()
   })
 
@@ -614,7 +650,8 @@ describe('上报落库（服务端）', () => {
     insertRecords(db, [makeRecord('s1', 1)])
     // 本机数据只有我一个人，归属只对「上报道服务端」有意义 ——
     // 本地路径若哪天开始写归属，说明两条链路的边界被搞混了
-    expect(ownerOf(db, 's1:1')).toEqual({ user_id: null, user_name: null, dept: null })
+    // （列名走 localOwnerOf：本机库 v3 的快照列仍叫 dept）
+    expect(localOwnerOf(db, 's1:1')).toEqual({ user_id: null, user_name: null, dept: null })
     db.close()
   })
 })

@@ -57,6 +57,10 @@ import { dirname } from 'node:path'
  * |---|---|
  * | 2 | `ingest_run` 补解析计数列 |
  * | 3 | `usage_event` 加归属三列 `user_id` / `user_name` / `dept`（服务端上报写入） |
+ *
+ * ⚠️ 第 3 版里的 `dept` 列**名字没跟着实体改名**：本地库是日志的派生物、
+ *   坏了直接重建，为一次改名去升版本 + 迁移不划算。它承载的语义已经是「分组」，
+ *   上报库里的对应列叫 `group_name`（见 `portal-schema-v5.ts`）。
  */
 export const DB_SCHEMA_VERSION = 3
 
@@ -92,6 +96,8 @@ CREATE TABLE IF NOT EXISTS ${EVENT_TABLE} (
   --   ⚠️ SQL 里的注释不能写反引号 —— 会把外层模板字符串截断。
   user_id             TEXT,
   user_name           TEXT,
+  -- ⚠️ 列名沿用历史的 dept，但它承载的语义已经是「分组」（见文件头版本表）。
+  --   改名要升本地库版本并重建整库，而这里的数据全部可从日志重扫，不值当。
   dept                TEXT,
   -- ★ 四个独立列，绝不合并（铁律 1）
   input_tokens        INTEGER NOT NULL DEFAULT 0,

@@ -100,12 +100,16 @@ function normalize(value: unknown): Identity | null {
   const now = Date.now()
   const createdAt = typeof o['createdAt'] === 'number' ? o['createdAt'] : now
   const updatedAt = typeof o['updatedAt'] === 'number' ? o['updatedAt'] : createdAt
-  const dept = typeof o['dept'] === 'string' && o['dept'].trim() ? o['dept'].trim() : undefined
+  // ★ 这个字段曾经叫 `dept`（部门）。**读的时候两者都认，写的时候只写 `group`**：
+  //   兼容是为了不让已经署过名的同学升级一次就变成「未署名」——
+  //   那会直接停止上报，而不是报一个错。
+  const group = [o['group'], o['dept']]
+    .find((value): value is string => typeof value === 'string' && value.trim().length > 0)?.trim()
 
   return {
     name: name.trim(),
     token: token.trim(),
-    ...(dept ? { dept } : {}),
+    ...(group ? { group } : {}),
     createdAt,
     updatedAt,
   }
@@ -127,7 +131,7 @@ export interface WriteIdentityResult {
  */
 export function writeIdentity(
   path: string,
-  input: { name: string; token: string; dept?: string },
+  input: { name: string; token: string; group?: string },
 ): WriteIdentityResult {
   const name = input.name.trim()
   const token = input.token.trim()
@@ -141,11 +145,11 @@ export function writeIdentity(
   const existing = readIdentity(path).identity
   const now = Date.now()
 
-  const dept = input.dept?.trim()
+  const group = input.group?.trim()
   const identity: Identity = {
     name,
     token,
-    ...(dept ? { dept } : {}),
+    ...(group ? { group } : {}),
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
   }

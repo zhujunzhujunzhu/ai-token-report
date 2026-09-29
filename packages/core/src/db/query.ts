@@ -51,7 +51,7 @@ import { UNATTRIBUTED_USER } from '@ai-token-report/shared'
  * 归属只有上报库才有，而上报库**只有 SQL 一条路径**（`portal.ts`），
  * 所以这个维度只属于查询层。
  */
-export type QueryDimension = GroupDimension | 'user'
+export type QueryDimension = GroupDimension | 'user' | 'group'
 
 /** 查询筛选条件。字段语义与 CLI 的 `--period/--provider/--model` 一致。 */
 export interface QueryFilter {
@@ -77,6 +77,17 @@ export interface QueryFilter {
    * 与分组键 `COALESCE(user_id, 'unknown')` 是同一套语义。
    */
   userIds?: string[]
+  /**
+   * 按分组筛选（多选，**精确匹配**稳定分组 ID）。
+   *
+   * ⚠️ 多对多语义：一个人可同属多个分组，所以**多选是 OR**（命中任一所选分组即计入）。
+   *   因此「按两个分组分别筛出来的合计」会大于全量合计 —— 这不是重复计数的 bug，
+   *   同一条事件本来就要计入它所属的每个分组。
+   *
+   * 🚨 这一条会生成引用 `member_group_assignments` 的子查询，那张表**只有上报库有**。
+   *   本地库路径（`usage.sqlite`）绝不能带上它 —— 一旦带上就是「no such table」。
+   */
+  groupIds?: string[]
 }
 
 /** 一条从库里还原出来的原始行（对应 `UsageRecord`，但带 project 键）。 */
@@ -172,6 +183,17 @@ export function buildWhere(filter: QueryFilter): {
   })
   if (filter.unattributedOnly) identities.push('(member_id IS NULL AND user_id IS NULL)')
   if (identities.length) clauses.push(`(${identities.join(' OR ')})`)
+
+  // 按分组筛选：走关联表。用子查询而不是 JOIN —— JOIN 会让每个事件按所属分组数
+  // 复制成多行，把「筛选」悄悄变成「重复计数」。
+  if (filter.groupIds && filter.groupIds.length > 0) {
+    const keys = filter.groupIds.map((id, i) => {
+      const key = `$group${i}`
+      params[key] = id
+      return key
+    })
+    clauses.push(`member_id IN (SELECT member_id FROM member_group_assignments WHERE group_id IN (${keys.join(',')}))`)
+  }
 
   return {
     sql: clauses.length > 0 ? ` WHERE ${clauses.join(' AND ')}` : '',
@@ -487,7 +509,13 @@ export function queryIngestMoment(db: Database): number | null {
 export interface QueryGroupRow {
   label?: string
   memberId?: string | null
-  departmentName?: string | null
+  /**
+   * 该人员当前所属的全部分组名（多对多）。
+   *
+   * ★ 只有人员维度与分组维度的行才带它：其余维度（provider / model / …）
+   *   一行对应的是「一批调用」，没有单一的所属分组可言。
+   */
+  groupNames?: string[]
   attributionStatus?: 'member' | 'legacy' | 'unattributed'
   key: string
   counts: TokenCounts
@@ -636,6 +664,12 @@ function dimensionExpression(
       return null
     case 'project':
       // 需要 projectName() 的目录切分规则，交给 JS 侧
+      return null
+    case 'group':
+      // ★ 分组维度**不能**在这里出表达式：人员与分组是多对多，一个事件要同时
+      //   计入它的人员所属的每个分组，非 JOIN 关联表不可。JOIN 会放大行数，
+      //   于是「一个事件算几行」这件事必须由 `portal.ts` 显式处理 ——
+      //   本函数只产出等值聚合，硬塞进来会让它悄悄变成重复计数。
       return null
   }
 }

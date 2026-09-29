@@ -108,8 +108,10 @@ const numOrNull = toNumberOrNull
 export interface PortalRecordRow {
   memberId?: string | null
   userNameSnapshot?: string | null
-  departmentId?: string | null
-  deptSnapshot?: string | null
+  /** 该人员**当前**所属的分组 ID（不是上报时的值，那个在 `groupNameSnapshot`）。 */
+  groupIds?: string[]
+  /** 上报当时客户端自己填的分组文本快照。 */
+  groupNameSnapshot?: string | null
   attributionStatus?: 'member' | 'legacy' | 'unattributed'
   eventId: string
   sessionId: string
@@ -130,8 +132,7 @@ export interface PortalRecordRow {
 interface PortalRecordSqlRow {
   member_id: string | null
   user_name: string | null
-  department_id: string | null
-  dept: string | null
+  group_name: string | null
   event_id: string
   session_id: string
   seq: unknown
@@ -274,6 +275,7 @@ export class PortalStatsSession {
    */
   async groups(dim: QueryDimension): Promise<QueryGroupRow[]> {
     if (dim === 'user' && this.#filter.identityView === 'member') return this.memberGroups()
+    if (dim === 'group') return this.groupGroups()
     const q = groupsQuery(dim, this.#filter, this.#dialect)
     if (q) {
       const rows = await this.#store.all<RawGroupRow>(q.sql, q.params)
@@ -299,29 +301,87 @@ export class PortalStatsSession {
     return []
   }
 
+  /**
+   * 把一批稳定人员 ID 映射成「他当前属于哪些分组」。
+   *
+   * 🚨 **刻意单独查一次，而不是在主聚合里 LEFT JOIN 关联表**：多对多的 JOIN
+   *   会让每个事件行按所属分组数复制，`SUM()` 随之成倍放大 ——
+   *   那是一个静默的数据错误，页面上只是数字变大，没有任何报错。
+   *
+   * ⚠️ 分批查询：一次绑定几千个 UUID 会撞上 SQLite 的参数个数上限。
+   */
+  private async groupsOf(members: readonly (string | null)[]): Promise<Map<string, { groupId: string; name: string }[]>> {
+    const unique = [...new Set(members.filter((id): id is string => !!id))]
+    const map = new Map<string, { groupId: string; name: string }[]>()
+    for (let start = 0; start < unique.length; start += 200) {
+      const chunk = unique.slice(start, start + 200)
+      const params: Record<string, string> = {}
+      chunk.forEach((id, i) => { params[`$m${i}`] = id })
+      const rows = await this.#store.all<{ member_id: string; group_id: string; name: string }>(
+        `SELECT a.member_id AS member_id, g.group_id AS group_id, g.name AS name
+         FROM member_group_assignments a JOIN member_groups g ON g.group_id = a.group_id
+         WHERE a.member_id IN (${chunk.map((_, i) => `$m${i}`).join(',')})
+         ORDER BY g.name, g.group_id`, params)
+      for (const row of rows) {
+        const list = map.get(row.member_id) ?? []
+        list.push({ groupId: row.group_id, name: row.name })
+        map.set(row.member_id, list)
+      }
+    }
+    return map
+  }
+
   /** 按固定人员 ID 聚合；未确认历史的 key 与当前人员、真正未归属互不混淆。 */
   private async memberGroups(): Promise<QueryGroupRow[]> {
     const { sql, params } = buildWhere(this.#filter)
     const rows = await this.#store.all<RawGroupRow & {
       member_id: string | null; legacy_id: string | null; snapshot_name: string | null
-      display_name: string | null; department_name: string | null
-    }>(`SELECT g.*, m.display_name, d.name AS department_name FROM (
+      display_name: string | null
+    }>(`SELECT g.*, m.display_name FROM (
       SELECT member_id, CASE WHEN member_id IS NULL THEN user_id ELSE NULL END AS legacy_id,
         MIN(user_name) AS snapshot_name, SUM(input_tokens) AS input, SUM(output_tokens) AS output,
         SUM(cache_read_tokens) AS cache_read, SUM(cache_write_tokens) AS cache_write,
         SUM(reasoning_tokens) AS reasoning, COUNT(*) AS calls, MIN(ts) AS lo, MAX(ts) AS hi,
         COUNT(DISTINCT session_id) AS sessions
       FROM ${EVENT_TABLE}${sql} GROUP BY member_id, legacy_id
-      ) AS g LEFT JOIN members m ON m.member_id = g.member_id
-      LEFT JOIN departments d ON d.department_id = m.department_id`, params)
+      ) AS g LEFT JOIN members m ON m.member_id = g.member_id`, params)
+    const groups = await this.groupsOf(rows.map((row) => row.member_id))
     return sortGroupRows(rows.map((row) => {
       const attributionStatus = row.member_id ? 'member' : row.legacy_id !== null ? 'legacy' : 'unattributed'
       const key = row.member_id ?? (row.legacy_id !== null ? `legacy:${Buffer.from(row.legacy_id, 'utf8').toString('base64url')}` : 'unknown')
       const mapped = mapGroupRows([{ ...row, grp_key: key }])[0]!
-      return { ...mapped, memberId: row.member_id, departmentName: row.department_name,
+      return { ...mapped, memberId: row.member_id,
+        groupNames: (row.member_id ? groups.get(row.member_id) ?? [] : []).map((group) => group.name),
         attributionStatus, label: row.member_id ? row.display_name ?? row.snapshot_name ?? '已停用人员'
           : row.legacy_id !== null ? `历史人员：${row.snapshot_name ?? row.legacy_id}（待确认）` : '未归属' }
     }), 'user')
+  }
+
+  /**
+   * 按分组聚合（`by=group`）—— 「分组排行」的数据来源。
+   *
+   * ★ 这里 JOIN 关联表是**刻意的**：一个事件要同时计入它的人员所属的每个分组。
+   *   因此各分组行的合计会大于总量，这不是重复计数，而是多对多分组的定义。
+   * ⚠️ 没有关联行的人员（未分组）不进任何分组行，所以本维度看不见他们 ——
+   *   「总量对不上分组之和」的差额正是这部分人，页面必须说清楚。
+   * ⚠️ 事实表先按筛选收进子查询，再与关联表 JOIN：`buildWhere()` 产出的是
+   *   不带表别名的裸列名（它要同时服务本地库路径），直接用在 JOIN 上会歧义。
+   */
+  private async groupGroups(): Promise<QueryGroupRow[]> {
+    const { sql, params } = buildWhere(this.#filter)
+    const rows = await this.#store.all<RawGroupRow & { grp_name: string }>(
+      `SELECT g.group_id AS grp_key, g.name AS grp_name,
+              SUM(x.input_tokens) AS input, SUM(x.output_tokens) AS output,
+              SUM(x.cache_read_tokens) AS cache_read, SUM(x.cache_write_tokens) AS cache_write,
+              SUM(x.reasoning_tokens) AS reasoning, COUNT(*) AS calls,
+              MIN(x.ts) AS lo, MAX(x.ts) AS hi, COUNT(DISTINCT x.session_id) AS sessions
+       FROM (SELECT member_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                    reasoning_tokens, ts, session_id
+             FROM ${EVENT_TABLE}${sql}) AS x
+       JOIN member_group_assignments a ON a.member_id = x.member_id
+       JOIN member_groups g ON g.group_id = a.group_id
+       GROUP BY g.group_id, g.name`, params)
+    return sortGroupRows(rows.map((row) => ({ ...mapGroupRows([row])[0]!, label: row.grp_name })), 'group')
   }
 
   /** 旧页面无法表达同名/改名关系时明确拒绝，不能输出看似合理的合并排行。 */
@@ -374,13 +434,14 @@ export class PortalStatsSession {
     const rows = await this.#store.all<PortalRecordSqlRow>(
       // ⚠️ ORDER BY 用 (ts, seq) 而不是 ts：同一毫秒内的多条记录需要有
       //   稳定的次序，否则翻页时会出现「第 2 页重复了第 1 页的最后一行」。
-      `SELECT event_id, session_id, seq, ts, user_id, member_id, user_name, department_id, dept, provider, model, cwd,
+      `SELECT event_id, session_id, seq, ts, user_id, member_id, user_name, group_name, provider, model, cwd,
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
        FROM ${EVENT_TABLE}${sql}
        ORDER BY ts DESC, seq DESC, event_id DESC
        LIMIT $limit OFFSET $offset`,
       { ...params, $limit: limit, $offset: offset },
     )
+    const groups = await this.groupsOf(rows.map((row) => row.member_id))
 
     return {
       total: num(totalRow?.c),
@@ -391,8 +452,9 @@ export class PortalStatsSession {
         ts: num(r.ts),
         userId: r.user_id,
         ...(this.#filter.identityView === 'member' ? {
-          memberId: r.member_id, userNameSnapshot: r.user_name, departmentId: r.department_id,
-          deptSnapshot: r.dept, attributionStatus: r.member_id ? 'member' as const : r.user_id !== null ? 'legacy' as const : 'unattributed' as const,
+          memberId: r.member_id, userNameSnapshot: r.user_name,
+          groupIds: (r.member_id ? groups.get(r.member_id) ?? [] : []).map((group) => group.groupId),
+          groupNameSnapshot: r.group_name, attributionStatus: r.member_id ? 'member' as const : r.user_id !== null ? 'legacy' as const : 'unattributed' as const,
         } : {}),
         provider: r.provider,
         model: r.model,

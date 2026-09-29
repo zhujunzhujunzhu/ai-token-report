@@ -1,18 +1,22 @@
 /**
- * 上报库 v4 的**冻结基线**（历史版本，不再修改）。
+ * 上报库 v5 的可打包 SQL 真源（**全新库直接按它建**）。
  *
- * ★ 它的唯一用途是两条：
- *   1. 把 v3 老库先迁到 v4（`portal-migrations.ts` 的第一步）；
- *   2. 识别并核验一个 v4 库（v4 的 checksum 必须能重算出来，否则
- *      「这个库到底是不是完整的 v4」就无法判断，v4→v5 迁移也就没有起点）。
+ * v5 相对 v4 的三处结构变化：
+ * 1. `departments` → `member_groups`、`department_id` → `group_id`（术语统一为「分组」）；
+ * 2. ★ **人员与分组改为多对多**：`members.department_id` 单值列被删除，
+ *    改由 `member_group_assignments` 承载。因此 `usage_event` 也不再持有分组 ID ——
+ *    一个事件属于哪个分组，由它的 `member_id` 关联出当前所属的每个分组。
+ *    `usage_event.dept`（上报当时的文本快照）改名为 `group_name`。
+ * 3. 权限码 `departments:read` / `departments:manage` → `groups:read` / `groups:manage`。
  *
- * 🚨 **不要在这里改任何 SQL**：迁移账本按整段 SQL 的 SHA256 识别版本，
- *   改了文本会让线上已完成的 v4 迁移立刻变成「checksum 不符」而拒绝启动。
- *   当前版本的真源是 `portal-schema-v5.ts`。
+ * ⚠️ v4 的 SQL 仍是**冻结基线**，留在 `portal-schema-v4.ts`：v3 库要先经它迁到 v4，
+ *   再走本文件的 v4→v5 步骤。两份 SQL 都不允许再改 —— 迁移账本按文本摘要识别版本，
+ *   改了文本等于让已完成的迁移变成「checksum 不符」。
  */
 import { createHash } from 'node:crypto'
 import type { PortalBackendKind } from './dialect.js'
-export const PORTAL_SQLITE_V4_SQL = `-- 数据库 v4 设计原型：只允许在全新隔离库执行，不是现网迁移脚本。
+export const PORTAL_SCHEMA_VERSION = 5
+export const PORTAL_SQLITE_V5_SQL = `-- 数据库 v5：分组（多对多）+ 权限码 groups:*。
 -- 不执行 ALTER/DROP，不修改本地 usage.sqlite 的 schema v3。
 -- 部署前必须另行实现带备份、版本闸门与恢复点的生产迁移。
 -- UUID 使用小写标准格式；旧 event_id/session_id/user_id 保持原语义。
@@ -26,8 +30,8 @@ PRAGMA journal_mode = WAL;
 PRAGMA synchronous = FULL;
 PRAGMA busy_timeout = 0;
 
-CREATE TABLE departments (
-  department_id TEXT NOT NULL PRIMARY KEY CHECK ((length(department_id) = 36 AND substr(department_id,9,1) = '-' AND substr(department_id,14,1) = '-' AND substr(department_id,19,1) = '-' AND substr(department_id,24,1) = '-' AND length(replace(department_id,'-','')) = 32 AND replace(department_id,'-','') NOT GLOB '*[^0-9a-f]*')),
+CREATE TABLE member_groups (
+  group_id TEXT NOT NULL PRIMARY KEY CHECK ((length(group_id) = 36 AND substr(group_id,9,1) = '-' AND substr(group_id,14,1) = '-' AND substr(group_id,19,1) = '-' AND substr(group_id,24,1) = '-' AND length(replace(group_id,'-','')) = 32 AND replace(group_id,'-','') NOT GLOB '*[^0-9a-f]*')),
   name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 64),
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','disabled')),
   version INTEGER NOT NULL DEFAULT 1 CHECK ((typeof(version) = 'integer' AND version BETWEEN 1 AND 9007199254740991)),
@@ -40,16 +44,26 @@ CREATE TABLE departments (
 CREATE TABLE members (
   member_id TEXT NOT NULL PRIMARY KEY CHECK ((length(member_id) = 36 AND substr(member_id,9,1) = '-' AND substr(member_id,14,1) = '-' AND substr(member_id,19,1) = '-' AND substr(member_id,24,1) = '-' AND length(replace(member_id,'-','')) = 32 AND replace(member_id,'-','') NOT GLOB '*[^0-9a-f]*')),
   display_name TEXT NOT NULL CHECK (length(display_name) BETWEEN 1 AND 32),
-  department_id TEXT NULL CHECK (department_id IS NULL OR (length(department_id) = 36 AND substr(department_id,9,1) = '-' AND substr(department_id,14,1) = '-' AND substr(department_id,19,1) = '-' AND substr(department_id,24,1) = '-' AND length(replace(department_id,'-','')) = 32 AND replace(department_id,'-','') NOT GLOB '*[^0-9a-f]*')),
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','disabled','archived')),
   version INTEGER NOT NULL DEFAULT 1 CHECK ((typeof(version) = 'integer' AND version BETWEEN 1 AND 9007199254740991)),
   created_at_ms INTEGER NOT NULL CHECK ((typeof(created_at_ms) = 'integer' AND created_at_ms BETWEEN 0 AND 9007199254740991)),
   updated_at_ms INTEGER NOT NULL CHECK ((typeof(updated_at_ms) = 'integer' AND updated_at_ms BETWEEN 0 AND 9007199254740991)),
-  CHECK (updated_at_ms >= created_at_ms),
-  FOREIGN KEY (department_id) REFERENCES departments(department_id) ON DELETE RESTRICT ON UPDATE RESTRICT
+  CHECK (updated_at_ms >= created_at_ms)
 );
-CREATE INDEX idx_members_department ON members (department_id);
 CREATE INDEX idx_members_status ON members (status);
+
+-- ★ 人员与分组是**多对多**：一个人可以同时属于多个分组。
+-- 用独立关联表而不是 members 上的 JSON 数组 —— 按分组筛用量要能走索引，
+-- 而 JSON 数组会让它退化成全表扫描加 JS 侧解析。
+CREATE TABLE member_group_assignments (
+  member_id TEXT NOT NULL CHECK ((length(member_id) = 36 AND substr(member_id,9,1) = '-' AND substr(member_id,14,1) = '-' AND substr(member_id,19,1) = '-' AND substr(member_id,24,1) = '-' AND length(replace(member_id,'-','')) = 32 AND replace(member_id,'-','') NOT GLOB '*[^0-9a-f]*')),
+  group_id TEXT NOT NULL CHECK ((length(group_id) = 36 AND substr(group_id,9,1) = '-' AND substr(group_id,14,1) = '-' AND substr(group_id,19,1) = '-' AND substr(group_id,24,1) = '-' AND length(replace(group_id,'-','')) = 32 AND replace(group_id,'-','') NOT GLOB '*[^0-9a-f]*')),
+  created_at_ms INTEGER NOT NULL CHECK ((typeof(created_at_ms) = 'integer' AND created_at_ms BETWEEN 0 AND 9007199254740991)),
+  PRIMARY KEY (member_id,group_id),
+  FOREIGN KEY (member_id) REFERENCES members(member_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+  FOREIGN KEY (group_id) REFERENCES member_groups(group_id) ON DELETE RESTRICT ON UPDATE RESTRICT
+);
+CREATE INDEX idx_member_group_assignments_group ON member_group_assignments (group_id);
 
 CREATE TABLE roles (
   role_id TEXT NOT NULL PRIMARY KEY CHECK ((length(role_id) = 36 AND substr(role_id,9,1) = '-' AND substr(role_id,14,1) = '-' AND substr(role_id,19,1) = '-' AND substr(role_id,24,1) = '-' AND length(replace(role_id,'-','')) = 32 AND replace(role_id,'-','') NOT GLOB '*[^0-9a-f]*')),
@@ -259,7 +273,7 @@ CREATE TABLE usage_event (
   cwd TEXT NULL,
   user_id TEXT NULL CHECK (user_id IS NULL OR length(user_id) BETWEEN 1 AND 255),
   user_name TEXT NULL CHECK (user_name IS NULL OR length(user_name) BETWEEN 1 AND 255),
-  dept TEXT NULL CHECK (dept IS NULL OR length(dept) BETWEEN 1 AND 255),
+  group_name TEXT NULL CHECK (group_name IS NULL OR length(group_name) BETWEEN 1 AND 255),
   input_tokens INTEGER NOT NULL DEFAULT 0 CHECK ((typeof(input_tokens) = 'integer' AND input_tokens BETWEEN 0 AND 9007199254740991)),
   output_tokens INTEGER NOT NULL DEFAULT 0 CHECK ((typeof(output_tokens) = 'integer' AND output_tokens BETWEEN 0 AND 9007199254740991)),
   cache_read_tokens INTEGER NOT NULL DEFAULT 0 CHECK ((typeof(cache_read_tokens) = 'integer' AND cache_read_tokens BETWEEN 0 AND 9007199254740991)),
@@ -268,11 +282,9 @@ CREATE TABLE usage_event (
   turn INTEGER NULL CHECK (turn IS NULL OR (typeof(turn) = 'integer' AND turn BETWEEN -9007199254740991 AND 9007199254740991)),
   step INTEGER NULL CHECK (step IS NULL OR (typeof(step) = 'integer' AND step BETWEEN -9007199254740991 AND 9007199254740991)),
   member_id TEXT NULL CHECK (member_id IS NULL OR (length(member_id) = 36 AND substr(member_id,9,1) = '-' AND substr(member_id,14,1) = '-' AND substr(member_id,19,1) = '-' AND substr(member_id,24,1) = '-' AND length(replace(member_id,'-','')) = 32 AND replace(member_id,'-','') NOT GLOB '*[^0-9a-f]*')),
-  department_id TEXT NULL CHECK (department_id IS NULL OR (length(department_id) = 36 AND substr(department_id,9,1) = '-' AND substr(department_id,14,1) = '-' AND substr(department_id,19,1) = '-' AND substr(department_id,24,1) = '-' AND length(replace(department_id,'-','')) = 32 AND replace(department_id,'-','') NOT GLOB '*[^0-9a-f]*')),
   report_token_id TEXT NULL CHECK (report_token_id IS NULL OR (length(report_token_id) = 36 AND substr(report_token_id,9,1) = '-' AND substr(report_token_id,14,1) = '-' AND substr(report_token_id,19,1) = '-' AND substr(report_token_id,24,1) = '-' AND length(replace(report_token_id,'-','')) = 32 AND replace(report_token_id,'-','') NOT GLOB '*[^0-9a-f]*')),
   received_at_ms INTEGER NULL CHECK (received_at_ms IS NULL OR (typeof(received_at_ms) = 'integer' AND received_at_ms BETWEEN 0 AND 9007199254740991)),
   FOREIGN KEY (member_id) REFERENCES members(member_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
-  FOREIGN KEY (department_id) REFERENCES departments(department_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
   FOREIGN KEY (report_token_id) REFERENCES report_tokens(token_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
   FOREIGN KEY (member_id,report_token_id) REFERENCES report_tokens(member_id,token_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
   CHECK (report_token_id IS NULL OR member_id IS NOT NULL)
@@ -283,7 +295,6 @@ CREATE INDEX idx_usage_event_model ON usage_event (model);
 CREATE INDEX idx_usage_event_session ON usage_event (session_id);
 CREATE INDEX idx_usage_event_user ON usage_event (user_id);
 CREATE INDEX idx_usage_event_member_ts ON usage_event (member_id, ts);
-CREATE INDEX idx_usage_event_department_ts ON usage_event (department_id, ts);
 CREATE INDEX idx_usage_event_token ON usage_event (report_token_id);
 
 -- 仅 seed 内置角色/权限和身份互斥行；不会创建管理员账号或发放令牌。
@@ -300,15 +311,16 @@ INSERT INTO permissions (permission_id,code,description,created_at_ms) VALUES ('
 INSERT INTO permissions (permission_id,code,description,created_at_ms) VALUES ('00000000-0000-4000-8000-000000000107','roles:read','roles:read',0);
 INSERT INTO permissions (permission_id,code,description,created_at_ms) VALUES ('00000000-0000-4000-8000-000000000108','roles:assign','roles:assign',0);
 INSERT INTO permissions (permission_id,code,description,created_at_ms) VALUES ('00000000-0000-4000-8000-000000000109','audit:read','audit:read',0);
-INSERT INTO permissions (permission_id,code,description,created_at_ms) VALUES ('00000000-0000-4000-8000-000000000110','departments:read','departments:read',0);
-INSERT INTO permissions (permission_id,code,description,created_at_ms) VALUES ('00000000-0000-4000-8000-000000000111','departments:manage','departments:manage',0);
+INSERT INTO permissions (permission_id,code,description,created_at_ms) VALUES ('00000000-0000-4000-8000-000000000110','groups:read','groups:read',0);
+INSERT INTO permissions (permission_id,code,description,created_at_ms) VALUES ('00000000-0000-4000-8000-000000000111','groups:manage','groups:manage',0);
 INSERT INTO role_permissions (role_id,permission_id) SELECT '00000000-0000-4000-8000-000000000001',permission_id FROM permissions;
-INSERT INTO role_permissions (role_id,permission_id) SELECT '00000000-0000-4000-8000-000000000002',permission_id FROM permissions WHERE code IN ('identity:read','usage:write','stats:read','departments:read');
+INSERT INTO role_permissions (role_id,permission_id) SELECT '00000000-0000-4000-8000-000000000002',permission_id FROM permissions WHERE code IN ('identity:read','usage:write','stats:read','groups:read');
 INSERT INTO portal_identity_state (state_id,singleton_key,revision,updated_at_ms) VALUES ('00000000-0000-4000-8000-000000000003',1,0,0);
 -- 迁移记录由执行器在核实 DDL 后写入真实 checksum；本文件不伪造迁移完成证据。
 -- 此设计不创建本地扫描的 file_watermark/session_state，也不重定义 ingest_run。
 `
-export const PORTAL_MYSQL_V4_SQL = `-- 数据库 v4 设计原型：只允许在全新隔离库执行，不是现网迁移脚本。
+export const PORTAL_MYSQL_V5_SQL = `-- 数据库 v5：分组（多对多）+ 权限码 groups:*。
+-- 目标 MySQL 8.4；InnoDB/utf8mb4_0900_bin（NO PAD），原始事件键不 trim。
 -- 不执行 ALTER/DROP，不修改本地 usage.sqlite 的 schema v3。
 -- 部署前必须另行实现带备份、版本闸门与恢复点的生产迁移。
 -- UUID 使用小写标准格式；旧 event_id/session_id/user_id 保持原语义。
@@ -319,8 +331,8 @@ export const PORTAL_MYSQL_V4_SQL = `-- 数据库 v4 设计原型：只允许在�
 -- 历史引用全部 RESTRICT，不以删除人员/令牌清除历史。
 -- 目标 MySQL 8.4；InnoDB/utf8mb4_0900_bin（NO PAD），原始事件键不 trim。
 
-CREATE TABLE departments (
-  department_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY CHECK (department_id REGEXP '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'),
+CREATE TABLE member_groups (
+  group_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY CHECK (group_id REGEXP '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'),
   name VARCHAR(64) NOT NULL CHECK (CHAR_LENGTH(name) BETWEEN 1 AND 64),
   status VARCHAR(32) NOT NULL DEFAULT 'active' CHECK (status IN ('active','disabled')),
   version BIGINT NOT NULL DEFAULT 1 CHECK ((version BETWEEN 1 AND 9007199254740991)),
@@ -333,16 +345,24 @@ CREATE TABLE departments (
 CREATE TABLE members (
   member_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY CHECK (member_id REGEXP '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'),
   display_name VARCHAR(32) NOT NULL CHECK (CHAR_LENGTH(display_name) BETWEEN 1 AND 32),
-  department_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL CHECK (department_id IS NULL OR department_id REGEXP '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'),
   status VARCHAR(32) NOT NULL DEFAULT 'active' CHECK (status IN ('active','disabled','archived')),
   version BIGINT NOT NULL DEFAULT 1 CHECK ((version BETWEEN 1 AND 9007199254740991)),
   created_at_ms BIGINT NOT NULL CHECK ((created_at_ms BETWEEN 0 AND 9007199254740991)),
   updated_at_ms BIGINT NOT NULL CHECK ((updated_at_ms BETWEEN 0 AND 9007199254740991)),
-  CHECK (updated_at_ms >= created_at_ms),
-  FOREIGN KEY (department_id) REFERENCES departments(department_id) ON DELETE RESTRICT ON UPDATE RESTRICT
+  CHECK (updated_at_ms >= created_at_ms)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;
-CREATE INDEX idx_members_department ON members (department_id);
 CREATE INDEX idx_members_status ON members (status);
+
+-- ★ 人员与分组是**多对多**：一个人可以同时属于多个分组。
+CREATE TABLE member_group_assignments (
+  member_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL CHECK (member_id REGEXP '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'),
+  group_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL CHECK (group_id REGEXP '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'),
+  created_at_ms BIGINT NOT NULL CHECK ((created_at_ms BETWEEN 0 AND 9007199254740991)),
+  PRIMARY KEY (member_id,group_id),
+  FOREIGN KEY (member_id) REFERENCES members(member_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+  FOREIGN KEY (group_id) REFERENCES member_groups(group_id) ON DELETE RESTRICT ON UPDATE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;
+CREATE INDEX idx_member_group_assignments_group ON member_group_assignments (group_id);
 
 CREATE TABLE roles (
   role_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY CHECK (role_id REGEXP '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'),
@@ -552,7 +572,7 @@ CREATE TABLE usage_event (
   cwd TEXT NULL,
   user_id VARCHAR(255) NULL CHECK (user_id IS NULL OR CHAR_LENGTH(user_id) BETWEEN 1 AND 255),
   user_name VARCHAR(255) NULL CHECK (user_name IS NULL OR CHAR_LENGTH(user_name) BETWEEN 1 AND 255),
-  dept VARCHAR(255) NULL CHECK (dept IS NULL OR CHAR_LENGTH(dept) BETWEEN 1 AND 255),
+  group_name VARCHAR(255) NULL CHECK (group_name IS NULL OR CHAR_LENGTH(group_name) BETWEEN 1 AND 255),
   input_tokens BIGINT NOT NULL DEFAULT 0 CHECK ((input_tokens BETWEEN 0 AND 9007199254740991)),
   output_tokens BIGINT NOT NULL DEFAULT 0 CHECK ((output_tokens BETWEEN 0 AND 9007199254740991)),
   cache_read_tokens BIGINT NOT NULL DEFAULT 0 CHECK ((cache_read_tokens BETWEEN 0 AND 9007199254740991)),
@@ -561,11 +581,9 @@ CREATE TABLE usage_event (
   turn BIGINT NULL CHECK (turn IS NULL OR (turn BETWEEN -9007199254740991 AND 9007199254740991)),
   step BIGINT NULL CHECK (step IS NULL OR (step BETWEEN -9007199254740991 AND 9007199254740991)),
   member_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL CHECK (member_id IS NULL OR member_id REGEXP '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'),
-  department_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL CHECK (department_id IS NULL OR department_id REGEXP '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'),
   report_token_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL CHECK (report_token_id IS NULL OR report_token_id REGEXP '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'),
   received_at_ms BIGINT NULL CHECK (received_at_ms IS NULL OR (received_at_ms BETWEEN 0 AND 9007199254740991)),
   FOREIGN KEY (member_id) REFERENCES members(member_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
-  FOREIGN KEY (department_id) REFERENCES departments(department_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
   FOREIGN KEY (report_token_id) REFERENCES report_tokens(token_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
   FOREIGN KEY (member_id,report_token_id) REFERENCES report_tokens(member_id,token_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
   CHECK (report_token_id IS NULL OR member_id IS NOT NULL)
@@ -576,7 +594,6 @@ CREATE INDEX idx_usage_event_model ON usage_event (model);
 CREATE INDEX idx_usage_event_session ON usage_event (session_id);
 CREATE INDEX idx_usage_event_user ON usage_event (user_id);
 CREATE INDEX idx_usage_event_member_ts ON usage_event (member_id, ts);
-CREATE INDEX idx_usage_event_department_ts ON usage_event (department_id, ts);
 CREATE INDEX idx_usage_event_token ON usage_event (report_token_id);
 
 -- 仅 seed 内置角色/权限和身份互斥行；不会创建管理员账号或发放令牌。
@@ -593,15 +610,15 @@ INSERT INTO permissions (permission_id,code,description,created_at_ms) VALUES ('
 INSERT INTO permissions (permission_id,code,description,created_at_ms) VALUES ('00000000-0000-4000-8000-000000000107','roles:read','roles:read',0);
 INSERT INTO permissions (permission_id,code,description,created_at_ms) VALUES ('00000000-0000-4000-8000-000000000108','roles:assign','roles:assign',0);
 INSERT INTO permissions (permission_id,code,description,created_at_ms) VALUES ('00000000-0000-4000-8000-000000000109','audit:read','audit:read',0);
-INSERT INTO permissions (permission_id,code,description,created_at_ms) VALUES ('00000000-0000-4000-8000-000000000110','departments:read','departments:read',0);
-INSERT INTO permissions (permission_id,code,description,created_at_ms) VALUES ('00000000-0000-4000-8000-000000000111','departments:manage','departments:manage',0);
+INSERT INTO permissions (permission_id,code,description,created_at_ms) VALUES ('00000000-0000-4000-8000-000000000110','groups:read','groups:read',0);
+INSERT INTO permissions (permission_id,code,description,created_at_ms) VALUES ('00000000-0000-4000-8000-000000000111','groups:manage','groups:manage',0);
 INSERT INTO role_permissions (role_id,permission_id) SELECT '00000000-0000-4000-8000-000000000001',permission_id FROM permissions;
-INSERT INTO role_permissions (role_id,permission_id) SELECT '00000000-0000-4000-8000-000000000002',permission_id FROM permissions WHERE code IN ('identity:read','usage:write','stats:read','departments:read');
+INSERT INTO role_permissions (role_id,permission_id) SELECT '00000000-0000-4000-8000-000000000002',permission_id FROM permissions WHERE code IN ('identity:read','usage:write','stats:read','groups:read');
 INSERT INTO portal_identity_state (state_id,singleton_key,revision,updated_at_ms) VALUES ('00000000-0000-4000-8000-000000000003',1,0,0);
 -- 迁移记录由执行器在核实 DDL 后写入真实 checksum；本文件不伪造迁移完成证据。
 -- 此设计不创建本地扫描的 file_watermark/session_state，也不重定义 ingest_run。
 `
-export const PORTAL_SQLITE_V4_INGEST_SQL = `CREATE TABLE IF NOT EXISTS ingest_run (
+export const PORTAL_SQLITE_INGEST_SQL = `CREATE TABLE IF NOT EXISTS ingest_run (
   id                    INTEGER PRIMARY KEY CHECK (id = 1),
   last_ingest_ms        INTEGER NOT NULL,
   last_scan_events      INTEGER NOT NULL,
@@ -624,7 +641,7 @@ export const PORTAL_SQLITE_V4_INGEST_SQL = `CREATE TABLE IF NOT EXISTS ingest_ru
   event_types_json      TEXT NOT NULL DEFAULT '{}',
   providers_json        TEXT NOT NULL DEFAULT '[]'
 );`
-export const PORTAL_MYSQL_V4_INGEST_SQL = `CREATE TABLE IF NOT EXISTS ingest_run (
+export const PORTAL_MYSQL_INGEST_SQL = `CREATE TABLE IF NOT EXISTS ingest_run (
   id                      TINYINT NOT NULL PRIMARY KEY,
   last_ingest_ms          BIGINT  NOT NULL,
   last_scan_events        BIGINT  NOT NULL,
@@ -645,10 +662,10 @@ export const PORTAL_MYSQL_V4_INGEST_SQL = `CREATE TABLE IF NOT EXISTS ingest_run
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`
 
 /** 设计 SQL 没有触发器或字符串内分号；只在本模块的受控 SQL 上拆句。 */
-export function portalSchemaStatementsV4(kind: PortalBackendKind): string[] {
-  const source = kind === 'mysql' ? PORTAL_MYSQL_V4_SQL : PORTAL_SQLITE_V4_SQL
+export function portalSchemaStatements(kind: PortalBackendKind): string[] {
+  const source = kind === 'mysql' ? PORTAL_MYSQL_V5_SQL : PORTAL_SQLITE_V5_SQL
   return source.replace(/^--.*$/gm, '').split(';').map(s => s.trim()).filter(s => s && !s.startsWith('PRAGMA'))
 }
-export function portalSchemaChecksumV4(kind: PortalBackendKind): string {
-  return createHash('sha256').update(kind === 'mysql' ? PORTAL_MYSQL_V4_SQL : PORTAL_SQLITE_V4_SQL).digest('hex')
+export function portalSchemaChecksum(kind: PortalBackendKind): string {
+  return createHash('sha256').update(kind === 'mysql' ? PORTAL_MYSQL_V5_SQL : PORTAL_SQLITE_V5_SQL).digest('hex')
 }

@@ -16,7 +16,7 @@ const record = (id: string): IngestRecord => ({
   input_tokens: 11, output_tokens: 22, cache_read_tokens: 33, cache_write_tokens: 44,
   reasoning_tokens: 2, turn: -1, step: -2,
 })
-const owner = { userId: '先到人员', userName: '原姓名', dept: '原部门', receivedAtMs: 1234 }
+const owner = { userId: '先到人员', userName: '原姓名', groupName: '原分组', receivedAtMs: 1234 }
 
 interface Writes { parameters: number; bytes: number; rows: number }
 function observe(store: PortalStore, writes: Writes[]): PortalStore {
@@ -70,7 +70,9 @@ for (const kind of ['sqlite', 'mysql'] as const) {
       expect(writes.every(write => write.parameters <= 5000 && write.rows > 1)).toBe(true)
       const row = await store.get<Record<string, unknown>>("SELECT * FROM usage_event WHERE event_id='batch:200'")
       expect([row?.input_tokens, row?.output_tokens, row?.cache_read_tokens, row?.cache_write_tokens].map(Number)).toEqual([11, 22, 33, 44])
-      expect([row?.cwd, row?.member_id, row?.department_id, row?.report_token_id]).toEqual([null, null, null, null])
+      // v5 不再有 department_id（归属改由 member_group_assignments 展开），
+      // 上报当时的文本快照落在 group_name 上
+      expect([row?.cwd, row?.member_id, row?.group_name, row?.report_token_id]).toEqual([null, null, '原分组', null])
       expect([Number(row?.seq), Number(row?.turn), Number(row?.step), Number(row?.received_at_ms)]).toEqual([200, -1, -2, 1234])
       writes.length = 0
       expect(await insertAttributedRecords(observe(store, writes), records, { userId: '后到人员' })).toEqual({ inserted: 0, duplicates: 605 })

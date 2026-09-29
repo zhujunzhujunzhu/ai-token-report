@@ -12,16 +12,17 @@ const rounds = 3
 const root = mkdtempSync(join(tmpdir(), 'atr-ingest-benchmark-'))
 
 // 基线保留优化前的一次事务 + 每事件一次普通 INSERT，身份常量和列与批量路径一致。
+// ⚠️ 列集必须与 `ingest.ts` 的 `ATTRIBUTED_COLUMNS` 完全一致，否则基准测的不是同一条路径。
 const columns = ['event_id', 'session_id', 'seq', 'ts', 'provider', 'model', 'cwd',
-  'user_id', 'user_name', 'dept', 'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens',
-  'reasoning_tokens', 'turn', 'step', 'member_id', 'department_id', 'report_token_id', 'received_at_ms']
+  'user_id', 'user_name', 'group_name', 'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens',
+  'reasoning_tokens', 'turn', 'step', 'member_id', 'report_token_id', 'received_at_ms']
 const singleSql = `INSERT INTO usage_event (${columns.join(',')}) VALUES (${columns.map((_, i) => `$v${i}`).join(',')})`
 async function singleRows(store: PortalStore, records: IngestRecord[]): Promise<void> {
   if (store.kind === 'mysql') await store.get('SELECT @@SESSION.sql_mode AS mode')
   for (const record of records) {
     const values = [record.event_id, record.session_id, record.seq, record.ts, record.provider, record.model, record.cwd,
       '基准人员', '基准人员', null, record.input_tokens, record.output_tokens, record.cache_read_tokens,
-      record.cache_write_tokens, record.reasoning_tokens, record.turn, record.step, null, null, null, null]
+      record.cache_write_tokens, record.reasoning_tokens, record.turn, record.step, null, null, null]
     assert.equal((await store.run(singleSql, Object.fromEntries(values.map((value, i) => [`$v${i}`, value])))).changes, 1)
   }
 }

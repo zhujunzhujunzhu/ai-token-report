@@ -37,14 +37,20 @@ describe('写入与读取', () => {
   })
 
   test('写入后能读回，且字段一致', () => {
-    const r = writeIdentity(path, { name: '张三', token: 'tok-abc', dept: '研发一部' })
+    const r = writeIdentity(path, { name: '张三', token: 'tok-abc', group: '研发一部' })
     expect(r.ok).toBe(true)
 
     const got = readIdentity(path)
     expect(got.exists).toBe(true)
     expect(got.identity?.name).toBe('张三')
     expect(got.identity?.token).toBe('tok-abc')
-    expect(got.identity?.dept).toBe('研发一部')
+    expect(got.identity?.group).toBe('研发一部')
+
+    // ★ 写出侧只写 `group`：`dept` 仅作为旧文件的读取兼容保留，
+    //   新写的文件里出现 `dept` 就说明写出路径又退回了旧字段名。
+    const raw = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
+    expect(raw['group']).toBe('研发一部')
+    expect('dept' in raw).toBe(false)
   })
 
   test('目录不存在时自动创建', () => {
@@ -60,9 +66,46 @@ describe('写入与读取', () => {
     expect(got.identity?.token).toBe('tok-abc')
   })
 
-  test('不填部门时不写入 dept 字段', () => {
+  test('不填分组时不写入 group 字段', () => {
     writeIdentity(path, { name: '张三', token: 'tok-abc' })
-    expect(readIdentity(path).identity?.dept).toBeUndefined()
+    expect(readIdentity(path).identity?.group).toBeUndefined()
+    // 空值不落字段（而不是落一个 null/空串）：两者在读取侧的语义不同 ——
+    // 字段在但为空算「未署名」，字段缺失才算「没填过」
+    const raw = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
+    expect('group' in raw).toBe(false)
+    expect('dept' in raw).toBe(false)
+  })
+
+  test('★ 兼容旧文件：只含 dept 的对象读出来是 group', () => {
+    mkdirSync(join(home, 'token-report'), { recursive: true })
+    writeFileSync(
+      path,
+      JSON.stringify({ name: '张三', token: 'tok-abc', dept: '研发一部', createdAt: 1, updatedAt: 2 }),
+      'utf8',
+    )
+
+    const got = readIdentity(path)
+    // 读取侧按 `group ?? dept` 归一（见 src/identity-store.ts 的 normalize）：
+    // 已经署过名的同学升级一次不该变成「未署名」—— 那会直接停止上报，
+    // 而不是报一个错，最难被发现。
+    expect(got.identity?.group).toBe('研发一部')
+    expect(got.identity?.dept).toBeUndefined()
+
+    // 再保存一次就只剩新字段：兼容只是读取期的事，不会把旧字段继续写下去
+    writeIdentity(path, { name: '张三', token: 'tok-abc', group: got.identity!.group! })
+    const raw = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
+    expect(raw['group']).toBe('研发一部')
+    expect('dept' in raw).toBe(false)
+  })
+
+  test('同时含 group 与 dept 时以 group 为准（旧值不会盖掉新值）', () => {
+    mkdirSync(join(home, 'token-report'), { recursive: true })
+    writeFileSync(
+      path,
+      JSON.stringify({ name: '张三', token: 'tok-abc', group: '新分组', dept: '旧部门', createdAt: 1, updatedAt: 2 }),
+      'utf8',
+    )
+    expect(readIdentity(path).identity?.group).toBe('新分组')
   })
 })
 

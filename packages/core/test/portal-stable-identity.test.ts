@@ -13,7 +13,7 @@ const folder = mkdtempSync(join(tmpdir(),'atr-stable-identity-'))
 afterAll(async () => { await closeAllMysqlBackends(); rmSync(folder,{recursive:true,force:true}) })
 const memberA = '10000000-0000-4000-8000-000000000001'
 const memberB = '10000000-0000-4000-8000-000000000002'
-const dept = '10000000-0000-4000-8000-000000000003'
+const groupId = '10000000-0000-4000-8000-000000000003'
 const sqlite: PortalTarget = {sqlitePath:join(folder,'portal.sqlite')}
 const fixture = [
   {id:'a-old',member:memberA,user:'同名',received:1000,n:1},
@@ -27,9 +27,12 @@ const fixture = [
 async function seed(target: PortalTarget): Promise<void> {
   const store=await openPortalStore(target)
   try { await store.transaction(async tx => {
-    await tx.run("INSERT INTO departments (department_id,name,created_at_ms,updated_at_ms) VALUES ($id,'部门',1,1)",{$id:dept})
-    for (const [id,name] of [[memberA,'更名'],[memberB,'同名']]) await tx.run('INSERT INTO members (member_id,display_name,department_id,created_at_ms,updated_at_ms) VALUES ($id,$name,$dept,1,1)',{$id:id,$name:name,$dept:dept})
-    for (const item of fixture) await tx.run('INSERT INTO usage_event (event_id,session_id,seq,ts,provider,model,cwd,user_id,user_name,dept,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,member_id,department_id,received_at_ms) VALUES ($id,$session,1,$ts,$provider,$model,\'/workspace\',$user,$user,\'旧部门\',$n,$output,$read,$write,0,$member,$dept,$received)',{$id:item.id,$session:`session:${item.id}`,$ts:1700000000000+item.n,$provider:item.n===64?'p_%!\\':'p',$model:item.n===64?'m_%!\\':'m',$user:item.user,$n:item.n,$output:item.n*2,$read:item.n*3,$write:item.n*4,$member:item.member,$dept:item.member?dept:null,$received:item.received})
+    // v5：`departments` → `member_groups`，人员与分组改为多对多（关联表承载归属）。
+    await tx.run("INSERT INTO member_groups (group_id,name,created_at_ms,updated_at_ms) VALUES ($id,'分组',1,1)",{$id:groupId})
+    for (const [id,name] of [[memberA,'更名'],[memberB,'同名']]) await tx.run('INSERT INTO members (member_id,display_name,created_at_ms,updated_at_ms) VALUES ($id,$name,1,1)',{$id:id,$name:name})
+    // 两个人都在同一个分组里；`usage_event` 本身不再存分组 ID。
+    for (const id of [memberA,memberB]) await tx.run('INSERT INTO member_group_assignments (member_id,group_id,created_at_ms) VALUES ($id,$group,1)',{$id:id,$group:groupId})
+    for (const item of fixture) await tx.run('INSERT INTO usage_event (event_id,session_id,seq,ts,provider,model,cwd,user_id,user_name,group_name,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,member_id,received_at_ms) VALUES ($id,$session,1,$ts,$provider,$model,\'/workspace\',$user,$user,\'旧分组\',$n,$output,$read,$write,0,$member,$received)',{$id:item.id,$session:`session:${item.id}`,$ts:1700000000000+item.n,$provider:item.n===64?'p_%!\\':'p',$model:item.n===64?'m_%!\\':'m',$user:item.user,$n:item.n,$output:item.n*2,$read:item.n*3,$write:item.n*4,$member:item.member,$received:item.received})
     await tx.run("INSERT INTO legacy_attribution_map (mapping_id,legacy_user_id,member_id,status,source_import_ref,decision_reason,created_at_ms,decided_at_ms) VALUES ($id,'历史已认',$member,'mapped','test','人工确认',1,2)",{$id:'10000000-0000-4000-8000-000000000004',$member:memberA})
     await tx.run("INSERT INTO legacy_attribution_map (mapping_id,legacy_user_id,source_import_ref,created_at_ms) VALUES ($id,'历史待认','test',1)",{$id:'10000000-0000-4000-8000-000000000005'})
   }) } finally {await store.close()}

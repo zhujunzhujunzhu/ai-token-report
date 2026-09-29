@@ -660,14 +660,19 @@ export type IngestRecord = Omit<WireTokenRecord, 'total_tokens'>
  *   否则任何人改一下本地配置就能以他人名义上报。
  */
 export interface EventOwner {
-  /** 保留旧 user_id 的姓名快照语义；v4 稳定归属使用 memberId。 */
+  /** 保留旧 user_id 的姓名快照语义；v5 稳定归属使用 memberId。 */
   userId: string
   /** 展示用姓名。当前与 `userId` 同值，分开是为了将来一人多 token 时能只改一处。 */
   userName?: string | null
-  dept?: string | null
-  /** v4 归属只接受服务端解析出的稳定 ID；旧造数与本地路径仍可空。 */
+  /**
+   * 上报当时客户端自己填的分组文本快照。
+   *
+   * ⚠️ 它**不参与归属**：谁属于哪些分组由 `member_group_assignments` 决定，
+   *   快照只是「当时他填的是哪个分组」的历史痕迹，改名改组之后仍可追溯。
+   */
+  groupName?: string | null
+  /** v5 归属只接受服务端解析出的稳定 ID；旧造数与本地路径仍可空。 */
   memberId?: string | null
-  departmentId?: string | null
   tokenId?: string | null
   receivedAtMs?: number | null
 }
@@ -734,8 +739,8 @@ export async function insertAttributedRecordsInTransaction(
   }
   let inserted = 0
   let duplicates = 0
-  const identity = [owner.userId, owner.userName ?? owner.userId, owner.dept ?? null]
-  const attribution = [owner.memberId ?? null, owner.departmentId ?? null,
+  const identity = [owner.userId, owner.userName ?? owner.userId, owner.groupName ?? null]
+  const attribution = [owner.memberId ?? null,
     owner.tokenId ?? null, owner.receivedAtMs ?? null]
 
   async function writeBatch(rows: AttributedValues[]): Promise<void> {
@@ -791,8 +796,8 @@ export async function insertAttributedRecordsInTransaction(
 
 type AttributedValues = (string | number | null | undefined)[]
 const ATTRIBUTED_COLUMNS = ['event_id', 'session_id', 'seq', 'ts', 'provider', 'model', 'cwd',
-  'user_id', 'user_name', 'dept', 'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens',
-  'reasoning_tokens', 'turn', 'step', 'member_id', 'department_id', 'report_token_id', 'received_at_ms']
+  'user_id', 'user_name', 'group_name', 'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens',
+  'reasoning_tokens', 'turn', 'step', 'member_id', 'report_token_id', 'received_at_ms']
 // SQLite 每条最多 840 个参数（低于旧版 999），MySQL 最多 4,200（低于 65,535）。
 // 512 KiB 是批量目标而不是新接收上限：原协议允许的单条大记录独立写入，绝不截断。
 const ATTRIBUTED_BATCH_BYTES = 512 * 1024

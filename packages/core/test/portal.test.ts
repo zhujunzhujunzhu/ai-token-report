@@ -121,18 +121,18 @@ async function seed(): Promise<void> {
       {
         userId: '张三',
         userName: '张三',
-        dept: '研发一部',
+        groupName: '研发一部',
       },
     )
     await insertAttributedRecords(store, [wireRecord('f:1', { input_tokens: 500, cache_read_tokens: 0 })], {
       userId: '张三丰',
       userName: '张三丰',
-      dept: '研发一部',
+      groupName: '研发一部',
     })
     await insertAttributedRecords(store, [wireRecord('l:1', { input_tokens: 40, cache_read_tokens: 0 })], {
       userId: '李四',
       userName: '李四',
-      dept: '研发二部',
+      groupName: '研发二部',
     })
     await recordIngestMoment(store, todayAt(12))
   } finally {
@@ -233,6 +233,61 @@ describe('上报库查询：人员排行', () => {
     const filtered = await withSession((s) => s.groups('user'), { userIds: [UNATTRIBUTED_USER] })
     expect(filtered.length).toBe(1)
     expect(filtered[0]!.counts.total).toBe(100)
+  })
+
+  test('★ 人员排行的行带上该人员当前所属的分组名（多对多）', async () => {
+    await seed()
+
+    // 造一个稳定人员，并把他**同时**放进两个分组 —— 多对多的最小证据。
+    // ⚠️ 人员 / 分组 / 关联三张表都得先建好：上报库连接开了
+    //   `PRAGMA foreign_keys=ON`（见 portal-connection.ts），
+    //   `member_group_assignments` 与 `usage_event.member_id` 都是 RESTRICT 外键。
+    const memberId = '10000000-0000-4000-8000-000000000011'
+    const groupA = '10000000-0000-4000-8000-000000000021'
+    const groupB = '10000000-0000-4000-8000-000000000022'
+    const store = await openPortalStore({ sqlitePath: dbPath })
+    try {
+      await store.transaction(async (tx) => {
+        await tx.run(
+          "INSERT INTO member_groups (group_id,name,created_at_ms,updated_at_ms) VALUES ($id,'研发一部',1,1)",
+          { $id: groupA },
+        )
+        await tx.run(
+          "INSERT INTO member_groups (group_id,name,created_at_ms,updated_at_ms) VALUES ($id,'研发二部',1,1)",
+          { $id: groupB },
+        )
+        await tx.run(
+          "INSERT INTO members (member_id,display_name,created_at_ms,updated_at_ms) VALUES ($id,'王五',1,1)",
+          { $id: memberId },
+        )
+        for (const groupId of [groupA, groupB]) {
+          await tx.run(
+            'INSERT INTO member_group_assignments (member_id,group_id,created_at_ms) VALUES ($member,$group,1)',
+            { $member: memberId, $group: groupId },
+          )
+        }
+      })
+      await insertAttributedRecords(store, [wireRecord('g:1')], {
+        userId: '王五',
+        userName: '王五',
+        groupName: '研发一部',
+        memberId,
+      })
+    } finally {
+      await store.close()
+    }
+
+    // ★ 只有稳定人员视图（`identityView='member'`）按 `member_id` 聚合，
+    //   分组名也只挂在这一维度的行上：旧姓名视图没有稳定 ID，无从关联。
+    const rows = await withSession((s) => s.groups('user'), { identityView: 'member' })
+    const row = rows.find((r) => r.memberId === memberId)!
+    expect(row.label).toBe('王五')
+    // 一行带出他所属的**每个**分组名（顺序按分组名）
+    expect(row.groupNames).toEqual(['研发一部', '研发二部'])
+    // 其余没有稳定人员 ID 的行（legacy / 未归属）不属于任何分组 → 空数组而不是 undefined
+    for (const other of rows.filter((r) => r.memberId !== memberId)) {
+      expect(other.groupNames).toEqual([])
+    }
   })
 
   test('其余维度照常工作（provider / day）', async () => {

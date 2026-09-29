@@ -7,6 +7,7 @@ import { zstdCompressSync } from 'node:zlib'
 import { listSessionFiles, scanAll, scanIncremental, selectSessionLogFiles, SESSION_SCAN_REVISION } from '../src/scanner.js'
 import { emptyState, stageRecords } from '../src/state.js'
 import { ingest, openDatabaseForIngest, openPortalDb } from '../src/db/ingest.js'
+import { PORTAL_SCHEMA_VERSION } from '../src/db/portal-db.js'
 import { openDb } from '../src/db/schema.js'
 import { queryRecords } from '../src/db/query.js'
 import { readLocalRollup } from '../src/db/local-rollup.js'
@@ -137,7 +138,9 @@ test('传入 portal 路径而不传连接也必须在任何自动重建之前拒
   await expect(ingest({ sessionsRoot, dbPath: portalPath })).rejects.toThrow('唯一副本')
   const after = openDb(portalPath)
   try {
-    expect(after.query<{ user_version: number }>('PRAGMA user_version').get()?.user_version).toBe(4)
+    // ★ 跟着常量走，不要硬编码版本号：写死 4 会在上报库升 v5 时红掉，
+    //   而这行断言真正要证明的是「portal 库被建成了当前版本、没被当成要重建的本地库」。
+    expect(after.query<{ user_version: number }>('PRAGMA user_version').get()?.user_version).toBe(PORTAL_SCHEMA_VERSION)
     expect(after.query<{ value: string }>('SELECT value FROM only_copy').get()?.value).toBe('must survive')
     expect(after.query("SELECT name FROM sqlite_master WHERE name = 'local_scan_meta'").get()).toBeNull()
   } finally { after.close() }

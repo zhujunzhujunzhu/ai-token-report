@@ -1,4 +1,4 @@
-/** 上报库 v4 门面：业务入口强制版本闸门，旧库只能通过显式迁移保留历史升级。 */
+/** 上报库 v5 门面：业务入口强制版本闸门，旧库只能通过显式迁移保留历史升级。 */
 import type { Database } from './driver.js'
 import { openRawPortalSqlite, openRawPortalStore, type PortalTarget, type PortalStore } from './portal-connection.js'
 import { ensurePortalReady, ensurePortalSqliteReady } from './portal-migrations.js'
@@ -6,7 +6,7 @@ export { resolvePortalTarget, describePortalTarget, redactMysqlUrl } from './por
 export type { PortalTarget, PortalStore } from './portal-connection.js'
 export { portalDialect } from './dialect.js'
 export type { PortalBackendKind, PortalDialect } from './dialect.js'
-export { PORTAL_SCHEMA_VERSION } from './portal-schema-v4.js'
+export { PORTAL_SCHEMA_VERSION } from './portal-schema-v5.js'
 export { inspectPortalDatabase, migratePortalDatabase, preparePortalDatabase } from './portal-migrations.js'
 export type { PortalInspection, PortalMigrationOptions } from './portal-migrations.js'
 
