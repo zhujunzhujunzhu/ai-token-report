@@ -8,7 +8,7 @@
 
 ## 0. 原 MySQL 接入阶段的历史验收快照
 
-本节 707 项等数字记录旧阶段，不能替代当前 Portal v4 验收。当前身份和用量已共用数据库，显式迁移、约束目录核验及独立进程 HTTP 结果见 [v4 验证记录](database-v4/验证记录.md)；正式命令见 [数据库部署与迁移](数据库部署与迁移.md)。
+本节 707 项等数字记录旧阶段，不能替代当前 Portal v5 验收。当前身份和用量已共用数据库，显式迁移、约束目录核验及独立进程 HTTP 结果见 [v4 验证记录](database-v4/验证记录.md)（v4 是**冻结基线**）；正式命令见 [数据库部署与迁移](数据库部署与迁移.md)。
 
 | 部分 | 状态 | 证据 |
 |---|---|---|
@@ -204,7 +204,8 @@ packages/core/src/db/
                   + 进程内共享池 + $name→? 翻译；事务用**同一条连接**
   portal-db.ts    ★ 上报库门面：openPortalStore(target) → PortalStore（异步，两种后端共用）
                   + 「schema 不符抛错绝不重建」闸门
-  portal-schema-v4.ts  内嵌受控 DDL，与 docs SQL 逐字对照，产物无需 docs 目录
+  portal-schema-v5.ts  内嵌受控 DDL（当前版本），产物无需 docs 目录
+  portal-schema-v4.ts  v4 冻结基线的 SQL（v3→v4 步骤仍要用，不再改动）
   portal-migrations.ts 显式 inspect/migrate/resume、备份、检查点及实际约束校验
   portal-connection.ts 固定连接事务、SQLite FULL 与异步写锁排队
   query.ts        ★ SQL 构建器（两种后端共用同一份文本）+ 同步执行器（本地路径）
@@ -225,7 +226,8 @@ packages/core/src/db/
 3. **`close()` 的语义按后端不同**：SQLite 真的关；MySQL **空操作**（连接来自进程内
    共享池，每请求关池会让下一个请求重新 TCP + 认证握手）。上层照常
    `finally { await store.close() }`，两种后端形状一致。
-4. **MySQL Portal v4 使用 17 张身份/事实表、`ingest_run` 和 `portal_meta`**。
+4. **MySQL Portal v5 使用 18 张身份/事实表、`ingest_run` 和 `portal_meta`**（v4 基线是 17 张：
+   `departments` 改为 `member_groups`，并新增多对多关联表 `member_group_assignments`）。
    `file_watermark` / `session_state` 是**本机增量扫描**的水位线，
    部门服务端从不扫日志，建了永远是空表。
 
@@ -250,8 +252,8 @@ packages/core/src/db/
 ATR_MYSQL_URL='mysql://mysql_user:mysql_password@127.0.0.1:3335/ai-token'
 ```
 
-⚠️ 这台实例由多个项目共用。上面的 `ai-token` 是既有业务库，不能拿它做 v4 破坏、建删表或迁移演练。
-当前方言与 v4 验证脚本创建并清理自己随机命名的隔离 schema；MySQL 应用 QA 使用仅授权专用隔离库的账号。
+⚠️ 这台实例由多个项目共用。上面的 `ai-token` 是既有业务库，不能拿它做建删表或迁移演练（v5 的 v4→v5 升级尤其不能）。
+当前方言与验证脚本创建并清理自己随机命名的隔离 schema；MySQL 应用 QA 使用仅授权专用隔离库的账号。
 验证结果不表示既有业务库已经升级。正式部署和备份迁移步骤以 [数据库部署与迁移](数据库部署与迁移.md) 为准。
 
 > 💡 容器卷已存在时，MySQL 官方镜像的初始化脚本**不会重跑** —— 所以
