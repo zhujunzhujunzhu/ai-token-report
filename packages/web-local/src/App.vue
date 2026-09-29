@@ -18,7 +18,9 @@ const { state, onSigned, refresh } = useIdentity()
 
 const configuring = ref(false)
 
-function saveSettings(payload: { name: string; dept?: string }): void {
+// 载荷字段是 `group`（原 `dept`）—— 契约真源见 shared 的
+// `LocalIdentityResponse` / `LocalIdentitySubmit`，本地页面不带任何兼容别名。
+function saveSettings(payload: { name: string; group?: string }): void {
   onSigned(payload)
   configuring.value = false
 }
@@ -48,7 +50,7 @@ function saveSettings(payload: { name: string; dept?: string }): void {
       v-if="configuring"
       settings
       :initial-name="state.kind === 'ready' ? state.name : ''"
-      :initial-dept="state.kind === 'ready' ? state.dept : null"
+      :initial-group="state.kind === 'ready' ? state.group : null"
       @signed="saveSettings"
       @cancel="configuring = false"
     />

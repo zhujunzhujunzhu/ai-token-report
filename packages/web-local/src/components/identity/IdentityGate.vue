@@ -8,7 +8,7 @@
  * 页面必须把三件事讲清楚，否则会招致两类问题（用户乱填 / 拒绝填写）：
  *
  * 1. **填什么** —— 姓名 + 管理员发放的 token
- * 2. **为什么** —— 把用量归属到部门统计；不填就没法归属
+ * 2. **为什么** —— 把用量归属到分组统计；不填就没法归属
  * 3. **不填会怎样** —— ★ 明确承诺「不采集也不上报」，这是知情同意的关键
  *
  * 第 3 点尤其重要：含糊其辞会让人怀疑在偷偷采集，反而更容易被拒绝。
@@ -33,20 +33,25 @@ const props = withDefaults(
     /** 配置页复用校验流程，取消时保留原署名。 */
     settings?: boolean
     initialName?: string
-    initialDept?: string | null
+    /**
+     * 回填的分组名（原 `initialDept`）。
+     *
+     * 归属维度现在叫「分组」；`/api/local/identity` 只回 `group`，没有 `dept` 别名。
+     */
+    initialGroup?: string | null
   }>(),
-  { hint: null, allowSkip: true, settings: false, initialName: '', initialDept: null },
+  { hint: null, allowSkip: true, settings: false, initialName: '', initialGroup: null },
 )
 
 const emit = defineEmits<{
   /** 署名完成（skip 时 name 为空串） */
-  (e: 'signed', payload: { name: string; dept?: string }): void
+  (e: 'signed', payload: { name: string; group?: string }): void
   (e: 'cancel'): void
 }>()
 
 const name = ref(props.initialName)
 const token = ref('')
-const dept = ref(props.initialDept ?? '')
+const group = ref(props.initialGroup ?? '')
 const submitting = ref(false)
 const error = ref<string | null>(null)
 
@@ -65,7 +70,7 @@ async function onSubmit(): Promise<void> {
     const res = await submitIdentity({
       name: name.value.trim(),
       token: token.value.trim(),
-      ...(dept.value.trim() ? { dept: dept.value.trim() } : {}),
+      ...(group.value.trim() ? { group: group.value.trim() } : {}),
     })
 
     // 网络层失败
@@ -82,7 +87,7 @@ async function onSubmit(): Promise<void> {
 
     emit('signed', {
       name: res.data.name ?? name.value.trim(),
-      ...(res.data.dept ? { dept: res.data.dept } : {}),
+      ...(res.data.group ? { group: res.data.group } : {}),
     })
   } finally {
     submitting.value = false
@@ -100,7 +105,7 @@ function onSkip(): void {
       <header class="signin__head">
         <h1 class="signin__title">{{ props.settings ? '配置' : '署名后开始统计' }}</h1>
         <p class="signin__sub">
-          设置管理员发放的 Key，用于验证身份并将用量归属到部门统计。
+          设置管理员发放的 Key，用于验证身份并将用量归属到分组统计。
         </p>
         <p v-if="props.settings && props.initialName" class="signin__hint">
           当前已配置：{{ props.initialName }}。更新 Key 时请重新输入，已保存的 Key 不会回显。
@@ -134,9 +139,9 @@ function onSkip(): void {
         </label>
 
         <label class="field">
-          <span class="field__label">部门<em class="field__opt">选填</em></span>
+          <span class="field__label">分组<em class="field__opt">选填</em></span>
           <input
-            v-model="dept"
+            v-model="group"
             class="field__input"
             type="text"
             placeholder="例如：研发一部"

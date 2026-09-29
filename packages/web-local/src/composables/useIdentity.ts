@@ -31,7 +31,7 @@ export type GateState =
   /** 引导页。hint 来自服务端，便于统一措辞。 */
   | { kind: 'signin'; hint: string | null }
   /** 已署名，进统计页 */
-  | { kind: 'ready'; name: string; dept: string | null }
+  | { kind: 'ready'; name: string; group: string | null }
   /** 用户选择跳过 —— 统计页可用，但不采集不上报 */
   | { kind: 'skipped' }
   /** 无法连接本地服务 */
@@ -52,7 +52,9 @@ export function useIdentity() {
     }
 
     if (res.data.signed && res.data.name) {
-      state.value = { kind: 'ready', name: res.data.name, dept: res.data.dept }
+      // `/api/local/identity` 的字段在 shared 里已改名成 `group`（无 `dept` 别名），
+      // 所以本地页只认新名 —— 旧客户端的兼容读取发生在服务端与 shared，不在这里。
+      state.value = { kind: 'ready', name: res.data.name, group: res.data.group }
       return
     }
 
@@ -66,14 +68,14 @@ export function useIdentity() {
   }
 
   /** 引导页提交成功 */
-  function onSigned(payload: { name: string; dept?: string }): void {
+  function onSigned(payload: { name: string; group?: string }): void {
     if (!payload.name) {
       // name 为空 = 用户点了「跳过」
       skippedThisSession = true
       state.value = { kind: 'skipped' }
       return
     }
-    state.value = { kind: 'ready', name: payload.name, dept: payload.dept ?? null }
+    state.value = { kind: 'ready', name: payload.name, group: payload.group ?? null }
   }
 
   /** 重新检查（用户在别处改了署名后） */
