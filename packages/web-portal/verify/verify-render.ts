@@ -235,6 +235,18 @@ try {
     '并非一次扫描检查结果',
   ])
     check(`诊断页含 ${label}`, diagnosticsHtml.includes(label))
+  // 页面上不再堆说明文字，结论收敛成一行状态：有未归属时必须是可核查的
+  // 警告态，没有时才是常态 —— 两个分支都要钉住，否则「红变绿」静默失效。
+  check('诊断有未归属时状态行转为警告',
+    diagnosticsHtml.includes('存在 1 条未归属记录') &&
+    diagnosticsHtml.includes('is-warning') && diagnosticsHtml.includes('需核查'))
+  const unattributedDiagnostics = dashboard.diagnostics
+  dashboard.diagnostics = { ...unattributedDiagnostics, unattributedEvents: 0, unattributedRate: 0 }
+  const cleanDiagnosticsHtml = await render('/src/views/DiagnosticsView.vue')
+  check('诊断无未归属时状态行恢复常态',
+    cleanDiagnosticsHtml.includes('当前范围内未发现未归属记录') &&
+    cleanDiagnosticsHtml.includes('is-ok') && !cleanDiagnosticsHtml.includes('is-warning'))
+  dashboard.diagnostics = unattributedDiagnostics
   const filterHtml = await render('/src/components/FilterBar.vue')
   check(
     '筛选表单使用组件库',
