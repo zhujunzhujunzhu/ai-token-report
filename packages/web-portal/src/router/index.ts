@@ -77,10 +77,10 @@ export function createPortalRouter(
             meta: { title: '角色管理', requiredPermission: 'roles:read' },
           },
           {
-            path: 'departments',
-            name: 'departments',
-            component: () => import('../views/DepartmentsView.vue'),
-            meta: { title: '部门管理', requiredPermission: 'departments:manage' },
+            path: 'groups',
+            name: 'groups',
+            component: () => import('../views/GroupsView.vue'),
+            meta: { title: '分组管理', requiredPermission: 'groups:manage' },
           },
         ],
       },
@@ -106,7 +106,7 @@ export function createPortalRouter(
 /** 回跳只接受本站已知页面，避免把登录参数当作外部跳转地址。 */
 export function loginDestination(value: unknown): string {
   return typeof value === 'string' &&
-    /^\/(overview|analysis|records|diagnostics|members|appkeys|roles|departments)(\?.*)?$/.test(value)
+    /^\/(overview|analysis|records|diagnostics|members|appkeys|roles|groups)(\?.*)?$/.test(value)
     ? value
     : '/overview'
 }
