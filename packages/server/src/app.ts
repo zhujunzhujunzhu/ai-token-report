@@ -90,6 +90,14 @@ export interface AppDeps {
   enableLocalApi: boolean
   staticDir?: string
   /**
+   * 认证 Cookie 的 `Path`，**显式覆盖**用。
+   *
+   * 默认由 `portalOrigin` 的路径段自动推导（见 `createApp` 内的 `cookiePath`），
+   * 通常不需要设置。仅当反向代理的前缀与 `ATR_PORTAL_ORIGIN` 的路径段不一致时
+   * 才需要显式指定。
+   */
+  cookiePath?: string
+  /**
    * 请求日志（默认开）。
    *
    * ⚠️ 默认**开**：重构前请求路径上一条日志都没有，出问题时只能靠猜。
@@ -108,8 +116,35 @@ export function createApp(deps: AppDeps): Hono {
   const sessionCookie = 'atr_portal_session'
   const captchaCookie = 'atr_portal_captcha'
   const publicOrigin = deps.portalOrigin ? new URL(deps.portalOrigin).origin : null
+  /**
+   * 认证 Cookie 的 `Path`。
+   *
+   * ⚠️ **子路径部署的关键一环**。浏览器发出的请求是
+   * `/ai-token/api/v1/auth/login`，而 Cookie 若写死 `/api/v1`，
+   * 浏览器会因**路径不匹配而根本不发这个 Cookie** —— 服务端拿不到
+   * `binding`，验证码一律判为「错误或已过期」，**永远登不进去**。
+   * 实测症状：Cookie 确实在，`path=/api/v1`，但请求 `cookie=(无)`；
+   * 浏览器不报错、服务端日志也正常，只能抓包才看得见。
+   *
+   * 前缀直接取自 `ATR_PORTAL_ORIGIN` 的**路径部分**（它是部署方已经配好的
+   * 公开地址，如 `http://host/ai-token`）—— 这样前缀只有一个真源，
+   * 不会出现「改了环境变量却忘了改 Cookie」的漂移。
+   *
+   * 根路径部署时 `portalOrigin` 无路径段，结果仍是 `/api/v1`，行为不变。
+   */
+  const cookiePath = deps.cookiePath ?? (() => {
+    if (!deps.portalOrigin) return '/api/v1'
+    let prefix = ''
+    try {
+      prefix = new URL(deps.portalOrigin).pathname.replace(/\/+$/, '')
+    } catch {
+      // 非绝对 URL：当作没有前缀处理，回落默认值而不是让服务起不来。
+      return '/api/v1'
+    }
+    return prefix ? `${prefix}/api/v1` : '/api/v1'
+  })()
   const cookieOptions = (c: Context, maxAge: number) => ({
-    httpOnly: true, sameSite: 'Strict' as const, path: '/api/v1',
+    httpOnly: true, sameSite: 'Strict' as const, path: cookiePath,
     secure: new URL(publicOrigin ?? c.req.url).protocol === 'https:', maxAge,
   })
   // ★ Cookie 直接产生 Principal，生产路径不保存也不还原上报 Token。
@@ -188,7 +223,9 @@ export function createApp(deps: AppDeps): Hono {
     const parsed = await readJsonBodyStrict(c)
     if ('error' in parsed) return fail(parsed.error, 400)
     const result = await portalAuth.login(parsed.value, getCookie(c, captchaCookie))
-    deleteCookie(c, captchaCookie, { path: '/api/v1' })
+    // ★ 删除时的 path 必须与 setCookie 时**逐字一致**，否则浏览器不认这条删除指令，
+    //   验证码 Cookie 会一直留在浏览器里（子路径部署下曾因此踩坑）。
+    deleteCookie(c, captchaCookie, { path: cookiePath })
     if (!result.ok) return fail(result.reason, result.status)
     await portalAuth.logout(getCookie(c, sessionCookie))
     setCookie(c, sessionCookie, result.sessionId, cookieOptions(c, SESSION_SECONDS))
@@ -203,7 +240,7 @@ export function createApp(deps: AppDeps): Hono {
   })
   app.post('/api/v1/auth/logout', async (c) => {
     await portalAuth.logout(getCookie(c, sessionCookie))
-    deleteCookie(c, sessionCookie, { path: '/api/v1' })
+    deleteCookie(c, sessionCookie, { path: cookiePath })
     return c.json({ ok: true })
   })
 
