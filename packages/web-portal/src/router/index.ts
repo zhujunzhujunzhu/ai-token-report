@@ -67,8 +67,8 @@ export function createPortalRouter(
             path: 'appkeys',
             name: 'appkeys',
             component: () => import('../views/AppKeyView.vue'),
-            // 发放动作本身要 tokens:manage；页面主体是成员名单，因此读权限按名单来。
-            meta: { title: 'appKey 发放', requiredPermission: 'members:read' },
+            // 页面主体是凭证列表（读）与签发/轮换/吊销（写），两者都要 tokens:manage。
+            meta: { title: 'appKey 管理', requiredPermission: 'tokens:manage' },
           },
           {
             path: 'roles',
