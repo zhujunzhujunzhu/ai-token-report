@@ -12,7 +12,7 @@
     },
     "packages/cli": {
       "name": "@ai-token-report/cli",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "bin": {
         "dsh-token": "src/cli.ts",
       },
@@ -56,10 +56,10 @@
         "typescript": "^5.7.2",
       },
       "peerDependencies": {
-        "@deepseek-ai/cordis": "^4.0.2",
-        "@deepseek-ai/dsh-agent": "^0.1.5-rc.1",
-        "@deepseek-ai/dsh-session": "^0.1.5-rc.1",
-        "@deepseek-ai/dsh-session-telemetry": "^0.1.5-rc.1",
+        "@deepseek-ai/cordis": "~4.0.4",
+        "@deepseek-ai/dsh-agent": "0.1.7-rc.2",
+        "@deepseek-ai/dsh-session": "0.1.7-rc.2",
+        "@deepseek-ai/dsh-session-telemetry": "0.1.7-rc.2",
       },
       "optionalPeers": [
         "@deepseek-ai/dsh-agent",
