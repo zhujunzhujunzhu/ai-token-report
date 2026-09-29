@@ -75,7 +75,7 @@ const target = { sqlitePath: join(portalHome, 'portal.sqlite') }
 await preparePortalDatabase(target)
 await new IdentityRepository(target).importCredentials([
   { token: 'report-command-admin', name: '测试管理员', role: 'admin' },
-  { token, name: '服务端身份', dept: '验证部门' },
+  { token, name: '服务端身份', group: '验证分组' },
 ], 'verify-report-command')
 const portalOptions = {
   port: 18804, host: '127.0.0.1', dshHome: portalHome,

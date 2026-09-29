@@ -49,7 +49,7 @@ const target = { sqlitePath: dbPath }
 await preparePortalDatabase(target)
 await new IdentityRepository(target).importCredentials([
   { token: 'report-test-admin', name: '测试管理员', role: 'admin' },
-  { token: TOKEN, name: '张三', dept: '研发一部' },
+  { token: TOKEN, name: '张三', group: '研发一部' },
 ], 'verify-report-ingest')
 
 const sessionsRoot = join(HOME, 'sessions')
@@ -124,7 +124,7 @@ function countRows(where?: { user: string }): number {
 function allRows(): {
   event_id: string
   user_name: string | null
-  dept: string | null
+  group_name: string | null
   input_tokens: number
   cache_read_tokens: number
   cwd: string | null
@@ -136,14 +136,14 @@ function allRows(): {
         {
           event_id: string
           user_name: string | null
-          dept: string | null
+          group_name: string | null
           input_tokens: number
           cache_read_tokens: number
           cwd: string | null
         },
         []
       >(
-        `SELECT event_id, user_name, dept, input_tokens, cache_read_tokens, cwd
+        `SELECT event_id, user_name, group_name, input_tokens, cache_read_tokens, cwd
          FROM ${EVENT_TABLE} ORDER BY seq`,
       )
       .all()
@@ -178,6 +178,11 @@ const deliver = createHttpDeliverer({
   //   验证它不会覆盖服务端的判定（与 e2e-identity 的「张三三」同款手法）
   userName: '李四（客户端自称）',
   userId: 'lisi',
+  // `client.group` 是上报当时的**文本快照**（原 `client.dept`）：
+  // 服务端按 `client.group ?? client.dept` 写入 `usage_event.group_name`，
+  // 但它不参与归属 —— 归属由 token 解析出的 member 与其分组关联决定。
+  // 这里两个来源（凭证与客户端）填同一个值，真实部署就是这个形状。
+  group: '研发一部',
 })
 
 const first = await runReport({ sessionsRoot, dshHome: HOME, statePath, deliver })
@@ -195,7 +200,9 @@ check(
   rows[0]?.input_tokens === 7_772 && rows[0]?.cache_read_tokens === 1_024 && rows[1]?.cache_read_tokens === 98_976,
   JSON.stringify(rows),
 )
-check('部门落库', rows[0]?.dept === '研发一部')
+// `client.group` 只是**文本快照**（服务端按 `client.group ?? client.dept` 落
+// `usage_event.group_name`），不参与归属 —— 归属由 token 解析出的 member 决定。
+check('分组快照落库', rows[0]?.group_name === '研发一部', `group_name=${String(rows[0]?.group_name)}`)
 check('项目归属（cwd）落库', rows[0]?.cwd === 'D:\\Coding\\ai-token-report')
 check('幂等键就是 sessionId:seq', rows[0]?.event_id === 'session-1:1')
 

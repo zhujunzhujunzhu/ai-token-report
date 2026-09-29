@@ -46,6 +46,8 @@ import {
 } from '@ai-token-report/core'
 import { openStats, resetDb } from '@ai-token-report/core/db'
 import { derive, emptyDiagnostics, type UsageRecord } from '@ai-token-report/core'
+// 身份兼容归一（`group ?? dept`）只在 shared 里实现一次，这里只调用它。
+import { toAssertion } from '@ai-token-report/shared'
 
 const HELP = `
 dsh-token-report —— DSH token 用量统计
@@ -121,7 +123,7 @@ dsh-token-report —— DSH token 用量统计
   --timeout <ms>   单次请求超时 (默认 15000)
   --user-id <id>   客户端标识（归属由服务端按 token 决定）
   --user-name <n>  显示名; 也可用 env DSH_REPORT_USER_NAME
-  --dept <d>       部门; 也可用 env DSH_REPORT_DEPT
+  --group <g>      分组; 也可用 env DSH_REPORT_GROUP
 
   未署名时跳过采集和上报。可先在本地页面署名，或显式提供 token。
   --dry-run / --no-save / --out-file 是主动的本地演练，无需署名。
@@ -211,10 +213,22 @@ interface ReportOptions {
   timeoutMs: number
   userId?: string
   userName?: string
-  dept?: string
+  /** 分组名（原 `dept`）：随上报体一起发，仅作服务端侧的文本快照。 */
+  group?: string
   statePath?: string
 }
 
+/**
+ * `--by` 的白名单 —— **刻意不含 `group`**。
+ *
+ * `shared` 的 `GroupBy`（上报库/看板用）新增了 `'group'` 维度，但那是**服务端**
+ * 才有的归属维度：本机日志里根本没有归属字段，本机库 `usage.sqlite` 也不存分组。
+ * 把它放进这里，用户会得到一个恒为「未分组」的选项 —— 那不是数据缺失的提示，
+ * 而是一个看起来正常却毫无意义的排行。
+ *
+ * 维度集合的真源是 `core/aggregate.ts` 的 `GroupDimension`（直扫日志的内存聚合），
+ * 所以这里不需要再手工维护白名单。
+ */
 const VALID_DIMS: GroupDimension[] = [
   'provider',
   'model',
@@ -319,8 +333,8 @@ function parseArgs(argv: string[]): CliOptions | null {
         opts.report.userName = takeValue(i, arg)
         i++
         break
-      case '--dept':
-        opts.report.dept = takeValue(i, arg)
+      case '--group':
+        opts.report.group = takeValue(i, arg)
         i++
         break
       case '--state':
@@ -1092,7 +1106,16 @@ async function runReportCommand(opts: CliOptions, sessionsRoot: string): Promise
   }
   const userId = r.userId ?? process.env['DSH_REPORT_USER_ID']
   const userName = r.userName ?? process.env['DSH_REPORT_USER_NAME'] ?? identity.identity?.name
-  const dept = r.dept ?? process.env['DSH_REPORT_DEPT'] ?? identity.identity?.dept
+  /**
+   * 分组名（原 `dept`）的取值顺序：命令行 / 环境变量 → 本地 identity.json。
+   *
+   * ⚠️ 读本地文件时必须走 `toAssertion()` 而不是直接读某个字段：
+   *   新文件写的是 `group`，旧文件才是 `dept`，而兼容规则（`group ?? dept`）
+   *   只在 `shared` 里实现一次。在这里再写一遍 `??` 就等于第二处兼容口径 ——
+   *   它不会报错，只会在某个旧文件上静默少一个分组。
+   */
+  const assertion = identity.identity ? toAssertion(identity.identity) : null
+  const group = r.group ?? process.env['DSH_REPORT_GROUP'] ?? assertion?.group
 
   // 没有投递目标就等价于干跑：不会静默什么都不做
   const dryRun = r.dryRun || r.noSave || (!r.endpoint && !r.outFile)
@@ -1110,7 +1133,7 @@ async function runReportCommand(opts: CliOptions, sessionsRoot: string): Promise
         timeoutMs: r.timeoutMs,
         userId,
         userName,
-        dept,
+        group,
       })
     }
   }

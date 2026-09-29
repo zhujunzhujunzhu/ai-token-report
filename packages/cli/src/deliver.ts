@@ -25,7 +25,14 @@ export interface TokenUsagePayload {
     /** 客户端诊断标识；真实归属只由服务端按 token 决定。 */
     userId: string
     userName?: string
-    dept?: string
+    /**
+     * 分组名快照（原 `dept`）。
+     *
+     * ⚠️ 这只是**上报当时客户端自己填的文本**，不参与归属 —— 权威归属由服务端
+     *   按 token 解析出的 member 及其分组关联决定（见规范 §4.4）。
+     *   服务端迁移期按 `client.group ?? client.dept` 取值，所以新客户端只发 `group`。
+     */
+    group?: string
   }
   generatedAt: string
   /** 扁平化的线上记录（下划线字段，对齐 docs/插件方案.md §10.4 的表结构）。 */
@@ -40,7 +47,8 @@ export interface HttpDeliverOptions {
   timeoutMs?: number
   userId?: string
   userName?: string
-  dept?: string
+  /** 分组名（原 `dept`）；缺省表示本机没填过分组。 */
+  group?: string
   /** 注入用，便于测试；默认用全局 fetch。 */
   fetchImpl?: typeof fetch
 }
@@ -90,7 +98,7 @@ export function createHttpDeliverer(options: HttpDeliverOptions): Deliverer {
         name: 'dsh-token-stats',
         userId: options.userId ?? 'unknown',
         ...(options.userName ? { userName: options.userName } : {}),
-        ...(options.dept ? { dept: options.dept } : {}),
+        ...(options.group ? { group: options.group } : {}),
       },
       generatedAt: new Date().toISOString(),
       // 线上结构用下划线字段（对齐 docs/插件方案.md §10.4 的表结构）
