@@ -4,7 +4,8 @@ import { createPinia, disposePinia, setActivePinia, type Pinia } from 'pinia'
 import { useSessionStore } from '../src/stores/session.js'
 import { buildFilter, useDashboardStore } from '../src/stores/dashboard.js'
 import { useMembersStore } from '../src/stores/members.js'
-import { createDepartment, issueMember, updateRoles } from '../src/api/admin.js'
+import { periodReadyForQuery } from '../src/types/portal.js'
+import { createGroup, issueMember, updateMember, updateRoles } from '../src/api/admin.js'
 
 const originalFetch = globalThis.fetch
 let pinia: Pinia
@@ -37,7 +38,7 @@ function respond(
 function signIn(role: 'admin' | 'member' = 'member'): void {
   const session = useSessionStore()
   session.identity = { member_id: '00000000-0000-4000-8000-000000000001', name: '测试成员', username: 'test-user', role,
-    permissions: role === 'admin' ? ['members:read', 'members:manage', 'tokens:manage', 'roles:read', 'departments:read'] : ['stats:read'] }
+    permissions: role === 'admin' ? ['members:read', 'members:manage', 'tokens:manage', 'roles:read', 'groups:read'] : ['stats:read'] }
   session.generation++
   session.initialized = true
 }
@@ -355,13 +356,27 @@ describe('统计状态', () => {
       }).error,
     ).not.toBeNull()
   })
+  test('下拉选中即筛：具名周期随时可查，自定义区间要等起止填齐', () => {
+    // 时间范围 / 人员是离散选择，选中即应用，不再依赖「查询」按钮。
+    for (const period of ['today', 'last7d', 'month']) {
+      expect(periodReadyForQuery(period, '', '')).toBe(true)
+      expect(periodReadyForQuery(period, '2026-09-20T10:00', '')).toBe(true)
+    }
+    // 切到自定义区间的瞬间两个输入框必然为空：此刻查询只会报「请选择开始与结束时间」。
+    expect(periodReadyForQuery('custom', '', '')).toBe(false)
+    expect(periodReadyForQuery('custom', '2026-09-20T10:00', '')).toBe(false)
+    expect(periodReadyForQuery('custom', '', '2026-09-20T11:00')).toBe(false)
+    expect(
+      periodReadyForQuery('custom', '2026-09-20T10:00', '2026-09-20T11:00'),
+    ).toBe(true)
+  })
 })
 
 describe('人员管理状态', () => {
   function directoryResponse(url: string): Response {
     if (url.endsWith('/members')) return json({ members: [] })
     if (url.endsWith('/roles')) return json({ roles: [] })
-    if (url.endsWith('/departments')) return json({ departments: [] })
+    if (url.endsWith('/groups')) return json({ groups: [] })
     return json({ kind: 'sqlite', available: true })
   }
   test('三个管理页各自请求所需目录，刷新沿用当前页，清理后回到人员页', async () => {
@@ -369,7 +384,8 @@ describe('人员管理状态', () => {
     const calls: string[] = []
     respond((url) => { calls.push(url); return directoryResponse(url) })
     const admin = useMembersStore()
-    const memberRequests = ['/api/v1/admin/members', '/api/v1/admin/roles', '/api/v1/departments', '/api/v1/admin/storage']
+    // 人员页一轮要读四份目录：人员、角色、分组、数据库状态（分组走 /api/v1/groups）。
+    const memberRequests = ['/api/v1/admin/members', '/api/v1/admin/roles', '/api/v1/groups', '/api/v1/admin/storage']
     await admin.load()
     expect(calls).toEqual(memberRequests)
     calls.length = 0
@@ -379,18 +395,18 @@ describe('人员管理状态', () => {
     await admin.load()
     expect(calls).toEqual(['/api/v1/admin/members', '/api/v1/admin/roles'])
     calls.length = 0
-    await admin.load('departments')
-    expect(calls).toEqual(['/api/v1/departments'])
+    await admin.load('groups')
+    expect(calls).toEqual(['/api/v1/groups'])
     calls.length = 0
     admin.clear()
     await admin.load()
     expect(calls).toEqual(memberRequests)
   })
-  test('目录只读权限不会额外请求无权访问的人员、角色、部门或数据库状态', async () => {
+  test('目录只读权限不会额外请求无权访问的人员、角色、分组或数据库状态', async () => {
     const scenarios = [
       { section: 'members', permission: 'members:read', urls: ['/api/v1/admin/members', '/api/v1/admin/storage'] },
       { section: 'roles', permission: 'roles:read', urls: ['/api/v1/admin/roles'] },
-      { section: 'departments', permission: 'departments:read', urls: ['/api/v1/departments'] },
+      { section: 'groups', permission: 'groups:read', urls: ['/api/v1/groups'] },
     ] as const
     for (const scenario of scenarios) {
       signIn('admin')
@@ -402,7 +418,7 @@ describe('人员管理状态', () => {
       expect(useMembersStore().error).toBeNull()
     }
   })
-  test('目录变更成功只刷新当前角色页或部门页', async () => {
+  test('目录变更成功只刷新当前角色页或分组页', async () => {
     signIn('admin')
     const calls: string[] = []
     respond((url, init) => {
@@ -414,10 +430,40 @@ describe('人员管理状态', () => {
     calls.length = 0
     await admin.mutate(() => updateRoles({ member_id: 'person', expected_version: 1, role_ids: ['member'] }), 'person')
     expect(calls).toEqual(['POST /api/v1/admin/members/roles', 'GET /api/v1/admin/members', 'GET /api/v1/admin/roles'])
-    await admin.load('departments')
+    await admin.load('groups')
     calls.length = 0
-    await admin.mutate(() => createDepartment('研发部'), 'new-department')
-    expect(calls).toEqual(['POST /api/v1/admin/departments', 'GET /api/v1/departments'])
+    await admin.mutate(() => createGroup('研发组'), 'new-group')
+    expect(calls).toEqual(['POST /api/v1/admin/groups', 'GET /api/v1/groups'])
+  })
+  /**
+   * ★ 人员与分组是多对多，`group_ids` 是**全量替换**语义。
+   *
+   * 这条断言钉住的是「请求体里给的就是最终的完整集合」：页面把多选框的
+   * 当前值整份提交，而不是发一个「新增了谁 / 移除了谁」的增量 ——
+   * 增量语义下两个人同时改同一个人会各自成功、结果却谁也没想到。
+   */
+  test('人员分组归属按全量替换提交，请求体给出完整集合', async () => {
+    signIn('admin')
+    const bodies: Array<Record<string, unknown>> = []
+    respond((url, init) => {
+      if (init?.method === 'POST') {
+        bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+        return json({ ok: true })
+      }
+      return directoryResponse(url)
+    })
+    const admin = useMembersStore()
+    const groupIds = ['00000000-0000-4000-8000-0000000000a1', '00000000-0000-4000-8000-0000000000b2']
+    await admin.mutate(() => updateMember({
+      member_id: '00000000-0000-4000-8000-000000000001', expected_version: 3, group_ids: groupIds,
+    }), 'person')
+    // 两个分组一起提交（多对多），且是整份替换：空数组代表「移出全部分组」。
+    expect(bodies[0]?.group_ids).toEqual(groupIds)
+    bodies.length = 0
+    await admin.mutate(() => updateMember({
+      member_id: '00000000-0000-4000-8000-000000000001', expected_version: 4, group_ids: [],
+    }), 'person')
+    expect(bodies[0]?.group_ids).toEqual([])
   })
   test('切换管理页后旧人员查询不能覆盖新页数据', async () => {
     signIn('admin')
@@ -452,7 +498,7 @@ describe('人员管理状态', () => {
   test('退出后迟到的名单不能回填', async () => {
     signIn('admin')
     const old = deferred<Response>()
-    respond((url) => url.endsWith('/members') ? old.promise : json({ roles: [], departments: [] }))
+    respond((url) => url.endsWith('/members') ? old.promise : json({ roles: [], groups: [] }))
     const admin = useMembersStore()
     const pending = admin.load()
     useSessionStore().expire()
@@ -482,13 +528,13 @@ describe('人员管理状态', () => {
     signIn('admin')
     respond((url) => url.endsWith('/roles') ? json({ reason: '会话已过期' }, 401)
       : url.endsWith('/members') ? json({ members: [{ member_id: 'old', name: '旧会话成员' }] })
-      : url.endsWith('/departments') ? json({ departments: [{ department_id: 'old', name: '旧部门' }] })
+      : url.endsWith('/groups') ? json({ groups: [{ group_id: 'old', name: '旧分组' }] })
       : json({ kind: 'mysql', available: true }))
     const admin = useMembersStore()
     await admin.load()
     expect(useSessionStore().signedIn).toBe(false)
     expect(admin.members).toEqual([])
-    expect(admin.departments).toEqual([])
+    expect(admin.groups).toEqual([])
     expect(admin.roles).toEqual([])
     expect(admin.storage).toBeNull()
   })

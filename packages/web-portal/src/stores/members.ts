@@ -1,39 +1,61 @@
-/** 数据库人员状态。会话切换丢弃迟到响应，退出立即清空一次性秘密。 */
+/** 数据库人员与凭证状态。会话切换丢弃迟到响应，退出立即清空一次性秘密。 */
 import { ref, watch } from 'vue'
 import { defineStore } from 'pinia'
 import type {
-  PortalMember, PortalRole, PortalDepartment, PortalReportToken, PortalStorageResponse,
+  PortalAppKeyEntry, PortalMember, PortalRole, PortalPermission, PortalGroup, PortalStorageResponse,
   PortalMutationResult, PortalTokenResult, PortalAuditEntry,
 } from '@ai-token-report/shared'
 import * as api from '../api/admin.js'
 import type { ApiResult } from '../api/request.js'
 import { useSessionStore } from './session.js'
 
-export type ManagementSection = 'members' | 'roles' | 'departments'
+export type ManagementSection = 'members' | 'roles' | 'groups'
 
 export const useMembersStore = defineStore('portal-members', () => {
   const session = useSessionStore()
   const members = ref<PortalMember[]>([])
   const roles = ref<PortalRole[]>([])
-  const departments = ref<PortalDepartment[]>([])
-  const tokens = ref<PortalReportToken[]>([])
+  /**
+   * 可授予的权限目录，随角色目录一起下发。
+   *
+   * ★ 它只用于**渲染勾选项**，不参与任何鉴权判断：真正的门禁是服务端
+   *   `subset()`（授予不得超出操作者本次权限）。页面按它勾出来的集合
+   *   如果超权，服务端会明确拒绝，而不是静默截断。
+   */
+  const permissions = ref<PortalPermission[]>([])
+  /**
+   * 分组目录（管理接口 `/api/v1/groups`）。
+   *
+   * ★ 与看板的 `dashboard.groupOptions`（`/api/v1/stats/groups`）**不是同一份**：
+   *   这里带版本号与启停状态，供人员建档 / 改归属时选择；那里只有候选项。
+   *   能读人员的人未必有 `groups:read`，两处权限各自独立，所以两处都读各自的接口。
+   */
+  const groups = ref<PortalGroup[]>([])
+  /**
+   * appKey 管理页的主体列表：跨人员，一行一把凭证。
+   *
+   * ★ 凭证只有这一份视图了 —— 人员页不再展示或签发凭证（那里只管
+   *   资料、角色与登录账号）。按人查凭证改用本列表的搜索框。
+   */
+  const appKeys = ref<PortalAppKeyEntry[]>([])
   const audits = ref<PortalAuditEntry[]>([])
   const storage = ref<PortalStorageResponse | null>(null)
   const loading = ref(false)
+  const appKeysLoading = ref(false)
   const busyId = ref<string | null>(null)
   const error = ref<string | null>(null)
   const forbidden = ref<string | null>(null)
-  const tokenMemberId = ref<string | null>(null)
   const issuedSecret = ref<string | null>(null)
   let revision = 0
   let loadSeq = 0
-  let tokenSeq = 0
+  let appKeySeq = 0
   let activeSection: ManagementSection = 'members'
   function dismissSecret(): void { issuedSecret.value = null }
   function clear(): void {
-    revision++; loadSeq++; tokenSeq++
-    members.value = []; roles.value = []; departments.value = []; tokens.value = []; audits.value = []
-    tokenMemberId.value = null; storage.value = null; loading.value = false
+    revision++; loadSeq++; appKeySeq++
+    members.value = []; roles.value = []; groups.value = []; appKeys.value = []; audits.value = []
+    permissions.value = []
+    storage.value = null; loading.value = false; appKeysLoading.value = false
     busyId.value = null; error.value = null; forbidden.value = null; dismissSecret()
     activeSection = 'members'
   }
@@ -47,41 +69,42 @@ export const useMembersStore = defineStore('portal-members', () => {
   async function load(section: ManagementSection = activeSection): Promise<void> {
     activeSection = section
     const current = revision, seq = ++loadSeq
-    // 每页只读自身所需目录；独立查看角色或部门不应触发人员、数据库权限校验。
+    // 每页只读自身所需目录；独立查看角色或分组不应触发人员、数据库权限校验。
     if (!session.can(`${section}:read`)) { loading.value = false; return }
-    const readMembers = section !== 'departments' && session.can('members:read')
-    const readRoles = section !== 'departments' && session.can('roles:read')
-    const readDepartments = section !== 'roles' && session.can('departments:read')
+    const readMembers = section !== 'groups' && session.can('members:read')
+    const readRoles = section !== 'groups' && session.can('roles:read')
+    const readGroups = section !== 'roles' && session.can('groups:read')
     const readStorage = section === 'members' && session.can('members:read')
     loading.value = true
     const results = await Promise.all([
       readMembers ? api.fetchMembers() : null,
       readRoles ? api.fetchRoles() : null,
-      readDepartments ? api.fetchDepartments() : null,
+      readGroups ? api.fetchGroups() : null,
       readStorage ? api.fetchStorage() : null,
     ])
     if (current !== revision || seq !== loadSeq) return
     loading.value = false
-    const [people, catalog, depts, db] = results
+    const [people, catalog, groupList, db] = results
     // 并发接口中任意一个发现会话失效，就丢弃这一轮全部数据，不能在清理后又回填名单。
     const expired = results.find((result) => result && !result.ok && result.status === 401)
     if (expired && !expired.ok) { failure(expired); return }
     for (const result of results) if (result && !result.ok) failure(result)
     if (people?.ok) members.value = people.data.members
-    if (catalog?.ok) roles.value = catalog.data.roles
-    if (depts?.ok) departments.value = depts.data.departments
+    if (catalog?.ok) { roles.value = catalog.data.roles; permissions.value = catalog.data.permissions ?? [] }
+    if (groupList?.ok) groups.value = groupList.data.groups
     if (db?.ok) storage.value = db.data
   }
-  async function loadTokens(memberId: string): Promise<void> {
-    const current = revision, seq = ++tokenSeq
-    tokenMemberId.value = memberId; tokens.value = []
-    const result = await api.fetchTokens(memberId)
-    if (current !== revision || seq !== tokenSeq) return
-    if (result.ok) tokens.value = result.data.tokens
+  async function loadAppKeys(): Promise<void> {
+    // ⚠️ 没有 `tokens:manage` 就不发请求：服务端一定回 403，把它渲染成
+    //   一条错误提示，只会让人以为「系统坏了」而不是「这个入口不该给我」。
+    if (!session.can('tokens:manage')) return
+    const current = revision, seq = ++appKeySeq
+    appKeysLoading.value = true
+    const result = await api.fetchAppKeys()
+    if (current !== revision || seq !== appKeySeq) return
+    appKeysLoading.value = false
+    if (result.ok) appKeys.value = result.data.appkeys
     else failure(result)
-  }
-  function closeTokens(): void {
-    tokenSeq++; tokenMemberId.value = null; tokens.value = []; dismissSecret()
   }
   async function loadAudit(): Promise<void> {
     const current = revision
@@ -99,27 +122,30 @@ export const useMembersStore = defineStore('portal-members', () => {
     busyId.value = null
     if (!result.ok) {
       failure(result)
-      if (result.status === 409) {
-        await load()
-        if (tokenMemberId.value) await loadTokens(tokenMemberId.value)
-      }
+      // 版本冲突意味着本地这一行已经过期，重载列表后才能再试。
+      if (result.status === 409) await load()
       return null
     }
     if (!result.data.ok) { error.value = result.data.reason ?? '操作失败'; return null }
     await load()
     return current === revision ? result.data : null
   }
-  async function tokenAction(action: () => Promise<ApiResult<PortalTokenResult>>, memberId: string): Promise<boolean> {
+  /**
+   * 签发 / 轮换 / 吊销 appKey 的共同路径。
+   *
+   * ★ 明文只在成功的这一次响应里：Store 把它存进 `issuedSecret`，
+   *   页面必须在同一轮把它展示并给出复制入口，关掉就只能轮换。
+   */
+  async function appKeyAction(action: () => Promise<ApiResult<PortalTokenResult>>, id: string): Promise<boolean> {
     dismissSecret()
-    const result = await mutate(action, memberId)
-    if (!result) return false
-    if (tokenMemberId.value === memberId) {
-      issuedSecret.value = result.token_secret ?? null
-      await loadTokens(memberId)
-    }
-    return true
+    const result = await mutate(action, id)
+    if (result) issuedSecret.value = result.token_secret ?? null
+    // 成功要刷新列表；409 版本冲突也要刷新后才能重试。其余失败多读一次无害，
+    // 不值得为省它再分一条分支 —— 那才是下次改错的地方。
+    if (session.signedIn) await loadAppKeys()
+    return result !== null
   }
   watch(() => session.generation, clear, { flush: 'sync' })
-  return { members, roles, departments, tokens, audits, storage, loading, busyId, error, forbidden,
-    tokenMemberId, issuedSecret, load, loadTokens, closeTokens, loadAudit, mutate, tokenAction, dismissSecret, clear }
+  return { members, roles, permissions, groups, appKeys, audits, storage, loading, appKeysLoading, busyId, error, forbidden,
+    issuedSecret, load, loadAppKeys, loadAudit, mutate, appKeyAction, dismissSecret, clear }
 })

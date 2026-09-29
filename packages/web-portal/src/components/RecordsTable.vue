@@ -49,8 +49,8 @@ const rowRecord = (row: unknown): RecordRow => row as RecordRow
           ><el-descriptions-item label="人员 ID">{{
             row.member_id || '待确认历史或未归属'
           }}</el-descriptions-item
-          ><el-descriptions-item label="上报时部门">{{
-            row.dept_snapshot || '未提供'
+          ><el-descriptions-item label="上报时分组">{{
+            row.group_name_snapshot || '未提供'
           }}</el-descriptions-item
           ><el-descriptions-item label="缓存写入">{{
             formatCount(row.cacheWriteTokens)

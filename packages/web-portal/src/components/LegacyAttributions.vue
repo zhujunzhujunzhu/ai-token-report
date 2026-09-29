@@ -2,10 +2,11 @@
 /** 历史姓名只能由管理员明确确认归属，不能按同名自动接管历史记录。 */
 import { onUnmounted, ref } from 'vue'
 import { ElAlert, ElButton, ElForm, ElFormItem, ElInput, ElMessage, ElMessageBox, ElOption, ElSelect, ElTable, ElTableColumn } from 'element-plus'
-import type { PortalLegacyAttribution } from '@ai-token-report/shared'
+import type { PortalLegacyAttribution, PortalMember } from '@ai-token-report/shared'
 import { useMembersStore } from '../stores/members.js'
 import { useSessionStore } from '../stores/session.js'
 import { fetchLegacyAttributions, confirmLegacyAttribution } from '../api/admin.js'
+import { groupNamesLabel } from '../types/portal.js'
 const admin = useMembersStore(), session = useSessionStore()
 const mappings = ref<PortalLegacyAttribution[]>([]), selected = ref<PortalLegacyAttribution | null>(null)
 const memberId = ref(''), reason = ref(''), error = ref<string | null>(null), loading = ref(false)
@@ -30,6 +31,16 @@ async function confirm(): Promise<void> {
     else error.value = admin.error
   } catch { /* 用户取消。 */ }
 }
+/** 目标人员选项文案：同名时要靠分组与短 ID 分辨，未分组显式写出来。 */
+function memberLabel(member: PortalMember): string {
+  return `${member.name} · ${groupNamesLabel(member.groups.map((group) => group.name)) || '未分组'} · ${member.member_id.slice(0, 8)}`
+}
+/**
+ * 表格插槽给的 `row` 是 Element Plus 自己的 `DefaultRow`（`Record<PropertyKey, any>`），
+ * 不是本组件的契约类型，而模板里做不了类型断言 —— 所以入口收 `unknown`、
+ * 在这里收窄一次。行的真实形状由 `GET /api/v1/admin/legacy-attributions` 决定。
+ */
+const rowMapping = (row: unknown): PortalLegacyAttribution => row as PortalLegacyAttribution
 onUnmounted(() => { alive = false; selected.value = null; reason.value = '' })
 </script>
 <template>
@@ -37,7 +48,7 @@ onUnmounted(() => { alive = false; selected.value = null; reason.value = '' })
     <el-alert title="旧记录保留为待确认历史；确认前请核对原人员与目标人员，不能仅凭同名判断。" type="info" :closable="false" />
     <el-alert v-if="error" :title="error" type="error" :closable="false" />
     <div><el-button :loading="loading" :disabled="!!admin.busyId" @click="load">加载历史归属</el-button></div>
-    <el-table :data="mappings" row-key="mapping_id"><el-table-column prop="legacy_user_id" label="旧归属" /><el-table-column label="状态"><template #default="{ row }">{{ row.status === 'pending' ? '待确认' : row.status === 'mapped' ? '已确认' : '已忽略' }}</template></el-table-column><el-table-column label="目标人员"><template #default="{ row }">{{ admin.members.find(m => m.member_id === row.member_id)?.name ?? '—' }}</template></el-table-column><el-table-column prop="decision_reason" label="确认依据" /><el-table-column v-if="session.can('members:manage')" label="操作"><template #default="{ row }"><el-button link :disabled="row.status !== 'pending' || !!admin.busyId" @click="select(row)">核对并确认</el-button></template></el-table-column></el-table>
-    <el-form v-if="selected" label-position="top" :disabled="!!admin.busyId" @submit.prevent="confirm"><el-form-item :label="'历史归属：' + selected.legacy_user_id"><el-select v-model="memberId" filterable placeholder="明确选择目标人员"><el-option v-for="member in admin.members" :key="member.member_id" :value="member.member_id" :label="member.name + ' · ' + (member.department_name ?? '未分配部门') + ' · ' + member.member_id.slice(0, 8)" /></el-select></el-form-item><el-form-item label="确认依据"><el-input v-model="reason" maxlength="512" placeholder="说明核对方式或原始记录依据" /></el-form-item><el-button @click="selected = null">取消</el-button><el-button type="primary" native-type="submit" :disabled="!memberId || !reason.trim()" :loading="!!admin.busyId">提交归属确认</el-button></el-form>
+    <el-table :data="mappings" row-key="mapping_id"><el-table-column prop="legacy_user_id" label="旧归属" /><el-table-column label="状态"><template #default="{ row }">{{ row.status === 'pending' ? '待确认' : row.status === 'mapped' ? '已确认' : '已忽略' }}</template></el-table-column><el-table-column label="目标人员"><template #default="{ row }">{{ admin.members.find(m => m.member_id === row.member_id)?.name ?? '—' }}</template></el-table-column><el-table-column prop="decision_reason" label="确认依据" /><el-table-column v-if="session.can('members:manage')" label="操作"><template #default="{ row }"><el-button link :disabled="row.status !== 'pending' || !!admin.busyId" @click="select(rowMapping(row))">核对并确认</el-button></template></el-table-column></el-table>
+    <el-form v-if="selected" label-position="top" :disabled="!!admin.busyId" @submit.prevent="confirm"><el-form-item :label="'历史归属：' + selected.legacy_user_id"><el-select v-model="memberId" filterable placeholder="明确选择目标人员"><el-option v-for="member in admin.members" :key="member.member_id" :value="member.member_id" :label="memberLabel(member)" /></el-select></el-form-item><el-form-item label="确认依据"><el-input v-model="reason" maxlength="512" placeholder="说明核对方式或原始记录依据" /></el-form-item><el-button @click="selected = null">取消</el-button><el-button type="primary" native-type="submit" :disabled="!memberId || !reason.trim()" :loading="!!admin.busyId">提交归属确认</el-button></el-form>
   </div>
 </template>
