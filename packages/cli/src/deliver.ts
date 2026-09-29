@@ -133,7 +133,13 @@ export function createHttpDeliverer(options: HttpDeliverOptions): Deliverer {
     }
 
     if (!res.ok) {
-      throw new Error(`上报失败: HTTP ${res.status}${raw ? ` — ${raw.slice(0, 300)}` : ''}`)
+      // ★ 503 是上报队列的**预期**过载信号（队列满 / 排队超时 / 正在停止），
+      //   服务端会带 `Retry-After`。把它译成人能读懂的提示，而不是只丢一个状态码 ——
+      //   「服务端让我等 1 秒」和「服务端坏了」在排障时是两件事。
+      //   这里**只改提示文案**：失败仍然抛错，pending 仍然原样保留（at-least-once）。
+      const retryAfter = res.status === 503 ? res.headers.get('retry-after') : null
+      const hint = retryAfter ? `，服务端建议 ${retryAfter} 秒后重试` : ''
+      throw new Error(`上报失败: HTTP ${res.status}${hint}${raw ? ` — ${raw.slice(0, 300)}` : ''}`)
     }
 
     let parsed: unknown
