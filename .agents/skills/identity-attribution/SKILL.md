@@ -15,7 +15,7 @@ DSH 原生**故意匿名**：`~/.dsh/.anonymous-user-id` 是 `crypto.randomUUID(
 
 ## 方案：用户主动署名（已确认，非 IT 写入）
 
-用户填 **姓名 + token**（管理员发放）+ 部门（选填）。
+用户填 **姓名 + token**（管理员发放）+ 分组（选填）。
 
 | | 旧设想（IT 装机写入） | **现行方案（用户主动填）** |
 |---|---|---|
@@ -29,9 +29,13 @@ DSH 原生**故意匿名**：`~/.dsh/.anonymous-user-id` 是 `crypto.randomUUID(
 用户填「张三」+ token
       ↓
 本地服务 POST /api/v1/identity/verify ──► 部门服务端凭证表
-      ↓  ◄── { ok, name: "张三", dept } ────┘
+      ↓  ◄── { ok, name: "张三", group } ──┘
 以【服务端返回的姓名】落盘 ← ★ 不采信用户输入
 ```
+
+> 兼容：`verify` 的响应**同时**带一个同值的 `dept` 字段，那是给已部署的旧插件 / CLI 读的，
+> 已废弃。新代码一律读 `group`。归属维度这个实体现在叫**分组**；「部门服务端 / 部门看板」
+> 说的是部署形态，不是这个实体，不要改。
 
 **若服务端直接采信客户端声明的姓名，任何人改一下本地配置就能以他人名义上报，
 部门看板的数据立刻失去意义。**
@@ -66,8 +70,8 @@ DSH 原生**故意匿名**：`~/.dsh/.anonymous-user-id` 是 `crypto.randomUUID(
 
 | 填写面 | 填什么 | 为什么 |
 |---|---|---|
-| **DSH 插件「上报连接」面板** | **服务端地址（baseUrl） + appKey** | 员工手上真正拿到的只有这两样；姓名/部门由服务端按 appKey 解析，上报路径由 baseUrl 推导 |
-| 本地页面（`dsh-token --web`） | 姓名 + Key + 部门（选填） | 本地页面还要兼容「显式提供 token」的 CLI 用法，暂未收敛 |
+| **DSH 插件「上报连接」面板** | **服务端地址（baseUrl） + appKey** | 员工手上真正拿到的只有这两样；姓名/分组由服务端按 appKey 解析，上报路径由 baseUrl 推导 |
+| 本地页面（`dsh-token --web`） | 姓名 + Key + 分组（选填） | 本地页面还要兼容「显式提供 token」的 CLI 用法，暂未收敛 |
 
 - 插件面板的 appKey 就是 `identity.json` 里的 `token`（同一份文件、同一个凭证），
   所以「在插件里填一次」对本地页与 CLI 上报同样生效。
@@ -88,9 +92,12 @@ $DSH_HOME/token-report/identity.json
 **本地页与插件共用同一份** —— 员工在哪里填一次就够了。
 
 ```json
-{ "name": "张三", "token": "...", "dept": "研发一部",
+{ "name": "张三", "token": "...", "group": "研发一部",
   "createdAt": 1789984019944, "updatedAt": 1789984019944 }
 ```
+
+> ⚠️ 字段曾经叫 `dept`。**读的时候两者都认（`group ?? dept`），写的时候只写 `group`** ——
+> 兼容是为了不让已经署过名的同学升级一次就变成「未署名」（那会直接停止上报，不报错）。
 
 ### 三条实现约束（`packages/core/src/identity-store.ts`）
 
@@ -108,7 +115,7 @@ Windows 上 `chmod` 是 no-op，靠目录 ACL 保护 —— 这是已知且可�
 
 ```jsonc
 // 格式一（推荐）：一 token 一人。role 缺省是 member
-[ { "token": "atr-zhangsan-9f3c", "name": "张三", "dept": "研发一部" },
+[ { "token": "atr-zhangsan-9f3c", "name": "张三", "group": "研发一部" },
   { "token": "atr-boss-9f3c",     "name": "李经理", "role": "admin" } ]
 
 // 格式二：姓名 → token 映射（该格式下所有人都是 member）

@@ -18,7 +18,7 @@ DSH token 用量统计平台。四种形态：**CLI / 本地页面 / 部门看�
 
 ```bash
 bun install
-bun test                        # 32 个文件 / 707 个测试，全绿
+bun test                        # 56 个文件 / 1002 个测试（设了 ATR_V4_TEST_MYSQL_URL 时 MySQL 用例实跑，否则跳过）
 bun run typecheck               # 7 个包全部 exit 0
 bun run build                   # web-local + web-portal 均构建成功
 bun run stats -- --period today # 终端统计（读本地库，热态 ~50ms）
@@ -30,13 +30,13 @@ bun run build:portal            # 部门看板构建产物（server 自动托管
 bun run dev:portal              # web-portal 开发服务器（5198，/api 代理到 8787）
 
 # 上报链路端到端（真 HTTP，不是 mock；改上报相关代码后全跑）
-bun run packages/server/test/e2e-ingest.ts           # 服务端侧 POST /api/v1/token-usage（35 项）
+bun run packages/server/test/e2e-ingest.ts           # 服务端侧 POST /api/v1/token-usage（37 项）
 bun run packages/cli/verify/verify-report-ingest.ts  # ④整条链 CLI report → 服务端 → 库（28 项）
 
 # 人员管理与权限端到端（真 HTTP；改 admin 路由 / 数据库身份 / 角色后全跑）
-bun run packages/server/test/e2e-admin.ts            # 签发即刻生效 + 401/403 + 护栏（54 项）
+bun run packages/server/test/e2e-admin.ts            # 签发即刻生效 + 401/403 + 护栏 + appKey 列表 + 分组多对多（120 项；`--mysql` 同款）
 
-# 分发面契约（67 项，含 S12.3 的静态托管断言；改 app.ts / 路由 / 方法 / 状态码后必跑）
+# 分发面契约（74 项，含 S12.3 的静态托管断言与分组目录/旧路径 404；改 app.ts / 路由 / 方法 / 状态码后必跑）
 bun test packages/server/test/http-contract.test.ts
 
 # 双轨对照验证（真实日志上跑 SQL vs 直扫，断言两者逐位一致）
@@ -49,7 +49,7 @@ bun run --filter '@ai-token-report/core' verify:drivers
 # 本机可用开发 Docker 管理连接；别的机器用 ATR_MYSQL_URL，禁止拿业务库做建删演练
 bun run --filter '@ai-token-report/core' verify:mysql
 
-# ★ 双后端逐位对账（53 项；需要本机可连的 MySQL；改上报库 / 看板查询后必跑）
+# ★ 双后端逐位对账（60 项；需要本机可连的 MySQL；改上报库 / 看板查询后必跑）
 #   同一批数据起两个服务端（SQLite / MySQL），断言看板每个接口的响应体 JSON 全等
 bun run packages/server/verify/verify-mysql-portal.ts
 
@@ -99,9 +99,9 @@ bun run --filter '@ai-token-report/web-portal' verify
 | `packages/core` | **内核**：decode / scanner / aggregate / range / state / format / types / home / identity-store |
 | `packages/core/src/db` | ★ **本地 SQLite 增量库**（独立入口 `@ai-token-report/core/db`）：schema / ingest / query / stats / **portal（上报库只读查询）** |
 | `packages/cli` | **命令入口**：`cli.ts` / `deliver.ts` / `report.ts` |
-| `packages/server` | 上报接收 + 本地直查 + 部门统计 + **数据库身份、账号、会话与人员管理** + 静态托管 |
+| `packages/server` | 上报接收 + 本地直查 + 部门统计（含**分组目录与 `by=group` 分组维度**）+ **数据库身份、账号、会话、人员与分组（多对多）管理** + 静态托管 |
 | `packages/web-local` | 本地页面（`/api/local/*`） |
-| `packages/web-portal` | 部门看板：人员排行 / 趋势 / 分布 / 明细 / 诊断 + **人员管理页（按权限）** + **appKey 发放页**，后台账号登录，数据来自 `/api/v1/stats/*` 与 `/api/v1/admin/members*` |
+| `packages/web-portal` | 部门看板：人员排行 / 趋势 / 分布 / 明细 / 诊断 + **人员管理页（按权限）** + **appKey 管理页（列表按人呈现归属）** + **分组管理页（`/groups`，需 `groups:manage`）**，后台账号登录，数据来自 `/api/v1/stats/*`（含分组候选项 `/api/v1/stats/groups`）、`/api/v1/admin/members*`、`/api/v1/admin/appkeys` 与 `/api/v1/admin/groups*` |
 | `packages/dsh-plugin` | DSH 插件：实时上报 + `token_usage` 工具 + `ctx.tokenReport` 服务 + **界面用量面板（宿主半 + 浏览器半）**。见其 `README.md` |
 
 > 迁移期旧目录（`dsh-token-stats/`、`p0-verify/`）**已删除**。
@@ -123,7 +123,8 @@ bun run --filter '@ai-token-report/web-portal' verify
 | **DSH 插件**（配置 / 安装 / 排障 / 为什么不能碰私有字段） | `packages/dsh-plugin/README.md` |
 | **server 层分层 / 要不要引入第三方库** | `docs/server架构重构方案.md` + `.agents/skills/repo-conventions/SKILL.md` |
 | **部门上报库接 MySQL（方言坑 / 部署 / 备份）** | `docs/mysql上报库.md` |
-| **Portal v4 部署 / 显式迁移 / 身份导入** | `docs/数据库部署与迁移.md` + `docs/数据库重设计.md` |
+| **Portal v5 部署 / v4→v5 显式迁移 / 身份导入** | `docs/数据库部署与迁移.md` + `docs/数据库重设计.md` |
+| **分组（多对多）/ 归属展开** | `docs/数据库重设计.md` + `ARCHITECTURE.md` §4.5；归属权威是关联表 `member_group_assignments`，`usage_event.group_name` 只是文本快照 |
 
 ---
 
@@ -197,8 +198,17 @@ bun run --filter '@ai-token-report/web-portal' verify
   （就是「上报」与「获取统计信息」两条），请求体里给不出更宽的范围**；
   因为不含 `identity:read`，`verifyIdentity` 同时接受 `usage:write`，
   使插件只填 appKey 就能拿到自己的服务端署名（仍然不回显客户端提交的姓名）。
-  平台「appKey 发放」页（web-portal `/appkeys`）只负责签发与**当场复制** ——
-  明文仅存于签发 / 轮换响应，库内只有摘要，关掉就找不回来。
+  平台「appKey 管理」页（web-portal `/appkeys`，需 `tokens:manage`）的主体是
+  **全部凭证的列表**：每行一把 key，归属由服务端按 `member_id` 关联人员表得出
+  （改名后仍指向同一个人），可按人员搜索、可轮换 / 吊销、可设置与修改**有效期**
+  （`POST /api/v1/admin/members/tokens/expiry`，`null` = 长期有效；过期只是时间比较，
+  所以过期 key 能续期而不必轮换），**交付信息**（上报 / 统计的完整地址 + 使用人 +
+  凭证提示）点开弹框查看。明文仅存于签发 / 轮换响应，库内只有摘要，关掉就找不回来 ——
+  所以页面**不把明文放进 DOM**（最多显示 `atr-ab12…ef34` 这种中间省略号遮罩），
+  完整值只在剪贴板里，且凭证提示（`token_prefix`）也统一按中间省略号渲染
+  （省略号是展示层的事：库里存裸摘要前缀，见 `web-portal/src/utils/credential.ts`）。
+  **人员管理页不再承担凭证功能**（无「上报凭证」入口、无「有效凭证」列）：
+  人是谁、有哪些角色在那里，key 发给了谁在这里。
   旧客户端兼容字段 `role: admin | member` 缺省 `member`。
   **绝不要用姓名白名单判断管理员** —— 姓名是可以随便改的显示值。
   消费方（页面 / 插件）拿到缺字段的校验响应时**必须按 `member` 处理**：
@@ -207,11 +217,11 @@ bun run --filter '@ai-token-report/web-portal' verify
   `403`（权限不足）、`503`（未初始化或数据库不可用）；版本冲突和最后管理员护栏为 `409`，输入错误为 `400`。
   `200 + ok:false` 的旧业务约定只留在历史独立处理器测试，不可照搬到新路由。
 - **🚨 生产身份的唯一真值是与用量共用的 portal 数据库**（`server/src/identity/`）。
-  人员、部门、角色、账号、Token 摘要、会话、挑战、限流和审计均入库；管理变更和成功审计在同一事务提交。
+  人员、分组、角色、账号、Token 摘要、会话、挑战、限流和审计均入库；管理变更和成功审计在同一事务提交。
   写事务锁住 `portal_identity_state` 后重新鉴权，跨进程签发/撤权立即生效，不能用内存长期缓存替代数据库事实。
 - **稳定归属使用 `member_id` UUID**；显示姓名允许重复、用户名仍唯一。
   改名或轮换 Token 不改写旧事件快照。历史引用使用 RESTRICT；最后一个仍有管理入口的管理员不可停用、降级或失去最后有效凭证。
-- **`credentials.json` 只作为显式离线导入源**：先完成 v4 结构迁移，再运行 `packages/server/scripts/import-credentials.ts`。
+- **`credentials.json` 只作为显式离线导入源**：先完成 v5 结构迁移（v4 是冻结基线，v3 库先迁 v4 再迁 v5），再运行 `packages/server/scripts/import-credentials.ts`。
   `credentials.ts` / `member-admin.ts` 和 `LegacyPortalAuth` 仅保留历史兼容测试；生产启动拒绝 `credentialsPath`，不双写文件。
 - **首次管理员初始化只允许空身份库执行一次**：`ATR_ADMIN_USERNAME` / `ATR_ADMIN_PASSWORD` 成对配置，
   `ATR_ADMIN_TOKEN` 可作为初始化输入；密码仅哈希、Token 仅摘要入库。已有初始化标记后重启不会从环境变量复活停用身份。
@@ -262,7 +272,7 @@ bun run --filter '@ai-token-report/web-portal' verify
   两边必然漂移且不会报错。
 - **🚨 server 的路由与中间件只在 `server/src/app.ts` 一份**（S12 起用 Hono，4.13.9 精确锁版）。
   改任何路径 / 方法 / 状态码，先跑 `packages/server/test/http-contract.test.ts`
-  （67 项契约断言，重构前 `bun test` 完全不覆盖分发面）。
+  （74 项契约断言，重构前 `bun test` 完全不覆盖分发面）。
   四条实测踩出来的坑，改这里之前必读 `app.ts` 的注释：
   1. **Hono 不做 405**，方法不匹配默认回**纯文本 404**且无 `Allow` ——
      405 靠 `hono/method-not-allowed` 读 `app.routes` 反查；
@@ -309,9 +319,41 @@ bun run --filter '@ai-token-report/web-portal' verify
   写成剥掉 `$` 的名字会让**每一句真实 SQL 都抛「参数缺失」**（这个 bug 被活体脚本抓到过）。
 - **MySQL 侧 `close()` 是空操作**（连接来自进程内共享池，每请求关池 = 每请求重新
   握手）。上层照常 `finally { await store.close() }`，两种后端形状一致。
-- **上报库的 schema 变更绝不能自愈**：portal 使用独立 v4，本地 `usage.sqlite` 仍为 v3。
+- **🚨 人员与分组是「多对多」（v5）**：一个人可同时属于多个分组，归属的**权威**是关联表
+  `member_group_assignments`（`member_id` + `group_id` + `created_at_ms`）。`members.department_id`
+  与 `usage_event.department_id` 已**删除**；`usage_event.group_name` 只是上报当时客户端自己填的
+  **文本快照**，不参与归属。`group_ids` 是**全量替换**语义，没有增量语义。
+  **按分组筛选与分组排行都是 OR / 展开**：一条事件计入它的人员所属的**每个**分组，
+  所以「各分组之和 > 总量」是**定义**，不是重复计数的 bug；未分组人员不进任何分组行，
+  差额就是他们 —— 页面必须能说清这一点。看板的分组候选项走 `GET /api/v1/stats/groups`
+  （`stats:read`），**不要**让页面去读管理接口 `/api/v1/admin/groups`（那是 `groups:read`）。
+- **上报库的 schema 变更绝不能自愈**：portal 使用独立 v5（**v4 是冻结基线**：v3 库先经
+  `portal-schema-v4.ts` 迁到 v4，再走 v4→v5 步骤；v5 的 `usage_event` 去掉了一列并把 `dept` 改名
+  `group_name`），本地 `usage.sqlite` 仍为 v3。
   空 portal 库可初始化；旧库/半完成迁移拒绝普通业务写入，只能通过 `packages/server/scripts/migrate-db.ts`
-  显式 inspect/migrate/resume。SQLite 先一致性备份，MySQL 需离线确认和备份证明；不 DROP/重建事件。
+  显式 inspect/migrate/resume。SQLite 先一致性备份（v5 在 SQLite 分支**必须重建事实表**才能去掉列，
+  所以按备份流程执行），MySQL 需离线确认和备份证明；迁移前后逐位校验事件指纹，**不改写任何事件原值**。
+- **🚨 MySQL 的 v5 结构迁移有三条「只有活体 MySQL 才会暴露」的坑**（SQLite 一条都不会报，
+  所以「SQLite 上测过了」在这里**不构成证据** —— 它们全是靠本机 Docker MySQL 才抓出来的）：
+  1. **`DROP COLUMN` / `RENAME COLUMN` 会被引用该列的 CHECK 约束挡住**
+     （errno 3959 `Check constraint 'x' uses column 'y', hence column cannot be dropped or renamed`）。
+     SQLite 会连带改写 CHECK 表达式，MySQL 不会。改列前先按 `information_schema.check_constraints`
+     摘下来、改完再装回去；列被彻底删掉的就**不**再装回。表达式必须读 `CHECK_CLAUSE` ——
+     内联 CHECK 的约束名是 MySQL 自己生成的（`member_groups_chk_1` 这种），硬编码必然写错。
+  2. **`RENAME COLUMN` 只改名字、不改类型**。实测 v3 的 `dept` 是 `TEXT`、v5 的 `group_name` 是
+     `VARCHAR(255)`，改名之后列定义与受控 DDL 对不上，`verifyCurrent` 会在**最后一步**拒绝标记完成 ——
+     表现为「迁移明明做完了却不算成功」。所以 MySQL 侧同样要按受控定义逐列 `MODIFY COLUMN` 对齐，
+     且必须剥掉行尾的内联 CHECK，否则会多出一份重复约束。
+  3. **`CHECK_CLAUSE` 里的字符串定界符是反斜线转义的**（`\'…\'`），拼回
+     `ADD CONSTRAINT … CHECK (…)` 之前必须还原成 `'…'`，否则 errno 1064 语法错误。
+- **🚨 resume 只看版本号判断「v4 基线是否就绪」会让 MySQL 库永久卡死**：v5 结构已经就位、
+  但 v5 账本行被标成 `started`/`failed` 的库（迁移中途崩过之后就是这副样子）版本号已经是 5，
+  只按版本判断会得出「基线还没做」→ 重跑 v3→v4 → 而那时 `dept` 早已改名 `group_name`，
+  `historyFingerprint('dept')` 抛 `Unknown column 'dept'`，此后**每一次 resume 都失败**。
+  判定依据要认「v5 账本行是否存在」，不是「版本号是否等于 4」。
+- **空库（`historyCount === 0`）不要求 MySQL 备份证明**：备份的意义是不丢唯一副本里的历史，
+  对一份没有保护对象的库索要备份证明，只会把「空库初始化」这条最常见的路径卡死 ——
+  它恰恰是除 `--confirm-offline` 之外**不需要任何人工准备**的那条路。
 - **本地库必须保留降级路径**：`openStats()` 在库不可用（磁盘满 / 权限 /
   `SQLITE_CORRUPT` / `SQLITE_BUSY`）时自动回退直扫日志并带 `degradedReason`。
   库是**日志的派生物**，不是真值 —— 为它让页面白屏是不划算的。
@@ -320,7 +362,7 @@ bun run --filter '@ai-token-report/web-portal' verify
 - **🚨 上报库（`portal.sqlite`）是唯一副本，绝不自动重建**：它由
   `openPortalDb()` 打开，schema 版本不符时**抛错**（不是 `rebuildSchema`）。
   客户端投递成功后已清掉自己的 pending / outbox，删掉 = 全员历史用量永久消失。
-  本地 v3 走 `openDatabaseForIngest()`（可重建），服务端独立 v4 走
+  本地 v3 走 `openDatabaseForIngest()`（可重建），服务端独立 v5 走
   `openPortalStore()`（不可重建），**两个入口和版本不能混用**。
   上报库还必须与本地库 `usage.sqlite` 分开：混用后无法事后拆开。
 - **🚨 `server/src/serve-node.ts` 必须动态 `import('node:http')`**：
@@ -331,8 +373,11 @@ bun run --filter '@ai-token-report/web-portal' verify
 - **🚨 上报接口的鉴权失败必须是非 2xx**（`401` / 未配置凭证时 `503`），
   **不能学 `/api/v1/identity/verify` 的 `200 + ok:false`**：客户端把 2xx 当作
   「已投递」并清掉 pending，回 200 等于把那批用量静默丢掉。
-- **上报的归属只信服务端**：`client.userName` 一律忽略，写入可信 `member_id`、部门 ID、Token ID 和接收时间，
-  同时保留 `user_id/user_name/dept` 的原姓名/快照语义。鉴权重验与插入在同一事务内。
+- **上报的归属只信服务端**：`client.userName` 一律忽略，写入可信 `member_id`、Token ID 和接收时间；
+  事件本身不再存分组 ID（归属由 `member_group_assignments` 关联展开），同时保留
+  `user_id` / `user_name` / `group_name` 的原姓名/快照语义 —— 服务端仍继续接受旧客户端上报体里的
+  `client.dept`，按 `client.group ?? client.dept` 写入 `usage_event.group_name`，`verify` 响应也同时
+  返回 `group` 与 `dept`（同值，`dept` 仅为兼容旧插件）。鉴权重验与插入在同一事务内。
   同一条记录被两个上报方上报时，归属以**先到的**为准（主键冲突整行不写）。
 - **🚨 看板接口（`/api/v1/stats/*`）的鉴权失败也必须是非 2xx**（`401` /
   未配置凭证时 `503`）。理由与上报不同但同样硬：它的响应体里装的是**数据**，
@@ -341,7 +386,7 @@ bun run --filter '@ai-token-report/web-portal' verify
 - **🚨 看板只读上报库，`stats-route.ts` 不写一个字节**。它由
   `openPortalStats()`（内部走 `openPortalDb()`）打开，schema 版本不符时
   **抛错而不是重建**；这里**没有降级直扫这条退路** —— 上报库没有可重扫的真值。
-- **未归属对外使用 `UNATTRIBUTED_USER`（`'unknown'`）**。v4 新视图区分稳定人员、
+- **未归属对外使用 `UNATTRIBUTED_USER`（`'unknown'`）**。portal 新视图（v4 起）区分稳定人员、
   legacy 待确认和真正未归属；旧历史标记为 `received_at_ms IS NULL`，legacy selector 只查这一子集。
   旧 `user` 视图保留原姓名键语义，有歧义时报错；禁止将待确认历史当成匿名或自动映射同名人员。
 - **按人筛选是精确匹配，provider/model 才是子串匹配**。人名做子串会把

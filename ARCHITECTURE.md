@@ -116,7 +116,7 @@ ai-token-report/
 │  │   ├─ src/api/portal.ts    #   调服务端的 /api/v1/stats/*（带 Bearer token）
 │  │   ├─ src/composables/     #   usePortalSession（门禁）/ usePortalDashboard（取数编排）
 │  │   ├─ src/views/
-│  │   │   └─ DashboardView.vue#     总览 + 趋势 + 人员排行 + 分布 + 明细 + 诊断
+│  │   │   └─ DashboardView.vue#     总览 + 趋势 + 人员排行 + 分组排行 + 分布 + 明细 + 诊断
 │  │   ├─ src/components/      #   RankingTable / TrendChart / RecordsTable / DiagnosticsPanel …
 │  │   └─ vite.config.ts       #   5198；开发期把 /api 代理到 8787（DSH_PORTAL_API 可改）
 │  │
@@ -347,7 +347,7 @@ event_id = `${sessionId}:${seq}`
 | 入口 | 配置文件 | **页面引导页** |
 | 合规 | 需另行书面告知 | **员工知情且主动**，更干净 |
 
-**填写内容**：`姓名` + `token`（管理员发放）+ `部门`（选填）。
+**填写内容**：`姓名` + `token`（管理员发放）+ `分组`（选填，可多选）。
 
 ### 4.5.2 关键设计：token 是身份凭证，不是普通鉴权
 
@@ -357,7 +357,8 @@ event_id = `${sessionId}:${seq}`
         ▼
 本地服务 POST /api/v1/identity/verify ──► 部门服务端凭证表
         │                                      │
-        │  ◄── { ok, name: "张三", dept } ─────┘
+        │  ◄── { ok, name: "张三", group } ───┘
+        │      （响应同时带兼容别名 dept，同值）
         ▼
 以【服务端返回的姓名】落盘 ← ★ 不采信用户输入
 ```
@@ -394,9 +395,12 @@ $DSH_HOME/token-report/identity.json
 **本地页与插件共用同一份** —— 员工在哪里填一次就够了。
 
 ```json
-{ "name": "张三", "token": "...", "dept": "研发一部",
+{ "name": "张三", "token": "...", "group": "研发一部",
   "createdAt": 1789984019944, "updatedAt": 1789984019944 }
 ```
+
+> 旧文件里这个字段叫 `dept`：读取按 `group ?? dept`，**写出只写 `group`** ——
+> 兼容只发生在读取边界，不能让两种写法在新文件里并存。
 
 实现要点（`packages/core/src/identity-store.ts`）：
 
@@ -409,16 +413,20 @@ $DSH_HOME/token-report/identity.json
 ### 4.5.5 数据库初始化与旧凭证导入
 
 生产服务端的身份与权限事实和用量事件存于同一个 portal 数据库，支持 MySQL 和 SQLite。
-人员 UUID、部门、角色权限、账号、Token 摘要、会话、挑战、限流及审计均持久化。
+人员 UUID、分组、角色权限、账号、Token 摘要、会话、挑战、限流及审计均持久化。
 `credentials.json` 不再是运行时来源；指定 `credentialsPath` 会拒绝启动，禁止文件与数据库双写。
 
-空库初始化为独立 portal v4，本地 `usage.sqlite` 仍为 v3。首次管理员可以由
+空库初始化为独立 portal v5（**v4 是冻结基线**），本地 `usage.sqlite` 仍为 v3。首次管理员可以由
 `ATR_ADMIN_USERNAME` / `ATR_ADMIN_PASSWORD` 成对初始化，`ATR_ADMIN_TOKEN` 可作为初始化输入，
 `ATR_ADMIN_NAME` 为显示名。密码只保存 KDF 哈希，Token 只保存摘要。
 初始化标记存在后，不会因重启重新导入环境变量或复活已停用人员。
 
 旧库必须先停止旧服务、备份并运行 `packages/server/scripts/migrate-db.ts` 的
 inspect/migrate/resume，再通过 `packages/server/scripts/import-credentials.ts` 显式离线导入旧文件。
+迁移路线是 **v3 → v4（冻结基线）→ v5**：v4 库直接走 v4→v5 步骤；v5 把 `usage_event` 的分组 ID 列
+删掉（归属改由关联表承载）并把 `dept` 改名为 `group_name`，所以 SQLite 分支会**重建事实表**（必须先按
+备份流程执行，迁移前后逐位核对事件指纹），MySQL 分支是 RENAME / DROP COLUMN。命令与备份参数见
+[数据库部署与迁移](docs/数据库部署与迁移.md)。
 导入检查原始重复 Token、用户名冲突、角色和哈希格式；源文件不改写，报告不输出秘密。
 旧姓名历史保持 pending，只有人工确认映射才回填人员 ID。
 
@@ -426,7 +434,7 @@ inspect/migrate/resume，再通过 `packages/server/scripts/import-credentials.t
 旧 `CredentialStore`、`member-admin.ts` 和 `LegacyPortalAuth` 只保留历史独立处理器测试。
 表结构和操作边界见 [数据库重设计](docs/数据库重设计.md) 与 [接口与验收](docs/数据库重设计-接口与验收.md)。
 
-### 4.5.6 人员管理与 token 发放（管理页）
+### 4.5.6 人员管理与 appKey 发放（管理页）
 
 人员管理按稳定的 `member_id` 操作；显示名可以重复，用户名仍唯一。
 账号和上报 Token 独立关联人员，Token 列表不返回明文，只在签发或轮换成功时返回一次。
@@ -439,7 +447,38 @@ inspect/migrate/resume，再通过 `packages/server/scripts/import-credentials.t
 | POST | `/api/v1/admin/members/login`、`login/status` | 设置独立登录账号、启停账号 |
 | GET / POST | `/api/v1/admin/members/tokens` | 凭证摘要列表 / 签发 |
 | POST | `/api/v1/admin/members/tokens/rotate`、`revoke`、`scopes` | 轮换、吊销与范围变更 |
-| GET | `/api/v1/admin/roles`、`storage`、`audit`、`legacy-attributions` | 角色、数据库状态、审计与历史映射 |
+| POST | `/api/v1/admin/members/tokens/expiry` | ★ 改有效期（`null` = 长期有效，其余须是未来时刻） |
+| POST | `/api/v1/admin/members/appkey` | ★ 签发 appKey（范围固定为上报 + 获取统计） |
+| GET | `/api/v1/admin/appkeys` | ★ appKey 列表：每行一把凭证 + 它发给了谁（`tokens:manage`） |
+| GET | `/api/v1/admin/roles`、`storage`、`audit`、`legacy-attributions` | 角色目录＋权限目录、数据库状态、审计与历史映射 |
+| POST | `/api/v1/admin/roles`、`roles/update`、`roles/status` | ★ 角色定义：新建 / 改名改权限 / 启停（均需 `roles:assign`；内置角色只读） |
+| GET | `/api/v1/groups` | 分组目录：`{ groups: PortalGroup[] }`（`groups:read`） |
+| POST | `/api/v1/admin/groups`、`groups/update`、`groups/status` | ★ 新建 / 改名 / 启用停用分组（`groups:manage`；动作名 `group.create` / `group.update` / `group.status`，审计 `target_type: 'group'`） |
+
+**几个页面的分工**（`packages/web-portal`）：人员管理页（`/members`，`members:read`）只管
+「这个人是谁」——资料、角色、登录账号与**所属分组（多选）**；分组管理页（`/groups`，`groups:manage`）
+维护分组目录本身；appKey 管理页（`/appkeys`，**`tokens:manage`**）只管「这把 key 发给了谁」——
+列表主体是全部凭证，归属由服务端按 `report_tokens.member_id`
+关联人员表得出（改名后仍指向同一个人），可按人员搜索、轮换 / 吊销，并设置与修改**有效期**
+（`null` = 长期有效，过期只是时间比较，所以过期 key 可以续期而不必轮换）。
+交付信息（上报 / 统计的完整地址 + 使用人 + 凭证提示）点开弹框查看，明文**不进 DOM**：
+页面最多显示中间省略号的遮罩 `atr-ab12…ef34`，完整明文只在剪贴板里 ——
+它只随签发 / 轮换响应出现一次，库内只有摘要，且凭证提示（`token_prefix`）也统一按
+中间省略号渲染（`web-portal/src/utils/credential.ts`，展示层加省略号，库里存裸摘要前缀）。
+两页权限互不附带：能读人员名单的人未必该看到谁手里有哪些凭证。
+**人员的分组归属是「多对多」**（`PortalMember.groups: PortalMemberGroupRef[]`）：
+`POST /api/v1/admin/members` 收 `group_ids?: string[]`，`members/update` 的 `group_ids` 是
+**全量替换**语义（不给增量接口）。归属的权威是关联表 `member_group_assignments`，见 §4.5.9。
+
+**角色的组成与分配**（角色管理页 `/roles`：`roles:read` 读、`roles:assign` 写）：一个角色就是一组权限的
+命名集合，而人员权限是他所持**全部角色权限的并集**（`member_roles` 是多对多，一个人可同时持多个角色）。
+页面可以新建自定义角色（`code` 是稳定标识，建后不可改）、改名、整组替换权限、停用 / 启用；
+**内置角色（`admin` / `member`）只读**，停用某个角色前服务端会确认没有在职成员仍持有它 ——
+否则会出现「零角色人员」（能登录、什么都不能做，而页面看不出原因）。
+角色定义管理复用 `roles:assign` 而不新增 `roles:manage`：权限目录来自 schema seed，而
+`portalSchemaChecksum` 是对整份 SQL（含 seed）求哈希，新增一行权限会让现有部署的校验和不匹配、
+`current` 判定失败而拒绝启动，必须配套显式迁移。授予的权限还必须是操作者本次有效权限的子集
+（`subset()`），否则一枚只有 `roles:assign` 的窄凭证就能给自己造一个高权限角色。
 
 实现位于 `packages/server/src/identity/`。写事务先锁住 `portal_identity_state`，重新验证操作者，
 再执行 CAS 版本检查、业务修改和成功审计；提交后其他进程立即读到新状态。
@@ -478,6 +517,23 @@ inspect/migrate/resume，再通过 `packages/server/scripts/import-credentials.t
 HTTPS 反向代理需配置 `ATR_PORTAL_ORIGIN`。密码版本变化、账号/人员停用使旧会话失效；
 单独轮换或吊销上报 Token 不使后台会话退出。数据库会话与验证码可跨服务重启、跨进程使用，
 请求仍执行同源校验和当前权限重验。迁移和验证结果见 [Portal v4 验证记录](docs/database-v4/验证记录.md)。
+
+### 4.5.9 分组（多对多）与归属展开
+
+「分组」是人员归属维度的实体（表 `member_groups`，主键 `group_id`；权限码 `groups:read` / `groups:manage`）。
+**人员与分组是多对多**：`members` 上不再有分组列，归属由关联表
+`member_group_assignments(member_id, group_id, created_at_ms)` 承载 —— 用关联表而不是
+`members` 上的 JSON 数组，是因为「按分组筛用量」必须能走索引。
+
+- **归属的权威是关联表**。`usage_event.group_name` 只是上报当时客户端自己填的**文本快照**，
+  不参与归属；服务端仍继续接受旧客户端的 `client.dept`，按 `client.group ?? client.dept` 落这一列。
+- `members.department_id` 与 `usage_event.department_id` 已**删除**（v5）：一条事件属于哪个分组，
+  由它的 `member_id` 关联出该人员**当前**所属的每个分组。
+- **按分组筛选与分组排行都是 OR / 展开**：一条事件计入它的人员所属的**每个**分组，所以
+  **「各分组之和 > 总量」是定义，不是重复计数的 bug**；未分组人员不进任何分组行，差额就是他们 ——
+  页面必须能说清这一点。
+- 权限码的改名随 v5 迁移**原地**发生（只改 `permissions.code`，权限 ID 与角色关联不变，**不做兼容别名**）；
+  前端管理页路由由 `/departments` 改为 `/groups`。
 
 ## 5. 接口契约
 
@@ -520,12 +576,14 @@ HTTPS 反向代理需配置 `ATR_PORTAL_ORIGIN`。密码版本变化、账号/�
 POST /api/v1/identity/verify
 Authorization: Bearer <token>
 { "token": "<token>" }
-→ { "ok": true, "name": "张三", "dept": "研发一部", "registered": true }
+→ { "ok": true, "name": "张三", "group": "研发一部", "dept": "研发一部", "registered": true }
 ```
 
 - 同时接受 header 与 body 里的 token（header 优先），兼容不同 HTTP 客户端
 - **纯查询，不写库不落日志** —— 让「验证一下 token」这个无害动作不产生审计噪音
 - ★ 返回的 `name` **只可能来自凭证表**，绝不回显客户端提交的内容
+- `group` 与 `dept` **同值**同时返回：`dept` 已废弃，仅为兼容已部署的旧插件 / 旧 CLI；
+  新代码一律读 `group`
 
 > 校验失败返回 **200 + `ok:false`**，而不是 401。
 > 用 401 会让前端把「token 填错了」和「网络坏了」混为一谈。
@@ -544,7 +602,7 @@ Content-Type: application/json
 {
   "schemaVersion": 1,
   "client": { "name": "dsh-token-stats", "userId": "zhangsan",
-              "userName": "张三", "dept": "研发一部" },
+              "userName": "张三", "group": "研发一部" },
   "generatedAt": "2026-09-21T10:00:00Z",
   "records": [ { "event_id": "...", "session_id": "...", "seq": 16,
                  "ts": 1789984019944, "provider": "dashscope",
@@ -564,6 +622,9 @@ Content-Type: application/json
 > ⚠️ **契约已由 CLI 侧固化**，服务端必须遵守：字段用**下划线**、
 > 身份在 `client` 对象内而非记录内、响应必须如实返回三个计数
 > （缺失时 CLI 会回退成「全部接受」—— 不报错，但统计会失真）。
+> 归属字段是 `client.group`；服务端**继续接受**旧客户端的 `client.dept`，
+> 按 `client.group ?? client.dept` 取值写入 `usage_event.group_name` ——
+> 旧插件 / 旧 CLI 不改也能继续上报（这是刻意的，不要删）。
 
 实现落在 `packages/server/src/ingest-route.ts`。四条容易搞错、且已在
 `test/ingest.test.ts` 里锁死的语义：
@@ -575,8 +636,11 @@ Content-Type: application/json
 | **`event_id` 主键幂等** | 普通 INSERT，仅事件主键冲突记为重复；其他数据库约束错误整批回滚 | 将外键/CHECK 错误当成重复会错误确认投递 |
 | **单行拒收不牵连整批** | 坏行计入 `rejected`，好行照常入库 | 一条脏数据让整批 10 分钟的增量被反复重投 |
 
-> portal v4 新增 `member_id`、`department_id`、`report_token_id` 和 `received_at_ms`，
-> 原 `user_id` / `user_name` / `dept` 姓名快照、事件键和四项 token 保持原意。
+> portal v5 里 `usage_event` 持有 `member_id`、`report_token_id` 和 `received_at_ms`，
+> 原 `user_id` / `user_name` / `group_name` 姓名快照、事件键和四项 token 保持原意；
+> **事件本身不再存分组 ID**（v4 的 `department_id` 列已删除，`dept` 改名为 `group_name`），
+> 一条事件属于哪些分组由 `member_id` 经 `member_group_assignments` 关联展开（见 §4.5.9）。
+> v4 是**冻结基线**：v3 库先迁到 v4 再走 v4→v5。
 > 本地派生库仍为 v3；两个入口和版本独立，不能共用库文件。
 
 #### 🚨 上报库（`portal.sqlite`）绝不自动重建
@@ -585,7 +649,7 @@ Content-Type: application/json
 **上报库不是** —— 客户端投递成功后就清掉了自己的 `pending` / outbox，
 **服务端是唯一副本**。因此 `openPortalDb()` 在 schema 版本不符时**抛错**，
 而不是沿用 `openDatabaseForIngest()` 的「丢了重建」。一旦搞反，
-一次 schema 升级就会把全部门的历史用量静默清空，且无从恢复。
+一次 schema 升级就会把全员历史用量静默清空，且无从恢复。
 
 库路径默认 `<dsh-home>/token-report/portal.sqlite`，与本地库
 `usage.sqlite` **必须分开**：混用会让全员数据与本机数据互相污染，
@@ -623,8 +687,9 @@ Content-Type: application/json
 |---|---|
 | `GET /api/v1/stats/overview?period&from&to&provider&model&user` | 部门总览卡片 |
 | `GET /api/v1/stats/series?bucket=day\|hour` | 部门趋势 |
-| `GET /api/v1/stats/breakdown?by=user\|model\|provider\|provider-model\|project\|day\|hour` | **★ 人员排行** |
-| `GET /api/v1/stats/records?limit&offset` | 明细（分页，最新在前） |
+| `GET /api/v1/stats/breakdown?by=user\|group\|model\|provider\|provider-model\|project\|day\|hour` | **★ 人员排行 / 分组排行**（`by=group` 是新增的分组维度） |
+| `GET /api/v1/stats/records?limit&offset` | 明细（分页，最新在前；每行带 `group_ids` 与 `group_name_snapshot`） |
+| `GET /api/v1/stats/groups` | ★ 分组候选项 `{ groups: StatsGroupOption[] }`（`stats:read`；筛选栏与分组排行的选项都取自它） |
 | `GET /api/v1/stats/diagnostics` | 覆盖率 / 未归属 / 数据边界 / 最近落库 |
 
 **页面上的筛选**（`web-portal`）：
@@ -634,11 +699,18 @@ Content-Type: application/json
 | **时间窗** | 具名周期 `period`（`today` / `上周` / `最近 90 天` …） | 由服务端 `core/range.ts` 解析，**前端不做日期换算** |
 | **自定义区间** | `from` / `to`（epoch 毫秒） | 那本来就是使用者选定的两个绝对时刻，不是口径；结束时刻按「含该分钟」处理 |
 | **人员** | `user=张三,李四`（**多人可多选**，逗号分隔） | 归属筛选是**精确匹配**；`unknown` 表示未署名 |
+| **分组** | `group_id`（**逗号分隔多选**，精确匹配） | 候选项来自 `GET /api/v1/stats/groups`，**不是** `/api/v1/admin/groups` |
 | **厂商 / 模型** | `provider` / `model` | **子串**匹配（与 CLI 同义），与人名规则刻意不同 |
 
 > ⚠️ 人员下拉的候选来自**不含人员筛选**的同窗口 `breakdown?by=user`：
 > 若从已筛选的结果里取候选，选中一个人之后下拉会塌缩成一个选项（自锁定），
 > 使用者再也加不回别人，而页面看起来像「其余人都没数据」。
+
+**分组维度是「展开」语义，不是重复计数**：人员与分组是多对多（§4.5.9），
+所以 `by=group` 与 `group_id` 筛选都把一条事件计入它的人员所属的**每个**分组 ——
+**各分组之和可能大于总量**，这是定义；未分组人员不进任何分组行，差额就是他们。
+明细里的 `group_ids` 是该人员**当前**的归属，`group_name_snapshot` 才是上报当时的文本快照，
+两者不该互相冒充。
 
 **响应结构在 `packages/shared/src/protocol.ts` 定义，前后端共用** —— 防漂移的关键。
 
@@ -650,7 +722,8 @@ Content-Type: application/json
 | **鉴权失败回 401/503，不是 `200 + ok:false`** | ★ 与 §5.1.1 的 `/identity/verify` **刻意相反**，理由同 §5.2 | 响应体里装的是**数据**，回 2xx 会让前端把「token 不对」渲染成「这段时间没人用」—— 一个 0 值空看板 |
 | **只读上报库，一个字节都不写** | `openPortalStats()` → `openPortalDb()` | 写坏唯一副本；schema 版本不符时还会触发「重建」 |
 | **没有降级路径** | 库打不开 → `500` + 具体原因 | 上报库没有可重扫的真值，拿空数据冒充「今天没人用」比报错危险 |
-| **未归属统一成 `unknown`** | v4 区分稳定人员、历史待确认和真正未归属；旧姓名视图保持原键含义 | 待确认历史不能冒充匿名或自动归给同名人员 |
+| **未归属统一成 `unknown`** | 稳定人员、历史待确认和真正未归属三者分开（v4 起建立的新视图）；旧姓名视图保持原键含义 | 待确认历史不能冒充匿名或自动归给同名人员 |
+| **分组是 OR / 展开** | 归属取 `member_group_assignments`，一条事件计入人员所属的每个分组；`usage_event.group_name` 只是快照，**不参与归属** | 把快照当归属 = 按错别字统计；断言「各分组之和 == 总量」= 把定义当 bug |
 | **时间窗由服务端解析** | 页面只传 `period`，服务端调 `core/range.ts` | 前端自己算「本月从哪天开始」= 时区口径的第二份实现 |
 
 > ⚠️ **权限来自数据库角色关系**（见 §4.5.6）：后台账号可按角色读取部门看板，
@@ -677,12 +750,12 @@ CLI / 插件 ──POST /api/v1/token-usage──► portal.sqlite ──只读�
 |---|---|---|
 | 使用者 | 我自己 | 管理者 / 全组 |
 | 数据范围 | 本机 | 全员 |
-| 数据源 | `/api/local/*`（本地增量库） | `/api/v1/stats/*`（只读上报库） |
+| 数据源 | `/api/local/*`（本地增量库） | `/api/v1/stats/*`（只读上报库；分组候选项走 `/api/v1/stats/groups`） |
 | 鉴权 | 无（仅 127.0.0.1） | 用户名、密码、验证码登录；HttpOnly Cookie 会话，退出后清除页面数据 |
 | 部署 | CLI 内置，随命令启动 | 独立部署（`bun run server` 托管 `packages/web-portal/dist`） |
 | 核心视图 | **首次署名引导** / 我的用量 / 我的项目分布 | **人员排行** / 部门趋势 / 模型分布 / 单人下钻 / 用量明细 / 采集诊断 |
-| 管理视图 | ❌ 无（本机数据只有我自己） | ★ **人员管理**（仅 `role=admin` 可见）：发放 / 重置 / 吊销 token |
-| 筛选 | 时间窗 / 厂商 / 模型 | 时间窗（**含自定义区间**）/ **人员（多选）** / 厂商 / 模型 |
+| 管理视图 | ❌ 无（本机数据只有我自己） | ★ **人员管理 / 分组管理 / 角色管理 / appKey 管理**（按服务端权限显示）：人员资料与分组归属、分组目录、角色、发放 / 重置 / 吊销 token |
+| 筛选 | 时间窗 / 厂商 / 模型 | 时间窗（**含自定义区间**）/ **人员（多选）** / **分组（多选）** / 厂商 / 模型 |
 | 金额 | ❌ **不展示**（已确认，无单价来源） | ❌ **不展示**（已确认） |
 | 特色指标 | 我的缓存命中率、我的项目消耗 | **未署名占比**、**是谁没署名**、**给谁发了 token** |
 
@@ -715,7 +788,7 @@ CLI / 插件 ──POST /api/v1/token-usage──► portal.sqlite ──只读�
    ✅ 已定：**监听地址仍默认 127.0.0.1，对全组开放用 `--host 0.0.0.0`；
    所有 `/api/v1/stats/*` 与页面数据均要求有效会话或含对应 scope 的 Token**（见 §5.3 与 §6）。
 6. ☐ **凭证发放方式**：管理员手工编辑 `credentials.json`，还是加一个签发页面/命令？
-   ✅ Portal v4 已改为**数据库初始化 + 人员管理页**。旧文件只作显式离线导入源；
+   ✅ Portal v5 已改为**数据库初始化 + 人员管理页 / 分组管理页**。旧文件只作显式离线导入源；
    环境变量只初始化一次，不作为永久旁路。之后在人员管理页操作独立账号与 Token（§4.5.6）。
    权限使用数据库角色和 scope，不用姓名白名单；部署命令见 [数据库部署与迁移](docs/数据库部署与迁移.md)。
 7. ✅ **迁移期旧目录如何处理？** 已确认并执行：`dsh-token-stats/`、`frontend/`、
@@ -759,7 +832,7 @@ CLI / 插件 ──POST /api/v1/token-usage──► portal.sqlite ──只读�
 > **S3 已完成**：`POST /api/v1/token-usage` 已落地（`server/src/ingest-route.ts`）——
 > 鉴权（Bearer → 凭证表）、逐行校验、`event_id` 幂等落库、如实返回
 > `accepted / duplicates / rejected`，归属写进 `usage_event` 的
-> `user_id / user_name / dept` 三列（schema 版本 3）。
+> `user_id / user_name / dept` 三列（schema 版本 3；该快照列现名 `group_name`）。
 > 两条端到端验证：
 >
 > ```bash
