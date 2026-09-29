@@ -22,7 +22,7 @@ npm 包名：`dsh-plugin-token-report` · 仓内开发包名：`@ai-token-report
 
 ## 安装最新稳定版
 
-需要已经安装 DSH，并使用与插件兼容的宿主模块（`@deepseek-ai/cordis ^4.0.2`、`@deepseek-ai/dsh-session-telemetry ^0.1.5-rc.1`）。Node.js 要求 **22.15.0 或更新版本**。
+需要已经安装 DSH `0.1.7-rc.2`，并使用同代宿主模块（`@deepseek-ai/cordis ~4.0.4`、`@deepseek-ai/dsh-session-telemetry 0.1.7-rc.2`）。不要把 0.1.5 的 telemetry 与 0.1.7 宿主混装，否则旧版会把合法会话日志误报为损坏。Node.js 要求 **22.15.0 或更新版本**。
 
 ```bash
 dsh plugin --profile web add dsh-plugin-token-report@latest
@@ -73,7 +73,23 @@ dsh --profile web --no-open
 
 ### 调整面板位置
 
-面板默认出现在**输入框上方**。想让它出现在**会话标题栏右上角**、或两个位置都要，在 profile 的 `cordis.patch.yml` 里给插件加一段 `ui`：
+面板默认出现在**输入框上方**。想让它出现在**会话标题栏右上角**、或两个位置都要，
+有两种办法 —— **面板内改（推荐，立刻生效）**，或在 profile 里改部署配置。
+
+**办法一（0.6.0 起）：面板右上角齿轮「配置」→ 面板位置 → 验证并保存。**
+保存后面板**就地**换地方，不必刷新页面、更不必重启 DSH：
+
+| 取值 | 效果 |
+|---|---|
+| `输入框上方（用量条）` | 只显示输入框上方的用量条（默认） |
+| `会话标题栏右上角（胶囊）` | 只显示标题栏右上角的胶囊；点开就是同一个详情面板 |
+| `两处都显示` | 两处都显示 —— 与 0.2.0 的外观一致 |
+
+这一项与下面「部署配置」写的是同一个东西，只是存在本机
+（`$DSH_HOME/token-report/plugin-connection.json`），并且**优先于部署配置**。
+
+**办法二：在 profile 的 `cordis.patch.yml` 里给插件加一段 `ui`** ——
+适合「IT 统一规定全公司都用某个位置」：
 
 ```yaml
 - id: token-report
@@ -82,22 +98,46 @@ dsh --profile web --no-open
       position: dock      # dock(默认，输入框上方) | header(右上角) | both(两处都要)
 ```
 
-| 取值 | 效果 |
-|---|---|
-| `dock` | 只显示输入框上方的用量条（默认） |
-| `header` | 只显示标题栏右上角的胶囊；点开就是同一个详情面板 |
-| `both` | 两处都显示 —— 与 0.2.0 的外观一致 |
-
-改完**刷新页面**即可生效（位置在页面加载时确定）。三种取值共用同一个详情面板，数字口径完全一致。
+改完**刷新页面**即可生效。三种取值共用同一个详情面板，数字口径完全一致。
 也可以不改 YAML，用环境变量 `DSH_TOKEN_REPORT_UI_POSITION` 临时覆盖。
 
 **写错的值不会让面板消失**：只认上面三个值，其它一律回退 `dock`，并在 DSH 启动日志里告警。
+面板内那一栏同样只提供这三个值，选不出非法值。
 
 ### 开启团队上报
 
-在详情面板右上角点击齿轮「配置」，只填两项：**服务端地址**（部门平台根地址，例如 `https://portal.example.com`，或本机自建的 `http://127.0.0.1:8787`）与**管理员发放的 appKey**。上报地址由服务端地址推导（`<地址>/api/v1/token-usage`），不需要自己拼路径。
+在详情面板右上角点击齿轮「配置」，**四个字段**：
 
-点击「验证并保存」后，插件用这个 appKey 向对应服务端的 `/api/v1/identity/verify` 校验身份，**姓名与部门以服务端返回值为准**（面板不再询问姓名 —— 它由 appKey 在服务端绑定的人决定）。**保存后重启 DSH**，新的上报连接才会生效。已保存的 appKey 不回显。
+| 字段 | 说明 |
+|---|---|
+| 服务端地址 | 部门平台根地址（例如 `https://portal.example.com`，或本机自建的 `http://127.0.0.1:8787`）。上报地址由它推导（`<地址>/api/v1/token-usage`），不需要自己拼路径 |
+| appKey | 管理员在平台「appKey 管理」页签发的那一串。**已配置时留空 = 只改下面两项偏好**，不会重新校验、也不重写身份文件 |
+| 上报间隔 | 5 秒 / 10 秒（默认）/ 30 秒 / 1 分钟 / 5 分钟。这个数字直接决定部门服务端的请求密度，所以只给档位 |
+| 面板位置 | 见上一节；保存后**就地**换地方 |
+
+点击「验证并保存」后，插件用这个 appKey 向对应服务端的 `/api/v1/identity/verify` 校验身份，
+**姓名与分组以服务端返回值为准**（面板不再询问姓名 —— 它由 appKey 在服务端绑定的人决定）。
+
+**★ 保存后立即生效，不需要重启 DSH。** 保存成功后页面会如实回报当前状态
+（「已保存并开始上报 → 地址」或「上报仍未启用：原因」），并当场开始补报本机全部历史用量。
+已保存的 appKey 不回显。
+
+### 看「到底上报了什么」（上报调试）
+
+配置页第二个页签 **「上报调试」** 是排查「部门看板上没有我的数」的地方。
+它每 3 秒刷新一次，把下面这些一次说清：
+
+- **在不在上报**：状态 + 地址；没在跑时给**原因**（未署名 / 未配 appKey / 部署关闭了上报）。
+- **发了多少**：已采集、已投递（含重复与拒收）、内存队列、磁盘待投递（批数 / 条数 / 字节）、
+  请求数与失败数、最近成功时间。
+- **最近上报**：每次真实请求的**请求体原文**（点开可展开）+ 服务端回执
+  （接收 / 重复 / 拒收）与 HTTP 状态。请求体过大时只显示开头，并明确标注「已截断」。
+- **历史补报进度**：扫描文件数 / 服务端确认数 / 上次错误。
+- **两个按钮**：「立即上报一次」（真发）与「预览下一批内容」（**只显示，不发送、不消耗队列**）。
+
+> 🚨 **页面里看不到 appKey。** 调试数据由宿主半的 `GET /api/tokenReport.reports` 提供，
+> 而宿主只保留**请求体**、不保留请求头 —— appKey 走 `Authorization: Bearer`，天然不在这里。
+> 不要为了「方便排查」把请求头加进去：那会把一个调试页变成凭证泄漏面。
 
 身份与连接保存在 `$DSH_HOME/token-report/` 下；默认 DSH_HOME 为 `~/.dsh`。插件与本地 Web 共用身份文件。部署侧固定了身份时，页面会提示配置由管理员管理。
 
@@ -127,9 +167,11 @@ DSH 升级会保留旧格式日志作为备份；同一会话存在多个规范�
 | 时间分析 | 预设周期、双月日历、自定义范围、趋势切换 |
 | 明细分析 | 模型 / 服务商 / 项目 / 会话分组，展开与分页 |
 | 本地增量查询 | SQLite 增量索引；库不可用时自动回退日志扫描并提示 |
-| 上报连接 | 面板内填服务端地址 + appKey，验证后重启生效 |
+| 上报连接 | 面板内填服务端地址 + appKey，验证后**立即生效**（无需重启） |
+| 上报偏好 | 面板内选上报间隔与面板位置；只改偏好时不必重填 appKey，保存后即时生效 |
 | 实时上报 | 异步批量发送、磁盘 outbox、失败保留、重启重放 |
 | 历史补报 | 独立后台线程扫描全部历史，服务器确认后保存进度，失败持续重试 |
+| 上报调试 | 配置页「上报调试」页签：状态与原因、计数、**最近请求体原文与回执**、补报进度、立即上报 / 不发送预览 |
 | Agent 与插件集成 | `token_usage`、`token_usage_diagnostics`、`ctx.tokenReport` |
 
 只展示 token 数，不展示金额。只采集用量相关字段（包含模型名、工作目录、轮次等），不采集对话内容。上报失败不会阻塞 DSH 的会话循环；服务端按事件 ID 去重。
@@ -165,8 +207,8 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 | 没有用量入口 | 确认安装在 `web` profile、bundle 数组包含发布包名，并已重启；`features.ui` 不能关闭 |
 | 401 / 未通过宿主鉴权 | 使用本次 DSH 启动时打印的完整地址重新打开 |
 | 首次统计较慢 | 等待首次索引完成；如显示降级，检查 SQLite 权限与宿主 Node 版本 |
-| 团队看板没有数据 | 验证并保存身份与连接后重启，再调用 `token_usage_diagnostics` 查看原因 |
-| 修改配置后仍使用旧身份 | 当前进程仍绑定启动时配置，需要重启 DSH |
+| 团队看板没有数据 | 先看配置页「上报调试」页签：它会直接说「未上报及原因」并列出最近请求与回执；再用 `token_usage_diagnostics` 看补报进度 |
+| 改完配置没生效 | 0.6.0 起保存即生效（页面会回报状态）。若显示「需重启 DSH」，说明宿主没提供热生效入口（旧版本宿主），重启即可 |
 
 源码与开发文档见 [GitHub 仓库](https://github.com/zhujunzhujunzhu/ai-token-report/tree/main/packages/dsh-plugin)。
 
@@ -236,7 +278,7 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
     # user:
     #   name: 张三
     #   token: atr-zhangsan-9f3c
-    #   dept: 研发一部
+    #   group: 研发一部
 ```
 
 ### 取值的优先级
@@ -262,7 +304,7 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 | `DSH_TOKEN_REPORT_UI_POSITION` | `ui.position`（`dock` / `header` / `both`） |
 | `DSH_TOKEN_REPORT_USER_NAME` | `user.name` |
 | `DSH_TOKEN_REPORT_USER_TOKEN` | `user.token` |
-| `DSH_TOKEN_REPORT_DEPT` | `user.dept` |
+| `DSH_TOKEN_REPORT_GROUP` | `user.group` |
 
 > 前缀刻意用 `DSH_TOKEN_REPORT_` 而不是 CLI 的 `DSH_REPORT_*` ——
 > 两者是不同的部署面，混用会让「我改了变量为什么没生效」变成谜题。
@@ -297,7 +339,7 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 
 - **`appKey`**：管理员发放的上报凭证。没有它插件**不会上报**（这是合规底线）。
 - **`endpoint` 可达**：默认指向本仓部门服务端。
-- `@deepseek-ai/dsh-session-telemetry` ≥ `0.1.5-rc.1`（DSH 自带）。
+- `@deepseek-ai/dsh-session-telemetry` `0.1.7-rc.2`（与 DSH 宿主严格同代）。
 
 > ⚠️ **与官方 OTel 后端互斥**：同一时刻只能挂载**一个** telemetry 后端
 > （cordis 重复注册同名服务会抛错）。装了本插件就不要同时启用
@@ -554,7 +596,9 @@ svc.signed()                                            // → 身份是否就�
 | 会话标题栏右侧的徽章 | `conversation.session.header.utilities` | 一个紧凑胶囊 `● 2.39B 97.0%`，点开是居中浮层（Esc 关闭） | `ui.position: header` / `both` |
 
 挂哪几个由 `ui.position` 决定，**默认只挂输入框上方那一条**；`both` 才是 0.2.0 的外观。
-位置在**页面加载时定下来**（slot 注册是一次性的），所以改完配置要刷新页面。
+位置在**页面加载时**定下来（slot 注册是一次性的），但 0.6.0 起在配置页里改完位置会
+**就地重挂**：退掉旧挂载点、按新位置注册一遍（`client/position.ts` 的那条模块级信号），
+所以不必刷新页面。部署配置（`ui.position` / 环境变量）改完仍需刷新页面。
 
 两个挂载点用的是**同一份状态**（`store.ts` 里那个 store），所以数字永远一致，
 而且取数只做一次 —— 这点很重要，见下面的「缓存与轮询」。
@@ -592,6 +636,25 @@ svc.signed()                                            // → 身份是否就�
 `/api/tokenReport.stats` 那个载荷 —— 那个载荷首次返回要等冷建库，可能十几秒，
 面板会先在错的位置出现再跳一下。
 
+> 0.6.0 起这条路由**每次请求都现读**当前生效位置（`makeConfigFetch(() => runtime.config().ui.position)`），
+> 而不是启动时缓存一份 —— 否则设置页保存后的「就地重挂」会拿到旧值。
+
+#### 上报调试面（配置页第二个页签）
+
+```
+浏览器半  GET  /api/tokenReport.reports            ← 每 3 秒，状态 + 计数 + 最近请求 + 补报进度
+浏览器半  POST /api/tokenReport.reports {action:'flush'}    ← 真发一次（服务端不回就在 20 秒后如实回「仍在进行」）
+浏览器半  POST /api/tokenReport.reports {action:'preview'}  ← 只回「下一批请求体」，不发送、不消耗队列
+```
+
+宿主侧的 `ReportLog`（`src/report-log.ts`）在**投递链路上**留最近 20 次尝试：
+每次的请求体原文、HTTP 状态、服务端回执计数、错误原因。三层硬上限
+（条数 / 单条 96 KiB / 总量 512 KiB）保证它不会通宵吃内存；
+超长请求体按 UTF-8 边界截断并**明确标注**已截断（不能让人以为看到的就是全部）。
+
+🚨 **它只留请求体，不留请求头**：appKey 走 `Authorization: Bearer`，所以这条路由
+天然不含凭证。**不要**为了「方便排查」把 headers 塞进来 —— 那会让一个调试页变成泄漏面。
+
 **为什么复用 `/api` 而不自己 `ctx.webServer.register`**：
 DSH 的 web 服务器**不做任何鉴权**（`dsh-host-webserver` 的文档明写
 「No server-wide TLS, authentication, or origin policy」）。本仓的约定是
@@ -611,14 +674,28 @@ DSH 的 web 服务器**不做任何鉴权**（`dsh-host-webserver` 的文档明�
 点击明细行展开四项 token 与会话数；明细每页展示 10 行，超过一页时显示翻页与总条数，切换分组或时间范围回到第一页。明细保留全部数据，短周期趋势保留最多 31 点，今年和自定义范围保留完整序列。
 切换时间时保留已有内容与范围标签，结果返回后整体更新；图表复用实例，弹框保持稳定高度。底部不再展示数据来源、耗时与读取时间，仅在查询失败或降级时提示原因。
 
-「配置」页只填两项：服务端地址与 appKey（管理员在平台「appKey 发放」页生成并复制）。
-保存前向 `<服务端地址>/api/v1/identity/verify` 校验 appKey，姓名与部门只认服务端返回值。
+「配置」页有**四个字段**：服务端地址、appKey（管理员在平台「appKey 管理」页按人发放并复制）、
+**上报间隔**（5 秒～5 分钟档位）、**面板位置**（输入框上方 / 标题栏右上角 / 两处都要）。
+保存时若填了 appKey，先向 `<服务端地址>/api/v1/identity/verify` 校验，姓名与分组只认服务端返回值；
+**appKey 留空且地址没变 = 只更新间隔与位置**（不重校验、不重写身份文件）——
+那串密钥往往已经不在用户手边，只改偏好不该逼他再粘一次。
 未填 appKey 时仍可看本机统计，但不采集、不上报；已保存的 appKey 不回显。
 署名与本地 Web 共用 `$DSH_HOME/token-report/identity.json`（`token` 就是这串 appKey），
-连接保存到同目录的 `plugin-connection.json`（原子写入、0600）。
+连接与偏好保存到同目录的 `plugin-connection.json`（原子写入、0600）。
 用户保存的连接优先于部署默认连接；配置了固定 `user` 时页面只读。
 
-**保存后重启 DSH 生效**：当前上报器仍绑定启动时的身份与连接，页面会明确提示。
+**★ 保存后立即生效，不需要重启 DSH。** 宿主半的 `ReportRuntime` 会重新读一遍
+「已保存的连接 + 身份文件」并按需**换掉投递单元**（`runtime.ts`）：
+
+| 变了什么 | 做什么 | 为什么 |
+|---|---|---|
+| 间隔 | 只 `reporter.setFlushInterval()` | 重建会丢掉内存队列里还没落盘的记录 |
+| 地址 / appKey / 姓名 / 分组 / outbox 设置 | 装新单元 + **后台**停旧单元 | 旧 endpoint 可能已不可达，不能让用户在设置页上等一次网络超时 |
+| 未署名 / 部署关掉了上报 | 停单元，并在诊断里如实报「已停止」 | 「还在跑」和「已停」必须是两句话 |
+
+后端（`SessionTelemetryCoordinator` 的监听器）**只装一次**：那些监听器挂在 fiber 上、
+不随服务注销撤销，重复装会让每次会话事件都被折叠两遍。
+「已采集」计数也是运行时级的（跨单元不归零），所以调试页不会在换连接后突然显示 0。
 
 #### 缓存与轮询
 
@@ -761,7 +838,7 @@ inflight-<ts>-<pid>-<seq>.jsonl   ← 已发出但还没收到响应
 ## 8. 开发与验证
 
 ```bash
-bun test packages/dsh-plugin            # 214 个用例（fold / config / outbox / reporter / apply / identity / 界面）
+bun test packages/dsh-plugin            # 369 个用例（fold / config / outbox / reporter / runtime / settings / 上报实录 / 界面）
 bun run --filter '@ai-token-report/dsh-plugin' typecheck
 bun run --filter '@ai-token-report/dsh-plugin' build
 ```
@@ -770,11 +847,11 @@ bun run --filter '@ai-token-report/dsh-plugin' build
 
 | 脚本 | 层次 | 断言数 | 验证什么 |
 |---|---|---|---|
-| `bun test packages/dsh-plugin` | 单元 | 214 | 折叠口径 / 配置优先级 / **面板位置** / outbox 崩溃不丢 / 热路径只入队 / **界面：格式、取数状态机、挂载点、离屏渲染** |
+| `bun test packages/dsh-plugin` | 单元 | 369 | 折叠口径 / 配置优先级 / **面板位置与热切换** / outbox 崩溃不丢 / 热路径只入队 / **就地换连接（runtime）** / **上报实录的字节上限与截断** / **配置与调试路由与页面文案** / **界面：格式、取数状态机、挂载点、离屏渲染** |
 | `verify/verify-plugin.ts` | 端到端冒烟 | 55 | **真 HTTP 往返** + 真扫日志 + 崩溃恢复（假 ctx） |
 | `verify/verify-cordis-load.ts` | 真实框架装载 | 10 | 打包产物挂进**真 cordis Context**，含 `inject` 形状 |
 | `verify/verify-resolution.ts` | **宿主语义** | 9 | 用 **Node**（不是 Bun）解析并加载打包产物 |
-| `verify/verify-client-bundle.ts` | **浏览器半产物** | 32 | 真跑 `lib/client.js`：信封形状 / **平台模块纯度** / 双半路由一致 / **三种位置各注册哪些 slot** / slot 注册 |
+| `verify/verify-client-bundle.ts` | **浏览器半产物** | 36 | 真跑 `lib/client.js`：信封形状 / **平台模块纯度** / 双半路由一致（含配置与调试两条新路由） / **三种位置各注册哪些 slot** / slot 注册 |
 | `verify/diagnose-boot.ts` | 排障工具 | — | profile 里哪个包 import 就炸，展开完整 cause 链 |
 
 另有三个辅助脚本：
@@ -834,7 +911,7 @@ bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败
 {
   "authorization": "Bearer <appKey>",
   "schemaVersion": 1,
-  "client": { "name": "dsh-token-report", "userId": "张三", "userName": "张三", "dept": "研发一部" },
+  "client": { "name": "dsh-token-report", "userId": "张三", "userName": "张三", "group": "研发一部" },
   "records": [{
     "event_id": "session-63fe9359-...:17",
     "session_id": "session-63fe9359-...",
@@ -874,17 +951,24 @@ bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败
 | `src/config.ts` | 全局配置归一化（默认值 / 环境变量 / 校验） |
 | `src/fold.ts` | ★ 原始事件 → 计费记录（纯函数，唯一会算错数的地方） |
 | `src/outbox.ts` | 磁盘 outbox（两态 + 启动重放） |
-| `src/reporter.ts` | 内存队列 → 批量 → HTTP（热路径只入队） |
+| `src/reporter.ts` | 内存队列 → 批量 → HTTP（热路径只入队）+ 上报间隔热更新 + 请求预览 |
+| `src/report-log.ts` | 上报实录（环形缓冲：请求体原文 + 回执，三层字节上限，UTF-8 边界截断） |
+| `src/runtime.ts` | ★ 运行时：状态判定（`evaluateStatus`）、就地换连接（换投递单元而不是换后端）、调试数据出口 |
+| `src/settings.ts` | 配置页的宿主半：GET/POST `/api/tokenReport.settings`（四个字段、校验、偏好更新、就地生效） |
+| `src/reports.ts` | 调试页的宿主半：GET/POST `/api/tokenReport.reports`（状态 + 计数 + 实录 + 立即上报 / 不发送预览） |
 | `src/stats.ts` | 统计查询与渲染（**不实现任何公式**） |
 | `src/stats-worker-client.ts` / `src/stats-worker.ts` | 有界线程调度、日志变化合并及周期性完整对账 |
 | `src/identity.ts` | 身份解析（复用 core 的存储，与本地页共用同一份文件） |
-| `src/ui-bridge.ts` | 宿主侧 UI 数据通道：`/api/tokenReport.stats` + `/api/tokenReport.config`（面板位置）+ TTL 缓存 + 并发合并 |
-| `src/client/protocol.ts` | ★ **双半唯一契约**：载荷类型、周期、**面板位置枚举与配置解析**、响应解析（零依赖，两边都能 import） |
+| `src/ui-bridge.ts` | 宿主侧 UI 数据通道：`/api/tokenReport.stats` + `/api/tokenReport.config`（**每次现读**面板位置）+ TTL 缓存 + 并发合并 |
+| `src/client/protocol.ts` | ★ **双半唯一契约**：载荷类型、周期、**面板位置枚举与配置解析**、间隔档位、响应解析（零依赖，两边都能 import） |
 | `src/client/store.ts` | 浏览器侧取数状态机（`fetch`/时钟可注入，因此可单测） |
 | `src/client/format.ts` | 纯展示格式（不是口径公式，见文件头注释） |
 | `src/client/components.tsx` | 两个挂载点的 React 组件 |
+| `src/client/settings.tsx` | 配置页：四个字段 + 「连接配置 / 上报调试」两个页签 |
+| `src/client/report-debug.tsx` | 上报调试页：状态、计数、最近请求体与回执、补报进度、立即上报 / 预览 |
+| `src/client/position.ts` | 面板落点的进程内信号总线（保存后**就地**重挂挂载点） |
 | `src/client/styles.ts` | `<style>` 注入（全部用 `--dsw-alias-*` 主题变量） |
-| `src/client/index.ts` | 浏览器半入口：`apply()` + 取面板位置（取不到回退默认并照常挂载）+ 按位置注册 slot |
+| `src/client/index.ts` | 浏览器半入口：`apply()` + 取面板位置（取不到回退默认并照常挂载）+ 按位置注册 slot + 位置热切换 |
 | `build-client.ts` | 浏览器半构建：`__ModuleLoader__` 信封 + **平台模块纯度校验** |
 
 > ⚠️ **双环境的 tsconfig**：`tsconfig.json` 管宿主半（`lib: ES2022`，无 DOM），
@@ -925,13 +1009,15 @@ bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败
 |---|---|---|
 | 启动日志说「尚未署名」 | 没有身份文件 | 跑 `dsh-token --web` 在页面里填，或配 `config.user` |
 | 启动日志说「未配置上报凭证」 | 没配 `appKey` | 配 `appKey` 或 `DSH_TOKEN_REPORT_APP_KEY` |
-| 看板上没有我的数据 | 凭证过期 / 地址改了 / outbox 满 | 跑 `token_usage_diagnostics` 看 `lastError` 与 `磁盘待投递` |
+| 看板上没有我的数据 | 凭证过期 / 地址改了 / outbox 满 | 先看配置页「上报调试」页签（状态 + 原因 + 最近请求与回执），再跑 `token_usage_diagnostics` 看 `lastError` 与 `磁盘待投递` |
 | `$DSH_HOME/token-report/outbox` 目录不存在 | 上报后端从未构造（未署名 / 没 appKey / `features.reporting: false`） | 看启动日志给的原因；这是**预期行为**不是故障 |
 | 工具报的数比看板少 | 正常 —— 看板是服务端累计，工具只看本机日志 | 用 `period` 对齐时间窗 |
 | 统计很慢（10s+） | 走了直扫路径 | 确认 `localDb` 与宿主运行时；`source` 字段会如实标注 |
 | 界面没有用量面板 | 用的不是 web profile，或 `features.ui: false`，或浏览器半没被加载 | 见 §2.4 的三行对照表；启动日志会说明「数据通道已挂载」还是「宿主不提供 connection」 |
-| **升级后标题栏徽章不见了** | **预期行为**：0.3.0 起 `ui.position` 默认 `dock`，只挂输入框上方那条 | 要徽章就配 `ui.position: both`（= 0.2.0 的外观）或 `header` |
-| 配了 `ui.position` 但界面没变 | 值写错了（已回退 `dock`），或页面没刷新（位置在页面加载时定下来） | 看启动日志里 `ui.position` 的 warn 与「面板位置：」那句，然后**刷新页面** |
+| **升级后标题栏徽章不见了** | **预期行为**：0.3.0 起 `ui.position` 默认 `dock`，只挂输入框上方那条 | 要徽章就在配置页把「面板位置」改成 `两处都显示`（= 0.2.0 的外观）或 `会话标题栏右上角`，保存即生效 |
+| 配了 `ui.position` 但界面没变 | 值写错了（已回退 `dock`），或**部署配置**改完没刷新页面 | 看启动日志里 `ui.position` 的 warn 与「面板位置：」那句，然后刷新页面；**面板内**改的位置不需要刷新 |
+| 在配置页改了位置但面板没动 | 宿主半与浏览器半版本不一致（升级后没重启 DSH），或那条读位置的路由没通 | 重启 DSH 让两半对齐；旧宿主读位置会 404，此时保存只落盘、下次刷新页面才见效 |
+| 改了间隔/地址后「上报调试」显示未启用 | 未署名 / appKey 无效 / 部署关掉了上报 —— **原因就写在状态横幅里** | 按横幅文案处理；`restartRequired: true` 时说明宿主没提供热生效入口（旧宿主），重启即可 |
 | 面板位置忽然回到默认 | 读位置那条路由没通（旧宿主 → 404、中间层超时） | 浏览器控制台会有一条 `读取面板位置失败（…）`；面板**照常出现**，只是位置是默认的 |
 | 面板显示「返回 404」 | 宿主没有 `connection` 服务，或路由没注册上 | 看启动日志有无 `UI 用量面板数据通道已挂载`；headless 下是预期行为 |
 | 面板显示「未通过宿主鉴权（401）」 | 页面不是从带 `?token=` 的 DSH 地址打开的 | 用 `dsh web` 打印的那个完整地址重开页面 |
