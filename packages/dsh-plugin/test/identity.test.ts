@@ -108,7 +108,8 @@ describe('身份解析', () => {
     expect(s.ready).toBe(true)
     if (s.ready) {
       expect(s.assertion.name).toBe('张三')
-      expect(s.assertion.dept).toBe('研发一部')
+      // 旧文件里的 `dept` 经 `toAssertion()` 归一成 `group`（兼容期规则只在 shared 一处）
+      expect(s.assertion.group).toBe('研发一部')
       // ★ assertion 是发给服务端的视图，绝不能带 token
       expect(JSON.stringify(s.assertion)).not.toContain('tok-secret')
     }
@@ -147,14 +148,15 @@ describe('身份解析', () => {
 
   test('可以写入并读回（与本地页共用同一份文件）', () => {
     const r = new IdentityResolver({ dshHome: home })
-    const saved = r.save({ name: '张三', token: 'tok-abc', dept: '研发一部' })
+    const saved = r.save({ name: '张三', token: 'tok-abc', group: '研发一部' })
     expect(saved.ok).toBe(true)
 
     const s = r.resolve()
     expect(s.ready).toBe(true)
     if (s.ready) {
       expect(s.identity.name).toBe('张三')
-      expect(s.identity.dept).toBe('研发一部')
+      // 写出侧只写 `group`（原 `dept`）—— 规范 §5：写入不保留旧字段名
+      expect(s.identity.group).toBe('研发一部')
     }
   })
 

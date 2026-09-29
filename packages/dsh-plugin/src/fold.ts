@@ -39,7 +39,13 @@ export interface FoldIdentity {
   /** 上报方自称的标识。**服务端一律忽略它**，只认 Authorization 头里的 token。 */
   claimedUserId: string
   userName?: string
-  dept?: string
+  /**
+   * 分组名（原 `dept`）—— 上报体的 `client.group`。
+   *
+   * ⚠️ 它只是上报当时的**文本快照**，不参与归属：归属由服务端按 appKey 解析出的
+   *   member 及其分组关联（`member_group_assignments`）决定。
+   */
+  group?: string
 }
 
 /** 折叠后的计费记录（TS 内存侧，camelCase）。 */

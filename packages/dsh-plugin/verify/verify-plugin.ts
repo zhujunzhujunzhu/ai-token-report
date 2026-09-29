@@ -46,7 +46,7 @@ function makeHome(signed: boolean): string {
     mkdirSync(join(home, 'token-report'), { recursive: true })
     writeFileSync(
       join(home, 'token-report', 'identity.json'),
-      JSON.stringify({ name: '张三', token: 'tok-smoke', dept: '研发一部', createdAt: 1, updatedAt: 1 }),
+      JSON.stringify({ name: '张三', token: 'tok-smoke', group: '研发一部', createdAt: 1, updatedAt: 1 }),
     )
   }
   return home
@@ -248,7 +248,7 @@ console.log('\n── 2. 已署名：会话事件 → 上报 → 服务端收下
     check('schemaVersion = 1', payload?.schemaVersion === 1)
     check('client.name 用的是配置里的插件名', payload?.client.name === 'dsh-token-report')
     check('client.userName 来自身份文件', payload?.client.userName === '张三')
-    check('client.dept 来自身份文件', payload?.client.dept === '研发一部')
+    check('client.group 来自身份文件', payload?.client.group === '研发一部')
     check('appKey 走 Authorization: Bearer 头', receiver.authHeaders[0] === 'Bearer atr-smoke-key')
     check('请求体里不含 appKey', !JSON.stringify(payload).includes('atr-smoke-key'))
     check('条数为 3（非计费事件没进去）', payload?.records.length === 3)

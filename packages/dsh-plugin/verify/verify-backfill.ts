@@ -96,7 +96,7 @@ async function assertParity(label: string): Promise<void> {
 }
 
 console.log('历史自动补报端到端验证（临时日志、真实 HTTP、真实 portal SQLite）')
-await seedDatabaseIdentity(target, [{ token, name: '历史验证成员', dept: '测试部门' }])
+await seedDatabaseIdentity(target, [{ token, name: '历史验证成员', group: '测试分组' }])
 const bundle = await createHandlerFor({ dshHome: home, dbPath, mysqlUrl: '', enableLocalApi: false, requestLog: false })
 let reportRequests = 0
 let duplicateReceipts = 0

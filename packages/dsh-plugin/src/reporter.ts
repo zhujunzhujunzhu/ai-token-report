@@ -399,7 +399,9 @@ export class Reporter {
         name: this.#identity.clientName,
         userId: this.#identity.claimedUserId,
         ...(this.#identity.userName ? { userName: this.#identity.userName } : {}),
-        ...(this.#identity.dept ? { dept: this.#identity.dept } : {}),
+        // ⚠️ 只发新字段名 `group`：服务端迁移期按 `client.group ?? client.dept` 取值，
+        //   而**旧客户端**发 `dept` 由服务端兼容（规范 §5），这里不再回写旧名。
+        ...(this.#identity.group ? { group: this.#identity.group } : {}),
       },
       generatedAt: new Date().toISOString(),
       records,

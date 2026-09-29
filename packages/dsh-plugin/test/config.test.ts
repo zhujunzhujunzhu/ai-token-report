@@ -120,8 +120,8 @@ describe('非法值不让 DSH 起不来', () => {
 
 describe('身份', () => {
   test('config.user 两项齐全才生效', () => {
-    const c = resolveConfig({ user: { name: '张三', token: 'tok', dept: '研发一部' } })
-    expect(c.user).toEqual({ name: '张三', token: 'tok', dept: '研发一部' })
+    const c = resolveConfig({ user: { name: '张三', token: 'tok', group: '研发一部' } })
+    expect(c.user).toEqual({ name: '张三', token: 'tok', group: '研发一部' })
   })
 
   test('★ 半份身份（只有名字没 token）→ 视为这一级没配，回退到环境变量', () => {

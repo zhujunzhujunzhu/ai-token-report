@@ -88,7 +88,7 @@ function signIdentity(): void {
   mkdirSync(join(home, 'token-report'), { recursive: true })
   writeFileSync(
     join(home, 'token-report', 'identity.json'),
-    JSON.stringify({ name: '张三', token: 'tok-abc', dept: '研发一部', createdAt: 1, updatedAt: 1 }),
+    JSON.stringify({ name: '张三', token: 'tok-abc', group: '研发一部', createdAt: 1, updatedAt: 1 }),
     'utf8',
   )
 }

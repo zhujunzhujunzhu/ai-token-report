@@ -105,7 +105,7 @@ export interface EffectiveConfig {
     position: UiPosition
   }
   /** 固定身份（IT 统一部署场景）。留空则读本机身份文件。 */
-  user?: { name: string; token: string; dept?: string }
+  user?: { name: string; token: string; group?: string }
   /** DSH home，一般不需要手动指定。 */
   dshHome?: string
 }
@@ -176,7 +176,8 @@ export const ENV = {
   uiPosition: 'DSH_TOKEN_REPORT_UI_POSITION',
   userName: 'DSH_TOKEN_REPORT_USER_NAME',
   userToken: 'DSH_TOKEN_REPORT_USER_TOKEN',
-  dept: 'DSH_TOKEN_REPORT_DEPT',
+  // 归属维度现在叫「分组」（原 `DSH_TOKEN_REPORT_DEPT`）。
+  group: 'DSH_TOKEN_REPORT_GROUP',
 } as const
 
 /** 插件 config 的原始形状（全部可选 —— 团队下发的 YAML 里通常只写几项）。 */
@@ -205,7 +206,7 @@ export interface RawConfig {
     /** 面板落点。**字符串**而不是联合类型：YAML 里写错是常态，要能收下再回退。 */
     position?: string
   }
-  user?: { name?: string; token?: string; dept?: string }
+  user?: { name?: string; token?: string; group?: string }
   dshHome?: string
 }
 
@@ -234,7 +235,7 @@ export function resolveConfig(raw: RawConfig = {}): EffectiveConfig {
   const envUser = {
     name: envString(ENV.userName),
     token: envString(ENV.userToken),
-    dept: envString(ENV.dept),
+    group: envString(ENV.group),
   }
 
   // 身份的优先级：config.user > 环境变量。两处的必填项（name/token）必须**同时**
@@ -244,9 +245,9 @@ export function resolveConfig(raw: RawConfig = {}): EffectiveConfig {
   const cfgToken = raw.user?.token?.trim()
   const user =
     cfgName && cfgToken
-      ? { name: cfgName, token: cfgToken, ...(raw.user?.dept?.trim() ? { dept: raw.user.dept.trim() } : {}) }
+      ? { name: cfgName, token: cfgToken, ...(raw.user?.group?.trim() ? { group: raw.user.group.trim() } : {}) }
       : envUser.name && envUser.token
-        ? { name: envUser.name, token: envUser.token, ...(envUser.dept ? { dept: envUser.dept } : {}) }
+        ? { name: envUser.name, token: envUser.token, ...(envUser.group ? { group: envUser.group } : {}) }
         : undefined
 
   const outboxDir = raw.outbox?.dir?.trim() || envString(ENV.outboxDir)

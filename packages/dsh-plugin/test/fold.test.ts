@@ -18,7 +18,8 @@ const IDENTITY: FoldIdentity = {
   clientName: 'dsh-token-report',
   claimedUserId: '张三',
   userName: '张三',
-  dept: '研发一部',
+  // 分组名（原 `dept`）—— 进上报体的 `client.group`
+  group: '研发一部',
 }
 
 /**

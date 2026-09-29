@@ -43,7 +43,7 @@ const server = Bun.serve({
 
     const body = payload as {
       schemaVersion?: number
-      client?: { name?: string; userId?: string; userName?: string; dept?: string }
+      client?: { name?: string; userId?: string; userName?: string; group?: string }
       records?: Record<string, unknown>[]
     }
     const n = body.records?.length ?? 0

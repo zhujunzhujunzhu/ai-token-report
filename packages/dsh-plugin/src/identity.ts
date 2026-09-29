@@ -41,12 +41,12 @@ export interface IdentityResolverOptions {
    * 保留这条路径是为了「IT 统一部署」的场景仍然可行 ——
    * 但默认推荐让员工自己填，合规上更干净。
    */
-  configIdentity?: { name: string; token: string; dept?: string }
+  configIdentity?: { name: string; token: string; group?: string }
 }
 
 export class IdentityResolver {
   readonly #dshHome: string
-  readonly #configIdentity: { name: string; token: string; dept?: string } | undefined
+  readonly #configIdentity: { name: string; token: string; group?: string } | undefined
 
   /** 每个进程生命周期只提示一次，避免每次会话都打扰用户。 */
   #warned = false
@@ -75,7 +75,8 @@ export class IdentityResolver {
         const identity: Identity = {
           name,
           token,
-          ...(raw.dept?.trim() ? { dept: raw.dept.trim() } : {}),
+          // 归属维度现在叫「分组」（原 `dept`）；写出侧只写 `group`。
+          ...(raw.group?.trim() ? { group: raw.group.trim() } : {}),
           createdAt: 0,
           updatedAt: 0,
         }
@@ -157,7 +158,7 @@ export class IdentityResolver {
    *
    * 复用 core 的原子写入与校验，避免两套实现漂移。
    */
-  save(input: { name: string; token: string; dept?: string }): { ok: boolean; reason?: string } {
+  save(input: { name: string; token: string; group?: string }): { ok: boolean; reason?: string } {
     const r = writeIdentity(this.identityFilePath, input)
     if (!r.ok) return { ok: false, reason: r.reason }
     // 保存成功后重置提示状态，便于后续再次未署名的场景

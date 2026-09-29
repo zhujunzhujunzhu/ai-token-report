@@ -26,7 +26,8 @@ const IDENTITY: FoldIdentity = {
   clientName: 'dsh-token-report',
   claimedUserId: '张三',
   userName: '张三',
-  dept: '研发一部',
+  // 分组名（原 `dept`）—— 上报体的 `client.group`
+  group: '研发一部',
 }
 
 beforeEach(() => {
@@ -170,7 +171,8 @@ describe('★ 请求形状与凭证', () => {
       name: 'dsh-token-report',
       userId: '张三',
       userName: '张三',
-      dept: '研发一部',
+      // 上报体只发新字段名 `group`（旧客户端发 `dept` 由服务端兼容，规范 §5）
+      group: '研发一部',
     })
     expect(typeof body['generatedAt']).toBe('string')
 
