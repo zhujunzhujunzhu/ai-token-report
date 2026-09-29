@@ -37,7 +37,7 @@ const detail = computed(() => dashboard.detail)
         <TrendChart
           :labels="
             (detail.series?.points ?? []).map((p) =>
-              formatBucket(p.bucket, detail.series!.bucket),
+              formatBucket(p.bucket, detail?.series?.bucket ?? 'day'),
             )
           "
           :values="(detail.series?.points ?? []).map((p) => p.totalTokens)"
