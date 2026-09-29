@@ -52,6 +52,23 @@ export function formatFullDateTime(ms: number | null): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
+/**
+ * 两个时刻之间的相对间隔，用于展示「数据新鲜度」。
+ *
+ * ★ 基准刻意由调用方给（诊断页传**本次取数时刻**），不用 `Date.now()`：
+ *   上报时间来自服务端，浏览器时钟慢几分钟就会算出负数（「-3 分钟前」），
+ *   把一个健康的上报链路显示成未来数据。只做减法与措辞，不构成任何口径。
+ * @example formatTimeGap(earlier, later) // '3 分钟前'
+ */
+export function formatTimeGap(from: number | null, to: number | null): string {
+  if (from === null || from === 0 || to === null) return ''
+  const gap = to - from
+  if (gap < 60_000) return '刚刚'
+  if (gap < 3_600_000) return `${Math.floor(gap / 60_000)} 分钟前`
+  if (gap < 86_400_000) return `${Math.floor(gap / 3_600_000)} 小时前`
+  return `${Math.floor(gap / 86_400_000)} 天前`
+}
+
 /** `2026-09-21` —— 时间窗边界。 */
 export function formatDate(ms: number | null): string {
   if (ms === null) return '—'
