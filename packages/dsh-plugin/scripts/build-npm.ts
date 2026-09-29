@@ -200,12 +200,13 @@ const manifest = {
   // ⚠️ 一律不写 `dependencies`：`@ai-token-report/*` 已内联，
   //   写进去只会让同事装到指向未发布包的 404。
   peerDependencies: {
-    '@deepseek-ai/cordis': '^4.0.2',
-    '@deepseek-ai/dsh-session-telemetry': '^0.1.5-rc.1',
-    // ⚠️ 范围刻意收在 0.1.5 谱系：公网 `latest` 是 0.0.1-rc.1（API 不兼容的旧版），
-    //   而 `^0.1.5-rc.1` 按 semver 的预发布规则**只**匹配 0.1.5-*，天然躲开它。
-    '@deepseek-ai/dsh-agent': '^0.1.5-rc.1',
-    '@deepseek-ai/dsh-session': '^0.1.5-rc.1',
+    // DSH 的 session 格式与 telemetry API 必须和宿主严格同代。
+    // 0.1.5 的 telemetry 会嵌套一套旧 dsh-session，读取 0.1.7 日志时
+    // 会把合法的 system-prompt source 误判成缺少 plugin source。
+    '@deepseek-ai/cordis': '~4.0.4',
+    '@deepseek-ai/dsh-session-telemetry': '0.1.7-rc.2',
+    '@deepseek-ai/dsh-agent': '0.1.7-rc.2',
+    '@deepseek-ai/dsh-session': '0.1.7-rc.2',
   },
   peerDependenciesMeta: {
     '@deepseek-ai/dsh-agent': { optional: true },
