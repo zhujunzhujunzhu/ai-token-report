@@ -30,6 +30,7 @@ import { resolveDshHome } from '@ai-token-report/core'
 import type { EffectiveConfig } from './config.js'
 import { toWireRecord, type BillingRecord, type FoldIdentity } from './fold.js'
 import { Outbox, type OutboxStats } from './outbox.js'
+import type { ReportAttempt } from './report-log.js'
 
 /** 给一次编码/请求设硬边界；低于服务端 32 MiB 上限，并限制宿主的同步工作片段。 */
 export const MAX_REPORT_BODY_BYTES = 1024 * 1024
@@ -59,6 +60,45 @@ export interface ReporterStats {
   outbox: OutboxStats
 }
 
+/** 上报未启用（或已停机）时的零值统计 —— 让诊断面永远有个形状一致的对象。 */
+export function emptyReporterStats(): ReporterStats {
+  return {
+    enqueued: 0, delivered: 0, duplicates: 0, rejected: 0, queueLength: 0,
+    requests: 0, failures: 0, lastSuccessAt: 0, lastError: null,
+    outbox: { pendingBatches: 0, pendingRecords: 0, pendingBytes: 0, droppedBatches: 0 },
+  }
+}
+
+/**
+ * 把「读当前统计」包成**既能调用、又能当纯数据读**的对象。
+ *
+ * 🚨 为什么不是普通方法或 getter：cordis 的 `ctx.get(name)` 返回服务代理，
+ *   而 JS 私有字段**穿不过 Proxy** —— 任何 `this.#x` 的取值器经代理都会抛
+ *   `TypeError: Cannot access invalid private field`。这里在构造时就把
+ *   `read` 捕获进闭包，挂在**自有属性**上，于是
+ *   `backend.reporterStats.enqueued` 与 `backend.reporterStats()` 都成立。
+ *
+ * ★ 上报单元可以被**就地替换**（改地址/appKey 后重新启用），
+ *   所以这里每次都向 `read()` 要当前值，而不是构造那一刻的快照。
+ */
+export function makeReporterStatsView(read: () => ReporterStats | null): (() => ReporterStats) & ReporterStats {
+  const snapshot = (): ReporterStats => read() ?? emptyReporterStats()
+  const field = (get: () => unknown): PropertyDescriptor => ({ get, enumerable: true, configurable: false })
+  return Object.defineProperties(snapshot, {
+    // 🚨 generation 每 3 秒读 enqueued；标量 getter 不能顺带扫描整个 outbox。
+    enqueued: field(() => snapshot().enqueued),
+    delivered: field(() => snapshot().delivered),
+    duplicates: field(() => snapshot().duplicates),
+    rejected: field(() => snapshot().rejected),
+    queueLength: field(() => snapshot().queueLength),
+    requests: field(() => snapshot().requests),
+    failures: field(() => snapshot().failures),
+    lastSuccessAt: field(() => snapshot().lastSuccessAt),
+    lastError: field(() => snapshot().lastError),
+    outbox: field(() => snapshot().outbox),
+  }) as (() => ReporterStats) & ReporterStats
+}
+
 /**
  * 计数器本体。
  *
@@ -84,7 +124,19 @@ export interface ReporterOptions {
   fetchImpl?: typeof fetch
   /** 注入用，便于测试观察诊断输出。 */
   onLog?: (level: 'info' | 'warn', message: string) => void
+  /**
+   * 每次真实投递尝试的实录出口（设置页「上报调试」）。
+   *
+   * 🚨 它在投递链路上被同步调用，实现必须**不抛错、不做 IO、不做重活**。
+   *   `ReportLog.record()` 满足这三条。
+   */
+  onReport?: (attempt: Omit<ReportAttempt, 'payload' | 'truncated'> & { payload: string }) => void
 }
+
+/** 预览结果：将要发出的请求体（**不发送**）。 */
+export type ReporterPreview =
+  | { ok: true; body: string; records: number; source: 'queue' | 'outbox' }
+  | { ok: false; reason: string }
 
 /** outbox 目录：默认与身份文件同级，便于「一键清理这台机器的插件数据」。 */
 export function resolveOutboxDir(config: EffectiveConfig): string {
@@ -115,6 +167,15 @@ export class Reporter {
   readonly #outbox: Outbox | null
   /** 计数器集中在这里，便于整体读快照。 */
   readonly #stats = new StatsKeeper()
+  readonly #onReport: ((attempt: Omit<ReportAttempt, 'payload' | 'truncated'> & { payload: string }) => void) | null
+  /**
+   * 当前定时冲刷间隔。
+   *
+   * ⚠️ 与 `#config.batch.flushIntervalMillis` **分开存**：配置对象在运行期是只读的，
+   *   而用户在设置页改间隔后必须就地生效（不能要求重启 DSH）。
+   *   改这里只动定时器，不动任何投递语义。
+   */
+  #intervalMillis: number
 
   /** 内存队列：`enqueue()` 只碰它。 */
   #queue: (BillingRecord | undefined)[] = []
@@ -146,6 +207,8 @@ export class Reporter {
     this.#identity = options.identity
     this.#fetch = options.fetchImpl ?? fetch
     this.#log = options.onLog ?? (() => {})
+    this.#onReport = options.onReport ?? null
+    this.#intervalMillis = options.config.batch.flushIntervalMillis
 
     // 闭包捕获私有状态，绕开 Proxy 对私有字段的限制。
     //
@@ -197,9 +260,35 @@ export class Reporter {
     if (this.#timer !== null || this.#closed) return
     this.#timer = setInterval(() => {
       void this.flush()
-    }, this.#config.batch.flushIntervalMillis)
+    }, this.#intervalMillis)
     // 定时器不该把进程钉住：DSH 退出时我们靠 shutdown() 排空，而不是靠它续命
     this.#timer.unref?.()
+  }
+
+  /** 当前生效的定时冲刷间隔（毫秒）。 */
+  get flushIntervalMillis(): number {
+    return this.#intervalMillis
+  }
+
+  /**
+   * 就地改定时冲刷间隔（设置页保存后调用）。
+   *
+   * ★ 只换定时器，**不重建 reporter**：重建会丢掉内存队列里还没落盘的记录，
+   *   而「改个间隔」不该有任何数据代价。
+   *
+   * @param millis — 新的间隔；非法值一律忽略（保持原值），不抛错。
+   * @returns 是否真的改了。
+   */
+  setFlushInterval(millis: number): boolean {
+    if (!Number.isSafeInteger(millis) || millis <= 0) return false
+    if (millis === this.#intervalMillis) return false
+    this.#intervalMillis = millis
+    if (this.#timer !== null) {
+      clearInterval(this.#timer)
+      this.#timer = null
+      this.start()
+    }
+    return true
   }
 
   /**
@@ -221,6 +310,37 @@ export class Reporter {
   /** turn 结束提示：把手上攒的发出去，让长会话的延迟从 10s 降到「每轮」。 */
   hintFlush(): void {
     if (this.#queueLength() > 0) void this.flush()
+  }
+
+  /**
+   * 预览「下一批会发出去的请求体」。
+   *
+   * ★ **不发送、不落盘、不消耗队列** —— 这是设置页「上报调试」里
+   *   「我到底会发出什么」那一问的答案。发送动作只由 `flush()` 承担。
+   *
+   * 优先看内存队列；内存为空时看 outbox 里最旧的一批（那正是一轮失败之后
+   * 用户最想确认的东西）。两处都空才回「没有待上报的数据」。
+   */
+  preview(): ReporterPreview {
+    try {
+      if (this.#queueLength() > 0) {
+        const records = this.#memoryBatch(this.#queue.length)
+        if (records.length > 0) {
+          return { ok: true, body: JSON.stringify(this.#payload(records)), records: records.length, source: 'queue' }
+        }
+      }
+      if (this.#outbox) {
+        const batch = this.#outbox.take(1)[0]
+        if (batch) {
+          const records = this.#boundedBatch(batch.records.length, (index) => batch.records[index]!)
+          return { ok: true, body: JSON.stringify(this.#payload(records)), records: records.length, source: 'outbox' }
+        }
+      }
+      return { ok: false, reason: '当前没有待上报的数据（内存队列与 outbox 都是空的）' }
+    } catch (err) {
+      // ⚠️ 单条记录超限等情况会在这里抛错。预览失败要说出来，不能假装没事。
+      return { ok: false, reason: truncate(messageOf(err)) }
+    }
   }
 
   /**
@@ -323,7 +443,7 @@ export class Reporter {
         // 老版本可能写过一个超大的文件：按新上限逐段发，全部确认才删源文件。
         for (let offset = 0; offset < batch.records.length;) {
           const part = this.#boundedBatch(batch.records.length - offset, n => batch.records[offset + n]!)
-          if (!await this.#post(part)) { ok = false; break }
+          if (!await this.#post(part, 'outbox')) { ok = false; break }
           offset += part.length
         }
       } catch (err) {
@@ -343,18 +463,27 @@ export class Reporter {
   /**
    * 发一批记录。
    *
+   * @param records — 本批记录（线上格式）。
+   * @param source — 这批来自内存队列还是 outbox，仅用于调试实录。
    * @returns 是否成功（服务端 2xx）。
    */
-  async #post(records: Record<string, unknown>[]): Promise<boolean> {
+  async #post(records: Record<string, unknown>[], source: 'queue' | 'outbox' = 'queue'): Promise<boolean> {
     if (records.length === 0) return true
 
     const payload = this.#payload(records)
     const body = JSON.stringify(payload)
-    if (Buffer.byteLength(body) > MAX_REPORT_BODY_BYTES) throw new Error('上报请求超过批次字节上限，保留待投递记录')
+    const size = Buffer.byteLength(body)
+    if (size > MAX_REPORT_BODY_BYTES) throw new Error('上报请求超过批次字节上限，保留待投递记录')
 
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), this.#config.batch.timeoutMillis)
     this.#stats.requests += 1
+
+    // 调试实录用的局部量：只有这里知道「这一次」的原文与回执。
+    let httpStatus: number | null = null
+    let ok = false
+    let error: string | null = null
+    let counts: { accepted: number; duplicates: number; rejected: number } = { accepted: 0, duplicates: 0, rejected: 0 }
 
     try {
       const res = await this.#fetch(this.#config.endpoint, {
@@ -367,10 +496,17 @@ export class Reporter {
         body,
         signal: controller.signal,
       })
+      httpStatus = res.status
       // ★ 超时覆盖整个响应体。只等响应头就清定时器，会让半截回执永远卡住 flush。
       const raw = await res.text()
-      if (!res.ok) throw new Error(truncate(`HTTP ${res.status}${raw ? ` — ${raw}` : ''}`))
-      const counts = parseCounts(raw, records.length)
+      // ★ 503 表示上报队列过载（队列满 / 排队超时 / 正在停止），是预期信号而非故障。
+      //   带上服务端的 Retry-After 让诊断里能看出「该等多久」。失败仍返回 false，
+      //   批次仍留在 outbox 等下一轮（at-least-once）。
+      if (!res.ok) {
+        const retryAfter = res.status === 503 ? res.headers.get('retry-after') : null
+        throw new Error(truncate(`HTTP ${res.status}${retryAfter ? `（服务端建议 ${retryAfter} 秒后重试）` : ''}${raw ? ` — ${raw}` : ''}`))
+      }
+      counts = parseCounts(raw, records.length)
       if (counts.rejected > 0) {
         this.#stats.rejected += counts.rejected
         throw new Error(`服务端拒收 ${counts.rejected} 条记录，保留整批等待重试`)
@@ -379,16 +515,33 @@ export class Reporter {
       this.#stats.duplicates += counts.duplicates
       this.#stats.lastSuccessAt = Date.now()
       this.#stats.lastError = null
+      ok = true
       return true
     } catch (err) {
       this.#stats.failures += 1
-      this.#stats.lastError =
+      error =
         err instanceof Error && err.name === 'AbortError'
           ? `请求超时（${this.#config.batch.timeoutMillis}ms）`
           : truncate(messageOf(err))
+      this.#stats.lastError = error
       return false
     } finally {
       clearTimeout(timer)
+      // 🚨 只记请求体：appKey 在请求头里，**绝不允许进入这份实录**。
+      this.#recordAttempt({
+        at: Date.now(), ok, source, records: records.length, bytes: size,
+        accepted: counts.accepted, duplicates: counts.duplicates, rejected: counts.rejected,
+        httpStatus, error, payload: body,
+      })
+    }
+  }
+
+  /** 把一次尝试交给调试出口；**它出任何问题都不影响投递结果**。 */
+  #recordAttempt(attempt: Omit<ReportAttempt, 'payload' | 'truncated'> & { payload: string }): void {
+    try {
+      this.#onReport?.(attempt)
+    } catch {
+      /* 调试记录失败不能反过来把一次成功的上报判成失败 */
     }
   }
 

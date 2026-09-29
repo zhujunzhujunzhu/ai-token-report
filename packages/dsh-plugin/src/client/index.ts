@@ -23,7 +23,7 @@
  *    面板会出现但显示「宿主未提供用量数据通道（404）」。
  *    这个提示是刻意写清楚的，见 `store.ts` 的 `describeFetchFailure()`。
  *
- * ## 位置是「挂载前」决定的
+ * ## 位置来自宿主，并且可以**就地**改
  *
  * 用量面板挂在哪儿（输入框上方 / 标题栏右上角）来自宿主半的
  * `GET /api/tokenReport.config` —— **DSH 的客户端插件条目拿不到插件 config**
@@ -32,6 +32,10 @@
  *
  * ⚠️ 取配置失败 / 超时 / 旧宿主 404 一律**回退默认位置并照常挂载**：
  *   「问不到位置」绝不能让面板消失 —— 那正是本项目最难排查的一类故障。
+ *
+ * ★ 位置**只在挂载时**用到（组件本身不认识位置），所以设置页改完位置后
+ *   可以简单地把旧的挂载点退掉、按新位置重新注册一遍 —— 见 `position.ts`。
+ *   这也是为什么 `registerSurface()` 必须把 `slots.inject()` 的退订函数交上来。
  */
 
 import {
@@ -41,6 +45,7 @@ import {
   type UiPosition,
 } from './protocol.js'
 import { UsageBadge, UsageDock } from './components.js'
+import { onPositionApplied } from './position.js'
 import { createUsageStore, type UsageStore, type UsageStoreDeps } from './store.js'
 import { installStyles } from './styles.js'
 
@@ -121,6 +126,7 @@ interface SlotRegistration {
  *   `register`，必须先 `inject`。
  */
 interface SlotsLike {
+  /** @returns 退订函数（真框架里返回 disposer；老版本可能返回 undefined）。 */
   inject(name: string, callback: () => unknown): unknown
   register(options: SlotRegistration, component: unknown): () => void
 }
@@ -170,8 +176,19 @@ export async function apply(ctx: ClientContext, deps: ClientDeps = {}): Promise<
   const store = createUsageStore({ fetch: deps.fetch ?? defaultFetch() })
   const teardownStyles = installStyles()
 
+  // ★ 就地换位置用的两个句柄：已注册的挂载点、以及位置总线的退订函数。
+  //   它们都在**同一个** ctx.effect 里被回收 —— 再加一个 effect 会让
+  //   「取配置期间被卸载」那条路径多一个可能漏掉清理的点。
+  let unmounted = false
+  let registered: (() => void)[] = []
+  let unsubscribe: (() => void) | undefined
+
   if (typeof ctx.effect === 'function') {
     ctx.effect(() => () => {
+      unmounted = true
+      unsubscribe?.()
+      disposeSurfaces(registered)
+      registered = []
       // 面板卸载后不该还有定时器在解码日志
       store.dispose()
       teardownStyles()
@@ -179,14 +196,43 @@ export async function apply(ctx: ClientContext, deps: ClientDeps = {}): Promise<
   }
 
   const position = await loadPosition(ctx, deps)
+  // 取配置期间 fiber 被卸载了：什么都别再注册（否则会留下没人回收的挂载点）
+  if (unmounted) return
 
-  const surfaces = resolveSurfaces(position)
-  for (const slot of surfaces) {
+  registered = mountSurfaces(slots, position, store)
+  ctx.logger?.info?.(`token-report: 用量面板已挂载（${resolveSurfaces(position).join(' + ')}）`)
+
+  // ★ 设置页改完位置后就地换地方：不必刷新页面，更不必重启 DSH。
+  //   实现是「退掉旧的挂载点 + 按新位置重新注册」——`slots.inject()` 的
+  //   退订是幂等的，而位置只在挂载时用到（组件本身不认识位置）。
+  unsubscribe = onPositionApplied((next) => {
+    if (unmounted || next === position) return
+    disposeSurfaces(registered)
+    registered = mountSurfaces(slots, next, store)
+    ctx.logger?.info?.(`token-report: 面板位置已切换为 ${next}（${resolveSurfaces(next).join(' + ')}）`)
+  })
+}
+
+/** 按位置注册挂载点，返回退订函数组。 */
+function mountSurfaces(slots: SlotsLike, position: UiPosition, store: UsageStore): (() => void)[] {
+  const disposers: (() => void)[] = []
+  for (const slot of resolveSurfaces(position)) {
     const spec = surfaceSpec(slot)
-    registerSurface(slots, slot, spec.order, store, spec.component)
+    const dispose = registerSurface(slots, slot, spec.order, store, spec.component)
+    if (typeof dispose === 'function') disposers.push(dispose)
   }
+  return disposers
+}
 
-  ctx.logger?.info?.(`token-report: 用量面板已挂载（${surfaces.join(' + ')}）`)
+/** 退掉一组挂载点。单项抛错不影响其余项（换位置不能因为一个 slot 坏了就卡住）。 */
+function disposeSurfaces(disposers: readonly (() => void)[]): void {
+  for (const dispose of disposers) {
+    try {
+      dispose()
+    } catch {
+      // 退订失败最多留下一个多余的面板，不该把切换过程打断
+    }
+  }
 }
 
 /**
@@ -230,8 +276,10 @@ function registerSurface(
   order: number,
   store: UsageStore,
   component: unknown,
-): void {
-  slots.inject(slot, () =>
+): (() => void) | undefined {
+  // ⚠️ `slots.inject` 的返回值在这里**必须**往上交：它是这条挂载的唯一退订口，
+  //   丢掉它就意味着「换位置」只能是单向的（旧的留在原地）。
+  const injected = slots.inject(slot, () =>
     slots.register(
       {
         name: slot,
@@ -244,6 +292,7 @@ function registerSurface(
       component,
     ),
   )
+  return typeof injected === 'function' ? (injected as () => void) : undefined
 }
 
 /**

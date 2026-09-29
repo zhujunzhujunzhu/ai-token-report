@@ -39,6 +39,7 @@ import { queryUsage, type StatsContext, type UsageQuery, type UsageResult } from
 import {
   UI_CONFIG_PATH,
   UI_DEFAULT_POSITION,
+  UI_REPORTS_PATH,
   UI_STATS_PATH,
   UI_SETTINGS_PATH,
   UI_SERIES_POINTS,
@@ -347,9 +348,12 @@ function unchangedResponse(): Response {
  * 它不查库、不读文件 —— 响应就是一个常量对象，因此**不会给面板启动加任何延迟**。
  * 把位置塞进 `/api/tokenReport.stats` 是行不通的：那个载荷首次返回要等冷建库
  * （可能十几秒），面板会先在错的位置出现、再跳一下。
+ *
+ * ★ 参数是**取值函数**而不是值：用户在设置页改了位置之后，
+ *   同一个进程里再打开页面必须看到新位置（不必重启 DSH）。
  */
-export function makeConfigFetch(position: UiPosition): (request: Request) => Promise<Response> {
-  return async () => jsonResponse({ position } satisfies UiConfigPayload)
+export function makeConfigFetch(read: () => UiPosition): (request: Request) => Promise<Response> {
+  return async () => jsonResponse({ position: read() } satisfies UiConfigPayload)
 }
 
 /**
@@ -458,12 +462,21 @@ export function installUiRoute(
     ttlMs?: number
     settingsFetch?: (request: Request) => Promise<Response>
     /**
+     * 上报调试路由（`GET/POST /api/tokenReport.reports`）。
+     *
+     * 缺省不挂 —— 那条路由回答的是「发出去了什么」，
+     * 与面板取数是两件独立的事（headless 下没有它也不影响任何东西）。
+     */
+    reportsFetch?: (request: Request) => Promise<Response>
+    /**
      * 面板落点，随 `/api/tokenReport.config` 交给浏览器半。
      *
      * 缺省用 `UI_DEFAULT_POSITION` —— 与浏览器半在取不到配置时的回退值**同一个常量**，
      * 两边不会各跑各的。
+     *
+     * ★ 可以传**取值函数**：设置页改完位置后，下一次页面加载就该看到新值。
      */
-    position?: UiPosition
+    position?: UiPosition | (() => UiPosition)
     /**
      * 数据代次来源（见 `createUiStatsProvider`）。
      *
@@ -482,8 +495,14 @@ export function installUiRoute(
     ...(options.generation !== undefined ? { generation: options.generation } : {}),
   })
   const fetchStats = makeStatsFetch(provider)
-  const position = options.position ?? UI_DEFAULT_POSITION
-  const fetchConfig = makeConfigFetch(position)
+  // ⚠️ 先取到局部常量再判类型：在闭包里读 `options.position` 拿不到这个收窄，
+  //   TS 会认为它仍可能是函数（联合类型），而运行时其实不会。
+  const positionOption = options.position
+  const readPosition: () => UiPosition =
+    typeof positionOption === 'function'
+      ? positionOption
+      : () => positionOption ?? UI_DEFAULT_POSITION
+  const fetchConfig = makeConfigFetch(readPosition)
 
   // 只会真正注册一次：ctx.inject 的回调在依赖出现时机上可能被调用多次，
   // 而 webServer/connection 的路由表对重复路径是**直接抛错**的。
@@ -509,13 +528,17 @@ export function installUiRoute(
       const disposeSettings = options.settingsFetch ? connection.fetch.register({
         path: UI_SETTINGS_PATH, methods: ['GET', 'POST'], requestBody: 'buffered', fetch: options.settingsFetch,
       }) : undefined
+      const disposeReports = options.reportsFetch ? connection.fetch.register({
+        path: UI_REPORTS_PATH, methods: ['GET', 'POST'], requestBody: 'buffered', fetch: options.reportsFetch,
+      }) : undefined
       host.logger.info(
-        `token-report: UI 用量面板数据通道已挂载 → GET ${UI_STATS_PATH}（面板位置：${position}）`,
+        `token-report: UI 用量面板数据通道已挂载 → GET ${UI_STATS_PATH}（面板位置：${readPosition()}）`,
       )
       return () => {
         void dispose()
         void disposeConfig()
         void disposeSettings?.()
+        void disposeReports?.()
       }
     })
     registered = true

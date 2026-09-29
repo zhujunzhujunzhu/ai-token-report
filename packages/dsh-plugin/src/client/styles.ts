@@ -205,6 +205,52 @@ export const CSS = calendarCss.replaceAll('.rdp-', '.atr-rdp-') + `
 .atr-calendar-heading{position:sticky;top:0;z-index:2;padding-top:2px;background:var(--dsw-alias-bg-base)}
 .atr-calendar-footer{position:sticky;bottom:0;z-index:2;padding-bottom:2px;background:var(--dsw-alias-bg-base)}}
 
+/* ── 设置页：页签 / 下拉 / 上报调试 ──────────────────────────────────
+   这一块的规矩与本文件其它部分一致：只用宿主的主题变量，颜色都经语义别名取，
+   深浅两套主题下都不写死颜色。 */
+.atr-tabs{display:flex;gap:2px;padding:3px;border-radius:10px;background:var(--dsw-specific-tip,var(--dsw-alias-bg-layer-1));width:fit-content}
+.atr-tabs .atr-btn[aria-pressed="true"]{border-color:transparent;background:var(--dsw-alias-bg-base);color:var(--atr-accent);font-weight:600;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+.atr-field select{box-sizing:border-box;width:100%;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;cursor:pointer}
+.atr-field select:disabled{cursor:not-allowed;opacity:.6}
+.atr-field select:focus-visible{outline:2px solid var(--atr-accent);outline-offset:2px}
+.atr-field input:disabled{opacity:.6;cursor:not-allowed}
+
+/* 状态横幅：一眼看清「现在到底在不在上报」 */
+.atr-dbg-status{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:12px 14px;border:1px solid var(--dsw-alias-border-l1);border-radius:11px;background:var(--dsw-alias-bg-base)}
+.atr-dbg-status strong{font-size:14px}
+.atr-dbg-on{border-color:color-mix(in srgb,var(--dsw-alias-state-business-primary) 35%,transparent);background:var(--atr-soft)}
+.atr-dbg-on strong{color:var(--atr-accent)}
+.atr-dbg-off strong{color:var(--dsw-alias-state-error-primary)}
+.atr-dbg-endpoint{font-size:11.5px;color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%;font-variant-numeric:tabular-nums}
+
+.atr-dbg-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
+.atr-dbg-stat{display:flex;flex-direction:column;gap:3px;padding:11px 13px;border:1px solid var(--dsw-alias-border-l1);border-radius:11px;background:var(--dsw-alias-bg-base);min-width:0}
+.atr-dbg-stat-k{font-size:11px;color:var(--dsw-alias-label-secondary)}
+.atr-dbg-stat-v{font-size:19px;font-weight:650;letter-spacing:-.4px;font-variant-numeric:tabular-nums}
+.atr-dbg-stat-h{font-size:10.5px;color:var(--dsw-alias-label-tertiary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.atr-dbg-err{margin:0;padding:9px 12px;border-radius:9px;font-size:12px;color:var(--dsw-alias-state-error-primary);background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 10%,transparent)}
+.atr-dbg-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.atr-dbg-h3{margin:4px 0 0;font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary)}
+.atr-dbg-list{display:flex;flex-direction:column;gap:6px}
+.atr-dbg-item{border:1px solid var(--dsw-alias-border-l1);border-radius:10px;overflow:hidden;background:var(--dsw-alias-bg-base)}
+.atr-dbg-row{display:flex;align-items:center;gap:12px;width:100%;padding:10px 12px;border:0;background:transparent;color:inherit;font:inherit;font-size:12px;text-align:left;cursor:pointer}
+.atr-dbg-row:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.atr-dbg-row:focus-visible{outline:2px solid var(--atr-accent);outline-offset:-2px}
+.atr-dbg-time{font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-secondary)}
+.atr-dbg-count{font-weight:600;font-variant-numeric:tabular-nums}
+.atr-dbg-src{font-size:11px;color:var(--dsw-alias-label-tertiary)}
+.atr-dbg-bytes{font-size:11px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}
+.atr-dbg-verdict{font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px;border:1px solid transparent}
+.atr-dbg-ok{color:var(--dsw-alias-state-business-primary);background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 12%,transparent);border-color:color-mix(in srgb,var(--dsw-alias-state-business-primary) 30%,transparent)}
+.atr-dbg-bad{color:var(--dsw-alias-state-error-primary);background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 12%,transparent);border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary) 30%,transparent)}
+.atr-dbg-warn{color:var(--dsw-alias-label-primary);background:color-mix(in srgb,var(--dsw-alias-label-primary) 8%,transparent)}
+.atr-dbg-detail{display:flex;flex-direction:column;gap:8px;padding:0 12px 12px}
+.atr-dbg-detail .atr-note{margin:0}
+/* 请求体原文：等宽 + 可横向滚动，长行不折断（折断后 JSON 更难读） */
+.atr-dbg-payload{box-sizing:border-box;max-height:260px;overflow:auto;margin:0;padding:12px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-specific-tip,var(--dsw-alias-bg-layer-1));color:var(--dsw-alias-label-primary);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px;line-height:1.5;white-space:pre;tab-size:2}
+.atr-grow{flex:1 1 auto}
+@media(max-width:700px){.atr-dbg-row{gap:8px}.atr-dbg-src{display:none}.atr-dbg-stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
 `
 
 /**

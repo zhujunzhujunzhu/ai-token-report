@@ -50,24 +50,31 @@
  */
 
 import { resolvePaths } from '@ai-token-report/core'
-import { isSigned, toAssertion, type Identity } from '@ai-token-report/shared'
 import type { Context } from '@deepseek-ai/cordis'
 import { SessionTelemetryBackend, SessionTelemetryCoordinator } from '@deepseek-ai/dsh-session-telemetry'
 
 import {
   canReport,
-  claimedUserId,
   resolveConfig,
   validateConfig,
   type EffectiveConfig,
   type RawConfig,
 } from './config.js'
-import { foldRecord, type FoldIdentity } from './fold.js'
 import { IdentityResolver, type IdentityState } from './identity.js'
-import { Reporter, type ReporterStats } from './reporter.js'
-import { createHistoryBackfill } from './backfill.js'
+import type { ReporterStats } from './reporter.js'
 import type { BackfillStats } from './backfill-runner.js'
-import { createSettingsHandler, withSavedConnection } from './settings.js'
+import {
+  createSettingsHandler,
+  readConnection,
+  withSavedConnection,
+} from './settings.js'
+import { createReportsHandler } from './reports.js'
+import {
+  evaluateStatus,
+  ReportRuntime,
+  type BackendRefs,
+  type PluginStatus,
+} from './runtime.js'
 import { installUiRoute, type UiHostContext } from './ui-bridge.js'
 import type { UiRouteInstall } from './client/protocol.js'
 import { closeStatsWorker } from './stats-worker-client.js'
@@ -91,79 +98,14 @@ export const SERVICE_NAME = 'tokenReport'
 /** 插件对外暴露的配置（与 `config.ts` 的 `RawConfig` 同构）。 */
 export type Config = RawConfig
 
-/** 插件运行时状态 —— 暴露出来便于诊断。 */
-export interface PluginStatus {
-  identityReady: boolean
-  identityReason?: string
-  /** 上报是否已启用（需要「已署名」且「配了 appKey/endpoint」） */
-  reportingEnabled: boolean
-  /** 未启用上报的原因，用于给出可操作的提示 */
-  disabledReason?: string
-  /** 工具是否注册成功。 */
-  toolsRegistered: boolean
-  /** 服务是否注册成功。 */
-  serviceRegistered: boolean
-  /**
-   * UI 数据通道（`/api/tokenReport.stats`）的落点。
-   *
-   * 由**宿主能力**决定（有没有 `connection` 服务），不是配置或身份决定的，
-   * 所以不参与 `evaluateStatus()` 的判定，只在 `apply()` 里填。
-   * `undefined` 表示 `features.ui` 被关掉了。
-   */
-  uiRoute?: UiRouteInstall
-}
-
 /**
- * 决定插件是否应该启动上报。
+ * 上报与装配的判定留在 `runtime.ts`，这里只做**再导出**。
  *
- * 抽成纯函数便于测试 —— 这里的判断错了会导致
- * 「偷偷上报」（合规事故）或「永远不上报」（数据缺失）两种极端。
+ * ⚠️ 测试与文档一直从 `index.js` 取它们（`evaluateStatus` / `PluginStatus`），
+ *   所以搬家之后必须保留这条入口 —— 否则「判定逻辑只有一份」会变成
+ *   「判定逻辑有两份，其中一份是空 import」。
  */
-export function evaluateStatus(
-  identity: IdentityState,
-  config: EffectiveConfig,
-): PluginStatus {
-  const base = { toolsRegistered: false, serviceRegistered: false }
-
-  if (!config.features.reporting) {
-    return {
-      ...base,
-      identityReady: identity.ready,
-      reportingEnabled: false,
-      disabledReason: '上报已在配置中关闭（features.reporting = false）',
-    }
-  }
-
-  if (!identity.ready) {
-    return {
-      ...base,
-      identityReady: false,
-      identityReason: identity.reason,
-      reportingEnabled: false,
-      disabledReason: '尚未署名',
-    }
-  }
-
-  if (!config.appKey) {
-    return {
-      ...base,
-      identityReady: true,
-      reportingEnabled: false,
-      disabledReason: '未配置上报凭证（config.appKey）',
-    }
-  }
-
-  if (!config.endpoint) {
-    return {
-      ...base,
-      identityReady: true,
-      reportingEnabled: false,
-      disabledReason: '未配置上报地址（config.endpoint）',
-    }
-  }
-
-  return { ...base, identityReady: true, reportingEnabled: true }
-}
+export { evaluateStatus, type PluginStatus } from './runtime.js'
 
 /**
  * 组装提示文案（未启用上报时）。
@@ -227,18 +169,6 @@ export interface BackendContext {
   sessions: { list(): Iterable<unknown> }
 }
 
-/** 由生效配置与身份派生折叠身份。三处调用点共用，避免各处漏字段。 */
-function foldIdentityOf(config: EffectiveConfig, identity: Identity): FoldIdentity {
-  const assertion = toAssertion(identity)
-  return {
-    clientName: config.name,
-    // ⚠️ 服务端会忽略这个自称值，身份以 appKey 解析结果为准
-    claimedUserId: claimedUserId(config, identity),
-    userName: assertion.name,
-    ...(assertion.dept ? { dept: assertion.dept } : {}),
-  }
-}
-
 /**
  * 挂上脱敏规则。
  *
@@ -260,9 +190,13 @@ function installRedaction(ctx: BackendContext): void {
 }
 
 /**
- * 上报后端本体。
+ * 上报后端本体 —— **薄适配器**。
  *
- * `emit()` 里只有一次纯函数折叠 + 一次数组 push —— 这是本文件最重要的性质，
+ * 它只把 coordinator 的三个回调转发给运行时给的那组闭包，并暴露两个诊断入口。
+ * 「往哪发、以谁的名义、多久发一次」全都在 `ReportRuntime` 里，可以被就地替换
+ * （设置页保存后立刻生效，不必重启 DSH）。
+ *
+ * `emit()` 链路上只有一次纯函数折叠 + 一次数组 push —— 这是本类最重要的性质，
  * 任何改动都要重新确认它没有引入 IO。
  */
 export class TokenReportBackend extends SessionTelemetryBackend implements BackendPort {
@@ -277,7 +211,7 @@ export class TokenReportBackend extends SessionTelemetryBackend implements Backe
   static inject = ['sessions']
 
   /**
-   * 热路径上要用的两样东西，挂成**自有属性**而不是私有字段。
+   * 热路径与诊断入口，挂成**自有属性**而不是私有字段。
    *
    * 🚨 原因是 cordis 的 `ctx.get('sessionTelemetry')` 返回**服务代理**，
    *   而 JS 的私有字段（`#x`）穿不过 Proxy —— 任何 `emit()` 方法体里的
@@ -293,69 +227,41 @@ export class TokenReportBackend extends SessionTelemetryBackend implements Backe
   /** 历史补报独立于实时队列；自有闭包入口可安全经 cordis 代理读取。 */
   readonly backfillStats: () => BackfillStats
 
-  /** 折叠时用的身份（自有属性，同样为了穿过代理）。 */
-  readonly foldIdentity: FoldIdentity
-
   /**
-   * 热路径接收器：折叠 + 入队的闭包实现。
+   * 热路径接收器：由运行时给的闭包（折叠 + 入队到**当前**投递单元）。
    *
-   * ★ 之所以不让 `emit()` 直接访问私有字段：`emit()` 会被 cordis 通过
-   *   服务代理调用（coordinator 持有的是代理），而私有字段穿不过 Proxy。
-   *   闭包实现没有任何 `this` 依赖，因此在代理与原对象上行为完全一致 ——
+   * ★ 闭包实现没有任何 `this` 依赖，因此在代理与原对象上行为完全一致 ——
    *   并且**顺带保证了热路径不做 IO**（它只碰内存数组）。
    */
-  readonly sink: BackendSink
+  readonly sink: BackendRefs
 
   /**
    * @param ctx - DSH 的插件上下文（cordis Context）。
-   * @param options - 生效配置 + 已解析的身份。
+   * @param refs - 运行时给的闭包组（热路径 + 诊断入口）。
    *
    * ⚠️ 类型上刻意收成 `BackendContext` 而不是 cordis 的 `Context`：
    *   本文件只用到 `logger` / `effect` / `on` / `sessions` 四个能力，
    *   用宽接口能让 `apply()` 的契约一眼看清「这个插件到底依赖什么」。
    *   真实的 Context 结构上满足它，所以装配时无需任何断言。
    */
-  constructor(ctx: BackendContext, options: { config: EffectiveConfig; identity: Identity }) {
+  constructor(ctx: BackendContext, refs: BackendRefs) {
     super(ctx as Context)
 
-    this.foldIdentity = foldIdentityOf(options.config, options.identity)
-    const reporter = new Reporter({
-      config: options.config,
-      identity: this.foldIdentity,
-      onLog: (level, message) => {
-        if (level === 'warn') ctx.logger.warn(message)
-        else ctx.logger.info(message)
-      },
-    })
-
-    // 把上报器的统计入口**原样**挂成自有属性（原因见上方字段注释）
-    this.reporterStats = reporter.stats
-
-    const backfill = createHistoryBackfill({
-      config: options.config,
-      identity: this.foldIdentity,
-      sessionsRoot: resolvePaths(options.config.dshHome).sessionsRoot,
-      onLog: (level, message) => {
-        if (level === 'warn') ctx.logger.warn(message)
-        else ctx.logger.info(message)
-      },
-    })
-    this.backfillStats = backfill.stats
+    this.sink = refs
+    this.reporterStats = refs.reporterStats
+    this.backfillStats = refs.backfillStats
 
     // 装配捕获侧：本后端是热路径的唯一消费者。
     //
-    // ⚠️ 三个回调都用**闭包里的 `reporter` / `foldIdentity`**，而不是
-    //   `this.emit` / `this.#reporter` —— 因为 coordinator 拿到的是服务代理，
-    //   走 `this.#x` 会炸（见字段注释）。
-    const runner = createSink(this.foldIdentity, reporter, backfill.stop)
-    this.sink = runner
+    // ⚠️ 三个回调都用**闭包**而不是 `this.sink.x` —— 因为 coordinator 拿到的是
+    //   服务代理，走 `this.#x` 会炸（见字段注释）。
     new SessionTelemetryCoordinator(
       ctx as Context,
       {
-        emit: runner.emit,
+        emit: (record) => refs.emit(record),
         // turn 结束时提示冲刷 —— 长会话的延迟从「一个周期」降到「每轮」
-        flush: runner.flush,
-        shutdown: runner.shutdown,
+        flush: () => refs.flush(),
+        shutdown: () => refs.shutdown(),
       },
       { capture: 'live', includeHistory: true },
     )
@@ -365,18 +271,6 @@ export class TokenReportBackend extends SessionTelemetryBackend implements Backe
     //   所以即便宿主没装配规则，这里也把话题正文剥掉。
     //   放在本插件自己的 fiber 上，卸载时自动解除。
     installRedaction(ctx)
-
-    reporter.start()
-    // ★ coordinator 的 includeHistory 只回放已打开会话；磁盘全部历史由独立线程补齐。
-    // 卸载也必须停止线程，避免切换身份/上报连接后旧线程仍继续发送。
-    ctx.effect(() => {
-      backfill.start()
-      return () => { void runner.shutdown() }
-    })
-    ctx.logger.info(
-      `token-report: 已启用实时上报 → ${options.config.endpoint}` +
-        `（身份 ${options.identity.name}，插件名 ${options.config.name}）`,
-    )
   }
 
   /**
@@ -384,7 +278,7 @@ export class TokenReportBackend extends SessionTelemetryBackend implements Backe
    *
    * 这里**不能**访问 `this.#私有字段`（见上方字段注释），
    * 所以状态与实现都通过自有属性/闭包取。
-   * 实例被 cordis 代理后调用本方法时，`this` 上仍能读到这两个自有属性。
+   * 实例被 cordis 代理后调用本方法时，`this` 上仍能读到这个自有属性。
    */
   emit(record: Parameters<SessionTelemetryBackend['emit']>[0]): void {
     this.sink.emit(record)
@@ -398,38 +292,6 @@ export class TokenReportBackend extends SessionTelemetryBackend implements Backe
   /** 排空并停止。抛错只会被 coordinator 记一条 warning，不会阻断退出。 */
   async shutdown(): Promise<void> {
     await this.sink.shutdown()
-  }
-}
-
-/** 热路径接收器的形状（自有属性，穿得过 cordis 的服务代理）。 */
-interface BackendSink {
-  emit(record: Parameters<SessionTelemetryBackend['emit']>[0]): void
-  flush(): void
-  shutdown(): Promise<void>
-}
-
-/**
- * 用闭包把「折叠 + 入队」包成一组无 `this` 依赖的函数。
- *
- * ★ 抽成独立函数（而不是类的私有方法）是被真实装载逼出来的：
- *   后端实例会被 cordis 包成服务代理，私有字段与 `this` 都可能失效。
- *   闭包捕获的状态天然免疫这个问题，而且顺带让热路径的调用链更短 ——
- *   `emit` 里只有一次纯函数折叠和一次数组 push，这正是我们想要的性质。
- */
-function createSink(foldIdentity: FoldIdentity, reporter: Reporter, stopBackfill: () => Promise<void>): BackendSink {
-  return {
-    emit(record) {
-      const billing = foldRecord(record, foldIdentity)
-      // 非计费事件直接丢弃：不进队列、不落盘、不上报
-      if (billing === null) return
-      reporter.enqueue(billing)
-    },
-    flush() {
-      reporter.hintFlush()
-    },
-    async shutdown() {
-      await Promise.all([stopBackfill(), reporter.shutdown()])
-    },
   }
 }
 
@@ -521,11 +383,31 @@ export function apply(
   const statsContext = buildStatsContext(config)
   ctx.effect(() => () => { void closeStatsWorker(statsContext.dbPath) })
 
-  // ── ① 实时上报 ────────────────────────────────────────────────────
+  // ── ① 上报运行时 ──────────────────────────────────────────────────
+  //
+  // ★ 与旧实现的关键差别：上报后端不再由配置**一次性**钉死。
+  //   设置页保存完连接后调 `runtime.refresh()`，运行时就地换一个「投递单元」
+  //   （新 endpoint / 新 appKey / 新间隔），用户不必重启 DSH。
+  //   合规底线那一步仍然只在 `runtime.applyState()` 里（同一个 `evaluateStatus`）。
+  const runtime = new ReportRuntime<TokenReportBackend>(
+    {
+      logger: {
+        info: (message) => ctx.logger.info(message),
+        warn: (message) => ctx.logger.warn(message),
+      },
+      // ⚠️ 传**原始**配置而不是 merged：运行时自己每次现读磁盘上的已保存连接，
+      //   否则保存完再 refresh 会拿着旧快照覆盖新值。
+      raw: rawConfig,
+      resolver,
+      createBackend: (refs: BackendRefs) => new TokenReportBackend(ctx, refs),
+    },
+    config,
+  )
+
   let backend: TokenReportBackend | null = null
   if (status.reportingEnabled && identityState.ready) {
-    backend = new TokenReportBackend(ctx, { config, identity: identityState.identity })
-    if (backend.reporterStats.outbox.droppedBatches > 0) {
+    backend = runtime.start(config, identityState.identity)
+    if (backend !== null && backend.reporterStats.outbox.droppedBatches > 0) {
       ctx.logger.warn(
         `token-report: outbox 超过上限，已丢弃 ${backend.reporterStats.outbox.droppedBatches} 批最旧数据`,
       )
@@ -538,7 +420,7 @@ export function apply(
 
   // ── ② 统计工具 ────────────────────────────────────────────────────
   if (config.features.tools) {
-    status.toolsRegistered = registerTools(ctx, config, statsContext, backend)
+    status.toolsRegistered = registerTools(ctx, statsContext, runtime)
   }
 
   // ── ③ 统计服务 ────────────────────────────────────────────────────
@@ -553,8 +435,9 @@ export function apply(
   //   宿主没有 `connection`（headless / 非 web profile）时安静跳过。
   if (config.features.ui) {
     status.uiRoute = installUiRoute(ctx, statsContext, {
-      // ★ 位置只能这样交给页面：客户端插件条目拿不到插件 config
-      position: config.ui.position,
+      // ★ 位置只能这样交给页面：客户端插件条目拿不到插件 config。
+      //   传**取值函数** —— 设置页改完位置后，同一个进程里再打开页面就是新位置。
+      position: () => runtime.config().ui.position,
       // ★ 数据代次 = 本进程已采集的计费记录数。
       //
       //   面板上的数字来自本机日志的聚合，而「本进程又采到用量」正是它变化的主因；
@@ -562,14 +445,27 @@ export function apply(
       //   于是它可以 3 秒看一次而几乎不花钱（见 client/store.ts）。
       //
       //   ⚠️ 这里必须是**纯内存读**：探针默认 3 秒一次，任何 IO 都等于把
-      //     省下来的开销又加回去。`enqueued` 只是读一个计数器。
-      //   ⚠️ 上报未启用（未署名 / 没 appKey）时没有后端，代次恒为 0，
+      //     省下来的开销又加回去。`enqueued()` 只是读一个计数器。
+      //   ⚠️ 上报未启用（未署名 / 没 appKey）时没有投递单元，代次恒为 0，
       //      此时浏览器半退回「按兜底周期全量取数」—— 与改动前一致，
       //      不会退化成「永远不刷新」。
-      generation: () => backend?.reporterStats.enqueued ?? 0,
-      settingsFetch: createSettingsHandler(config, {
-        locked: !!rawConfig.user,
+      generation: () => runtime.enqueued(),
+      // ★ 设置页的读与写：GET 反映**当前运行状态**（保存后立刻是新值），
+      //   POST 落盘之后调 `runtime.refresh()` 让上报就地生效。
+      settingsFetch: createSettingsHandler({
+        state: () => ({
+          config: runtime.config(),
+          identity: runtime.identity(),
+          saved: readConnection(runtime.config().dshHome),
+          reporting: runtime.status(),
+          // 身份由部署配置钉死时不允许在页面上改连接：那会造出
+          // 「实名来自配置、凭证来自页面」这种自相矛盾的署名。
+          locked: !!rawConfig.user,
+        }),
+        apply: () => runtime.refresh(),
       }),
+      // ★ 上报调试面：让用户看见「到底发出去了什么」，而不只是「已启用」。
+      reportsFetch: createReportsHandler(runtime),
     })
     if (status.uiRoute === 'unavailable') {
       ctx.logger.info(
@@ -625,9 +521,8 @@ export interface ApplyContext extends BackendContext, UiHostContext {
  */
 function registerTools(
   ctx: ApplyContext,
-  config: EffectiveConfig,
   statsContext: StatsContext,
-  backend: TokenReportBackend | null,
+  runtime: ReportRuntime<TokenReportBackend>,
 ): boolean {
   try {
     ctx.reflect.provide('tokenReportTools', {
@@ -653,7 +548,9 @@ function registerTools(
         description: '查看 token 上报链路的运行状态（已入队 / 已投递 / 待投递 / 最近错误）。',
         parameters: {},
         async run(): Promise<string> {
-          return formatReporterDiagnostics(config, backend)
+          // ★ 读的是**运行时**而不是启动时那个后端实例：用户随时可以改连接，
+          //   诊断必须回答「现在」的地址与计数，否则它回的是历史。
+          return formatReporterDiagnostics(runtime)
         },
       },
     })
@@ -707,9 +604,12 @@ async function runTool(statsContext: StatsContext, raw: Record<string, unknown>)
  *   而是**静默地不上报**（凭证过期、地址改了、outbox 满）——
  *   看板上少了几个人的数据，没人会发现。
  */
-function formatReporterDiagnostics(config: EffectiveConfig, backend: TokenReportBackend | null): string {
+function formatReporterDiagnostics(runtime: ReportRuntime<TokenReportBackend>): string {
   const lines: string[] = []
   const n = (v: number): string => v.toLocaleString('en-US')
+  // ⚠️ 读**运行时当前**的配置：用户可能刚在设置页换了地址/间隔。
+  const config = runtime.config()
+  const status = runtime.status()
 
   lines.push('=== token 上报链路诊断 ===')
   lines.push(`  插件名      ${config.name}`)
@@ -717,29 +617,47 @@ function formatReporterDiagnostics(config: EffectiveConfig, backend: TokenReport
   lines.push(`  凭证        ${config.appKey ? '已配置（不回显）' : '★ 未配置 —— 上报不会启动'}`)
   lines.push(`  批量        最多 ${config.batch.maxRecords} 条 / 每 ${config.batch.flushIntervalMillis}ms`)
   lines.push(`  outbox      ${config.outbox.enabled ? config.outbox.dir ?? '默认位置' : '已关闭'}`)
+  lines.push(`  运行状态    ${status.enabled ? '上报中' : `已停止（${status.reason ?? '原因未知'}）`}`)
 
-  if (!backend) {
+  if (!status.enabled) {
     lines.push('')
     lines.push('★ 上报未启用（未署名或未配 appKey）。在完成配置之前，本插件不采集也不上报。')
+    lines.push('  在插件设置页填好「服务端地址 + appKey」即可立即启用，无需重启 DSH。')
     return lines.join('\n')
   }
 
-  const stats = backend.reporterStats()
+  const stats = runtime.stats()
   lines.push('')
   lines.push('=== 投递统计 ===')
-  lines.push(`  已采集      ${n(stats.enqueued)} 条`)
-  lines.push(`  已投递      ${n(stats.delivered)} 条（服务端判定重复 ${n(stats.duplicates)}，拒收 ${n(stats.rejected)}）`)
-  lines.push(`  内存队列    ${n(stats.queueLength)} 条`)
-  lines.push(`  磁盘待投递  ${n(stats.outbox.pendingRecords)} 条 / ${n(stats.outbox.pendingBatches)} 批`)
-  lines.push(`  请求        ${n(stats.requests)} 次（失败 ${n(stats.failures)} 次）`)
-  lines.push(`  最近成功    ${stats.lastSuccessAt ? new Date(stats.lastSuccessAt).toLocaleString() : '从未'}`)
-  if (stats.outbox.droppedBatches > 0) {
-    lines.push(`  ⚠ 因超出容量上限丢弃 ${n(stats.outbox.droppedBatches)} 批**最旧**数据`)
+  if (stats === null) {
+    lines.push('  （本进程尚未创建投递单元）')
+  } else {
+    lines.push(`  已采集      ${n(stats.enqueued)} 条`)
+    lines.push(`  已投递      ${n(stats.delivered)} 条（服务端判定重复 ${n(stats.duplicates)}，拒收 ${n(stats.rejected)}）`)
+    lines.push(`  内存队列    ${n(stats.queueLength)} 条`)
+    lines.push(`  磁盘待投递  ${n(stats.outbox.pendingRecords)} 条 / ${n(stats.outbox.pendingBatches)} 批`)
+    lines.push(`  请求        ${n(stats.requests)} 次（失败 ${n(stats.failures)} 次）`)
+    lines.push(`  最近成功    ${stats.lastSuccessAt ? new Date(stats.lastSuccessAt).toLocaleString() : '从未'}`)
+    if (stats.outbox.droppedBatches > 0) {
+      lines.push(`  ⚠ 因超出容量上限丢弃 ${n(stats.outbox.droppedBatches)} 批**最旧**数据`)
+    }
+    if (stats.lastError) {
+      lines.push(`  最近错误    ${stats.lastError}`)
+    }
+
+    // 最近一次真实投递：回答「刚刚到底发了什么、服务端怎么回的」。
+    // ⚠️ 只报条数与状态码 —— 请求体只在设置页的「上报调试」里展开，不进对话记录。
+    const last = runtime.attempts()[0]
+    if (last) {
+      const verdict = last.error ?? `HTTP ${last.httpStatus ?? '无响应'}`
+      lines.push(
+        `  最近一次    ${new Date(last.at).toLocaleString()} → ${n(last.records)} 条，` +
+          `${n(last.bytes)} 字节，${verdict}`,
+      )
+    }
   }
-  if (stats.lastError) {
-    lines.push(`  最近错误    ${stats.lastError}`)
-  }
-  const history = backend.backfillStats()
+
+  const history = runtime.backfillStats()
   const labels: Record<BackfillStats['status'], string> = {
     idle: '等待扫描', running: '正在扫描补报', complete: '本轮已全部确认', retrying: '等待重试', stopped: '已停止',
   }
@@ -848,6 +766,7 @@ export {
   UI_CONFIG_PATH,
   UI_STATS_PATH,
   UI_SETTINGS_PATH,
+  UI_REPORTS_PATH,
   UI_PERIODS,
   UI_POSITIONS,
   UI_DEFAULT_POSITION,
@@ -855,10 +774,39 @@ export {
   parseUiPosition,
   readUiConfig,
   readUiResponse,
+  readUiReporting,
+  readUiSettings,
+  readUiReports,
+  readUiReportAction,
   type UiConfigPayload,
   type UiPayload,
   type UiPeriod,
   type UiPosition,
+  type UiReportAction,
+  type UiReportActionResult,
+  type UiReportingStatus,
+  type UiReportsPayload,
   type UiRouteInstall,
+  type UiSettingsPayload,
+  type UiSettingsSavePayload,
 } from './client/protocol.js'
+export {
+  ReportRuntime,
+  foldIdentityOf,
+  unitKey,
+  type BackendRefs,
+  type ReportBackendLike,
+  type ReportingStatus,
+} from './runtime.js'
+export { ReportLog, REPORT_LOG_LIMITS, type ReportAttempt } from './report-log.js'
+export { createReportsHandler, toReportsPayload, type ReportsHost } from './reports.js'
+export {
+  createSettingsHandler,
+  readConnection,
+  parseFlushInterval,
+  MIN_FLUSH_INTERVAL_MILLIS,
+  MAX_FLUSH_INTERVAL_MILLIS,
+  type SettingsHost,
+  type SettingsState,
+} from './settings.js'
 export { isSigned } from '@ai-token-report/shared'

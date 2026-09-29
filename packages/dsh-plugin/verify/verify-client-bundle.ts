@@ -125,6 +125,8 @@ const hostExport = pkg.exports['.'] as { default: string }
 const host = (await import(join(pkgDir, hostExport.default))) as {
   UI_STATS_PATH?: string
   UI_CONFIG_PATH?: string
+  UI_SETTINGS_PATH?: string
+  UI_REPORTS_PATH?: string
   UI_DEFAULT_POSITION?: string
 }
 check('宿主半导出了 UI_STATS_PATH', typeof host.UI_STATS_PATH === 'string', String(host.UI_STATS_PATH))
@@ -140,6 +142,19 @@ check(
   typeof host.UI_CONFIG_PATH === 'string' && code.includes(JSON.stringify(host.UI_CONFIG_PATH)),
   `宿主 = ${String(host.UI_CONFIG_PATH)}`,
 )
+// ★ 配置页与调试页是 0.6.0 新加的两条路由：同样各写一个字面量，
+//   不一致的表现是「保存没反应 / 调试页永远转圈」，而不是任何报错。
+for (const [label, path] of [
+  ['保存配置', host.UI_SETTINGS_PATH],
+  ['上报调试', host.UI_REPORTS_PATH],
+] as const) {
+  check(`宿主半导出了「${label}」路由`, typeof path === 'string', String(path))
+  check(
+    `★ 浏览器半里的「${label}」路由字面量与宿主半一致（不一致 = 那一页永远 404）`,
+    typeof path === 'string' && code.includes(JSON.stringify(path)),
+    `宿主 = ${String(path)}`,
+  )
+}
 
 // ── ④ 真的执行一遍 ──────────────────────────────────────────────────────
 console.log('\n── 执行产物（假 loader + 严格 require）──')

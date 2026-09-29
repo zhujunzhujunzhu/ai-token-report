@@ -34,6 +34,23 @@ export const UI_STATS_PATH = '/api/tokenReport.stats'
 export const UI_SETTINGS_PATH = '/api/tokenReport.settings'
 
 /**
+ * 上报调试地址（宿主保留的最近若干次上报实录）。
+ *
+ * ★ 为什么要有这条：上报是**无人值守**的 —— 用户唯一能观察到的现象是
+ *   「部门看板上没有我的数」。而可能的原因有一长串（没署名、没配 appKey、
+ *   地址写错、服务端 401、outbox 积压、补报还没跑完）。这条路由把
+ *   「进程刚刚到底发了什么、服务端怎么回的」如实端到页面，
+ *   让排查从「猜」变成「看」。
+ *
+ * ⚠️ 响应里**只有请求体，没有请求头** —— appKey 走 `Authorization`，
+ *   绝不进入这份快照（否则调试页会变成凭证泄漏面）。
+ */
+export const UI_REPORTS_PATH = '/api/tokenReport.reports'
+
+/** 调试页能触发的动作。 */
+export type UiReportAction = 'flush' | 'preview'
+
+/**
  * 界面呈现配置的取数地址。
  *
  * ★ 为什么需要**单独一条**路由：DSH 的客户端插件条目**拿不到**插件的
@@ -117,6 +134,32 @@ export function validDateRange(range: UiDateRange | undefined): range is UiDateR
 
 /** 默认周期：同事打开面板时最想看的是「我今天用了多少」。 */
 export const UI_DEFAULT_PERIOD: UiPeriod = 'today'
+
+/**
+ * 面板上可选的「上报间隔」。
+ *
+ * ★ 只给几档而不是让用户填任意毫秒：这个数字直接决定**部门服务端**要承受的
+ *   请求密度，而用户无从判断「3 秒一次」意味着什么。给档位 + 文案就够了。
+ *
+ * ⚠️ 用户也能选「自定义」以外的值时，宿主仍按 1 秒~60 分钟的范围校验
+ *   （`MIN/MAX_FLUSH_INTERVAL_MILLIS`），不依赖这张表 ——
+ *   表变了不该让旧客户端发来的值突然非法。
+ */
+export const UI_FLUSH_INTERVALS = [
+  { millis: 5_000, label: '5 秒（最实时）' },
+  { millis: 10_000, label: '10 秒（推荐）' },
+  { millis: 30_000, label: '30 秒' },
+  { millis: 60_000, label: '1 分钟' },
+  { millis: 300_000, label: '5 分钟（最省流量）' },
+] as const
+
+/**
+ * 取不到宿主间隔时的回退值。
+ *
+ * ⚠️ 必须与宿主 `config.ts` 的 `DEFAULTS.batch.flushIntervalMillis` **相等**：
+ *   两边各写一份就会出现「面板显示 10 秒、实际按 30 秒发」这种没人能查的偏差。
+ */
+export const UI_DEFAULT_FLUSH_INTERVAL_MILLIS = 10_000
 
 /** 趋势图最多画多少个点（超出取最近的 N 个）。 */
 export const UI_SERIES_POINTS = 31
@@ -375,6 +418,273 @@ export function readUiResponse(value: unknown): { ok: true; payload: UiPayload }
       elapsedMs: count(raw['elapsedMs']),
       scannedAt: count(raw['scannedAt']),
       ...(typeof gen === 'number' && Number.isFinite(gen) ? { gen } : {}),
+    },
+  }
+}
+
+/**
+ * 配置页的**读取**载荷（`GET /api/tokenReport.settings`）。
+ *
+ * ⚠️ 这里永远不含 appKey 本身，只有「填过没有」（`hasAppKey`）。
+ *   GET 还回一次 appKey 就等于把凭证发进浏览器历史与缓存。
+ */
+export interface UiSettingsPayload {
+  signed: boolean
+  name: string
+  /** 分组名（原 `dept`）—— 内部分组契约，宿主半与浏览器半同版本改。 */
+  group?: string
+  baseUrl: string
+  hasAppKey: boolean
+  locked: boolean
+  /** 旧宿主字段：`true` 表示保存后必须重启 DSH。新宿主固定 `false`（就地生效）。 */
+  restartRequired: boolean
+  /** 定时冲刷间隔（毫秒）。 */
+  flushIntervalMillis: number
+  /** 面板落点（保存后无需刷新页面即切换）。 */
+  position: UiPosition
+  /** 上报此刻是否真的在跑，以及没跑的原因。 */
+  reporting: UiReportingStatus
+}
+
+/** 配置页的**保存**结果（`POST /api/tokenReport.settings`）。 */
+export interface UiSettingsSavePayload {
+  ok: boolean
+  reason?: string
+  /** 服务端认下的姓名（只可能来自服务端，绝不是客户端提交的内容）。 */
+  name?: string
+  position?: UiPosition
+  flushIntervalMillis?: number
+  reporting?: UiReportingStatus
+  restartRequired?: boolean
+}
+
+/** 上报是否在跑 + 为什么没跑。 */
+export interface UiReportingStatus {
+  enabled: boolean
+  endpoint: string
+  reason?: string
+}
+
+/** 一次真实上报尝试的实录。**只有请求体，没有请求头。** */
+export interface UiReportAttempt {
+  /** 该次请求的发起时刻（epoch 毫秒）。 */
+  at: number
+  ok: boolean
+  /** 这批记录来自内存队列还是磁盘 outbox。 */
+  source: 'queue' | 'outbox'
+  records: number
+  /** 请求体字节数（未截断前的真实大小）。 */
+  bytes: number
+  accepted: number
+  duplicates: number
+  rejected: number
+  httpStatus: number | null
+  error: string | null
+  /** 请求体原文；超过上限只留开头并置 `truncated`。 */
+  payload: string
+  truncated: boolean
+}
+
+/** 上报调试页的载荷（`GET /api/tokenReport.reports`）。 */
+export interface UiReportsPayload {
+  reporting: UiReportingStatus
+  /** 插件实例名（上报 `client.name`）。 */
+  name: string
+  flushIntervalMillis: number
+  maxRecords: number
+  timeoutMillis: number
+  outboxEnabled: boolean
+  /** 当前署名（服务端认下的那个），未署名为 `null`。 */
+  identity: { name: string; group?: string } | null
+  /** 运行计数；上报未启用时为 `null`。 */
+  stats: {
+    enqueued: number
+    delivered: number
+    duplicates: number
+    rejected: number
+    queueLength: number
+    requests: number
+    failures: number
+    lastSuccessAt: number
+    lastError: string | null
+    /** 磁盘 outbox 状态。**保持嵌套**：与宿主 `ReporterStats` 同形，少一层搬运。 */
+    outbox: {
+      pendingBatches: number
+      pendingRecords: number
+      pendingBytes: number
+      droppedBatches: number
+    }
+  } | null
+  backfill: {
+    status: string
+    filesTotal: number
+    filesProcessed: number
+    confirmed: number
+    accepted: number
+    duplicates: number
+    lastError: string | null
+  } | null
+  /** 最近若干次上报，**最新的在前**。 */
+  recent: UiReportAttempt[]
+}
+
+/** 调试页动作的响应体。 */
+export interface UiReportActionResult {
+  ok: boolean
+  reason?: string
+  /** `preview` 动作回的内容（`flush` 不回）。 */
+  preview?: { body: string; records: number; source: 'queue' | 'outbox'; bytes: number }
+}
+
+function bool(value: unknown): boolean {
+  return value === true
+}
+
+function optionalText(value: unknown): string | undefined {
+  return typeof value === 'string' && value !== '' ? value : undefined
+}
+
+/**
+ * 解析上报状态块。
+ *
+ * ★ `enabled` **只在明确为 `true` 时才认**：少一个字段必须是「未启用」。
+ *   反向缺省（把缺字段当成已上报）会让页面显示「一切正常」而数据其实没发出去。
+ */
+export function readUiReporting(value: unknown): UiReportingStatus {
+  const raw = record(value) ?? {}
+  return {
+    enabled: bool(raw['enabled']),
+    endpoint: text(raw['endpoint'], ''),
+    ...(optionalText(raw['reason']) ? { reason: text(raw['reason'], '') } : {}),
+  }
+}
+
+/** 解析配置读取载荷。任何缺字段都回退到「未署名 + 默认位置」，绝不抛错。 */
+export function readUiSettings(value: unknown): UiSettingsPayload {
+  const raw = record(value) ?? {}
+  const group = optionalText(raw['group'])
+  const interval = count(raw['flushIntervalMillis'])
+  return {
+    signed: bool(raw['signed']),
+    name: text(raw['name'], ''),
+    ...(group ? { group } : {}),
+    baseUrl: text(raw['baseUrl'], ''),
+    hasAppKey: bool(raw['hasAppKey']),
+    locked: bool(raw['locked']),
+    restartRequired: bool(raw['restartRequired']),
+    // 0 / 缺字段一律当没给：面板只在拿到正整数时才把它当间隔显示。
+    flushIntervalMillis: interval > 0 ? interval : 0,
+    position: parseUiPosition(raw['position']) ?? UI_DEFAULT_POSITION,
+    reporting: readUiReporting(raw['reporting']),
+  }
+}
+
+/** 解析一次上报实录。坏条目返回 `null`，由调用方跳过（一条坏数据不该让整页白屏）。 */
+function readUiAttempt(value: unknown): UiReportAttempt | null {
+  const raw = record(value)
+  if (raw === undefined) return null
+  const status = raw['httpStatus']
+  const source = raw['source'] === 'outbox' ? 'outbox' : 'queue'
+  return {
+    at: count(raw['at']),
+    ok: bool(raw['ok']),
+    source,
+    records: count(raw['records']),
+    bytes: count(raw['bytes']),
+    accepted: count(raw['accepted']),
+    duplicates: count(raw['duplicates']),
+    rejected: count(raw['rejected']),
+    httpStatus: typeof status === 'number' && Number.isFinite(status) ? status : null,
+    error: optionalText(raw['error']) ?? null,
+    payload: text(raw['payload'], ''),
+    truncated: bool(raw['truncated']),
+  }
+}
+
+/** 解析计数块（`stats` / `backfill`）。缺字段一律当 0，但**整块缺失时回 `null`**。 */
+function readUiStats(value: unknown): UiReportsPayload['stats'] {
+  const raw = record(value)
+  if (raw === undefined) return null
+  const outbox = record(raw['outbox']) ?? {}
+  return {
+    enqueued: count(raw['enqueued']),
+    delivered: count(raw['delivered']),
+    duplicates: count(raw['duplicates']),
+    rejected: count(raw['rejected']),
+    queueLength: count(raw['queueLength']),
+    requests: count(raw['requests']),
+    failures: count(raw['failures']),
+    lastSuccessAt: count(raw['lastSuccessAt']),
+    lastError: optionalText(raw['lastError']) ?? null,
+    outbox: {
+      pendingBatches: count(outbox['pendingBatches']),
+      pendingRecords: count(outbox['pendingRecords']),
+      pendingBytes: count(outbox['pendingBytes']),
+      droppedBatches: count(outbox['droppedBatches']),
+    },
+  }
+}
+
+function readUiBackfill(value: unknown): UiReportsPayload['backfill'] {
+  const raw = record(value)
+  if (raw === undefined) return null
+  return {
+    status: text(raw['status'], 'idle'),
+    filesTotal: count(raw['filesTotal']),
+    filesProcessed: count(raw['filesProcessed']),
+    confirmed: count(raw['confirmed']),
+    accepted: count(raw['accepted']),
+    duplicates: count(raw['duplicates']),
+    lastError: optionalText(raw['lastError']) ?? null,
+  }
+}
+
+/**
+ * 解析上报调试载荷 —— 与 `readUiResponse` 同一套「逐字段重建」的规矩。
+ *
+ * 这里**不设「缺少某字段就报错」**：调试页本身就是要看「哪一项是空的」，
+ * 一个缺字段的旧宿主响应应当渲染成「该项暂无数据」而不是整页失败。
+ */
+export function readUiReports(value: unknown): UiReportsPayload {
+  const raw = record(value) ?? {}
+  const identity = record(raw['identity'])
+  const identityName = identity === undefined ? undefined : optionalText(identity['name'])
+  const group = identity === undefined ? undefined : optionalText(identity['group'])
+  const recent: UiReportAttempt[] = []
+  for (const entry of Array.isArray(raw['recent']) ? raw['recent'] : []) {
+    const attempt = readUiAttempt(entry)
+    if (attempt !== null) recent.push(attempt)
+  }
+  const interval = count(raw['flushIntervalMillis'])
+  return {
+    reporting: readUiReporting(raw['reporting']),
+    name: text(raw['name'], 'dsh-token-report'),
+    flushIntervalMillis: interval > 0 ? interval : 0,
+    maxRecords: count(raw['maxRecords']),
+    timeoutMillis: count(raw['timeoutMillis']),
+    outboxEnabled: bool(raw['outboxEnabled']),
+    identity: identityName === undefined ? null : { name: identityName, ...(group ? { group } : {}) },
+    stats: readUiStats(raw['stats']),
+    backfill: readUiBackfill(raw['backfill']),
+    recent,
+  }
+}
+
+/** 解析调试动作结果。 */
+export function readUiReportAction(value: unknown): UiReportActionResult {
+  const raw = record(value) ?? {}
+  const preview = record(raw['preview'])
+  if (preview === undefined) {
+    return { ok: bool(raw['ok']), ...(optionalText(raw['reason']) ? { reason: text(raw['reason'], '') } : {}) }
+  }
+  return {
+    ok: bool(raw['ok']),
+    ...(optionalText(raw['reason']) ? { reason: text(raw['reason'], '') } : {}),
+    preview: {
+      body: text(preview['body'], ''),
+      records: count(preview['records']),
+      source: preview['source'] === 'outbox' ? 'outbox' : 'queue',
+      bytes: count(preview['bytes']),
     },
   }
 }

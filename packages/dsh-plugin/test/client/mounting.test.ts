@@ -17,7 +17,7 @@
  * 于是「取配置失败」是本模块最需要被钉住的分支 —— 见文件末尾那一组用例。
  */
 
-import { describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
 import {
   apply,
@@ -29,6 +29,7 @@ import {
   resolveSurfaces,
   UI_CONFIG_TIMEOUT_MS,
 } from '../../src/client/index.js'
+import { applyPosition, resetPositionBus } from '../../src/client/position.js'
 import { UI_CONFIG_PATH, UI_DEFAULT_POSITION, type UiPosition } from '../../src/client/protocol.js'
 import type { UsageStore, UsageStoreDeps } from '../../src/client/store.js'
 
@@ -41,15 +42,27 @@ interface Recorded {
   face: () => Record<string, unknown>
 }
 
-/** 假 slots 服务：记录注册，并立刻回调（模拟「slot 已声明」）。 */
-function fakeSlots(): { slots: unknown; recorded: Recorded[] } {
+/**
+ * 假 slots 服务：记录注册与**退订**，并立刻回调（模拟「slot 已声明」）。
+ *
+ * ⚠️ 退订必须被记下来：设置页改位置靠的就是「退掉旧的 + 注册新的」，
+ *   而假服务若把 disposer 丢掉，那条路径就完全测不到。
+ */
+function fakeSlots(): { slots: unknown; recorded: Recorded[]; disposals: string[] } {
   const recorded: Recorded[] = []
+  const disposals: string[] = []
   const slots = {
-    inject(_name: string, callback: () => unknown) {
+    inject(name: string, callback: () => unknown) {
       // ⚠️ 真框架里这个回调要等 slot 被**声明**之后才跑；
       //   这里立刻跑，等价于「宿主 UI 已经把 slot 声明好了」这一正常路径。
       callback()
-      return () => {}
+      let done = false
+      return () => {
+        // 退订是幂等的：重复调用只算一次
+        if (done) return
+        done = true
+        disposals.push(`inject:${name}`)
+      }
     },
     register(
       options: { name: string; id?: string; order?: number; inject?: () => Record<string, unknown> },
@@ -62,10 +75,10 @@ function fakeSlots(): { slots: unknown; recorded: Recorded[] } {
         component,
         face: options.inject ?? (() => ({})),
       })
-      return () => {}
+      return () => disposals.push(`register:${options.name}`)
     },
   }
-  return { slots, recorded }
+  return { slots, recorded, disposals }
 }
 
 /** 假配置通道：按给定位置作答，并记下被请求的地址。 */
@@ -88,19 +101,38 @@ function configFetch(
   return { fetch, urls }
 }
 
-/** 跑一次装配，返回注册结果与日志。 */
+/**
+ * 跑一次装配，返回注册结果与日志。
+ *
+ * ⚠️ 每次装配都真的注册了 `ctx.effect` 清理，并在 `afterEach` 里执行 ——
+ *   位置总线是**模块级**的，不清理就会让上一个用例的挂载点跟着下一个用例的
+ *   `applyPosition()` 一起重挂（断言会莫名其妙多出一行）。
+ */
 async function mount(
   deps: { fetch?: UsageStoreDeps['fetch']; configTimeoutMs?: number } = {},
-): Promise<{ recorded: Recorded[]; warnings: string[]; infos: string[] }> {
-  const { slots, recorded } = fakeSlots()
+): Promise<{ recorded: Recorded[]; disposals: string[]; warnings: string[]; infos: string[] }> {
+  const { slots, recorded, disposals } = fakeSlots()
   const warnings: string[] = []
   const infos: string[] = []
   await apply(
-    { slots, logger: { info: (m: string) => infos.push(m), warn: (m: string) => warnings.push(m) } } as never,
+    {
+      slots,
+      // 与真 cordis 一致：立即执行回调，并把它的返回值登记为清理函数
+      effect: (callback: () => (() => void) | void) => { activeCleanups.push(callback() as () => void) },
+      logger: { info: (m: string) => infos.push(m), warn: (m: string) => warnings.push(m) },
+    } as never,
     deps,
   )
-  return { recorded, warnings, infos }
+  return { recorded, disposals, warnings, infos }
 }
+
+/** 本用例里所有已注册的清理函数（`afterEach` 里统一执行）。 */
+const activeCleanups: (() => void)[] = []
+
+beforeEach(() => resetPositionBus())
+afterEach(() => {
+  for (const cleanup of activeCleanups.splice(0)) cleanup()
+})
 
 describe('★ slot 名字必须与 DSH 声明一致（写错是静默失效）', () => {
   test('两个字面量与 DSH 的 SlotMap 声明逐字相符', () => {
@@ -267,5 +299,58 @@ describe('★ 位置取不到 → 回退默认位置，但**面板照常挂载**
     expect(warnings.some((w) => w.includes('aborted'))).toBe(true)
     // 正常路径的上限就是导出的那个常量，别让它悄悄变成 0 或很大
     expect(UI_CONFIG_TIMEOUT_MS).toBeGreaterThan(0)
+  })
+})
+
+/**
+ * ★ 设置页改完位置后**就地**换挂载点。
+ *
+ * 这条路径失败是完全静默的：面板还在原处，用户以为「保存没生效」，
+ * 而唯一的线索是一句日志。所以三个动作都要钉住：
+ * 退掉旧的 → 注册新的 → 共用同一个 store。
+ */
+describe('★ 位置热切换（保存后不必刷新页面）', () => {
+  test('dock → header：退掉旧挂载点，注册新的，且**共用同一个 store**', async () => {
+    const { fetch } = configFetch('dock')
+    const { recorded, disposals, infos } = await mount({ fetch })
+    expect(recorded.map((r) => r.slot)).toEqual([DOCK_SLOT])
+    const store = recorded[0]?.face()['usage']
+
+    applyPosition('header')
+
+    expect(disposals).toEqual([`inject:${DOCK_SLOT}`])
+    expect(recorded.map((r) => r.slot)).toEqual([DOCK_SLOT, HEADER_SLOT])
+    expect(recorded[1]?.order).toBe(BADGE_ORDER)
+    // ★ 换位置不能顺带换 store：那会让两个面板取数翻倍（Node 宿主上是真重扫）
+    expect(recorded[1]?.face()['usage']).toBe(store as UsageStore)
+    expect(infos.some((l) => l.includes('面板位置已切换为 header'))).toBe(true)
+  })
+
+  test('dock → both：新位置需要两个挂载点', async () => {
+    const { fetch } = configFetch('dock')
+    const { recorded, disposals } = await mount({ fetch })
+    applyPosition('both')
+    expect(disposals).toEqual([`inject:${DOCK_SLOT}`])
+    expect(recorded.map((r) => r.slot)).toEqual([DOCK_SLOT, DOCK_SLOT, HEADER_SLOT])
+  })
+
+  test('广播同一个位置是空操作（不会重复注册、也不会闪一下）', async () => {
+    const { fetch } = configFetch('dock')
+    const { recorded, disposals } = await mount({ fetch })
+    applyPosition('dock')
+    expect(disposals).toEqual([])
+    expect(recorded.map((r) => r.slot)).toEqual([DOCK_SLOT])
+  })
+
+  test('★ 面板已卸载后广播：不许再注册（否则会在页面上留一个没人回收的面板）', async () => {
+    const { fetch } = configFetch('dock')
+    const { recorded, disposals } = await mount({ fetch })
+    // 执行 ctx.effect 登记的清理（等价于 fiber 被卸载）
+    for (const cleanup of activeCleanups.splice(0)) cleanup()
+
+    applyPosition('header')
+
+    expect(disposals).toEqual([`inject:${DOCK_SLOT}`])
+    expect(recorded.map((r) => r.slot)).toEqual([DOCK_SLOT])
   })
 })

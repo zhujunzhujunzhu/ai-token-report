@@ -395,15 +395,23 @@ describe('Fetch 处理器', () => {
 
 describe('配置通道（位置只能这样到页面）', () => {
   test('回的就是那个位置，且带 no-store', async () => {
-    const res = await makeConfigFetch('header')(new Request(`http://127.0.0.1${UI_CONFIG_PATH}`))
+    const res = await makeConfigFetch(() => 'header')(new Request(`http://127.0.0.1${UI_CONFIG_PATH}`))
     expect(res.status).toBe(200)
     expect(res.headers.get('cache-control')).toBe('no-store')
     expect((await res.json()) as UiConfigPayload).toEqual({ position: 'header' })
   })
 
   test('★ 载荷里只有 position：这是展示面，不是数据面', async () => {
-    const body = (await (await makeConfigFetch('both')(new Request(`http://127.0.0.1${UI_CONFIG_PATH}`))).json()) as Record<string, unknown>
+    const body = (await (await makeConfigFetch(() => 'both')(new Request(`http://127.0.0.1${UI_CONFIG_PATH}`))).json()) as Record<string, unknown>
     expect(Object.keys(body)).toEqual(['position'])
+  })
+
+  test('★ 每次请求现读：设置页改完位置后不必重启，下一拍就是新值', async () => {
+    let position: 'dock' | 'header' | 'both' = 'dock'
+    const fetch = makeConfigFetch(() => position)
+    expect(((await (await fetch(new Request('http://127.0.0.1/x'))).json()) as UiConfigPayload).position).toBe('dock')
+    position = 'both'
+    expect(((await (await fetch(new Request('http://127.0.0.1/x'))).json()) as UiConfigPayload).position).toBe('both')
   })
 })
 
