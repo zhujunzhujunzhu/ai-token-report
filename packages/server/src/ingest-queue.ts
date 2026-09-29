@@ -8,7 +8,16 @@ import type { IngestQueueStatusResponse } from '@ai-token-report/shared'
 export interface IngestQueueOptions {
   /** 包含正在处理的请求；等待者尚未读入/解析完整请求体。 */
   maxRequests?: number
-  /** 仅限制等待，不能超时取消已开始的事务并误报提交结果。 */
+  /**
+   * 排队预算：只限制**等待**，不能超时取消已开始的事务并误报提交结果。
+   *
+   * ★ 这个值必须留在客户端超时之内，且要留出后续阶段的余量 ——
+   *   任务真正耗时 = 等待 + 正文读取（最多 10 秒）+ 鉴权与提交。
+   *   客户端（CLI / 插件）默认超时 15 秒；若排队预算取满 5 秒，
+   *   最坏情况刚好撞满 15 秒，客户端先超时并保留 pending 重试，
+   *   而服务端仍在继续处理 —— 一次上报变成两次无用功，还挤占队列。
+   *   故默认 3 秒：给正文读取与提交留出确定余量。
+   */
   maxWaitMs?: number
 }
 
@@ -39,7 +48,7 @@ export class IngestQueue {
 
   constructor(options: IngestQueueOptions = {}) {
     this.maxRequests = options.maxRequests ?? 64
-    this.maxWaitMs = options.maxWaitMs ?? 5_000
+    this.maxWaitMs = options.maxWaitMs ?? 3_000
     for (const [name, value] of [['maxRequests', this.maxRequests], ['maxWaitMs', this.maxWaitMs]] as const) {
       if (!Number.isSafeInteger(value) || value < 1 || value > 2_147_483_647) throw new Error(`上报队列 ${name} 必须是正整数且不超过 2147483647`)
     }
@@ -103,6 +112,20 @@ export class IngestQueue {
     this.#active = true
     const started = Date.now()
     this.#lastWaitMs = started - job.enqueuedAt
+    // ★ 兜底：等待已耗尽预算的请求不再进入正文读取。
+    //   否则「等到第 2.9 秒轮到，再读最多 10 秒正文」必然超过客户端 15 秒超时 ——
+    //   服务端会白做一次完整解析与写事务，而客户端早已放弃并保留 pending。
+    //   在开始时（而非排队中途）放弃：此刻还没读一个字节正文，也没有打开事务。
+    if (this.#lastWaitMs > this.maxWaitMs) {
+      this.#active = false
+      this.#completed++
+      this.#rejected++
+      this.#lastCompletedAt = Date.now()
+      job.reject(new IngestQueueUnavailable('上报排队超时，请稍后重试'))
+      this.#schedule()
+      this.#finishDrain()
+      return
+    }
     try { await job.work(); job.resolve() }
     catch (error) { job.reject(error) }
     finally {

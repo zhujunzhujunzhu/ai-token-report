@@ -65,6 +65,23 @@ describe('上报有界异步队列', () => {
       expect(() => new IngestQueue({ maxWaitMs: value })).toThrow()
     }
   })
+
+  test('超时后才轮到的任务不执行，避免再叠加正文读取而撞客户端超时', async () => {
+    const queue = new IngestQueue({ maxWaitMs: 20 })
+    const gate = deferred(), started = deferred()
+    // 先占住消费者，让第二个任务的等待时间必然超过 20ms 预算。
+    const blocker = queue.run(async () => { started.resolve(); await gate.promise })
+    await started.promise
+    let ran = false
+    const late = queue.run(async () => { ran = true })
+    await expect(late).rejects.toThrow('排队超时')
+    // 释放消费者后，已放弃的迟到任务不会被补执行。
+    gate.resolve()
+    await blocker
+    await queue.close()
+    expect(ran).toBe(false)
+    expect(queue.snapshot()).toMatchObject({ active_requests: 0, waiting_requests: 0, rejected_requests: 1 })
+  })
 })
 
 const fixtures: { root: string; bundle: HandlerBundle }[] = []

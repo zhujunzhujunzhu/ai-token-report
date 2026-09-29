@@ -118,7 +118,8 @@ ai-token-report 部门服务端
 
 上报队列:
   ATR_INGEST_MAX_REQUESTS  同时接收的上报请求数（含执行中，默认 64）。
-  ATR_INGEST_MAX_WAIT_MS   最长排队时间（毫秒，默认 5000）。
+  ATR_INGEST_MAX_WAIT_MS   最长排队时间（毫秒，默认 3000）。
+  排队预算须留在客户端 15 秒超时之内：真正耗时 = 等待 + 正文读取（最多 10 秒）+ 提交。
   队列满/等待超时返回 503 + Retry-After；事务提交后才返回成功。
   正文读取最多 10 秒、32 MiB，分别以 408/413 拒绝超限请求。
   管理员可通过 GET /api/v1/admin/ingest-status 查看当前实例的队列状态。
