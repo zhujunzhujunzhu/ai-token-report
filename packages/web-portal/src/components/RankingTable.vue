@@ -1,10 +1,16 @@
 <script setup lang="ts">
-/** 人员排行保留未归属行；条形宽度只用于排版，所有展示数值来自接口。 */
+/**
+ * 人员排行保留未归属行；条形宽度只用于排版，所有展示数值来自接口。
+ *
+ * ★ 人员维度每行还带**当前所属分组**（`row.group_names`，多对多）：
+ *   同一个名字可能属于不同分组，分组标签是分辨他们的第一手信息；
+ *   未分组的人显式标「未分组」—— 那一部分正是「各分组之和不等于总量」的差额。
+ */
 import { ElButton, ElTable, ElTableColumn, ElTag } from 'element-plus'
 import { computed } from 'vue'
 import type { BreakdownRow } from '@ai-token-report/shared'
 import { formatCount, formatPercent } from '../utils/format.js'
-import { identityLabel, isUnattributed } from '../types/portal.js'
+import { isUnattributed, userLabel } from '../types/portal.js'
 const props = defineProps<{ rows: BreakdownRow[] }>()
 defineEmits<{ select: [userId: string] }>()
 const maxTotal = computed(() =>
@@ -26,14 +32,28 @@ const maxTotal = computed(() =>
         }}</span></template
       ></el-table-column
     >
-    <el-table-column label="成员" min-width="150"
+    <el-table-column label="成员" min-width="200"
       ><template #default="{ row }"
         ><el-button
           link
           :type="isUnattributed(row.key) ? 'warning' : 'primary'"
           @click.stop="$emit('select', row.key)"
-          >{{ identityLabel(row) }}</el-button
-        ></template
+          >{{ row.label ?? userLabel(row.key) }}</el-button
+        ><el-tag
+          v-for="name in row.group_names ?? []"
+          :key="name"
+          size="small"
+          type="info"
+          effect="plain"
+          class="member-group-tag"
+          >{{ name }}</el-tag
+        ><small
+          v-if="row.member_id && !row.group_names?.length"
+          class="muted member-group-tag"
+          >未分组</small
+        ><br v-if="row.member_id" /><small v-if="row.member_id" class="muted">{{
+          row.member_id.slice(0, 8)
+        }}</small></template
       ></el-table-column
     >
     <el-table-column label="计费总量" min-width="155" align="right"

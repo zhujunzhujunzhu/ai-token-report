@@ -9,10 +9,12 @@ import type {
   OverviewResponse,
   RecordRow,
   SeriesResponse,
+  StatsGroupOption,
 } from '@ai-token-report/shared'
 import {
   fetchBreakdown,
   fetchDiagnostics,
+  fetchGroupOptions,
   fetchOverview,
   fetchRecords,
   fetchSeries,
@@ -27,6 +29,13 @@ export interface DashboardFilters {
   provider: string
   model: string
   users: string[]
+  /**
+   * 分组筛选（`group_id`，多选 = OR）。
+   *
+   * ⚠️ 与 `users` 是**两个独立维度**：人员筛的是「哪个人」，分组筛的是
+   *   「归属该分组的人」，两者同时给出时服务端按 AND 叠加。
+   */
+  groups: string[]
   customFrom: string
   customTo: string
 }
@@ -43,6 +52,7 @@ const initialFilters = (): DashboardFilters => ({
   provider: '',
   model: '',
   users: [],
+  groups: [],
   customFrom: '',
   customTo: '',
 })
@@ -56,6 +66,8 @@ export function buildFilter(input: DashboardFilters): {
   const filter: PortalFilter = {
     provider: input.provider.trim(),
     model: input.model.trim(),
+    // 分组是多选 OR（见 PortalFilter.groups）：这里只做去重，不改变语义。
+    groups: [...new Set(input.groups)],
   }
   if (input.period === CUSTOM_PERIOD) {
     const from = input.customFrom ? new Date(input.customFrom).getTime() : NaN
@@ -81,7 +93,22 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
   const overview = ref<OverviewResponse | null>(null)
   const series = ref<SeriesResponse | null>(null)
   const ranking = ref<BreakdownRow[]>([])
+  /**
+   * 分组排行（`breakdown?by=group`）。
+   *
+   * ★ 与人员排行榜并列而不是替换它：多对多下一条用量会同时计入所属的每个分组，
+   *   所以「各分组之和 > 总量」是定义；两个榜回答的是不同问题。
+   */
+  const groupRanking = ref<BreakdownRow[]>([])
   const userOptions = ref<BreakdownRow[]>([])
+  /**
+   * 分组候选项，来自看板接口 `GET /api/v1/stats/groups`（`stats:read`）。
+   *
+   * ⚠️ 刻意不用管理接口 `/api/v1/admin/groups`：那是 `groups:read`，
+   *   而看板使用者不一定有管理目录的权限。也刻意**不带筛选**，
+   *   否则选中一个分组后下拉会塌缩成一项（自锁定）。
+   */
+  const groupOptions = ref<StatsGroupOption[]>([])
   const breakdown = ref<BreakdownResponse | null>(null)
   const diagnostics = ref<DiagnosticsResponse | null>(null)
   const records = ref<RecordRow[]>([])
@@ -102,7 +129,8 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
       !!(
         filters.value.provider ||
         filters.value.model ||
-        filters.value.users.length
+        filters.value.users.length ||
+        filters.value.groups.length
       ),
   )
   let requestSeq = 0
@@ -115,6 +143,7 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     overview.value = null
     series.value = null
     ranking.value = []
+    groupRanking.value = []
     breakdown.value = null
     diagnostics.value = null
     records.value = []
@@ -169,16 +198,23 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     error.value = null
     // 候选始终不带人员筛选；全员排行可复用同一请求，避免每轮重复聚合。
     const candidates = fetchBreakdown(built.filter, 'user')
-    const [ov, opts, se, rank, bd, rec, diag] = await Promise.all([
+    // ★ 分组候选同样不能带筛选（含分组筛选本身）：从已筛选结果里取候选，
+    //   选中一个分组之后下拉会塌缩成一个选项，使用者再也加不回别的分组。
+    const groupCandidates = fetchGroupOptions()
+    const [ov, opts, gopts, se, rank, groupRank, bd, rec, diag] = await Promise.all([
       fetchOverview(filter),
       // ★ 候选不能带人员筛选，否则选择一个人后再也选不到其他人。
       candidates,
+      groupCandidates,
       active === 'overview' || active === 'analysis'
         ? fetchSeries(filter, granularity.value)
         : null,
       active === 'overview'
         ? filter.users.length ? fetchBreakdown(filter, 'user') : candidates
         : null,
+      // ★ 分组排行按**当前筛选**取（含分组筛选本身）：「只看这两个分组时各占多少」
+      //   正是使用者下一步要问的问题。数值全部来自服务端，前端不做任何换算。
+      active === 'overview' ? fetchBreakdown(filter, 'group') : null,
       active === 'analysis'
         ? breakdownBy.value === 'user' && !filter.users.length
           ? candidates
@@ -195,7 +231,7 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     if (seq !== requestSeq || generation !== session.generation) return
     pending = false
     loading.value = false
-    const failures = [ov, opts, se, rank, bd, rec, diag].filter(
+    const failures = [ov, opts, gopts, se, rank, groupRank, bd, rec, diag].filter(
       (r) => r && !r.ok,
     )
     const failure =
@@ -206,8 +242,10 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     }
     if (ov.ok) overview.value = ov.data
     if (opts.ok) userOptions.value = opts.data.rows
+    if (gopts.ok) groupOptions.value = gopts.data.groups ?? []
     if (se?.ok) series.value = se.data
     if (rank?.ok) ranking.value = rank.data.rows
+    if (groupRank?.ok) groupRanking.value = groupRank.data.rows
     if (bd?.ok) breakdown.value = bd.data
     if (rec?.ok) {
       records.value = rec.data.rows
@@ -223,7 +261,7 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     const built = buildFilter(next)
     rangeError.value = built.error
     if (built.error) return false
-    filters.value = { ...next, users: [...next.users] }
+    filters.value = { ...next, users: [...next.users], groups: [...next.groups] }
     page.value = 1
     await load()
     return true
@@ -301,6 +339,7 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
       loading.value = false
       clearData()
       userOptions.value = []
+      groupOptions.value = []
       filters.value = initialFilters()
       page.value = 1
       breakdownBy.value = 'provider-model'
@@ -318,7 +357,9 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     overview,
     series,
     ranking,
+    groupRanking,
     userOptions,
+    groupOptions,
     breakdown,
     diagnostics,
     records,

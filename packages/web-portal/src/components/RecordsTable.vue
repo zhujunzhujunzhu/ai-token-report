@@ -7,17 +7,25 @@ import {
   ElTable,
   ElTableColumn,
 } from 'element-plus'
-import type { RecordRow } from '@ai-token-report/shared'
+import type { RecordRow, StatsGroupOption } from '@ai-token-report/shared'
 import { formatCount, formatDateTime } from '../utils/format.js'
-import { userLabel } from '../types/portal.js'
+import { recordGroupNames, userLabel } from '../types/portal.js'
 defineProps<{
   rows: RecordRow[]
   total: number
   page: number
   pageSize: number
   loading?: boolean
+  /** 分组候选目录（看板接口给的），把 `group_ids` 翻成名字供人读。 */
+  groups: StatsGroupOption[]
 }>()
 defineEmits<{ page: [value: number] }>()
+/**
+ * 表格插槽给的 `row` 是 Element Plus 自己的 `DefaultRow`（`Record<PropertyKey, any>`），
+ * 不是本页的契约类型，而模板里做不了类型断言 —— 所以入口收 `unknown`、
+ * 在这里收窄一次。行的真实形状由 `/api/v1/stats/records` 决定。
+ */
+const rowRecord = (row: unknown): RecordRow => row as RecordRow
 </script>
 <template>
   <el-table
@@ -58,6 +66,17 @@ defineEmits<{ page: [value: number] }>()
     <el-table-column label="署名" min-width="105"
       ><template #default="{ row }">{{
         row.user_name_snapshot ?? userLabel(row.userId)
+      }}</template></el-table-column
+    >
+    <!--
+      当前分组与「上报时分组」（展开区）**不是一回事**：
+      这一列由 `group_ids`（关联表）经分组候选目录翻名，是**此刻**的归属；
+      展开区的 `group_name_snapshot` 只是上报当时客户端自己填的文本快照。
+      多对多下这里可能列出多个分组；没有归属时显式写「未分组」。
+    -->
+    <el-table-column label="当前分组" min-width="140"
+      ><template #default="{ row }">{{
+        recordGroupNames(rowRecord(row), groups)
       }}</template></el-table-column
     >
     <el-table-column

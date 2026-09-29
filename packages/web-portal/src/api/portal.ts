@@ -1,7 +1,7 @@
 /**
  * 部门看板 API 客户端。
  *
- * ★ 五个接口全部对应 `shared/src/protocol.ts` 里的类型，两端共用契约：
+ * ★ 这里的接口全部对应 `shared/src/protocol.ts` 里的类型，两端共用契约：
  *   字段对不上时 `bun run typecheck` 直接编译失败，而不是等页面上
  *   看到空图表。
  *
@@ -19,6 +19,7 @@ import type {
   OverviewResponse,
   RecordsResponse,
   SeriesResponse,
+  StatsGroupsResponse,
 } from '@ai-token-report/shared'
 
 import { request, type ApiResult } from './request.js'
@@ -49,6 +50,15 @@ export interface PortalFilter {
   model?: string
   /** 服务端返回的不透明归属键：人员 UUID / legacy:… / unknown。 */
   users?: string[]
+  /**
+   * 分组筛选：稳定 `group_id` 列表（多选 = OR）。
+   *
+   * ★ 与 `users` 是**两个独立参数**（`member_id` 与 `group_id` 同时出现时服务端按 AND 叠加），
+   *   且语义不同：人员是精确匹配某个人，分组是把「归属该分组的人」的事件整体取出来。
+   * ⚠️ 多对多下多选是 OR / 展开：同一条事件会同时计入它的人员所属的每个分组，
+   *   所以两个分组筛出来的合计大于全量合计是**定义**，不是重复计数。
+   */
+  groups?: string[]
 }
 
 /** 把筛选条件拼成查询串（省略空值，避免发出 `?provider=` 这种噪声）。 */
@@ -64,7 +74,21 @@ function toQuery(filter: PortalFilter): string {
     if (key === 'unknown') params.set('unattributed', 'true')
     else params.append(key.startsWith('legacy:') ? 'legacy_user' : 'member_id', key)
   }
+  // 分组是多选：同一参数重复出现，服务端按 OR 展开（协议里的 `group_id?: string[]`）。
+  for (const groupId of new Set(filter.groups ?? [])) params.append('group_id', groupId)
   return params.toString()
+}
+
+/**
+ * 分组候选项（`GET /api/v1/stats/groups`）。
+ *
+ * ★ 刻意走**看板接口**而不是管理接口 `/api/v1/admin/groups`：筛选栏与分组排行
+ *   只需要知道「有哪些分组」，而能看数据的人不一定有 `groups:read`。
+ * ⚠️ 它不接受筛选参数：候选必须始终是**完整的分组集合**，否则选中一个分组后
+ *   下拉会塌缩成一项（自锁定），使用者再也加不回别的分组。
+ */
+export function fetchGroupOptions(): Promise<ApiResult<StatsGroupsResponse>> {
+  return request<StatsGroupsResponse>('/api/v1/stats/groups')
 }
 
 /** 顶部指标卡片。 */

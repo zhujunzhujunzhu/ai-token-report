@@ -7,7 +7,13 @@
  *   与后端完全对不上，接上真数据后就是一片空图表 —— 不再重演。
  */
 
-import { UNATTRIBUTED_USER, type GroupBy, type BreakdownRow } from '@ai-token-report/shared'
+import {
+  UNATTRIBUTED_USER,
+  type BreakdownRow,
+  type GroupBy,
+  type RecordRow,
+  type StatsGroupOption,
+} from '@ai-token-report/shared'
 
 /** 时间窗选项（value 是服务端认识的具名周期）。 */
 export interface TimeRangeOption {
@@ -59,7 +65,14 @@ export const TIME_RANGES: TimeRangeOption[] = [
   { value: CUSTOM_PERIOD, label: '自定义区间…' },
 ]
 
-/** 分布页签（人员排行单独一栏，见 `RankingTable`）。 */
+/**
+ * 分布页签（人员排行单独一栏，见 `RankingTable`）。
+ *
+ * ⚠️ 这里**没有** `group` / `user`：多对多下的分组维度是「展开」语义
+ *   （一条事件计入所属的每个分组），和这些等值维度的表放同一组页签里，
+ *   会让人以为它们可以相加。分组排行在总览里单独成块并附口径说明，
+ *   `GroupBy` 里的 `'group'`（协议已定义）由那里使用。
+ */
 export const BREAKDOWN_TABS: { value: GroupBy; label: string }[] = [
   { value: 'provider-model', label: '厂商 / 模型' },
   { value: 'model', label: '模型' },
@@ -105,6 +118,25 @@ export function bucketFor(period: string, spanMs?: number): 'day' | 'hour' {
 }
 
 /**
+ * 时间范围下拉变更后是否可以立即查询。
+ *
+ * ★ 两个下拉（时间范围 / 人员）是离散选择，**选中即筛**，不必再点「查询」；
+ *   厂商 / 模型是子串输入，逐字符查询没有意义，仍由按钮或回车提交。
+ *
+ * ⚠️ 自定义区间例外：切过去的那一瞬间两个输入框必然是空的，
+ *   此时查询只会换来一句「请选择开始与结束时间」（`buildFilter` 的错误，
+ *   且发出去还会因 `period=custom` 不是服务端认识的周期而 400）。
+ *   必须等起止时间都填齐再自动生效。
+ */
+export function periodReadyForQuery(
+  period: string,
+  from: string,
+  to: string,
+): boolean {
+  return period !== CUSTOM_PERIOD || (!!from && !!to)
+}
+
+/**
  * 归属键的展示文案。
  *
  * `unknown` 是协议里的未归属键（`UNATTRIBUTED_USER`），直接显示成
@@ -114,10 +146,48 @@ export function userLabel(key: string): string {
   return key === UNATTRIBUTED_USER ? '未署名' : key
 }
 
-/** 同名人员用部门与短 ID 辅助区分；旧响应仍可显示旧人名。 */
+/** 同名人员用分组与短 ID 辅助区分；旧响应仍可显示旧人名。 */
 export function identityLabel(row: BreakdownRow): string {
   const name = row.label ?? userLabel(row.key)
-  return row.member_id ? `${name} · ${row.department_name ? row.department_name + ' · ' : ''}${row.member_id.slice(0, 8)}` : name
+  const groups = groupNamesLabel(row.group_names)
+  return row.member_id ? `${name} · ${groups ? groups + ' · ' : ''}${row.member_id.slice(0, 8)}` : name
+}
+
+/**
+ * 分组名列表的展示文案（多对多用「、」拼接）。
+ *
+ * ⚠️ 空数组是**有意义的状态**（这个人未分组），不是「没加载出来」：
+ *   所以调用方要用 `|| '未分组'` 兜底，而不是把它当成缺失数据。
+ */
+export function groupNamesLabel(names: string[] | readonly string[] | undefined): string {
+  return (names ?? []).join('、')
+}
+
+/**
+ * 分组排行一行的显示名。
+ *
+ * ★ `by=group` 的行里 `key` 是**稳定 `group_id`**（归属的权威标识），
+ *   而候选目录来自 `GET /api/v1/stats/groups` —— 用候选把 ID 翻成名字，
+ *   页面不自己拼字符串、也不改任何数字。翻不到时保留原始 ID，
+ *   宁可让人看见一个 UUID，也不要把行显示成空白。
+ */
+export function groupLabelOf(row: BreakdownRow, groups: readonly StatsGroupOption[]): string {
+  if (row.label) return row.label
+  return groups.find((group) => group.group_id === row.key)?.name ?? row.key
+}
+
+/**
+ * 明细行里「该人员当前所属分组」的展示文案。
+ *
+ * ⚠️ 与 `row.group_name_snapshot`（上报当时的文本快照）是两件事：
+ *   这里展示的是**当前**归属（`group_ids` 经候选目录翻译），
+ *   快照只说明上报那一刻客户端自己填了什么。
+ */
+export function recordGroupNames(row: RecordRow, groups: readonly StatsGroupOption[]): string {
+  const names = (row.group_ids ?? []).map(
+    (id) => groups.find((group) => group.group_id === id)?.name ?? '未知分组',
+  )
+  return names.join('、') || '未分组'
 }
 
 /** 未归属行的展示标记（用于给那一行加醒目的底色）。 */

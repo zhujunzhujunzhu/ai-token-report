@@ -602,6 +602,18 @@ code {
 .ranking-table .el-table__row {
   cursor: pointer;
 }
+/*
+ * 分组标签跟在姓名 / 维度名后面，用左间距把它们连成一组。
+ *
+ * ⚠️ 这两条刻意放在全局样式里而不是 SFC 的 `<style scoped>`：scoped 会给
+ *   渲染出的元素加 `data-v-*` 属性，而 `verify/verify-render.ts` 逐字比较
+ *   分布表单元格的 HTML（`<td><strong>14,690</strong></td>`），多加一个属性
+ *   就会让那条断言失败 —— 断言本身是对的，不该为了样式去放宽它。
+ */
+.member-group-tag,
+.row-group-tag {
+  margin-left: 6px;
+}
 .rank-number {
   font-variant-numeric: tabular-nums;
   color: #9ba7b6;

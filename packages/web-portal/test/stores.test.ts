@@ -154,12 +154,23 @@ describe('统计状态', () => {
     })
     const dashboard = useDashboardStore()
     await dashboard.activate('overview')
-    expect(urls).toHaveLength(3)
-    expect(urls.filter((url) => url.pathname.endsWith('breakdown'))).toHaveLength(1)
+    // 总览一轮 5 个请求：指标、人员候选、分组候选、趋势、分组排行。
+    // ★ 分组候选走看板接口 `/api/v1/stats/groups`（`stats:read`），
+    //   不是管理接口 `/api/v1/admin/groups`（那是 `groups:read`）。
+    expect(urls).toHaveLength(5)
+    expect(urls.filter((url) => url.pathname.endsWith('/api/v1/stats/groups'))).toHaveLength(1)
+    const by = (url: URL, value: string) =>
+      url.pathname.endsWith('breakdown') && url.searchParams.get('by') === value
+    // ★ 全员排行复用候选请求：`by=user` 只发一次；另一次是分组排行 `by=group`。
+    expect(urls.filter((url) => by(url, 'user'))).toHaveLength(1)
+    expect(urls.filter((url) => by(url, 'group'))).toHaveLength(1)
     expect(dashboard.ranking).toEqual(dashboard.userOptions)
     urls.length = 0
     await dashboard.applyFilters({ ...dashboard.filters, users: ['selected'] })
-    expect(urls.filter((url) => url.pathname.endsWith('breakdown'))).toHaveLength(2)
+    // 筛人后 `by=user` 变成两次（不带筛选的候选 + 带筛选的排行），
+    // 分组排行仍是一次 —— 两个维度各自取数，互不吞掉对方的候选。
+    expect(urls.filter((url) => by(url, 'user'))).toHaveLength(2)
+    expect(urls.filter((url) => by(url, 'group'))).toHaveLength(1)
     expect(dashboard.ranking.map((row) => row.key)).toEqual(['selected'])
     expect(dashboard.userOptions.map((row) => row.key)).toEqual(['selected', 'other'])
   })
@@ -242,18 +253,28 @@ describe('统计状态', () => {
     await dashboard.activate('records')
     await dashboard.applyFilters({ ...dashboard.filters, users: ['00000000-0000-4000-8000-000000000003'] })
     await dashboard.setPage(2)
-    const last = urls.slice(-3)
+    // 一轮请求的实际发出顺序是「候选 → 分组候选 → 指标 → 本页数据」，
+    // 所以取末尾 4 条来覆盖这一轮（多了分组候选这一条）。
+    const last = urls.slice(-4)
     expect(
       last
         .find((u) => u.pathname.endsWith('breakdown'))
         ?.searchParams.has('member_id'),
     ).toBe(false)
+    // ★ 分组候选必须始终是完整集合：带上筛选就会让下拉在选中后塌缩成一项。
+    expect(urls.find((u) => u.pathname.endsWith('/api/v1/stats/groups'))?.searchParams.size).toBe(0)
     expect(
       last
         .find((u) => u.pathname.endsWith('records'))
         ?.searchParams.get('member_id'),
     ).toBe('00000000-0000-4000-8000-000000000003')
-    expect(urls.every((u) => u.searchParams.get('identity_view') === 'member')).toBe(true)
+    expect(
+      // 分组候选是唯一**完全不带查询参数**的请求：它只回答「有哪些分组」，
+      // 一旦带上筛选就会自锁定，所以把它排除在「都带 identity_view」之外。
+      urls
+        .filter((u) => !u.pathname.endsWith('/api/v1/stats/groups'))
+        .every((u) => u.searchParams.get('identity_view') === 'member'),
+    ).toBe(true)
     expect(urls.every((u) => !u.searchParams.has('user'))).toBe(true)
     expect(
       last

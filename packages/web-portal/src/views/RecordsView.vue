@@ -21,6 +21,7 @@ const dashboard = useDashboardStore()
       :page="dashboard.page"
       :page-size="PAGE_SIZE"
       :loading="dashboard.loading"
+      :groups="dashboard.groupOptions"
       @page="dashboard.setPage"
   /></el-card>
 </template>
