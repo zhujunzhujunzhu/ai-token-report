@@ -25,8 +25,11 @@ import {
   parseAdminUpdateBody,
   parseIngestEnvelope,
   parsePortalBody,
+  portalCreateRoleSchema,
   portalIssueAppKeySchema,
   portalIssueTokenSchema,
+  portalRoleStatusSchema,
+  portalUpdateRoleSchema,
   type ShapeResult,
 } from '../src/schemas.js'
 
@@ -211,17 +214,17 @@ describe('ingestRecordSchema（单行：失败只计入 rejected）', () => {
 // ─────────────────────────────────────────────────────────────
 describe('parseAdminIssueBody（签发）', () => {
   test('合法请求体通过，未声明的键被丢掉', () => {
-    const r = parseAdminIssueBody({ name: '张三', dept: '研发一部', role: 'admin', extra: 1 })
+    const r = parseAdminIssueBody({ name: '张三', group: '研发一部', role: 'admin', extra: 1 })
     expect(r.ok).toBe(true)
     if (!r.ok) return
-    expect(r.value).toEqual({ name: '张三', dept: '研发一部', role: 'admin' })
+    expect(r.value).toEqual({ name: '张三', group: '研发一部', role: 'admin' })
   })
 
-  test('dept / role 是可选的', () => {
+  test('group / role 是可选的', () => {
     const r = parseAdminIssueBody({ name: '张三' })
     expect(r.ok).toBe(true)
     if (!r.ok) return
-    expect(r.value.dept).toBeUndefined()
+    expect(r.value.group).toBeUndefined()
     expect(r.value.role).toBeUndefined()
   })
 
@@ -237,15 +240,15 @@ describe('parseAdminIssueBody（签发）', () => {
     expect(reasonOf(parseAdminIssueBody({ name: null }))).toBe('缺少 name（要发放 token 的姓名）')
   })
 
-  test('dept / role 非字符串 → 各自那句文案', () => {
-    expect(reasonOf(parseAdminIssueBody({ name: 'a', dept: 1 }))).toBe('dept 需要是字符串')
+  test('group / role 非字符串 → 各自那句文案', () => {
+    expect(reasonOf(parseAdminIssueBody({ name: 'a', group: 1 }))).toBe('group 需要是字符串')
     expect(reasonOf(parseAdminIssueBody({ name: 'a', role: 1 }))).toBe('role 需要是字符串')
-    expect(reasonOf(parseAdminIssueBody({ name: 'a', dept: 'x', role: {} }))).toBe('role 需要是字符串')
+    expect(reasonOf(parseAdminIssueBody({ name: 'a', group: 'x', role: {} }))).toBe('role 需要是字符串')
   })
 
   test('★ 多处同时不合法时报第一条（顺序即优先级，与手写 if 链一致）', () => {
-    expect(reasonOf(parseAdminIssueBody({ dept: 1, role: 1 }))).toBe('缺少 name（要发放 token 的姓名）')
-    expect(reasonOf(parseAdminIssueBody({ name: 'a', dept: 1, role: 1 }))).toBe('dept 需要是字符串')
+    expect(reasonOf(parseAdminIssueBody({ group: 1, role: 1 }))).toBe('缺少 name（要发放 token 的姓名）')
+    expect(reasonOf(parseAdminIssueBody({ name: 'a', group: 1, role: 1 }))).toBe('group 需要是字符串')
   })
 
   test('空姓名 / 未知角色是**业务**失败，形状层放行（回 200 + ok:false 的那一类）', () => {
@@ -256,14 +259,14 @@ describe('parseAdminIssueBody（签发）', () => {
   })
 })
 
-describe('parseAdminUpdateBody（改名 / 换部门 / 调角色）', () => {
+describe('parseAdminUpdateBody（改名 / 换分组 / 调角色）', () => {
   test('合法请求体通过；token 原样保留（不 trim）', () => {
-    const r = parseAdminUpdateBody({ token: ' atr-x ', name: '李四', dept: '', role: 'member' })
+    const r = parseAdminUpdateBody({ token: ' atr-x ', name: '李四', group: '', role: 'member' })
     expect(r.ok).toBe(true)
     if (!r.ok) return
     // ★ 只校验、不改值：下游 member-admin 拿到的仍是原始 token
     expect(r.value.token).toBe(' atr-x ')
-    expect(r.value.dept).toBe('')
+    expect(r.value.group).toBe('')
   })
 
   test('缺 token / token 空白 / token 非字符串 → 「缺少 token（要修改哪个人）」', () => {
@@ -273,9 +276,9 @@ describe('parseAdminUpdateBody（改名 / 换部门 / 调角色）', () => {
     expect(reasonOf(parseAdminUpdateBody({ token: null }))).toBe('缺少 token（要修改哪个人）')
   })
 
-  test('name / dept / role 非字符串 → 各自那句文案', () => {
+  test('name / group / role 非字符串 → 各自那句文案', () => {
     expect(reasonOf(parseAdminUpdateBody({ token: 't', name: 1 }))).toBe('name 需要是字符串')
-    expect(reasonOf(parseAdminUpdateBody({ token: 't', dept: 1 }))).toBe('dept 需要是字符串')
+    expect(reasonOf(parseAdminUpdateBody({ token: 't', group: 1 }))).toBe('group 需要是字符串')
     expect(reasonOf(parseAdminUpdateBody({ token: 't', role: 1 }))).toBe('role 需要是字符串')
   })
 
@@ -371,5 +374,82 @@ describe('parsePortalBody(portalIssueAppKeySchema)', () => {
     const r = parsePortalBody(portalIssueTokenSchema, { member_id: id, label: 'x' })
     expect(r.ok).toBe(true)
     if (r.ok) expect(r.value.scopes).toBeUndefined()
+  })
+})
+
+describe('parsePortalBody(角色定义：新建 / 改写 / 启停)', () => {
+  const id = '00000000-0000-4000-8000-0000000000a1'
+  const create = (body: unknown) => parsePortalBody(portalCreateRoleSchema, body)
+  const update = (body: unknown) => parsePortalBody(portalUpdateRoleSchema, body)
+
+  test('合法请求体通过：角色名去首尾空白，权限可为空（先建角色、之后再授权）', () => {
+    const r = create({ code: 'ops-viewer', name: '  运营查看者  ', permission_codes: ['roles:read', 'members:read'] })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.value).toEqual({ code: 'ops-viewer', name: '运营查看者', permission_codes: ['roles:read', 'members:read'] })
+    }
+    const empty = create({ code: 'ops', name: '运营', permission_codes: [] })
+    expect(empty.ok).toBe(true)
+  })
+
+  test('角色标识必须是稳定的小写标识：中文、大写、空串都被拒绝', () => {
+    // 标识会出现在审计、日志与排查里，而且**创建后不可改** —— 放进来一个中文标识，
+    // 以后每次看日志都要在脑子里做一次「这个中文名是哪个角色」的映射。
+    for (const code of ['运营', 'Ops', '', 'o'.repeat(65), '-x', '1ops']) {
+      const r = create({ code, name: '运营', permission_codes: [] })
+      expect(r.ok).toBe(false)
+      if (!r.ok) expect(r.reason).toMatch(/角色标识/)
+    }
+  })
+
+  test('角色名不能为空、不能含换行与制表符', () => {
+    for (const name of ['', '   ', '运营\n查看', '运营\t查看', '运'.repeat(129)]) {
+      const r = create({ code: 'ops', name, permission_codes: [] })
+      expect(r.ok).toBe(false)
+      if (!r.ok) expect(r.reason).toMatch(/角色名称/)
+    }
+  })
+
+  test('🚨 `is_builtin` 写不进请求体：内置角色只能由 schema seed 产生', () => {
+    // 这一条是**安全边界**：若请求体能声明 is_builtin，`assertEditableRole` 就形同虚设，
+    // 而那一层护栏正托着「最后一个管理员」与兼容字段 `role: admin | member`。
+    const r = create({ code: 'ops', name: '运营', permission_codes: [], is_builtin: true })
+    expect(r.ok).toBe(false)
+  })
+
+  test('权限码只查形状（存在性与是否超权由服务端查库判定）', () => {
+    // 形状层的上限是 64 个码、每个 64 字符；「这个码存不存在」「我能不能给」都要查库，
+    // 写在这里只会得到一份会过期的副本。
+    expect(create({ code: 'ops', name: '运营', permission_codes: ['a'.repeat(65)] }).ok).toBe(false)
+    expect(create({ code: 'ops', name: '运营', permission_codes: Array.from({ length: 65 }, (_, i) => `p${i}`) }).ok).toBe(false)
+    expect(create({ code: 'ops', name: '运营', permission_codes: [''] }).ok).toBe(false)
+    expect(create({ code: 'ops', name: '运营', permission_codes: ['不存在:read'] }).ok).toBe(true)
+  })
+
+  test('改写必须带 role_id 与正整数版本号，且至少改一样东西', () => {
+    expect(update({ role_id: id, expected_version: 1, name: '改名' }).ok).toBe(true)
+    expect(update({ role_id: id, expected_version: 1, permission_codes: [] }).ok).toBe(true)
+    // 什么都没改的请求是无意义的一次写事务与一条审计，直接拒绝
+    const nothing = update({ role_id: id, expected_version: 1 })
+    expect(nothing.ok).toBe(false)
+    if (!nothing.ok) expect(nothing.reason).toContain('至少提供角色名称或权限')
+    expect(update({ role_id: 'x', expected_version: 1, name: '改名' }).ok).toBe(false)
+    expect(update({ role_id: id, expected_version: 0, name: '改名' }).ok).toBe(false)
+    expect(update({ role_id: id, expected_version: 1, name: '改名', is_builtin: false }).ok).toBe(false)
+  })
+
+  test('启停只接受两种状态', () => {
+    expect(parsePortalBody(portalRoleStatusSchema, { role_id: id, expected_version: 2, status: 'disabled' }).ok).toBe(true)
+    expect(parsePortalBody(portalRoleStatusSchema, { role_id: id, expected_version: 2, status: 'archived' }).ok).toBe(false)
+    expect(parsePortalBody(portalRoleStatusSchema, { role_id: id, status: 'active' }).ok).toBe(false)
+  })
+
+  test('非对象 → 与其它管理接口给出同一条文案（不为新接口另立一套）', () => {
+    for (const bad of [null, undefined, 5, 'x', []]) {
+      const role = create(bad)
+      const appKey = parsePortalBody(portalIssueAppKeySchema, bad)
+      expect(role.ok).toBe(false)
+      if (!role.ok && !appKey.ok) expect(role.reason).toBe(appKey.reason)
+    }
   })
 })

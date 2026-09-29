@@ -193,7 +193,7 @@ function tokenField(reason: string) {
 export const adminIssueBodySchema = z.object(
   {
     name: z.string({ error: '缺少 name（要发放 token 的姓名）' }),
-    dept: z.string({ error: 'dept 需要是字符串' }).optional(),
+    group: z.string({ error: 'group 需要是字符串' }).optional(),
     // ⚠️ 角色只查类型，取值合法性留给 member-admin 的 normalizeRole()
     //    （它要报「未知角色「x」，只支持 admin / member」这句业务文案）
     role: z.string({ error: 'role 需要是字符串' }).optional(),
@@ -201,12 +201,12 @@ export const adminIssueBodySchema = z.object(
   { error: '请求体需要是一个对象' },
 )
 
-/** `POST /api/v1/admin/members/update` —— 改名 / 换部门 / 调角色。 */
+/** `POST /api/v1/admin/members/update` —— 改名 / 换分组 / 调角色。 */
 export const adminUpdateBodySchema = z.object(
   {
     token: tokenField('缺少 token（要修改哪个人）'),
     name: z.string({ error: 'name 需要是字符串' }).optional(),
-    dept: z.string({ error: 'dept 需要是字符串' }).optional(),
+    group: z.string({ error: 'group 需要是字符串' }).optional(),
     role: z.string({ error: 'role 需要是字符串' }).optional(),
   },
   { error: '请求体需要是一个对象' },
@@ -234,11 +234,11 @@ export type AdminTokenBody = z.infer<typeof adminTokenBodySchema>
 export type AdminLoginBody = z.infer<typeof adminLoginBodySchema>
 
 export function parseAdminIssueBody(value: unknown): ShapeResult<AdminIssueBody> {
-  return check(adminIssueBodySchema, [null, 'name', 'dept', 'role'], value)
+  return check(adminIssueBodySchema, [null, 'name', 'group', 'role'], value)
 }
 
 export function parseAdminUpdateBody(value: unknown): ShapeResult<AdminUpdateBody> {
-  return check(adminUpdateBodySchema, [null, 'token', 'name', 'dept', 'role'], value)
+  return check(adminUpdateBodySchema, [null, 'token', 'name', 'group', 'role'], value)
 }
 
 export function parseAdminTokenBody(value: unknown): ShapeResult<AdminTokenBody> {
@@ -260,18 +260,20 @@ const roleIds = z.array(portalId).min(1).max(32)
 const scopes = z.array(z.string().min(1).max(64)).min(1).max(64)
 const memberVersion = { member_id: portalId, expected_version: portalVersion }
 const tokenVersion = { ...memberVersion, token_id: portalId }
-const departmentVersion = { department_id: portalId, expected_version: portalVersion }
-const departmentName = z.string().min(1).max(64).refine(
-  (name) => !!name.trim() && !/[\r\n\t]/.test(name), { error: '部门名称不能为空或包含换行、制表符' },
+const groupVersion = { group_id: portalId, expected_version: portalVersion }
+/** 人员与分组是多对多：一次最多挂 64 个分组，去重后由仓储整组替换。 */
+const groupIds = z.array(portalId).max(64)
+const groupName = z.string().min(1).max(64).refine(
+  (name) => !!name.trim() && !/[\r\n\t]/.test(name), { error: '分组名称不能为空或包含换行、制表符' },
 ).transform((name) => name.trim())
 
 export const portalCreateMemberSchema = z.strictObject({
-  name: portalName, department_id: portalId.nullable().optional(), role_ids: roleIds,
+  name: portalName, group_ids: groupIds.optional(), role_ids: roleIds,
 })
 export const portalUpdateMemberSchema = z.strictObject({
-  ...memberVersion, name: portalName.optional(), department_id: portalId.nullable().optional(),
-}).refine((value) => value.name !== undefined || value.department_id !== undefined, {
-  error: '至少提供姓名或部门',
+  ...memberVersion, name: portalName.optional(), group_ids: groupIds.optional(),
+}).refine((value) => value.name !== undefined || value.group_ids !== undefined, {
+  error: '至少提供姓名或分组',
 })
 export const portalMemberRolesSchema = z.strictObject({ ...memberVersion, role_ids: roleIds })
 export const portalMemberStatusSchema = z.strictObject({
@@ -299,10 +301,47 @@ export const portalIssueAppKeySchema = z.strictObject({
 })
 export const portalTokenVersionSchema = z.strictObject(tokenVersion)
 export const portalTokenScopesSchema = z.strictObject({ ...tokenVersion, scopes })
-export const portalCreateDepartmentSchema = z.strictObject({ name: departmentName })
-export const portalUpdateDepartmentSchema = z.strictObject({ ...departmentVersion, name: departmentName })
-export const portalDepartmentStatusSchema = z.strictObject({
-  ...departmentVersion, status: z.enum(['active', 'disabled']),
+/**
+ * 改有效期。
+ *
+ * 🚨 `expires_at_ms` 在这里是**必填**（可以是 `null`）：`null` 表示长期有效，
+ *   而不是「没给」。若做成可选，漏传字段就会被服务端当成「清空到期时间」——
+ *   一个把短效 key 悄悄变成长效 key 的默认值。
+ */
+export const portalTokenExpirySchema = z.strictObject({
+  ...tokenVersion, expires_at_ms: z.int().positive().nullable(),
+})
+export const portalCreateGroupSchema = z.strictObject({ name: groupName })
+export const portalUpdateGroupSchema = z.strictObject({ ...groupVersion, name: groupName })
+export const portalGroupStatusSchema = z.strictObject({
+  ...groupVersion, status: z.enum(['active', 'disabled']),
+})
+/**
+ * 角色标识。
+ *
+ * ★ 建后不可改，所以这里必须一次卡死格式：它是稳定标识，将来若允许中文或大写，
+ *   「同一个角色」会在日志与审计里出现两种写法，而页面看不出这是同一个。
+ */
+const roleCode = z.string().min(1, { error: '角色标识不能为空' }).max(64, { error: '角色标识不能超过 64 个字符' }).refine(
+  (code) => /^[a-z][a-z0-9_.:-]*$/.test(code),
+  { error: '角色标识需要以字母开头，只能使用小写字母、数字与 _ . : -' },
+)
+const roleName = z.string().min(1, { error: '角色名称不能为空或包含换行、制表符' }).max(128, { error: '角色名称不能超过 128 个字符' }).refine(
+  (name) => !!name.trim() && !/[\r\n\t]/.test(name), { error: '角色名称不能为空或包含换行、制表符' },
+).transform((name) => name.trim())
+/** 权限码由服务端目录校验，这里只负责形状；空数组合法（先建空角色、之后再授权）。 */
+const permissionCodes = z.array(z.string().min(1).max(64)).max(64)
+const roleVersion = { role_id: portalId, expected_version: portalVersion }
+export const portalCreateRoleSchema = z.strictObject({
+  code: roleCode, name: roleName, permission_codes: permissionCodes,
+})
+export const portalUpdateRoleSchema = z.strictObject({
+  ...roleVersion, name: roleName.optional(), permission_codes: permissionCodes.optional(),
+}).refine((value) => value.name !== undefined || value.permission_codes !== undefined, {
+  error: '至少提供角色名称或权限',
+})
+export const portalRoleStatusSchema = z.strictObject({
+  ...roleVersion, status: z.enum(['active', 'disabled']),
 })
 export const portalConfirmLegacySchema = z.strictObject({
   mapping_id: portalId, member_id: portalId, expected_status: z.literal('pending'),
@@ -311,7 +350,7 @@ export const portalConfirmLegacySchema = z.strictObject({
 
 /** 新管理接口共用校验出口，不改变既有上报与署名的错误优先级。 */
 export function parsePortalBody<T extends z.ZodType>(schema: T, value: unknown): ShapeResult<z.infer<T>> {
-  return check(schema, [null, 'member_id', 'token_id', 'department_id', 'expected_version'], value)
+  return check(schema, [null, 'member_id', 'token_id', 'group_id', 'group_ids', 'role_id', 'code', 'permission_codes', 'expected_version'], value)
 }
 
 // ─────────────────────────────────────────────────────────────

@@ -72,6 +72,20 @@ export interface WireClientIdentity {
   /** 客户端自称的标识。**服务端应忽略此字段**，仅用于排查。 */
   userId: string
   userName?: string
+  /**
+   * 客户端在身份文件里填的分组名快照。
+   *
+   * ★ 只是**快照文本**，不参与归属：真正的归属由服务端按 token 查出
+   *   `member_id`，再经 `member_group_members` 关联出分组。
+   *   快照列让「这个人当时自己填的是哪个分组」在改名/改组之后仍可追溯。
+   */
+  group?: string
+  /**
+   * ⚠️ **已废弃，仅为兼容旧插件 / 旧 CLI 保留读取**。
+   *
+   *   旧客户端发的是 `dept`；服务端把它当作 `group` 的同义字段写入
+   *   `usage_event.group_name`。新代码一律用 `group`。
+   */
   dept?: string
 }
 
@@ -106,7 +120,7 @@ export interface IngestResponse {
 // ─────────────────────────────────────────────────────────────
 
 /** 分组维度。与 CLI 的 `--by` 选项保持一致。 */
-export type GroupBy = 'provider' | 'model' | 'provider-model' | 'user' | 'project' | 'day' | 'hour'
+export type GroupBy = 'provider' | 'model' | 'provider-model' | 'user' | 'group' | 'project' | 'day' | 'hour'
 
 /** 时间分桶粒度。 */
 export type Bucket = 'day' | 'hour'
@@ -127,6 +141,14 @@ export interface StatsQuery {
   member_id?: string[]
   legacy_user?: string[]
   unattributed?: boolean
+  /**
+   * 按分组过滤（多选，**精确匹配**稳定分组 ID）。
+   *
+   * ⚠️ 多对多语义下的取舍：一个人可同属多个分组，所以**多选是 OR**——
+   *   命中任一所选分组即计入。因此「按两个分组筛出来的合计」会大于
+   *   全量合计，这不是 bug：同一条事件本来就要计入它的人员所属的每个分组。
+   */
+  group_id?: string[]
   /** epoch 毫秒；缺省表示不限 */
   from?: number
   to?: number
@@ -204,7 +226,8 @@ export interface BreakdownRow {
   key: string
   label?: string
   member_id?: string | null
-  department_name?: string | null
+  /** 该人员当前所属的全部分组名；分组维度的行本身没有它。 */
+  group_names?: string[]
   attribution_status?: import('./portal-identity.js').PortalAttributionStatus
   totalTokens: number
   inputTokens: number
@@ -229,8 +252,10 @@ export interface RecordRow {
   userId: string
   member_id?: string | null
   user_name_snapshot?: string | null
-  department_id?: string | null
-  dept_snapshot?: string | null
+  /** 该人员当前所属的分组 ID；不是上报时的值（那个在 `group_name_snapshot`）。 */
+  group_ids?: string[]
+  /** 上报当时客户端自己填的分组文本快照。 */
+  group_name_snapshot?: string | null
   attribution_status?: import('./portal-identity.js').PortalAttributionStatus
   provider: string
   model: string
@@ -247,6 +272,27 @@ export interface RecordsResponse {
   limit: number
   offset: number
   rows: RecordRow[]
+}
+
+/**
+ * 筛选栏与分组排行要用的分组候选项（`GET /api/v1/stats/groups`）。
+ *
+ * ★ 刻意由**看板接口**提供而不是让页面去读管理接口 `/api/v1/admin/groups`：
+ *   能看数据的人不一定有 `groups:read`（那是管理目录权限），
+ *   而「按什么分组筛数据」是看板自身的能力。少一个权限就少一处 403。
+ * ⚠️ 候选**只列存在的分组**，不掺入数据里出现过的快照文本 ——
+ *   快照文本是可以随便填的，拿它当筛选项等于让页面按错别字筛选。
+ */
+export interface StatsGroupOption {
+  group_id: string
+  name: string
+  status: 'active' | 'disabled'
+  /** 当前关联到该分组的人员数（不是事件数）。 */
+  member_count: number
+}
+
+export interface StatsGroupsResponse {
+  groups: StatsGroupOption[]
 }
 
 /** 当前实例的入口队列观测；完成计数包含业务拒绝，不代表成功落库条数。 */
@@ -461,7 +507,7 @@ export interface LocalIdentityResponse {
   signed: boolean
   /** 姓名。未署名时为 null。 */
   name: string | null
-  dept: string | null
+  group: string | null
   createdAt: number | null
   /** 未署名时给出提示文案，由服务端决定，便于统一措辞。 */
   hint: string | null
@@ -470,13 +516,13 @@ export interface LocalIdentityResponse {
 /**
  * 提交署名（`POST /api/local/identity`）。
  *
- * ★ 服务端必须在此刻**向部门服务端校验 token**，校验通过才落盘。
+ * ★ 服务端必须在此刻**向平台服务端校验 token**，校验通过才落盘。
  *   本地不做形式以外的判断。
  */
 export interface LocalIdentitySubmit {
   name: string
   token: string
-  dept?: string
+  group?: string
 }
 
 /** 署名提交结果。 */
@@ -486,7 +532,7 @@ export interface LocalIdentitySubmitResponse {
   reason?: string
   /** 成功后回显的姓名（供页面立即更新，无需再请求一次）。 */
   name?: string
-  dept?: string
+  group?: string
 }
 
 /**
@@ -501,6 +547,11 @@ export interface VerifyTokenResponse {
   member_id?: string
   /** 该 token 对应的姓名（由服务端决定，客户端不可覆盖）。 */
   name?: string
+  group?: string
+  /**
+   * ⚠️ **已废弃，仅为兼容旧插件 / 旧 CLI 保留**：与 `group` 同值。
+   *   新代码读 `group`。兼容期结束后删掉这个别名。
+   */
   dept?: string
   /**
    * 该 token 的角色。服务端**始终**返回它，页面据此决定是否显示管理页。
@@ -558,7 +609,7 @@ export interface AdminMember {
    */
   token: string
   name: string
-  dept: string | null
+  group: string | null
   role: UserRole
   /** token 发放时刻（epoch ms）。手工写进文件的凭证没有这个字段 → null。 */
   createdAt: number | null
@@ -584,7 +635,7 @@ export interface AdminMembersResponse {
  */
 export interface AdminIssueMemberRequest {
   name: string
-  dept?: string
+  group?: string
   /** 缺省为 {@link ROLE_MEMBER}。 */
   role?: UserRole
 }
@@ -594,8 +645,8 @@ export interface AdminUpdateMemberRequest {
   /** 定位用：要改的那个人当前持有的 token。 */
   token: string
   name?: string
-  /** 传空串表示清除部门。 */
-  dept?: string
+  /** 传空串表示清除分组。 */
+  group?: string
   role?: UserRole
 }
 
@@ -614,13 +665,18 @@ export interface AdminLoginAccountRequest {
 /** 后台认证的公开身份，不含上报 Token。 */
 export interface PortalViewer {
   member_id?: string
-  department_id?: string | null
-  department_name?: string | null
+  /** 该账号所属分组的稳定 ID 与名称；多对多，未分组时为空数组。 */
+  group_ids?: string[]
+  group_names?: string[]
   roles?: import('./portal-identity.js').PortalRole[]
   permissions?: string[]
   name: string
   username: string
-  dept?: string
+  /**
+   * ⚠️ 已废弃的兼容别名，与「第一个分组名」同值，仅供旧页面显示。
+   *   新代码读 `group_names`。
+   */
+  group?: string
   role: UserRole
 }
 

@@ -41,7 +41,14 @@ export interface Identity {
    * 不要记录到日志、不要随上报体明文回传（上报时只作为 Authorization 头）。
    */
   token: string
-  /** 部门。可空 —— 不确定的员工可以先留空。 */
+  /** 分组名。可空 —— 不确定的员工可以先留空。 */
+  group?: string
+  /**
+   * ⚠️ **已废弃，仅为兼容旧 `identity.json` 保留读取**。
+   *
+   *   旧文件写的是 `dept`；读取侧按 `group ?? dept` 取值，写出侧只写 `group`。
+   *   兼容期结束后删掉这个字段。
+   */
   dept?: string
   /** 首次署名时间（epoch 毫秒），用于审计。 */
   createdAt: number
@@ -57,7 +64,7 @@ export interface Identity {
  */
 export interface IdentityAssertion {
   name: string
-  dept?: string
+  group?: string
 }
 
 /** 身份校验结果。 */
@@ -119,9 +126,15 @@ export function isSigned(i: Pick<Identity, 'name' | 'token'> | null | undefined)
   return !!i && i.name.trim().length > 0 && i.token.trim().length > 0
 }
 
-/** 从完整身份中取出可安全上报的视图（剥离 token）。 */
+/**
+ * 从完整身份中取出可安全上报的视图（剥离 token）。
+ *
+ * ⚠️ 兼容旧文件的 `dept`：只在 `group` 缺失时才回退到它，
+ *   避免一份同时含两个字段的文件把新值忽略掉。
+ */
 export function toAssertion(i: Identity): IdentityAssertion {
-  return i.dept ? { name: i.name, dept: i.dept } : { name: i.name }
+  const group = i.group ?? i.dept
+  return group ? { name: i.name, group } : { name: i.name }
 }
 
 /** 姓名脱敏，用于日志与看板展示（「张三」→「张*」）。 */
