@@ -68,6 +68,12 @@ bun run build:npm:plugin && bun run verify:npm:plugin  # 插件同款
 bun run publish:plugin:dry / :next / publish:plugin    # 插件同款
 bun run publish:dry                                   # 两个包一起 dry-run
 
+# 部门服务端部署（本地构建 → 上传 → 切换 → 重启；见 docs/服务器部署.md）
+# ★ 与上面的 npm 发布是两件事：这条送产物到 117.72.173.21，那条发到 registry
+bun run deploy:server            # dry-run：只本地构建 + 打包，不连服务器
+bun run deploy:server:preflight  # 上传到服务器 /tmp 并校验，不切换不重启
+bun run deploy:server:apply      # 真部署：备份 → 切换 → 重启 → 健检，失败自动回滚
+
 # DSH 插件：构建 + 五层验证（从内到外逐层接近真实，改插件后全跑）
 bun run --filter '@ai-token-report/dsh-plugin' build
 bun run packages/dsh-plugin/verify/verify-plugin.ts         # 真 HTTP 往返（55 项）

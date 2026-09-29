@@ -39,6 +39,10 @@
     "publish:dry": "bun run scripts/release.ts all --dry-run",
     "repair:plugin": "bun run packages/dsh-plugin/scripts/repair-profile.ts",
 
+    "deploy:server": "node scripts/deploy-server.mjs",
+    "deploy:server:preflight": "node scripts/deploy-server.mjs --preflight",
+    "deploy:server:apply": "node scripts/deploy-server.mjs --apply",
+
     "server": "bun run --filter '@ai-token-report/server' start",
     "typecheck": "bun run --filter '*' typecheck && bun run typecheck:release",
     "typecheck:release": "tsc -p scripts/tsconfig.json --noEmit",

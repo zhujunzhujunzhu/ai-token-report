@@ -18,7 +18,22 @@ import { defineConfig } from 'vite'
  */
 const portalApiTarget = process.env.DSH_PORTAL_API ?? 'http://127.0.0.1:8787'
 
+/**
+ * 静态资源与接口的公共前缀。
+ *
+ * 生产形态下本页常被挂在反向代理的**子路径**（如 `/ai-token/`），此时产物
+ * 里若仍是 `/assets/...` 这种**绝对路径**，浏览器会去站点根取资源 ——
+ * 而站点根通常被同实例上别的应用占着（实测：拿到别人的 `index.html`，
+ * `Content-Type: text/html`），脚本执行失败、页面一片空白。
+ *
+ * 由 `DSH_PORTAL_BASE` 注入，默认 `/`（根路径部署时行为不变）。
+ * 必须以 `/` 开头和结尾，Vite 的 `base` 就是这么要求的。
+ */
+const portalBase = process.env.DSH_PORTAL_BASE ?? '/'
+
 export default defineConfig({
+  // ★ 子路径部署的关键：让产物里的资源与 API 路径都带上这个前缀。
+  base: portalBase,
   plugins: [vue()],
   resolve: {
     alias: {
