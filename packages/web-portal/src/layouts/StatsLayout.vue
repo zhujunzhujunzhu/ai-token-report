@@ -10,11 +10,12 @@ import { useDashboardStore, type StatsSection } from '../stores/dashboard.js'
 import { formatFullDateTime } from '../utils/format.js'
 const dashboard = useDashboardStore()
 const route = useRoute()
+// 页面副标题只在真正需要补充说明时给（`section` 未登记即不渲染）：
+// 「采集诊断」这类标题已经自明的页面，多一行灰字只是噪音。
 const descriptions: Record<string, string> = {
   overview: '从团队全貌到个人用量，掌握每一次 AI 调用。',
   analysis: '观察用量变化，了解团队的模型与项目使用分布。',
   records: '查看每一条调用记录，追溯用量来源。',
-  diagnostics: '查看数据归属与上报时间，及时发现采集缺口。',
 }
 const description = computed(
   () => descriptions[String(route.meta.section)] ?? '',
@@ -49,7 +50,7 @@ onUnmounted(() => {
       <div>
         <div class="eyebrow">TEAM WORKSPACE</div>
         <h1>{{ route.meta.title }}</h1>
-        <p>{{ description }}</p>
+        <p v-if="description">{{ description }}</p>
       </div>
       <el-button
         :icon="Refresh"
