@@ -28,6 +28,10 @@ export * from './local-rollup.js'
 //   因为两者服务的是**两个不同的库**（usage.sqlite vs portal.sqlite/MySQL），
 //   调用方必须显式选一个，不能靠「默认值」蒙对。
 export * from './portal.js'
+// ★ 供应商归一化：上报库里五花八门的 provider 名折叠成一个口径。
+//   它属于**查询层**（`query.ts` 的 SQL 构造器吃它的表达式），
+//   所以必须与 `query.js` 一起可被 `portal.ts` / `stats-route.ts` 取到。
+export * from './provider-alias.js'
 // ★ 方言 / MySQL 驱动 / 上报库门面。三者共同构成「一份 SQL、两种后端」：
 //   方言定义必须可被 `query.ts`（本地 + 部门共用）与 `ingest.ts` 直接取到，
 //   不能只藏在 `portal-db.ts` 里（那会形成 `query.ts → portal-db.ts` 的假依赖）。

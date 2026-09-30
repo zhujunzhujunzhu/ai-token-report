@@ -61,8 +61,10 @@ import {
   groupRowsFromTime,
   ingestMomentQuery,
   mapGroupRows,
+  mapRecordProvider,
   projectGroupsQuery,
   projectSessionsQuery,
+  recordProjection,
   seriesFromRows,
   sessionCountQuery,
   sortGroupRows,
@@ -80,6 +82,7 @@ import {
   type RawGroupRow,
   type TimeBucketRow,
 } from './query.js'
+import { providerNormalizer, type ProviderAliasMap, type ProviderNormalizer } from './provider-alias.js'
 import { EVENT_TABLE } from './schema.js'
 import { Buffer } from 'node:buffer'
 
@@ -119,7 +122,10 @@ export interface PortalRecordRow {
   ts: number
   /** 归属键。未归属时为 `null` —— 由调用方映射成协议里的 `unknown`。 */
   userId: string | null
+  /** ★ 展示用的供应商名（已按规则归一化；未配规则时等于 `providerRaw`）。 */
   provider: string
+  /** 上报当时的供应商原值。明细要能核对规则，所以两个都留着。 */
+  providerRaw: string
   model: string
   cwd: string | null
   input: number
@@ -139,6 +145,8 @@ interface PortalRecordSqlRow {
   ts: unknown
   user_id: string | null
   provider: string
+  /** 归一化表达式的结果；没配规则时该列与 `provider` 同值。 */
+  provider_norm?: unknown
   model: string
   cwd: string | null
   input_tokens: unknown
@@ -168,21 +176,36 @@ export class PortalStatsSession {
   /** ★ 与 `store.kind` 绑定的方言：`provider-model` 的拼接表达式靠它。 */
   readonly #dialect: PortalDialect
   readonly #filter: QueryFilter
+  /**
+   * 供应商归一化（可选）。`undefined` = 一条规则都没有 ——
+   * 此时所有 SQL 与迁移前**逐字相同**，本机库路径也走这一支。
+   */
+  readonly #normalize: ProviderNormalizer | undefined
   #closed = false
 
-  constructor(init: { store: PortalStore; target: PortalTarget; filter?: QueryFilter }) {
+  constructor(init: {
+    store: PortalStore
+    target: PortalTarget
+    filter?: QueryFilter
+    aliases?: ProviderAliasMap
+  }) {
     this.#store = init.store
     this.#dialect = portalDialect(init.store.kind)
     this.label = init.store.label
     this.dbPath = init.target.sqlitePath
     this.kind = init.store.kind
     this.#filter = init.filter ?? {}
+    // ⚠️ 空映射必须折成 `undefined`：空 `CASE` 在 MySQL 上是语法错误，
+    //   而在 SQLite 上只是「恒为 NULL」—— 后者更危险，它不会报错。
+    this.#normalize = init.aliases && init.aliases.size > 0
+      ? providerNormalizer(init.aliases, this.#dialect)
+      : undefined
     this.openedAt = Date.now()
   }
 
   /** 总计（四项独立 + calls）。派生指标请用 `derive()` / `shared/metrics.ts`。 */
   async totals(): Promise<TokenCounts> {
-    const q = totalsQuery(this.#filter)
+    const q = totalsQuery(this.#filter, this.#normalize)
     const row = await this.#store.get<{
       calls: unknown
       input: unknown
@@ -224,14 +247,14 @@ export class PortalStatsSession {
 
   /** 涉及的会话数（按筛选去重）。 */
   async sessions(): Promise<number> {
-    const q = sessionCountQuery(this.#filter)
+    const q = sessionCountQuery(this.#filter, this.#normalize)
     const row = await this.#store.get<{ c: unknown }>(q.sql, q.params)
     return num(row?.c)
   }
 
   /** 未归属的调用条数（`user_id IS NULL`）。 */
   async unattributedCalls(): Promise<number> {
-    const q = unattributedCallsQuery(this.#filter)
+    const q = unattributedCallsQuery(this.#filter, this.#normalize)
     const row = await this.#store.get<{ c: unknown }>(q.sql, q.params)
     return num(row?.c)
   }
@@ -239,21 +262,21 @@ export class PortalStatsSession {
   /** 非空归属分组数；成员视图按稳定人员与历史身份分别计数，旧视图按 `user_id` 去重。 */
   async distinctUsers(): Promise<number> {
     if (this.#filter.identityView === 'member') {
-      const { sql, params } = buildWhere(this.#filter)
+      const { sql, params } = buildWhere(this.#filter, this.#normalize)
       const row = await this.#store.get<{ c: unknown }>(`SELECT COUNT(*) AS c FROM (
         SELECT member_id, CASE WHEN member_id IS NULL THEN user_id ELSE NULL END AS legacy_id
         FROM ${EVENT_TABLE}${sql}${sql ? ' AND' : ' WHERE'} (member_id IS NOT NULL OR user_id IS NOT NULL)
         GROUP BY member_id, legacy_id) AS identities`, params)
       return num(row?.c)
     }
-    const q = distinctUsersQuery(this.#filter)
+    const q = distinctUsersQuery(this.#filter, this.#normalize)
     const row = await this.#store.get<{ c: unknown }>(q.sql, q.params)
     return num(row?.c)
   }
 
   /** 数据的时间边界。NULL 必须保持 null（见 `numOrNull`）。 */
   async timeBounds(): Promise<{ earliest: number | null; latest: number | null }> {
-    const q = timeBoundsQuery(this.#filter)
+    const q = timeBoundsQuery(this.#filter, this.#normalize)
     const row = await this.#store.get<{ lo: unknown; hi: unknown }>(q.sql, q.params)
     return { earliest: numOrNull(row?.lo), latest: numOrNull(row?.hi) }
   }
@@ -276,7 +299,7 @@ export class PortalStatsSession {
   async groups(dim: QueryDimension): Promise<QueryGroupRow[]> {
     if (dim === 'user' && this.#filter.identityView === 'member') return this.memberGroups()
     if (dim === 'group') return this.groupGroups()
-    const q = groupsQuery(dim, this.#filter, this.#dialect)
+    const q = groupsQuery(dim, this.#filter, this.#dialect, this.#normalize)
     if (q) {
       const rows = await this.#store.all<RawGroupRow>(q.sql, q.params)
       return sortGroupRows(mapGroupRows(rows), dim)
@@ -293,7 +316,7 @@ export class PortalStatsSession {
 
     // day / hour：时间键必须在 JS 侧算（见 `dimensionExpression` 的注释）
     if (dim === 'day' || dim === 'hour') {
-      const rowsQuery = timeBucketRowsQuery(this.#filter, true)
+      const rowsQuery = timeBucketRowsQuery(this.#filter, true, this.#normalize)
       const rows = await this.#store.all<TimeBucketRow>(rowsQuery.sql, rowsQuery.params)
       return groupRowsFromTime(rows, dim)
     }
@@ -333,7 +356,7 @@ export class PortalStatsSession {
 
   /** 按固定人员 ID 聚合；未确认历史的 key 与当前人员、真正未归属互不混淆。 */
   private async memberGroups(): Promise<QueryGroupRow[]> {
-    const { sql, params } = buildWhere(this.#filter)
+    const { sql, params } = buildWhere(this.#filter, this.#normalize)
     const rows = await this.#store.all<RawGroupRow & {
       member_id: string | null; legacy_id: string | null; snapshot_name: string | null
       display_name: string | null
@@ -368,7 +391,7 @@ export class PortalStatsSession {
    *   不带表别名的裸列名（它要同时服务本地库路径），直接用在 JOIN 上会歧义。
    */
   private async groupGroups(): Promise<QueryGroupRow[]> {
-    const { sql, params } = buildWhere(this.#filter)
+    const { sql, params } = buildWhere(this.#filter, this.#normalize)
     const rows = await this.#store.all<RawGroupRow & { grp_name: string }>(
       `SELECT g.group_id AS grp_key, g.name AS grp_name,
               SUM(x.input_tokens) AS input, SUM(x.output_tokens) AS output,
@@ -387,7 +410,7 @@ export class PortalStatsSession {
   /** 旧页面无法表达同名/改名关系时明确拒绝，不能输出看似合理的合并排行。 */
   async assertLegacyIdentityView(): Promise<void> {
     if (this.#filter.identityView === 'member') return
-    const { sql, params } = buildWhere(this.#filter)
+    const { sql, params } = buildWhere(this.#filter, this.#normalize)
     const pairs = await this.#store.all<{ member_id: string | null; user_id: string | null }>(
       `SELECT DISTINCT member_id, user_id FROM ${EVENT_TABLE}${sql}`, params,
     )
@@ -413,7 +436,7 @@ export class PortalStatsSession {
    *   这种差异出现，而且没有任何报错。
    */
   async series(granularity: 'day' | 'hour', fillGaps = true): Promise<SeriesPointCounts[]> {
-    const q = timeBucketRowsQuery(this.#filter, false)
+    const q = timeBucketRowsQuery(this.#filter, false, this.#normalize)
     const rows = await this.#store.all<TimeBucketRow>(q.sql, q.params)
     const points = seriesFromRows(rows, granularity)
     return fillGaps ? renderSeriesGaps(points, granularity) : points
@@ -421,7 +444,7 @@ export class PortalStatsSession {
 
   /** 明细分页（最新在前）。返回总行数供页面算分页。 */
   async records(limit: number, offset: number): Promise<{ total: number; rows: PortalRecordRow[] }> {
-    const { sql, params } = buildWhere(this.#filter)
+    const { sql, params } = buildWhere(this.#filter, this.#normalize)
 
     // ⚠️ 这条 SQL 刻意留在本文件：它带 `user_id`（**上报库专有**的列，
     //   本地库那三列恒为 NULL），因此不与本地路径共用。
@@ -431,15 +454,19 @@ export class PortalStatsSession {
       params,
     )
 
+    // ★ provider 的归一化表达式来自 `query.ts` 的 `recordProjection()`
+    //   （与分组维度同一份实现），这里只负责把两份参数合起来。
+    const projection = recordProjection(this.#normalize)
     const rows = await this.#store.all<PortalRecordSqlRow>(
       // ⚠️ ORDER BY 用 (ts, seq) 而不是 ts：同一毫秒内的多条记录需要有
       //   稳定的次序，否则翻页时会出现「第 2 页重复了第 1 页的最后一行」。
-      `SELECT event_id, session_id, seq, ts, user_id, member_id, user_name, group_name, provider, model, cwd,
+      `SELECT event_id, session_id, seq, ts, user_id, member_id, user_name, group_name, model, cwd,
+              ${projection.columns},
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
        FROM ${EVENT_TABLE}${sql}
        ORDER BY ts DESC, seq DESC, event_id DESC
        LIMIT $limit OFFSET $offset`,
-      { ...params, $limit: limit, $offset: offset },
+      { ...projection.params, ...params, $limit: limit, $offset: offset },
     )
     const groups = await this.groupsOf(rows.map((row) => row.member_id))
 
@@ -456,7 +483,7 @@ export class PortalStatsSession {
           groupIds: (r.member_id ? groups.get(r.member_id) ?? [] : []).map((group) => group.groupId),
           groupNameSnapshot: r.group_name, attributionStatus: r.member_id ? 'member' as const : r.user_id !== null ? 'legacy' as const : 'unattributed' as const,
         } : {}),
-        provider: r.provider,
+        ...mapRecordProvider(r),
         model: r.model,
         cwd: r.cwd,
         input: num(r.input_tokens),
@@ -483,14 +510,24 @@ export class PortalStatsSession {
  *   （上报库是唯一副本，绝不自动重建），后者会「丢了重建」。
  *   两者搞反 = 一次版本升级静默清空全部门历史用量。
  *   两种后端遵守同一条铁律。
+ *
+ * `aliases` 是**已经按查看者解析完毕**的供应商归一化映射（全局 + 人员逐条覆盖），
+ * 由 `stats-route.ts` 从 `provider_alias` 表读出来传进去 —— 查询层不认识那张表，
+ * 也不该认识：它只认「原始名 → 展示名」这一件事。
+ *
+ * ⚠️ 传的是**加载函数**而不是现成的映射表：加载要用同一个已打开、且已过版本闸门的
+ *   连接（`provider_alias` 表的存在性由闸门保证）。让调用方自己先开一次连接去读规则、
+ *   再开一次查数据，等于每次看板请求握两次库句柄，而 SQLite 上的代价是真金白银的。
  */
 export async function openPortalStats(
   target: PortalTarget,
   filter: QueryFilter = {},
+  loadAliases?: (store: PortalStore) => Promise<ProviderAliasMap>,
 ): Promise<PortalStatsSession> {
   const store = await openPortalStore(target)
-  const session = new PortalStatsSession({ store, target, filter })
   try {
+    const aliases = loadAliases ? await loadAliases(store) : undefined
+    const session = new PortalStatsSession({ store, target, filter, ...(aliases && aliases.size > 0 ? { aliases } : {}) })
     await session.assertLegacyIdentityView()
     return session
   } catch (error) { await store.close(); throw error }

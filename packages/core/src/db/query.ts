@@ -36,6 +36,13 @@ import { projectName, toDayKey, toHourKey, type GroupDimension } from '../aggreg
 import { emptyCounts, type TokenCounts } from '../types.js'
 import { EVENT_TABLE } from './schema.js'
 import { SQLITE_DIALECT, type PortalDialect } from './dialect.js'
+import {
+  applyProviderModel,
+  coalesceOriginal,
+  providerCaseSql,
+  providerModelKey,
+  type ProviderNormalizer,
+} from './provider-alias.js'
 import { UNATTRIBUTED_USER } from '@ai-token-report/shared'
 
 /**
@@ -122,8 +129,22 @@ export interface RawEventRow {
  * ★ 本函数是**唯一的筛选条件实现**（`portal.ts` 也用它），
  *   因此「按人筛选」不会出现第二套 SQL —— 两套筛选条件的漂移不会有任何报错，
  *   只会让某个接口的过滤悄悄失效。
+ *
+ * ## 供应商归一化（`normalize`）
+ *
+ * 传了 {@link ProviderNormalizer} 时，`provider` 筛选匹配的是**归一化后**的名字：
+ * 使用者看到的行是 `bailian-tpp`，他筛 `bailian-tpp` 就必须把
+ * `dashscope` / `bailian` 那些原值一起筛出来。
+ * 这与 `dimensionExpression()` 的分组口径**必须一致**，否则会出现
+ * 「筛了某个供应商，行里却有别的名字」这种看起来像数据错了的现象。
+ *
+ * ⚠️ 反过来的代价是**不能按原始名搜**（`dashscope` 已经改名为 `bailian-tpp`）。
+ *   这是刻意的：页面展示的名字就是可搜的名字，两套名字只会让人怀疑自己筛错了。
  */
-export function buildWhere(filter: QueryFilter): {
+export function buildWhere(
+  filter: QueryFilter,
+  normalize?: ProviderNormalizer,
+): {
   sql: string
   params: Record<string, string | number>
 } {
@@ -151,7 +172,9 @@ export function buildWhere(filter: QueryFilter): {
     clauses.push(`(${parts.join(' OR ')})`)
   }
 
-  likeAny('provider', filter.providers, 'prov')
+  // ★ 供应商筛选走归一化后的名字（见上方注释）。没有规则时
+  //   `providerFilterExpression()` 返回裸 `provider`，SQL 与迁移前逐字相同。
+  likeAny(providerFilterExpression(normalize, params), filter.providers, 'prov')
   likeAny('model', filter.models, 'model')
 
   // 归属：精确匹配。`unknown` 走 IS NULL —— 库里未归属的行 user_id 为 NULL，
@@ -204,6 +227,132 @@ export function buildWhere(filter: QueryFilter): {
 /** 两个数据库统一用 ! 转义，避免 MySQL 字符串反斜线模式改变 SQL 语义。 */
 function escapeLike(s: string): string {
   return s.replace(/!/g, '!!').replace(/%/g, '!%').replace(/_/g, '!_')
+}
+
+/** 没有任何规则时，归一化表达式就是裸列名 —— SQL 与迁移前逐字相同。 */
+function hasNormalization(normalize?: ProviderNormalizer): normalize is ProviderNormalizer {
+  // `apply()` 对未命中的字符串返回 undefined，所以「有没有规则」只能由
+  // 调用方在拿到映射表时就判定（见 `providerNormalizer()` 的调用点）。
+  return !!normalize && normalize.rules > 0
+}
+
+/**
+ * 供应商筛选用的 SQL 表达式（归一化已内联）。
+ *
+ * ⚠️ 返回的表达式**已经内联了绑定值**，所以调用方必须先调用它、
+ *   再把 pattern 参数写进同一张 `params` 表。
+ */
+function providerFilterExpression(
+  normalize: ProviderNormalizer | undefined,
+  params: Record<string, string | number>,
+): string {
+  if (!hasNormalization(normalize)) return 'provider'
+  return coalesceOriginal(providerCaseSql('provider', normalize.map, params, 'pf'), 'provider')
+}
+
+/**
+ * `provider/model` 组合维度的表达式（走方言拼接）。
+ *
+ * ⚠️ `provider-model` 的分组键必须与 `aggregate.ts` 的 `groupKey()` 逐字一致，
+ *   而「归一化作用在拼接后的字符串上」这件事也只能有一份实现 ——
+ *   两处各写一遍必然漂移，且漂移的表现只是「某些模型的行名不一样」。
+ *
+ * @param providerExpression 参与拼接的 provider 表达式。默认是裸列名；
+ *   传了归一化规则时由调用方给出 `COALESCE(CASE …)` —— **归一化必须作用在
+ *   拼接之前的那一段上**。
+ *   🚨 直接把 `CASE` 套在拼接结果上（`CASE WHEN provider || '/' || model = 'dashscope'`）
+ *   永远不成立：拿一个 `provider/model` 字符串去等于一个 provider 名，
+ *   结果是一行都不命中，于是「按 provider-model 分组」静默地全是原值。
+ */
+function providerModelExpression(dialect: PortalDialect, providerExpression = 'provider'): string {
+  // 分隔符与 aggregate.ts 的 groupKey() 一致（`provider/model`）。
+  return dialect.concat([providerExpression, `'${PROVIDER_MODEL_SEPARATOR_SQL}'`, 'model'])
+}
+
+/** SQL 字符串字面量里的分隔符，与 `provider-alias.ts` 的常量必须同值。 */
+const PROVIDER_MODEL_SEPARATOR_SQL = '/'
+
+/**
+ * 维度 → SQL 表达式。返回 null 表示该维度需要特殊处理（在 JS 侧分组）。
+ *
+ * 🚨 **`day` / `hour` 返回 null 是有意为之，不要「优化」成 `strftime`。**
+ *
+ * 看起来 `strftime('%Y-%m-%d', ts/1000, 'unixepoch', 'localtime')` 与
+ * `toDayKey()` 等价，实际**不是**：
+ *
+ * - SQLite 的 `'localtime'` 依据 **操作系统时区**
+ * - JS 的 `new Date().getHours()` 依据 **进程的 TZ 解析结果**
+ *
+ * 两者在本项目的 `bun test` 环境下实测**不一致**：
+ *
+ * | 环境 | `new Date().getTimezoneOffset()` | SQLite `'localtime'` |
+ * |---|---|---|
+ * | `bun run` | -480（+08:00，正确） | +08:00 |
+ * | `bun test` | **0（被强制成 UTC）** | **仍是 +08:00** |
+ *
+ * 于是同一份数据在测试里会分到相差 8 小时的桶：SQL 侧 `2026-09-25T00`、
+ * 内存侧 `2026-09-24T16`。这会直接表现为「趋势图的点错位」，
+ * 而且**只在测试环境下暴露**，本地手测完全正常 —— 最难查的一类 bug。
+ *
+ * 因此时间分桶一律在 JS 侧用 `toDayKey()` / `toHourKey()` 做：
+ * 那是全仓唯一的时间键实现，两条路径必然一致，也不受 TZ 解析差异影响。
+ * 代价是 `day` / `hour` 分组要多一次 `(ts, 四项, session_id)` 的取值，
+ * 实测在 16k 行上仍是毫秒级。
+ *
+ * ## 🚨 拼接必须走方言（`provider-model`）
+ *
+ * `provider || '/' || model` 在 SQLite 是字符串拼接，在 **MySQL 是逻辑或** ——
+ * 实测返回 `0` / `1`，于是分组键静默变成 `"0"` / `"1"`：看板上的模型分布
+ * 变成两行垃圾数据，**没有任何报错**。所以这里调 `dialect.concat()`，
+ * MySQL 侧生成 `CONCAT(provider, '/', model)`。
+ *
+ * ## 归一化
+ *
+ * 传了 `normalize` 时，`provider` 维度与 `provider-model` 维度都会把
+ * 原值经规则折叠后再分组。**逐条覆盖、未命中保持原值**两条约束的实现在
+ * `provider-alias.ts`，这里只负责把表达式接上去。
+ */
+function dimensionExpression(
+  dim: QueryDimension,
+  dialect: PortalDialect = SQLITE_DIALECT,
+  normalize?: ProviderNormalizer,
+  params?: Record<string, string | number>,
+): string | null {
+  switch (dim) {
+    case 'provider': {
+      if (!hasNormalization(normalize) || !params) return 'provider'
+      return coalesceOriginal(providerCaseSql('provider', normalize.map, params, 'gp'), 'provider')
+    }
+    case 'model':
+      return 'model'
+    case 'session':
+      return 'session_id'
+    case 'provider-model': {
+      if (!hasNormalization(normalize) || !params) return providerModelExpression(dialect)
+      // ★ 先归一化 provider 那一段，再拼接：规则里的 `provider` 只写供应商名，
+      //   所以比较也必须发生在单个 provider 上（见 providerModelExpression 的 🚨）。
+      return providerModelExpression(dialect, coalesceOriginal(providerCaseSql('provider', normalize.map, params, 'gm'), 'provider'))
+    }
+    case 'user':
+      // ★ 未归属归到 UNATTRIBUTED_USER 这一组，而不是被 GROUP BY 丢进 NULL ——
+      //   人员排行里必须看得见「有 3 个人没署名」，否则覆盖率问题永远浮不上来。
+      //   该值与 `QueryFilter.userIds` 的筛选语义、协议里的 `userId === 'unknown'`
+      //   是同一个字符串（契约里只有一份定义）。
+      return `COALESCE(user_id, '${UNATTRIBUTED_USER}')`
+    case 'day':
+    case 'hour':
+      // ⚠️ 见上方 🚨 注释：故意交给 JS 侧分桶，不要改成 strftime
+      return null
+    case 'project':
+      // 需要 projectName() 的目录切分规则，交给 JS 侧
+      return null
+    case 'group':
+      // ★ 分组维度**不能**在这里出表达式：人员与分组是多对多，一个事件要同时
+      //   计入它的人员所属的每个分组，非 JOIN 关联表不可。JOIN 会放大行数，
+      //   于是「一个事件算几行」这件事必须由 `portal.ts` 显式处理 ——
+      //   本函数只产出等值聚合，硬塞进来会让它悄悄变成重复计数。
+      return null
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -259,8 +408,8 @@ export function toNumberOrNull(v: unknown): number | null {
 }
 
 /** 汇总四项 token 与调用次数（本地路径 `queryTotals` 与部门看板共用）。 */
-export function totalsQuery(filter: QueryFilter = {}): SqlQuery {
-  const { sql, params } = buildWhere(filter)
+export function totalsQuery(filter: QueryFilter = {}, normalize?: ProviderNormalizer): SqlQuery {
+  const { sql, params } = buildWhere(filter, normalize)
   return {
     sql: `SELECT COUNT(*) AS calls,
                  SUM(input_tokens)       AS input,
@@ -274,8 +423,8 @@ export function totalsQuery(filter: QueryFilter = {}): SqlQuery {
 }
 
 /** 去重会话数。 */
-export function sessionCountQuery(filter: QueryFilter = {}): SqlQuery {
-  const { sql, params } = buildWhere(filter)
+export function sessionCountQuery(filter: QueryFilter = {}, normalize?: ProviderNormalizer): SqlQuery {
+  const { sql, params } = buildWhere(filter, normalize)
   return {
     sql: `SELECT COUNT(DISTINCT session_id) AS c FROM ${EVENT_TABLE}${sql}`,
     params,
@@ -283,8 +432,8 @@ export function sessionCountQuery(filter: QueryFilter = {}): SqlQuery {
 }
 
 /** 最早 / 最晚事件时间。 */
-export function timeBoundsQuery(filter: QueryFilter = {}): SqlQuery {
-  const { sql, params } = buildWhere(filter)
+export function timeBoundsQuery(filter: QueryFilter = {}, normalize?: ProviderNormalizer): SqlQuery {
+  const { sql, params } = buildWhere(filter, normalize)
   return {
     sql: `SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM ${EVENT_TABLE}${sql}`,
     params,
@@ -297,8 +446,8 @@ export function timeBoundsQuery(filter: QueryFilter = {}): SqlQuery {
  * ★ 它必须与 {@link totalsQuery} 打上**同一组筛选条件**（同一个 filter），
  *   否则比值的分子分母来自两个数据集 —— 会算出大于 1 的占比。
  */
-export function unattributedCallsQuery(filter: QueryFilter = {}): SqlQuery {
-  const { sql, params } = buildWhere(filter)
+export function unattributedCallsQuery(filter: QueryFilter = {}, normalize?: ProviderNormalizer): SqlQuery {
+  const { sql, params } = buildWhere(filter, normalize)
   // 未归属条件与筛选条件用 AND 组合：filter 里若已有 user_id 条件，
   // 也能正确收敛（例如只看某个已署名的人 → 未归属恒为 0）
   const condition = filter.identityView === 'member' ? 'member_id IS NULL AND user_id IS NULL' : 'user_id IS NULL'
@@ -307,8 +456,8 @@ export function unattributedCallsQuery(filter: QueryFilter = {}): SqlQuery {
 }
 
 /** 已署名人数（按 `user_id` 去重）。 */
-export function distinctUsersQuery(filter: QueryFilter = {}): SqlQuery {
-  const { sql, params } = buildWhere(filter)
+export function distinctUsersQuery(filter: QueryFilter = {}, normalize?: ProviderNormalizer): SqlQuery {
+  const { sql, params } = buildWhere(filter, normalize)
   return {
     sql: `SELECT COUNT(DISTINCT user_id) AS c FROM ${EVENT_TABLE}${sql}`,
     params,
@@ -332,11 +481,13 @@ export function groupsQuery(
   dim: QueryDimension,
   filter: QueryFilter = {},
   dialect: PortalDialect = SQLITE_DIALECT,
+  normalize?: ProviderNormalizer,
 ): SqlQuery | null {
-  const dimExpr = dimensionExpression(dim, dialect)
+  const params: Record<string, string | number> = {}
+  const dimExpr = dimensionExpression(dim, dialect, normalize, params)
   if (!dimExpr) return null
 
-  const { sql, params } = buildWhere(filter)
+  const { sql, params: whereParams } = buildWhere(filter, normalize)
   return {
     sql: `SELECT ${dimExpr} AS grp_key,
                  SUM(input_tokens)       AS input,
@@ -350,8 +501,65 @@ export function groupsQuery(
                  COUNT(DISTINCT session_id) AS sessions
           FROM ${EVENT_TABLE}${sql}
           GROUP BY grp_key`,
+    // ⚠️ 两份参数必须合并：`dimExpr` 里内联了归一化映射的绑定值
+    //   （`$gpk0` / `$gpv0`），而 `buildWhere` 产出的是筛选条件的绑定值。
+    //   漏掉任何一份都会让 MySQL 侧抛「绑定参数缺失」，而 SQLite 侧
+    //   只是把那几个参数当 NULL —— 于是分组结果里少掉所有配了规则的供应商。
+    params: { ...params, ...whereParams },
+  }
+}
+
+/**
+ * 明细行的**取数**投影（只出列与表达式，拼接 WHERE / ORDER BY / LIMIT 由调用方做）。
+ *
+ * ## ★ 为什么明细要同时取「原值」和「归一化名」
+ *
+ * 聚合维度只认归一化名（`by=provider` 的行就该是 `bailian-tpp`），但明细是
+ * 人用来**核对规则配得对不对**的地方：只显示归一化名的话，一条把
+ * `dashscope` 错配成 `bailian-tpp` 的规则会表现得完全正常 ——
+ * 总量对、名字错，没有任何地方能看出来。
+ *
+ * ⚠️ 两个字段名刻意不叫 `provider` / `provider_raw`：
+ *   取数层的字段名与线上契约解耦，「哪一个是展示名」这件事只由
+ *   `stats-route.ts` 的映射决定，改契约时不会牵动 SQL。
+ */
+export interface RecordProjection {
+  columns: string
+  params: Record<string, string | number>
+}
+
+export function recordProjection(normalize?: ProviderNormalizer): RecordProjection {
+  const params: Record<string, string | number> = {}
+  const raw = 'provider'
+  // 没有规则时两个表达式都是裸列名 —— SQL 与迁移前逐字相同（多一列同值）。
+  const normalized = hasNormalization(normalize)
+    ? coalesceOriginal(providerCaseSql(raw, normalize.map, params, 'rp'), raw)
+    : raw
+  return {
+    columns: `${raw} AS provider, ${normalized} AS provider_norm`,
     params,
   }
+}
+
+/**
+ * 明细行的归一化**返回值**。
+ *
+ * ★ 与 `portal.ts` 取数用的是同一个 `recordProjection()`：归一化的实现在
+ *   查询层只有一份，明细不可能与分组口径漂移。
+ */
+export interface NormalizedRecordProvider {
+  /** 上报当时的原值，一个字节都没改过。 */
+  providerRaw: string
+  /** 看板展示用的名字（未配规则时等于 `providerRaw`）。 */
+  provider: string
+}
+
+export function mapRecordProvider(row: { provider: unknown; provider_norm?: unknown }): NormalizedRecordProvider {
+  const raw = String(row.provider ?? '')
+  // ⚠️ `provider_norm` 在旧调用方（不带归一化的查询）里没有这一列，
+  //   此时回落原值 —— 而不是回落空串，那会让明细里的供应商列整列消失。
+  const normalized = row.provider_norm === null || row.provider_norm === undefined ? raw : String(row.provider_norm)
+  return { providerRaw: raw, provider: normalized }
 }
 
 /**
@@ -361,8 +569,12 @@ export function groupsQuery(
  *   `withSessionId` 只有分组才需要（会话要去重计数），序列不需要 ——
  *   少取一列在大表上就是少一次宽行扫。
  */
-export function timeBucketRowsQuery(filter: QueryFilter = {}, withSessionId = false): SqlQuery {
-  const { sql, params } = buildWhere(filter)
+export function timeBucketRowsQuery(
+  filter: QueryFilter = {},
+  withSessionId = false,
+  normalize?: ProviderNormalizer,
+): SqlQuery {
+  const { sql, params } = buildWhere(filter, normalize)
   const cols = withSessionId
     ? 'ts, session_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens'
     : 'ts, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens'
@@ -590,88 +802,19 @@ export function queryGroups(
   dim: QueryDimension,
   filter: QueryFilter = {},
   dialect: PortalDialect = SQLITE_DIALECT,
+  normalize?: ProviderNormalizer,
 ): QueryGroupRow[] {
   // project 维度走「取出 cwd 后内存分组」的特殊路径
   if (dim === 'project') return queryGroupsByProject(db, filter)
   // day / hour 同理：时间键必须在 JS 侧算
   if (dim === 'day' || dim === 'hour') return queryGroupsByTime(db, dim, filter)
 
-  const q = groupsQuery(dim, filter, dialect)
+  const q = groupsQuery(dim, filter, dialect, normalize)
   if (!q) return []
 
   const rows = db.query<RawGroupRow, SQLQueryBindings>(q.sql).all(q.params)
 
   return sortGroupRows(mapGroupRows(rows), dim)
-}
-
-/**
- * 维度 → SQL 表达式。返回 null 表示该维度需要特殊处理（在 JS 侧分组）。
- *
- * 🚨 **`day` / `hour` 返回 null 是有意为之，不要「优化」成 `strftime`。**
- *
- * 看起来 `strftime('%Y-%m-%d', ts/1000, 'unixepoch', 'localtime')` 与
- * `toDayKey()` 等价，实际**不是**：
- *
- * - SQLite 的 `'localtime'` 依据 **操作系统时区**
- * - JS 的 `new Date().getHours()` 依据 **进程的 TZ 解析结果**
- *
- * 两者在本项目的 `bun test` 环境下实测**不一致**：
- *
- * | 环境 | `new Date().getTimezoneOffset()` | SQLite `'localtime'` |
- * |---|---|---|
- * | `bun run` | -480（+08:00，正确） | +08:00 |
- * | `bun test` | **0（被强制成 UTC）** | **仍是 +08:00** |
- *
- * 于是同一份数据在测试里会分到相差 8 小时的桶：SQL 侧 `2026-09-25T00`、
- * 内存侧 `2026-09-24T16`。这会直接表现为「趋势图的点错位」，
- * 而且**只在测试环境下暴露**，本地手测完全正常 —— 最难查的一类 bug。
- *
- * 因此时间分桶一律在 JS 侧用 `toDayKey()` / `toHourKey()` 做：
- * 那是全仓唯一的时间键实现，两条路径必然一致，也不受 TZ 解析差异影响。
- * 代价是 `day` / `hour` 分组要多一次 `(ts, 四项, session_id)` 的取值，
- * 实测在 16k 行上仍是毫秒级。
- *
- * ## 🚨 拼接必须走方言（`provider-model`）
- *
- * `provider || '/' || model` 在 SQLite 是字符串拼接，在 **MySQL 是逻辑或** ——
- * 实测返回 `0` / `1`，于是分组键静默变成 `"0"` / `"1"`：看板上的模型分布
- * 变成两行垃圾数据，**没有任何报错**。所以这里调 `dialect.concat()`，
- * MySQL 侧生成 `CONCAT(provider, '/', model)`。
- */
-function dimensionExpression(
-  dim: QueryDimension,
-  dialect: PortalDialect = SQLITE_DIALECT,
-): string | null {
-  switch (dim) {
-    case 'provider':
-      return 'provider'
-    case 'model':
-      return 'model'
-    case 'session':
-      return 'session_id'
-    case 'provider-model':
-      // 分隔符必须与 aggregate.ts 的 groupKey() 一致（`provider/model`）
-      return dialect.concat(['provider', "'/'", 'model'])
-    case 'user':
-      // ★ 未归属归到 UNATTRIBUTED_USER 这一组，而不是被 GROUP BY 丢进 NULL ——
-      //   人员排行里必须看得见「有 3 个人没署名」，否则覆盖率问题永远浮不上来。
-      //   该值与 `QueryFilter.userIds` 的筛选语义、协议里的 `userId === 'unknown'`
-      //   是同一个字符串（契约里只有一份定义）。
-      return `COALESCE(user_id, '${UNATTRIBUTED_USER}')`
-    case 'day':
-    case 'hour':
-      // ⚠️ 见上方 🚨 注释：故意交给 JS 侧分桶，不要改成 strftime
-      return null
-    case 'project':
-      // 需要 projectName() 的目录切分规则，交给 JS 侧
-      return null
-    case 'group':
-      // ★ 分组维度**不能**在这里出表达式：人员与分组是多对多，一个事件要同时
-      //   计入它的人员所属的每个分组，非 JOIN 关联表不可。JOIN 会放大行数，
-      //   于是「一个事件算几行」这件事必须由 `portal.ts` 显式处理 ——
-      //   本函数只产出等值聚合，硬塞进来会让它悄悄变成重复计数。
-      return null
-  }
 }
 
 /**
