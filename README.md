@@ -53,7 +53,7 @@ bun run report -- --endpoint http://<服务端>:8787/api/v1/token-usage --token 
 | `packages/cli` | 命令行入口：`stats` / `report` / `--web` |
 | `packages/server` | 后端：上报接收 + 本地直查 + 部门统计（含分组目录与分组维度查询）+ **数据库身份、人员与分组管理** + 静态托管 |
 | `packages/web-local` | **本地页面**：只看本机，数据来自 `/api/local/*` |
-| `packages/web-portal` | **部门看板 + 人员管理页 + 分组管理页**：看全员，数据来自 `/api/v1/stats/*`（含分组候选项 `/api/v1/stats/groups`）、`/api/v1/admin/members*` 与 `/api/v1/admin/groups*`（数据库会话鉴权） |
+| `packages/web-portal` | **部门看板 + 人员管理页 + 分组管理页**：看全员，数据来自 `/api/v1/stats/*`（含分组候选项 `/api/v1/stats/groups` 与人员候选项 `/api/v1/stats/members`）、`/api/v1/admin/members*` 与 `/api/v1/admin/groups*`（数据库会话鉴权） |
 | `packages/dsh-plugin` | **DSH 插件**：实时上报 |
 
 ## 三条铁律
@@ -72,8 +72,12 @@ bun run report -- --endpoint http://<服务端>:8787/api/v1/token-usage --token 
 - ❌ 不采集、也不向任何服务端发送数据
 - ✅ 仍可查看本机统计（那是你自己的数据）
 
-填写后保存在 `$DSH_HOME/token-report/identity.json`，**本地页与插件共用同一份**，
-填一次即可。`token` 是**身份凭证** —— 姓名以服务端凭证表为准，改本地文件无法冒用他人身份。
+填写后保存在**数据目录**下的 `identity.json`（缺省 `~/.ai-token-report/identity.json`，
+可用配置项 `dataDir` 或 `DSH_TOKEN_REPORT_DATA_DIR` 覆盖），
+**本地页与插件共用同一份**，填一次即可。
+`token` 是**身份凭证** —— 姓名以服务端凭证表为准，改本地文件无法冒用他人身份。
+DSH Desktop 与命令行版 DSH **缺省就共用这份署名**（数据目录不再跟随各自的 home），
+想各用一套时才在插件配置里指 `dataDir`（**不要**改 `dshHome`），见 `packages/dsh-plugin/README.md` §1.1。
 
 ### 数据库与管理员初始化
 

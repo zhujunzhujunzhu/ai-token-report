@@ -21,8 +21,16 @@
 ```
 
 **核心结构决策**：本地与服务端**彻底解耦** —— 本地用自己的库
-（`$DSH_HOME/token-report/usage.sqlite`），**只装本机数据、从不出网**。
+（`~/.ai-token-report/usage.sqlite`），**只装本机数据、从不出网**。
 这让「本地」名副其实：断网也能用，且服务端挂掉不影响任何人看自己的数据。
+
+> ⚠️ **「会话日志根」与「token-report 数据目录」是两个东西**（`core/src/home.ts`）：
+> `dshHome`（默认 `$DSH_HOME`，再缺省 `~/.dsh`）决定**日志从哪读**，
+> `dataDir`（默认 **`~/.ai-token-report`**，**刻意与 `dshHome` 无关**）决定**身份 / 本地库 / outbox / 补报水位放哪**；
+> 可用配置项 `dataDir` 或环境变量 `DSH_TOKEN_REPORT_DATA_DIR` 覆盖。本文里出现的 `~/.ai-token-report/...` 都是 `dataDir` 的默认值。
+> 因为缺省不跟随 `DSH_HOME`，DSH Desktop 与命令行版 DSH **天然共用同一份身份与凭证**（都落到 `~/.ai-token-report`），
+> 不需要任何配置；想「只这套 DSH 用它」时才显式写 `dataDir`（例：`dataDir: ~/.dsh/token-report`）
+> —— 改 `dshHome` 会把日志来源一起换掉（详见 `packages/dsh-plugin/README.md` §1.1）。
 
 > ⚠️ **本地端数据源在 S10 阶段从「直扫日志」改为「本地 SQLite 增量库」。**
 > 原因是实测发现瓶颈**不是 IO 而是 CPU**：196 文件 / 80.8 MB 的全量扫描中，
@@ -389,10 +397,12 @@ event_id = `${sessionId}:${seq}`
 ### 4.5.4 身份文件
 
 ```
-$DSH_HOME/token-report/identity.json
+<dataDir>/identity.json          # 缺省 ~/.ai-token-report/identity.json
 ```
 
 **本地页与插件共用同一份** —— 员工在哪里填一次就够了。
+两套 DSH（Desktop 与命令行版）**缺省就共用同一份**（都落到 `~/.ai-token-report`），不需要任何配置；
+想各用一套时才显式写 `dataDir` 或 `DSH_TOKEN_REPORT_DATA_DIR`。
 
 ```json
 { "name": "张三", "token": "...", "group": "研发一部",
@@ -448,6 +458,7 @@ inspect/migrate/resume，再通过 `packages/server/scripts/import-credentials.t
 | GET / POST | `/api/v1/admin/members/tokens` | 凭证摘要列表 / 签发 |
 | POST | `/api/v1/admin/members/tokens/rotate`、`revoke`、`scopes` | 轮换、吊销与范围变更 |
 | POST | `/api/v1/admin/members/tokens/expiry` | ★ 改有效期（`null` = 长期有效，其余须是未来时刻） |
+| POST | `/api/v1/admin/members/tokens/delete` | ★ 物理删除凭证（仅限从未上报、也未被审计引用的；其余 409 并提示改用吊销） |
 | POST | `/api/v1/admin/members/appkey` | ★ 签发 appKey（范围固定为上报 + 获取统计） |
 | GET | `/api/v1/admin/appkeys` | ★ appKey 列表：每行一把凭证 + 它发给了谁（`tokens:manage`） |
 | GET | `/api/v1/admin/roles`、`storage`、`audit`、`legacy-attributions` | 角色目录＋权限目录、数据库状态、审计与历史映射 |
@@ -459,8 +470,12 @@ inspect/migrate/resume，再通过 `packages/server/scripts/import-credentials.t
 「这个人是谁」——资料、角色、登录账号与**所属分组（多选）**；分组管理页（`/groups`，`groups:manage`）
 维护分组目录本身；appKey 管理页（`/appkeys`，**`tokens:manage`**）只管「这把 key 发给了谁」——
 列表主体是全部凭证，归属由服务端按 `report_tokens.member_id`
-关联人员表得出（改名后仍指向同一个人），可按人员搜索、轮换 / 吊销，并设置与修改**有效期**
-（`null` = 长期有效，过期只是时间比较，所以过期 key 可以续期而不必轮换）。
+关联人员表得出（改名后仍指向同一个人），可按人员搜索、轮换 / 吊销、**删除从未上报过的**，
+并设置与修改**有效期**（`null` = 长期有效，过期只是时间比较，所以过期 key 可以续期而不必轮换）。
+「删除」与「吊销」分工明确：吊销保留整行（谁被吊销过一屏可见，历史用量仍指向它），
+删除只放行**从未被引用**的凭证 —— `usage_event.report_token_id` 与
+`admin_audit_log.actor_token_id` 都是 RESTRICT 外键，被引用时服务端回 409 并在原因里
+直说「请改用吊销」，页面原样呈现，不做「失败就降级成吊销」。
 交付信息（上报 / 统计的完整地址 + 使用人 + 凭证提示）点开弹框查看，明文**不进 DOM**：
 页面最多显示中间省略号的遮罩 `atr-ab12…ef34`，完整明文只在剪贴板里 ——
 它只随签发 / 轮换响应出现一次，库内只有摘要，且凭证提示（`token_prefix`）也统一按
@@ -651,7 +666,7 @@ Content-Type: application/json
 而不是沿用 `openDatabaseForIngest()` 的「丢了重建」。一旦搞反，
 一次 schema 升级就会把全员历史用量静默清空，且无从恢复。
 
-库路径默认 `<dsh-home>/token-report/portal.sqlite`，与本地库
+库路径默认 `<dataDir>/portal.sqlite`（即 `~/.ai-token-report/portal.sqlite`），与本地库
 `usage.sqlite` **必须分开**：混用会让全员数据与本机数据互相污染，
 而库里没有「数据来源」列，事后拆不开。
 
@@ -690,6 +705,7 @@ Content-Type: application/json
 | `GET /api/v1/stats/breakdown?by=user\|group\|model\|provider\|provider-model\|project\|day\|hour` | **★ 人员排行 / 分组排行**（`by=group` 是新增的分组维度） |
 | `GET /api/v1/stats/records?limit&offset` | 明细（分页，最新在前；每行带 `group_ids` 与 `group_name_snapshot`） |
 | `GET /api/v1/stats/groups` | ★ 分组候选项 `{ groups: StatsGroupOption[] }`（`stats:read`；筛选栏与分组排行的选项都取自它） |
+| `GET /api/v1/stats/members` | ★ 人员候选项 `{ members: StatsMemberOption[] }`（`stats:read`；名册 + 每人**当前**分组 ID，筛选栏的人员下拉取自它） |
 | `GET /api/v1/stats/diagnostics` | 覆盖率 / 未归属 / 数据边界 / 最近落库 |
 
 **页面上的筛选**（`web-portal`）：
@@ -698,13 +714,21 @@ Content-Type: application/json
 |---|---|---|
 | **时间窗** | 具名周期 `period`（`today` / `上周` / `最近 90 天` …） | 由服务端 `core/range.ts` 解析，**前端不做日期换算** |
 | **自定义区间** | `from` / `to`（epoch 毫秒） | 那本来就是使用者选定的两个绝对时刻，不是口径；结束时刻按「含该分钟」处理 |
-| **人员** | `user=张三,李四`（**多人可多选**，逗号分隔） | 归属筛选是**精确匹配**；`unknown` 表示未署名 |
+| **人员** | `member_id` / `legacy_user` / `unattributed`（**多选**） | 归属筛选是**精确匹配**；候选来自 `GET /api/v1/stats/members` **名册 ∪ 用量派生键**（未署名 / 待确认历史） |
 | **分组** | `group_id`（**逗号分隔多选**，精确匹配） | 候选项来自 `GET /api/v1/stats/groups`，**不是** `/api/v1/admin/groups` |
 | **厂商 / 模型** | `provider` / `model` | **子串**匹配（与 CLI 同义），与人名规则刻意不同 |
 
-> ⚠️ 人员下拉的候选来自**不含人员筛选**的同窗口 `breakdown?by=user`：
+> ⚠️ 人员下拉的候选**必须不带任何筛选参数**（名册接口本身不收参数）：
 > 若从已筛选的结果里取候选，选中一个人之后下拉会塌缩成一个选项（自锁定），
 > 使用者再也加不回别人，而页面看起来像「其余人都没数据」。
+>
+> ★ 候选也不能只从**用量**里取（`breakdown?by=user`）：那样「当前窗口内没有
+> 用量的人」会从下拉里消失，而**选中一个分组之后整个下拉会空掉** ——
+> 看起来像数据丢了。所以名册以 `GET /api/v1/stats/members` 为准（它由
+> `members` + `member_group_assignments` 两张权威表得出），页面再用每人当前的
+> `group_ids` 做**联动收窄**：未选分组 = 全部人员；选中分组 = 只列该分组成员。
+> 收窄是页面的展示过滤（不参与任何数值），`memberFilterOptions()` 是它唯一的实现。
+> 只有「未署名 / 待确认历史」这两类归属状态目录里表达不出来，仍由用量行补上。
 
 **分组维度是「展开」语义，不是重复计数**：人员与分组是多对多（§4.5.9），
 所以 `by=group` 与 `group_id` 筛选都把一条事件计入它的人员所属的**每个**分组 ——
@@ -750,7 +774,7 @@ CLI / 插件 ──POST /api/v1/token-usage──► portal.sqlite ──只读�
 |---|---|---|
 | 使用者 | 我自己 | 管理者 / 全组 |
 | 数据范围 | 本机 | 全员 |
-| 数据源 | `/api/local/*`（本地增量库） | `/api/v1/stats/*`（只读上报库；分组候选项走 `/api/v1/stats/groups`） |
+| 数据源 | `/api/local/*`（本地增量库） | `/api/v1/stats/*`（只读上报库；分组 / 人员候选项走 `/api/v1/stats/groups` 与 `/api/v1/stats/members`） |
 | 鉴权 | 无（仅 127.0.0.1） | 用户名、密码、验证码登录；HttpOnly Cookie 会话，退出后清除页面数据 |
 | 部署 | CLI 内置，随命令启动 | 独立部署（`bun run server` 托管 `packages/web-portal/dist`） |
 | 核心视图 | **首次署名引导** / 我的用量 / 我的项目分布 | **人员排行** / 部门趋势 / 模型分布 / 单人下钻 / 用量明细 / 采集诊断 |

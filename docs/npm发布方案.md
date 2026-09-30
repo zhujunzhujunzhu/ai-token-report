@@ -149,8 +149,8 @@ packages/dsh-plugin/dist/
      dsh plugin --profile tmp add dsh-plugin-token-report@next
      dsh --profile tmp --dump-config | Select-String token-report
      dsh --profile tmp --no-open
-   断言 $DSH_HOME/token-report/outbox 目录被创建
-   （这是「后端真的构造了」的唯一直接证据）
+   断言 ~/.ai-token-report/outbox 目录被创建
+   （这是「后端真的构造了」的唯一直接证据；不想写进真实数据目录就先设 DSH_TOKEN_REPORT_DATA_DIR）
 ⑥ 确认无误后再发 0.1.0 为 latest
      → bun run publish:plugin
 ```

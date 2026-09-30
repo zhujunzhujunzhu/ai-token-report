@@ -18,11 +18,14 @@ DSH token 用量统计平台。四种形态：**CLI / 本地页面 / 部门看�
 
 ```bash
 bun install
-bun test                        # 56 个文件 / 1002 个测试（设了 ATR_V4_TEST_MYSQL_URL 时 MySQL 用例实跑，否则跳过）
+bun test                        # 63 个文件 / 1184 个测试（设了 ATR_V4_TEST_MYSQL_URL 时 MySQL 用例实跑，否则跳过）
 bun run typecheck               # 7 个包全部 exit 0
 bun run build                   # web-local + web-portal 均构建成功
 bun run stats -- --period today # 终端统计（读本地库，热态 ~50ms）
 bun run stats -- --period today --no-db   # 直扫日志（与库结果做对照）
+bun run stats -- --discover               # 本机有哪些 DSH home（逐根会话数 / 最新写入）
+bun run stats -- --dsh-home ~/.dsh --dsh-home "$env:APPDATA/dsh-desktop/harness"   # 固定多根
+bun run stats -- --dsh-homes "$HOME/.dsh;$HOME/AppData/Roaming/dsh-desktop/harness"  # 一次给多个
 bun run web                     # 本地页面（需先 bun run build:local）
 bun run --filter '@ai-token-report/server' start   # 部门服务端 → 8787/api/health
 bun run dev:local               # web-local 开发服务器
@@ -34,9 +37,9 @@ bun run packages/server/test/e2e-ingest.ts           # 服务端侧 POST /api/v1
 bun run packages/cli/verify/verify-report-ingest.ts  # ④整条链 CLI report → 服务端 → 库（28 项）
 
 # 人员管理与权限端到端（真 HTTP；改 admin 路由 / 数据库身份 / 角色后全跑）
-bun run packages/server/test/e2e-admin.ts            # 签发即刻生效 + 401/403 + 护栏 + appKey 列表 + 分组多对多（120 项；`--mysql` 同款）
+bun run packages/server/test/e2e-admin.ts            # 签发即刻生效 + 401/403 + 护栏 + appKey 列表 + 分组多对多 + 供应商归一化（165 项；`--mysql` 同款）
 
-# 分发面契约（74 项，含 S12.3 的静态托管断言与分组目录/旧路径 404；改 app.ts / 路由 / 方法 / 状态码后必跑）
+# 分发面契约（79 项，含 S12.3 的静态托管断言与分组目录 / 供应商归一化 / 旧路径 404；改 app.ts / 路由 / 方法 / 状态码后必跑）
 bun test packages/server/test/http-contract.test.ts
 
 # 双轨对照验证（真实日志上跑 SQL vs 直扫，断言两者逐位一致）
@@ -45,12 +48,25 @@ bun run packages/cli/verify/verify-db-parity.ts
 # 双运行时驱动对照（Node 的 node:sqlite vs Bun 的 bun:sqlite，逐行比对）
 bun run --filter '@ai-token-report/core' verify:drivers
 
+# ★ 多 home 语义正确性（49 项）：并集 ≡ 把日志物理合并到一个根 / 顺序无关 / 嵌套 / 冲突 / 规模
+#   默认用合成日志（静止、可控，能断言严格相等）；`-- --real` 用本机真实日志只读复验
+#   （真实日志是**活的**：跨扫描的严格相等不成立，故按「手工并集 ⊆ 并集 + 并集单调」断言）
+bun run --filter '@ai-token-report/core' verify:multi-home
+bun run --filter '@ai-token-report/core' verify:multi-home -- --real
+
+# ★ 多 home 性能（11 项）：成本随**文件数**走而非事件数、去重不省扫描、多根无额外开销
+#   合成场景只用临时目录；`-- --real` 只读本机真实日志（库一律落临时目录，不写 dataDir）
+bun run --filter '@ai-token-report/core' benchmark:multi-home
+bun run --filter '@ai-token-report/core' benchmark:multi-home -- --real
+
 # MySQL 方言活体验证（17 项；需要可创建隔离 schema 的测试连接；只建/删自己随机测试库）
 # 本机可用开发 Docker 管理连接；别的机器用 ATR_MYSQL_URL，禁止拿业务库做建删演练
 bun run --filter '@ai-token-report/core' verify:mysql
 
-# ★ 双后端逐位对账（60 项；需要本机可连的 MySQL；改上报库 / 看板查询后必跑）
+# ★ 双后端逐位对账（62 项；需要本机可连的 MySQL；改上报库 / 看板查询后必跑）
 #   同一批数据起两个服务端（SQLite / MySQL），断言看板每个接口的响应体 JSON 全等
+#   （人员目录 `/api/v1/stats/members` 不能逐位比对 —— 两侧 UUID 各自随机生成 ——
+#    它比的是名册与分组关联条数）
 bun run packages/server/verify/verify-mysql-portal.ts
 
 # ★ 断言 zod 没进前端产物（S12.5；shared 根入口一旦 re-export schemas 就会变大且不报错）
@@ -101,7 +117,7 @@ bun run --filter '@ai-token-report/web-portal' verify
 | `packages/cli` | **命令入口**：`cli.ts` / `deliver.ts` / `report.ts` |
 | `packages/server` | 上报接收 + 本地直查 + 部门统计（含**分组目录与 `by=group` 分组维度**）+ **数据库身份、账号、会话、人员与分组（多对多）管理** + 静态托管 |
 | `packages/web-local` | 本地页面（`/api/local/*`） |
-| `packages/web-portal` | 部门看板：人员排行 / 趋势 / 分布 / 明细 / 诊断 + **人员管理页（按权限）** + **appKey 管理页（列表按人呈现归属）** + **分组管理页（`/groups`，需 `groups:manage`）**，后台账号登录，数据来自 `/api/v1/stats/*`（含分组候选项 `/api/v1/stats/groups`）、`/api/v1/admin/members*`、`/api/v1/admin/appkeys` 与 `/api/v1/admin/groups*` |
+| `packages/web-portal` | 部门看板：人员排行 / 趋势 / 分布 / 明细 / 诊断 + **人员管理页（按权限）** + **appKey 管理页（列表按人呈现归属）** + **分组管理页（`/groups`，需 `groups:manage`）** + **供应商归一化页（`/providers`，需 `providers:read`）**，后台账号登录，数据来自 `/api/v1/stats/*`（含分组候选项 `/api/v1/stats/groups` 与人员候选项 `/api/v1/stats/members`）、`/api/v1/admin/members*`、`/api/v1/admin/appkeys`、`/api/v1/admin/groups*` 与 `/api/v1/admin/provider-aliases*` |
 | `packages/dsh-plugin` | DSH 插件：实时上报 + `token_usage` 工具 + `ctx.tokenReport` 服务 + **界面用量面板（宿主半 + 浏览器半）**。见其 `README.md` |
 
 > 迁移期旧目录（`dsh-token-stats/`、`p0-verify/`）**已删除**。
@@ -123,7 +139,8 @@ bun run --filter '@ai-token-report/web-portal' verify
 | **DSH 插件**（配置 / 安装 / 排障 / 为什么不能碰私有字段） | `packages/dsh-plugin/README.md` |
 | **server 层分层 / 要不要引入第三方库** | `docs/server架构重构方案.md` + `.agents/skills/repo-conventions/SKILL.md` |
 | **部门上报库接 MySQL（方言坑 / 部署 / 备份）** | `docs/mysql上报库.md` |
-| **Portal v5 部署 / v4→v5 显式迁移 / 身份导入** | `docs/数据库部署与迁移.md` + `docs/数据库重设计.md` |
+| **Portal v6 部署 / v4→v5→v6 显式迁移 / 身份导入** | `docs/数据库部署与迁移.md` + `docs/数据库重设计.md` |
+| **供应商归一化（查询期口径 / 按查看者解析）** | `packages/core/src/db/provider-alias.ts` + `docs/数据库重设计.md` §4.3.1 |
 | **分组（多对多）/ 归属展开** | `docs/数据库重设计.md` + `ARCHITECTURE.md` §4.5；归属权威是关联表 `member_group_assignments`，`usage_event.group_name` 只是文本快照 |
 
 ---
@@ -202,7 +219,10 @@ bun run --filter '@ai-token-report/web-portal' verify
   **全部凭证的列表**：每行一把 key，归属由服务端按 `member_id` 关联人员表得出
   （改名后仍指向同一个人），可按人员搜索、可轮换 / 吊销、可设置与修改**有效期**
   （`POST /api/v1/admin/members/tokens/expiry`，`null` = 长期有效；过期只是时间比较，
-  所以过期 key 能续期而不必轮换），**交付信息**（上报 / 统计的完整地址 + 使用人 +
+  所以过期 key 能续期而不必轮换），可**删除**（`POST /api/v1/admin/members/tokens/delete`，
+  物理删除：只放行从未上报、也没被审计引用的凭证 —— `usage_event.report_token_id` 与
+  `admin_audit_log.actor_token_id` 都是 RESTRICT 外键，被引用时回 `409 token_referenced`
+  并提示改用吊销，页面**原样**呈现那条原因；失败不会降级成吊销），**交付信息**（上报 / 统计的完整地址 + 使用人 +
   凭证提示）点开弹框查看。明文仅存于签发 / 轮换响应，库内只有摘要，关掉就找不回来 ——
   所以页面**不把明文放进 DOM**（最多显示 `atr-ab12…ef34` 这种中间省略号遮罩），
   完整值只在剪贴板里，且凭证提示（`token_prefix`）也统一按中间省略号渲染
@@ -221,15 +241,23 @@ bun run --filter '@ai-token-report/web-portal' verify
   写事务锁住 `portal_identity_state` 后重新鉴权，跨进程签发/撤权立即生效，不能用内存长期缓存替代数据库事实。
 - **稳定归属使用 `member_id` UUID**；显示姓名允许重复、用户名仍唯一。
   改名或轮换 Token 不改写旧事件快照。历史引用使用 RESTRICT；最后一个仍有管理入口的管理员不可停用、降级或失去最后有效凭证。
-- **`credentials.json` 只作为显式离线导入源**：先完成 v5 结构迁移（v4 是冻结基线，v3 库先迁 v4 再迁 v5），再运行 `packages/server/scripts/import-credentials.ts`。
+- **`credentials.json` 只作为显式离线导入源**：先完成 v6 结构迁移（v4 是冻结基线，v3 库先迁 v4、再迁 v5、最后 v6），再运行 `packages/server/scripts/import-credentials.ts`。
   `credentials.ts` / `member-admin.ts` 和 `LegacyPortalAuth` 仅保留历史兼容测试；生产启动拒绝 `credentialsPath`，不双写文件。
 - **首次管理员初始化只允许空身份库执行一次**：`ATR_ADMIN_USERNAME` / `ATR_ADMIN_PASSWORD` 成对配置，
   `ATR_ADMIN_TOKEN` 可作为初始化输入；密码仅哈希、Token 仅摘要入库。已有初始化标记后重启不会从环境变量复活停用身份。
   后台验证码需要所有实例共享至少 32 字符的 `ATR_CAPTCHA_HMAC_KEY`，密钥不入数据库。
 - **看板的人员筛选是精确匹配、可多选**：新页面使用 `identity_view=member` 及稳定 ID；旧 `user` 视图有同名歧义时明确拒绝，不能静默合并。
-  provider / model 才是子串匹配。页面上的**人员候选必须用不含人员筛选的
-  同窗口查询**取回：从已筛选结果里取候选，选中一个人之后下拉会塌缩成一个选项
-  （自锁定），使用者再也加不回别人，而页面看起来像「其余人都没数据」。
+  provider / model 才是子串匹配。页面上的**人员候选不带任何筛选参数**（自锁定）：
+  从已筛选结果里取候选，选中一个人之后下拉会塌缩成一个选项，使用者再也加不回别人。
+  **候选的主来源是人员名册 `GET /api/v1/stats/members`（`stats:read`；`members` +
+  `member_group_assignments`），不是用量行** —— 只从用量取候选时，「当前窗口内没有
+  用量的人」不会出现，而**选中一个分组之后整个下拉会空掉**（看起来像数据丢了）。
+  分组与人员因此是**联动**的：未选分组 = 全部人员；选中分组 = 只列该分组成员，
+  同时把分组外的人选从筛选里去掉（服务端按 AND 叠加，留着必然查出 0）。
+  收窄只在名册可用时做；名册取不到（旧服务端 / 请求失败）时按原样保留。
+  名册接口失败**不拖垮看板**（回落成用量候选），但 401 仍要让会话过期。
+  只有「未署名 / 待确认历史」目录里表达不出来，仍由用量行补上。
+  实现只此一处：`web-portal/src/types/portal.ts` 的 `memberFilterOptions()`。
 - **不展示金额**（已确认决策）：无单价来源，只展示 token 数。
 - **本地身份文件解析失败降级为未署名并告警**；生产数据库损坏、不可用或版本不符则明确失败，不能退回空文件身份或另一个数据库。
 - **`Bun.serve` 必须显式设 `idleTimeout`**：默认 10 秒太短 —— 首次冷建库
@@ -272,7 +300,7 @@ bun run --filter '@ai-token-report/web-portal' verify
   两边必然漂移且不会报错。
 - **🚨 server 的路由与中间件只在 `server/src/app.ts` 一份**（S12 起用 Hono，4.13.9 精确锁版）。
   改任何路径 / 方法 / 状态码，先跑 `packages/server/test/http-contract.test.ts`
-  （74 项契约断言，重构前 `bun test` 完全不覆盖分发面）。
+  （79 项契约断言，重构前 `bun test` 完全不覆盖分发面）。
   四条实测踩出来的坑，改这里之前必读 `app.ts` 的注释：
   1. **Hono 不做 405**，方法不匹配默认回**纯文本 404**且无 `Allow` ——
      405 靠 `hono/method-not-allowed` 读 `app.routes` 反查；
@@ -326,14 +354,16 @@ bun run --filter '@ai-token-report/web-portal' verify
   **按分组筛选与分组排行都是 OR / 展开**：一条事件计入它的人员所属的**每个**分组，
   所以「各分组之和 > 总量」是**定义**，不是重复计数的 bug；未分组人员不进任何分组行，
   差额就是他们 —— 页面必须能说清这一点。看板的分组候选项走 `GET /api/v1/stats/groups`
-  （`stats:read`），**不要**让页面去读管理接口 `/api/v1/admin/groups`（那是 `groups:read`）。
-- **上报库的 schema 变更绝不能自愈**：portal 使用独立 v5（**v4 是冻结基线**：v3 库先经
-  `portal-schema-v4.ts` 迁到 v4，再走 v4→v5 步骤；v5 的 `usage_event` 去掉了一列并把 `dept` 改名
-  `group_name`），本地 `usage.sqlite` 仍为 v3。
+  （`stats:read`），**不要**让页面去读管理接口 `/api/v1/admin/groups`（那是 `groups:read`）；
+  人员候选项同理走 `GET /api/v1/stats/members`（`stats:read`），不是 `/api/v1/admin/members`。
+- **上报库的 schema 变更绝不能自愈**：portal 当前是 v6（**v4 是冻结基线**：v3 库先经
+  `portal-schema-v4.ts` 迁到 v4，再依次走 v4→v5、v5→v6；v5 的 `usage_event` 去掉了一列并把 `dept`
+  改名 `group_name`；**v6 只增表** `provider_alias` 与两个权限码，不改既有列、不重建事实表），
+  本地 `usage.sqlite` 仍为 v3。
   空 portal 库可初始化；旧库/半完成迁移拒绝普通业务写入，只能通过 `packages/server/scripts/migrate-db.ts`
   显式 inspect/migrate/resume。SQLite 先一致性备份（v5 在 SQLite 分支**必须重建事实表**才能去掉列，
   所以按备份流程执行），MySQL 需离线确认和备份证明；迁移前后逐位校验事件指纹，**不改写任何事件原值**。
-- **🚨 MySQL 的 v5 结构迁移有三条「只有活体 MySQL 才会暴露」的坑**（SQLite 一条都不会报，
+- **🚨 MySQL 的 v5/v6 结构迁移有五条「只有活体 MySQL 才会暴露」的坑**（SQLite 一条都不会报，
   所以「SQLite 上测过了」在这里**不构成证据** —— 它们全是靠本机 Docker MySQL 才抓出来的）：
   1. **`DROP COLUMN` / `RENAME COLUMN` 会被引用该列的 CHECK 约束挡住**
      （errno 3959 `Check constraint 'x' uses column 'y', hence column cannot be dropped or renamed`）。
@@ -346,6 +376,20 @@ bun run --filter '@ai-token-report/web-portal' verify
      且必须剥掉行尾的内联 CHECK，否则会多出一份重复约束。
   3. **`CHECK_CLAUSE` 里的字符串定界符是反斜线转义的**（`\'…\'`），拼回
      `ADD CONSTRAINT … CHECK (…)` 之前必须还原成 `'…'`，否则 errno 1064 语法错误。
+  4. **受控 DDL 的「唯一约束」解析必须锚定在关键字之后**。写成
+     `(?:PRIMARY KEY|UNIQUE) \(([^)]+)\)` 会**跨过中间的令牌**去匹配，于是列级写法
+     `alias_id … NOT NULL PRIMARY KEY CHECK (alias_id REGEXP '…')` 被捕获成
+     `alias_id REGEXP '^[0-9a-f]{8}-…'` —— 一个不存在的列组合。同时
+     `CREATE UNIQUE INDEX … ON t (a, b)` 是**独立语句**，不在 `CREATE TABLE` 文本里，
+     必须扫 `portalSchemaStatements(kind)` 才拿得到。两条都只在 MySQL 分支生效
+     （SQLite 分支只比对 `sqlite_master.sql` 全文），所以又是「SQLite 全绿、MySQL 报
+     `表 provider_alias 的唯一约束与主键不一致`」。另外 MySQL 主键索引名恒为 `PRIMARY`，
+     受控 DDL 里写的是列名 —— 只比**列组合**，比索引名会让每张带主键的表都判失败。
+  5. **两端的唯一索引都不拦含 `NULL` 的行**（实测 `(NULL, 'dashscope')` 在 SQLite 与
+     MySQL 上都能插进两行）。所以 `provider_alias` 的「同一原始名只有一条**全局**规则」
+     **不由数据库保证**，只有 `repository.ts` 的 `findProviderAlias()` 显式查重兜住 ——
+     不要写「数据库会拒」的断言（那是假承诺），也不要用生成列 `COALESCE(member_id,'')`
+     去补（受控 DDL 逐列核对，多一列会在迁移最后一步判成结构不符）。
 - **🚨 resume 只看版本号判断「v4 基线是否就绪」会让 MySQL 库永久卡死**：v5 结构已经就位、
   但 v5 账本行被标成 `started`/`failed` 的库（迁移中途崩过之后就是这副样子）版本号已经是 5，
   只按版本判断会得出「基线还没做」→ 重跑 v3→v4 → 而那时 `dept` 早已改名 `group_name`，
@@ -359,10 +403,68 @@ bun run --filter '@ai-token-report/web-portal' verify
   库是**日志的派生物**，不是真值 —— 为它让页面白屏是不划算的。
 - **本地库坏了就重建，不要写迁移逻辑**：`DB_SCHEMA_VERSION` 不符 → `rebuildSchema()`。
   数据全部可从日志重扫，迁移代码比「重建」更容易出错且更难测试。
+- **🚨 「会话日志根」与「token-report 数据目录」是两个概念，别合并**
+  （`core/src/home.ts`）：`dshHomes`（**一组** home，默认**自动发现**本机全部 DSH）
+  决定**日志从哪读**，`dataDir`（默认 **`~/.ai-token-report`**，**刻意与 home 无关**，可用
+  `DSH_TOKEN_REPORT_DATA_DIR` 或配置项 `dataDir` 覆盖）决定身份 / 本地库 / outbox / 补报水位放哪。
+  - **多个 home 是一组，库仍然只有一份**：`sessionsRoots` 是并集，而 `dataDir` / `usage.sqlite`
+    不随根分叉 —— 分成两个库就没法表达「并集」。镜像会话靠 `event_id`（`sessionId:seq`）
+    主键去重（直扫路径由 `scanner.ts` 的 `seenEvents` 保证同一语义），所以
+    **「并集 < 各根相加」是正确结果**，不是漏扫（本机实测：两个 home 共 254 个会话，不是 478）。
+  - **来源必须可见（四条形态都有）**：`--discover` 逐个打印候选（会话数 / 最新写入 / 是否被采用），
+    `--format json` 给 `dshHomes` / `sessionsRoots` / `missingRoots`；**本地页面**
+    `/api/local/stats/{overview,diagnostics}` 都带 `sources`（`LocalStatsSources` =
+    `sessionsRoots` + `missingRoots` + `dataDir`，见 `shared/src/protocol.ts`），
+    由 `UsageStatsView` 渲染成一行「数据来源」并对缺失根告警；
+    插件诊断打印全部根；`inspectSessionRoots()` 回答「这次统计到底读了哪几处」。
+    配了但不存在的根**逐项报出**，绝不静默 —— 否则「加了 home 数字没变」分不清是
+    镜像去重还是那个根根本没读到（两种情况的数字看起来一模一样）。
+    注意 `dshHomes` / `--dsh-home` / `DSH_TOKEN_REPORT_DSH_HOMES` 收的是 **home 目录**
+    （路径层自己拼 `<home>/sessions`）；写错成 sessions 目录会得到「全部缺失」而不是静默 0。
+  - **日志根的结构是固定三层** `sessions/<project>/<sessionId>/<file>`：`listSessionFilesInRoot`
+    只做两层 `readdir` 就找 `session*.jsonl.zstd`，`sessionFilesFromPaths` 也逐字校验
+    「三段式」（`candidate.length !== 3`）。自己搭测试 / 演练目录时多一级会让它
+    **静默扫到 0 个文件** —— 不报错、不告警、总量为 0，看起来像「这个 home 是空的」。
+    `core/verify/verify-multi-home.ts` 的 `materialize()` 注释里记了这条踩坑记录。
+  - **多根的成本只与「文件总数」有关**（`core/verify/benchmark-multi-home.ts` 实测）：
+    去重发生在**解析之后**，所以镜像文件照样要被打开、解压、`JSON.parse` ——
+    两个 root 全是镜像时数字一条不涨，扫描成本**照样翻倍**（本机真实日志：文件数 ×1.97，
+    并集事件只 ×1.05，冷扫 ×1.83）。同样的 800 个文件放进 1 个根与 4 个根耗时相同，
+    所以**多根本身没有额外开销**。热态路径只按文件数做一次 `stat`（约 0.5ms/文件），
+    与事件数无关。
+  - **自动发现是结构驱动的，不是硬编码清单**：候选 = `$DSH_HOME` + `~/.dsh` + `~/.dsh*`
+    + 各平台应用数据目录（Windows 的 `%APPDATA%` / `%LOCALAPPDATA%`）下名字以 `dsh` 开头的
+    目录及其 `<dir>/harness`；只有**真的有 `sessions` 子目录**才算一个根。名字不像 DSH 客户端
+    但结构像的目录只进 `suspicious`（只提示，**绝不自动采用**）。接入新的第三方客户端不需要改代码。
+    关掉发现：`DSH_TOKEN_REPORT_DISCOVER=0`；显式指定：`DSH_TOKEN_REPORT_DSH_HOMES`
+    （`path.delimiter` 分隔）或 CLI 的 `--dsh-home`（**可重复**）/ `--dsh-homes`。
+  - DSH Desktop 与命令行版 DSH **天然共用**同一份身份与凭证（都落到 `~/.ai-token-report`），
+    **不需要任何配置**；想「共用一份身份但各统计自己的会话」也只能改 `dataDir`，绝不要改 home
+    （那会把日志来源一起换掉，而且**不会以「完全没数据」的形式暴露** —— 实时上报不受影响，
+    只有面板与历史补报少掉那台机器自己的会话）。插件侧一律经 `dsh-plugin/src/paths.ts` 取路径，
+    不要在各处重新 `join(dshHome, 'token-report')`；`~` 的展开与绝对化只在
+    `core/src/home.ts` 一处做（`join()` 不展开 `~`，会建出字面的 `~` 目录）。
+- **🚨 隔离测试 / 验证脚本必须同时钉住「数据目录」与「会话日志根」**：数据目录不跟随
+  `DSH_HOME`，而会话日志根**默认自动发现**。只设 `DSH_HOME` 既不隔离身份/库、也不隔离扫描范围：
+  脚本会连带扫使用者真实的 home —— 断言随机器漂移，插件的历史补报线程还会把**真实用量
+  以验收身份上报出去**，而脚本输出一切正常。
+  - 同进程 `bun test` 由 preload（`scripts/test-preload.ts`）兜住：它设
+    `DSH_TOKEN_REPORT_DATA_DIR` 与 `DSH_TOKEN_REPORT_DISCOVER=0`。
+    ⚠️ 这里必须是**发现开关**而不是 `DSH_TOKEN_REPORT_DSH_HOMES` ——
+    `dsh-plugin/test/paths.test.ts` 会删掉 `DSH_HOME` 与插件 `ENV`（但不清发现开关），
+    用 `DSH_HOMES` 会把它的「缺省跟 `$DSH_HOME`」断言打成失败。`core/test/home.test.ts`
+    自己管 `DISCOVER`，别去动它。
+  - preload **管不到子进程**（实测 Bun 1.4.2：preload 改的 `process.env` 不被 `Bun.spawn` 继承），
+    所以**任何 spawn CLI / DSH / 服务端的测试与脚本必须自己传
+    `--data-dir` / `DSH_TOKEN_REPORT_DATA_DIR` **以及**
+    `DSH_TOKEN_REPORT_DSH_HOMES`（或 `DSH_TOKEN_REPORT_DISCOVER=0`）**。
+    spawn **真实 DSH 宿主**（`dsh --profile …`）时只能走环境变量 —— `dsh` 本体不认这些 CLI 参数；
+    而且那几个脚本会「删掉所有 `DSH_TOKEN_REPORT_*`」，救场变量必须在删完之后再钉上。
+    helper：`core/verify/lib/runtime.ts` 的 `scratchDataDir(home)` / `scratchDshHomes(...homes)`。
 - **🚨 上报库（`portal.sqlite`）是唯一副本，绝不自动重建**：它由
   `openPortalDb()` 打开，schema 版本不符时**抛错**（不是 `rebuildSchema`）。
   客户端投递成功后已清掉自己的 pending / outbox，删掉 = 全员历史用量永久消失。
-  本地 v3 走 `openDatabaseForIngest()`（可重建），服务端独立 v5 走
+  本地 v3 走 `openDatabaseForIngest()`（可重建），服务端独立 v6 走
   `openPortalStore()`（不可重建），**两个入口和版本不能混用**。
   上报库还必须与本地库 `usage.sqlite` 分开：混用后无法事后拆开。
 - **🚨 `server/src/serve-node.ts` 必须动态 `import('node:http')`**：
@@ -391,6 +493,18 @@ bun run --filter '@ai-token-report/web-portal' verify
   旧 `user` 视图保留原姓名键语义，有歧义时报错；禁止将待确认历史当成匿名或自动映射同名人员。
 - **按人筛选是精确匹配，provider/model 才是子串匹配**。人名做子串会把
   「张三」和「张三丰」并成一个人 —— 那是数据错误，不是便利。
+- **🚨 供应商归一化是「查询期的展示口径」，绝不是数据改写**（`provider_alias`，v6）：
+  `usage_event.provider` 永远是上报原值，规则只决定「分组与筛选时按哪个名字算」
+  （`core/src/db/provider-alias.ts` 的 `providerCaseSql()` 产出**没有 ELSE** 的 `CASE`，
+  命中不到就回落原值）。因此改规则即时生效、可逆，**历史数据不需要也没有回填步骤**。
+  四条实测踩出来的：
+  1. **没配规则的供应商保持原始名** —— 归一化是「折叠少数几个」，不是统一改名；
+  2. **原始名大小写敏感精确匹配**，写错就静默不命中；映射之后**原始名再也搜不到**它
+     （筛选作用在归一化后的表达式上，这是刻意的），所以明细必须同时给出原值；
+  3. **归一化按查看者解析**（只用 `auth.viewer.memberId`，**绝不从查询参数取「以谁的身份归一化」**）：
+     否则任何有 `stats:read` 的人都能套用别人的口径，而页面上看不出差别。人员规则逐条覆盖全局；
+  4. `provider-model` 维度必须**先归一化 provider 段再拼接**（`dialect.concat`），
+     对拼好的字符串做 `CASE` 永远匹配不到 —— 这是一个不会报错、只是不生效的坑。
 - **`user` 维度只存在于查询层**（`core/db/query.ts` 的 `QueryDimension`），
   **不要并进 `aggregate.ts` 的 `GroupDimension`**：后者是内存聚合（直扫日志）
   的维度集合，而日志里根本没有归属，塞进去只会多一个恒为 `unknown` 的选项。
