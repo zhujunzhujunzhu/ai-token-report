@@ -482,7 +482,29 @@ export interface UiSettingsPayload {
   position: UiPosition
   /** 上报此刻是否真的在跑，以及没跑的原因。 */
   reporting: UiReportingStatus
+  /**
+   * ★ 面板里存过的**会话日志根**（输入框回填值）。空数组 = 没设过覆盖，
+   *   跟随部署配置 / 自动发现。
+   *
+   * 🚨 这一项与 `effectiveRoots` 是**两件事**，不能只留一个：
+   *   前者是「我填了什么」，后者是「现在真的在读哪几处」。
+   *   只给前者，用户改完不知道有没有生效；只给后者，输入框会被自动发现的结果填满，
+   *   于是「留空 = 自动发现」这条语义在界面上消失。
+   */
+  dshHomes: string[]
+  /**
+   * ★ 此刻**真正生效**的会话日志根，逐项带存在性（`<home>/sessions` 在不在）。
+   *
+   * `exists: false` 必须显式显示：那是「这个根白写了」的唯一线索，
+   * 缺了它，一个不存在的 home 与一个空 home 在界面上长得一模一样。
+   */
+  effectiveRoots: { path: string; exists: boolean }[]
+  /** 生效的日志根来自哪一级（面板 / 部署配置 / 环境变量 / 自动发现）。 */
+  rootsSource: UiRootsSource
 }
+
+/** 生效日志根的来源。与宿主 `settings.ts` 的 `DshHomesSource` 同义。 */
+export type UiRootsSource = 'panel' | 'config' | 'env' | 'auto'
 
 /** 配置页的**保存**结果（`POST /api/tokenReport.settings`）。 */
 export interface UiSettingsSavePayload {
@@ -492,6 +514,9 @@ export interface UiSettingsSavePayload {
   name?: string
   position?: UiPosition
   flushIntervalMillis?: number
+  dshHomes?: string[]
+  effectiveRoots?: { path: string; exists: boolean }[]
+  rootsSource?: UiRootsSource
   reporting?: UiReportingStatus
   restartRequired?: boolean
 }
@@ -597,6 +622,37 @@ export function readUiReporting(value: unknown): UiReportingStatus {
   }
 }
 
+/** 只认四个已知来源；不认识（含旧宿主缺字段）一律当「自动发现」。 */
+export function coerceRootsSource(value: unknown): UiRootsSource {
+  return value === 'panel' || value === 'config' || value === 'env' ? value : 'auto'
+}
+
+/**
+ * 解析「会话日志根」三件套 —— **读取载荷与保存响应共用同一份形状**，
+ * 所以解析也只能有一处：各写一遍会出现「读取时认得、保存后回填错」这种偏一半的 bug。
+ *
+ * 与 `readUiResponse` 同一套规矩：逐字段重建，脏值一律丢弃或回落，
+ * **绝不抛错** —— 一个字段读不动不该让配置页整页失败。
+ */
+export function readUiRootsView(value: unknown): {
+  dshHomes: string[]
+  effectiveRoots: { path: string; exists: boolean }[]
+  rootsSource: UiRootsSource
+} {
+  const raw = record(value) ?? {}
+  const dshHomes: string[] = []
+  for (const item of Array.isArray(raw['dshHomes']) ? raw['dshHomes'] : []) {
+    if (typeof item === 'string' && item.trim() !== '') dshHomes.push(item.trim())
+  }
+  const effectiveRoots: { path: string; exists: boolean }[] = []
+  for (const item of Array.isArray(raw['effectiveRoots']) ? raw['effectiveRoots'] : []) {
+    const entry = record(item)
+    const path = entry === undefined ? undefined : optionalText(entry['path'])
+    if (path !== undefined) effectiveRoots.push({ path, exists: bool(entry!['exists']) })
+  }
+  return { dshHomes, effectiveRoots, rootsSource: coerceRootsSource(raw['rootsSource']) }
+}
+
 /** 解析配置读取载荷。任何缺字段都回退到「未署名 + 默认位置」，绝不抛错。 */
 export function readUiSettings(value: unknown): UiSettingsPayload {
   const raw = record(value) ?? {}
@@ -614,6 +670,7 @@ export function readUiSettings(value: unknown): UiSettingsPayload {
     flushIntervalMillis: interval > 0 ? interval : 0,
     position: parseUiPosition(raw['position']) ?? UI_DEFAULT_POSITION,
     reporting: readUiReporting(raw['reporting']),
+    ...readUiRootsView(raw),
   }
 }
 

@@ -122,8 +122,13 @@ export const CSS = calendarCss.replaceAll('.rdp-', '.atr-rdp-') + `
 .atr-settings{display:flex;flex-direction:column;gap:14px;line-height:1.6}.atr-form{display:grid;gap:16px}
 .atr-field{display:flex;flex-direction:column;gap:6px}
 .atr-field input{box-sizing:border-box;width:100%;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit}
+/* 会话日志根是多行输入；与 input 同款边框，只多一条可竖向拉伸与等宽字体（路径更好读）。 */
+.atr-textarea{box-sizing:border-box;width:100%;min-height:64px;resize:vertical;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;line-height:1.5}
+.atr-textarea:disabled{opacity:.6;cursor:not-allowed}
+.atr-roots{display:flex;flex-direction:column;gap:2px}
+.atr-root{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all}
 .atr-primary{padding:12px;border:1px solid var(--dsw-alias-border-l4)}
-.atr-btn:focus-visible,.atr-row:focus-visible,.atr-field input:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:2px}
+.atr-btn:focus-visible,.atr-row:focus-visible,.atr-field input:focus-visible,.atr-textarea:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:2px}
 /* 浮层使用宿主主题变量；卡片与日历共享语义色，深色模式下保持对比度。 */
 .atr-dialog{--atr-accent:var(--dsw-alias-state-business-primary,#536de5);--atr-soft:color-mix(in srgb,var(--atr-accent) 9%,var(--dsw-alias-bg-base,#fff));--atr-chart-fill:color-mix(in srgb,var(--atr-accent) 12%,transparent);position:relative;width:min(1080px,100%);max-height:90vh;border-radius:20px;background:var(--dsw-alias-bg-base,#fff);box-shadow:0 24px 90px rgba(0,0,0,.2);font-family:inherit}
 .atr-mask{background:rgba(20,28,45,.28);backdrop-filter:blur(4px);padding:28px}

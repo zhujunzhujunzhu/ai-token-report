@@ -380,15 +380,15 @@ export function apply(
   const identityState = deps.identityState ?? resolver.resolve()
   const status = evaluateStatus(identityState, config)
 
-  const statsContext = buildStatsContext(config)
-  ctx.effect(() => () => { void closeStatsWorker(statsContext.dbPath) })
-
   // ── ① 上报运行时 ──────────────────────────────────────────────────
   //
   // ★ 与旧实现的关键差别：上报后端不再由配置**一次性**钉死。
   //   设置页保存完连接后调 `runtime.refresh()`，运行时就地换一个「投递单元」
   //   （新 endpoint / 新 appKey / 新间隔），用户不必重启 DSH。
   //   合规底线那一步仍然只在 `runtime.applyState()` 里（同一个 `evaluateStatus`）。
+  //
+  // ⚠️ 顺序：运行时**先**建，统计上下文跟着它取值 —— 面板里可以把「会话日志根」
+  //   改掉，改完必须在同一个进程里立刻按新根取数（见 `buildStatsContext`）。
   const runtime = new ReportRuntime<TokenReportBackend>(
     {
       logger: {
@@ -403,6 +403,9 @@ export function apply(
     },
     config,
   )
+
+  const statsContext = buildStatsContext(() => runtime.config())
+  ctx.effect(() => () => { void closeStatsWorker(statsContext.dbPath) })
 
   let backend: TokenReportBackend | null = null
   if (status.reportingEnabled && identityState.ready) {
@@ -478,20 +481,41 @@ export function apply(
   return { status, backend }
 }
 
-/** 统计上下文：两个路径 + 功能开关。 */
-function buildStatsContext(config: EffectiveConfig): StatsContext {
-  // ⚠️ 会话日志根与数据目录都只经 `reportPaths()` 取（见 `paths.ts`）：
-  //   在这里手抄 `config.dshHome` 会漏掉 `dataDir`，而漏掉不会报错 ——
-  //   只会让「界面上的数」与「上报的数」来自两个不同的目录。
-  const paths = reportPaths(config)
+/**
+ * 统计上下文：**活取值**的三个路径 + 功能开关。
+ *
+ * ⚠️ 会话日志根与数据目录都只经 `reportPaths()` 取（见 `paths.ts`）：
+ *   在这里手抄 `config.dshHome` 会漏掉 `dataDir`，而漏掉不会报错 ——
+ *   只会让「界面上的数」与「上报的数」来自两个不同的目录。
+ *
+ * ★ 三个路径刻意做成 **getter**（每次取用时现算），不是启动那一刻的快照：
+ *   面板里改完「会话日志根」，同一个进程里的面板、`token_usage` 工具与
+ *   `ctx.tokenReport` 服务都必须立刻按新根取数（上报侧的补报线程由
+ *   `ReportRuntime` 重建，判据是 `unitKey` 里的 `dshHomes`）。
+ *   写成快照的话，保存成功、日志也打了，但面板数字仍然是旧范围的 —— 且不报错。
+ *
+ * @param read - 取**当前**生效配置（组合根传 `() => runtime.config()`）。
+ */
+function buildStatsContext(read: () => EffectiveConfig): StatsContext {
+  // 同一份配置对象在多次取用之间复用一次路径解析：`reportPaths()` 会做
+  // 自动发现（若干次 readdir/existsSync），而一次查询要读三个字段。
+  let cachedFor: EffectiveConfig | undefined
+  let cachedPaths: ReturnType<typeof reportPaths> | undefined
+  const paths = (): ReturnType<typeof reportPaths> => {
+    const config = read()
+    if (cachedPaths === undefined || cachedFor !== config) {
+      cachedFor = config
+      cachedPaths = reportPaths(config)
+    }
+    return cachedPaths
+  }
   return {
-    config,
-    // ★ 一组根（多套 DSH 并存）；与 CLI / 本地页吃的是同一个 `openStats`
-    sessionsRoots: paths.sessionsRoots,
-    dbPath: paths.dbPath,
+    get config() { return { localDb: read().localDb } },
+    get sessionsRoots() { return paths().sessionsRoots },
+    get dbPath() { return paths().dbPath },
     // 单价快照（`pricing.json`）就在数据目录里：金额是**本机**的估算，
     // 所以「按哪份价算的」这件事必须跟着数据目录一起传下去。
-    dataDir: paths.dataDir,
+    get dataDir() { return paths().dataDir },
     backgroundQueries: true,
   }
 }
@@ -832,8 +856,12 @@ export {
   createSettingsHandler,
   readConnection,
   parseFlushInterval,
+  parseDshHomes,
+  dshHomesSourceOf,
+  MAX_DSH_HOMES,
   MIN_FLUSH_INTERVAL_MILLIS,
   MAX_FLUSH_INTERVAL_MILLIS,
+  type DshHomesSource,
   type SettingsHost,
   type SettingsState,
 } from './settings.js'

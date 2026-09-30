@@ -4,18 +4,19 @@
  * 1. 服务端身份边界（姓名只信校验响应）
  * 2. 凭证边界（GET 不回显 appKey，错误信息不带它）
  * 3. 失败不覆盖（校验失败 / 锁定 / 非法输入都不得留下半份配置）
- * 4. ★ 保存即生效：四个字段（地址 / appKey / 间隔 / 位置）落盘后
+ * 4. ★ 保存即生效：五个字段（地址 / appKey / 间隔 / 位置 / 会话日志根）落盘后
  *    调 `host.apply()`，**不需要重启 DSH**；宿主没提供入口时才回退成重启。
  */
-import { test, expect, beforeEach, afterEach } from 'bun:test'
+import { test, expect, beforeEach, afterEach, describe } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { readIdentity, resolvePaths } from '@ai-token-report/core'
 import { resolveConfig, type EffectiveConfig } from '../src/config.js'
 import {
-  baseUrlOf, createSettingsHandler, endpointOf, normalizeBaseUrl, parseFlushInterval,
-  readConnection, withSavedConnection, MAX_FLUSH_INTERVAL_MILLIS, MIN_FLUSH_INTERVAL_MILLIS,
+  baseUrlOf, createSettingsHandler, dshHomesSourceOf, endpointOf, MAX_DSH_HOMES, normalizeBaseUrl,
+  parseDshHomes, parseFlushInterval, readConnection, withSavedConnection,
+  MAX_FLUSH_INTERVAL_MILLIS, MIN_FLUSH_INTERVAL_MILLIS,
   type SettingsState,
 } from '../src/settings.js'
 
@@ -62,21 +63,33 @@ interface HostOptions {
   seen?: string[]
   /** 保存成功后的「就地生效」入口；不给就模拟不支持热生效的旧宿主。 */
   apply?: () => SettingsState['reporting'] | Promise<SettingsState['reporting']>
-  /** 覆盖生效配置（测部署侧下发的值）。 */
+  /** 部署侧下发的配置（插件 config）；面板保存过的偏好**覆盖**它。 */
   config?: Partial<EffectiveConfig>
 }
 
 function handler(result: unknown, options: HostOptions = {}) {
-  const config: EffectiveConfig = { ...resolveConfig({ dshHome: home, dataDir }), ...options.config }
+  /**
+   * 部署层（插件 config）。面板保存的偏好覆盖它 —— 与真实宿主同款。
+   *
+   * ⚠️ 配置必须**每次 `state()` 现算**，而不是建 handler 时算一次：
+   *   真实宿主里 `host.apply()` 走的是 `runtime.refresh()`，同一个 handler
+   *   保存完再 GET 就该看到新值（含「现在真的在读哪几个根」）。
+   *   建 handler 时算一份的话，这一整类断言都测不到东西。
+   */
+  const deployment = { dshHome: home, dataDir, ...options.config }
+  const state = (): SettingsState => {
+    const config = resolveConfig(withSavedConnection(deployment))
+    return {
+      config,
+      identity: signed(),
+      saved: readConnection({ dshHome: home, dataDir }),
+      reporting: { enabled: false, endpoint: config.endpoint, reason: '未启用' },
+      locked: options.locked ?? false,
+    }
+  }
   return createSettingsHandler(
     {
-      state: (): SettingsState => ({
-        config,
-        identity: signed(),
-        saved: readConnection({ dshHome: home, dataDir }),
-        reporting: { enabled: false, endpoint: config.endpoint, reason: '未启用' },
-        locked: options.locked ?? false,
-      }),
+      state,
       ...(options.apply
         ? { apply: async () => options.apply!() }
         : {}),
@@ -119,26 +132,31 @@ test('保存 appKey 与地址，GET 不回传任何 Key，重启后连接可恢�
   expect(withSavedConnection({ dshHome: home, dataDir, appKey: 'deployment-key' }).appKey).toBe('report-secret')
 })
 
-test('★ 保存成功即生效：四个字段落盘后调 host.apply()，不再要求重启', async () => {
+test('★ 保存成功即生效：五个字段落盘后调 host.apply()，不再要求重启', async () => {
   const { run, calls } = handlerWithApply({ ok: true, name: '张三', group: '研发' })
+  const root = tempDir()
   const body = await (await run(request({
-    baseUrl, appKey: 'report-secret', flushIntervalMillis: 30_000, position: 'both',
+    baseUrl, appKey: 'report-secret', flushIntervalMillis: 30_000, position: 'both', dshHomes: [root],
   }))).json() as Record<string, unknown>
 
   expect(body).toMatchObject({
     ok: true, name: '张三', applied: true, restartRequired: false,
     flushIntervalMillis: 30_000, position: 'both',
+    // ★ 保存结果里必须带上「现在生效的根」：页面据此更新那一行，
+    //   不必再发一次 GET（也免得用户以为「保存了但范围没变」）
+    dshHomes: [root],
   })
   expect(calls()).toBe(1)
   // 生效结果如实回给页面（面板上要显示「上报中 / 已停止及原因」）
   expect(body['reporting']).toMatchObject({ enabled: true })
   // ★ 落盘的是用户选的偏好，不只是连接
   expect(readConnection({ dshHome: home, dataDir })).toEqual({
-    baseUrl, appKey: 'report-secret', flushIntervalMillis: 30_000, position: 'both',
+    baseUrl, appKey: 'report-secret', flushIntervalMillis: 30_000, position: 'both', dshHomes: [root],
   })
   // 同一个 handler 的 GET 必须立刻反映新值（页面保存后不再显示旧间隔）
   const get = await (await run(new Request('http://localhost/api/tokenReport.settings'))).json() as Record<string, unknown>
-  expect(get).toMatchObject({ flushIntervalMillis: 30_000, position: 'both' })
+  expect(get).toMatchObject({ flushIntervalMillis: 30_000, position: 'both', dshHomes: [root], rootsSource: 'panel' })
+  expect(get['effectiveRoots']).toEqual([{ path: root, exists: false }])
 })
 
 test('★ 偏好落进生效配置：间隔与位置可以就地生效而不必改部署文件', () => {
@@ -236,14 +254,26 @@ test('★ 留空 appKey 却改了地址 → 拒绝，且旧连接原样保留', 
   expect(readConnection({ dshHome: home, dataDir }).baseUrl).toBe(baseUrl)
 })
 
-test('★ 从没配过凭证时留空 appKey：拦在本地，也不留下半份偏好', async () => {
+test('★ 从没配过凭证也能保存本机偏好：只落偏好，绝不留下半份连接', async () => {
   const seen: string[] = []
+  const root = tempDir()
   const body = await handler({ ok: true, name: '不该被用到' }, { seen })(
-    request({ appKey: '', flushIntervalMillis: 5_000, position: 'both' }),
+    request({ baseUrl, appKey: '', flushIntervalMillis: 5_000, position: 'both', dshHomes: [root] }),
   ).then((r) => r.json() as Promise<Record<string, unknown>>)
-  expect(body['ok']).toBe(false)
+
+  // 会话日志根 / 间隔 / 位置都是纯本机偏好：一个还没署名、只看本机用量的人也要能存
+  expect(body).toMatchObject({ ok: true, applied: false, dshHomes: [root] })
+  // 没有凭证可校验 → 一个请求都不发
   expect(seen).toEqual([])
-  expect(readConnection({ dshHome: home, dataDir })).toEqual({})
+  // ★ 盘上**只有偏好**：没有 baseUrl / appKey（半份连接不会被认得）
+  expect(readConnection({ dshHome: home, dataDir })).toEqual({
+    flushIntervalMillis: 5_000, position: 'both', dshHomes: [root],
+  })
+  // 于是生效配置里也不会凭空冒出一个 endpoint / appKey
+  const merged = withSavedConnection({ dshHome: home, dataDir })
+  expect(merged.endpoint).toBeUndefined()
+  expect(merged.appKey).toBeUndefined()
+  expect(merged.dshHomes).toEqual([root])
 })
 
 test('缺服务端姓名的成功响应不能退回客户端提交内容', async () => {
@@ -271,10 +301,13 @@ test('★ 校验响应兼容旧服务端：只回 `dept` 时分组也必须落�
     .toMatchObject({ name: '张三', group: '研发' })
 })
 
-test('地址与凭证缺失都在本地就拦下，不发任何校验请求', async () => {
+test('地址非法 / 换凭证时没给地址：都在本地就拦下，不发任何校验请求', async () => {
   const seen: string[] = []
   const run = handler({ ok: true, name: '不该被用到' }, { seen })
-  expect(await (await run(request({ baseUrl, appKey: '   ' }))).json()).toMatchObject({ ok: false })
+  // 没给凭证时地址也必须合法（写坏了要说出来，而不是静默当成没给）
+  expect(await (await run(request({ baseUrl: 'ftp://nope', appKey: '   ' }))).json()).toMatchObject({ ok: false })
+  // 给了新凭证就必须给地址（否则不知道去哪校验）
+  expect(await (await run(request({ baseUrl: '', appKey: 'k' }))).json()).toMatchObject({ ok: false })
   expect(await (await run(request({ baseUrl: 'ftp://nope', appKey: 'k' }))).json()).toMatchObject({ ok: false })
   expect(seen).toEqual([])
 })
@@ -385,4 +418,143 @@ test('地址归一：接受完整上报地址与末尾斜杠，拒绝带账号�
   expect(baseUrlOf(endpoint)).toBe(baseUrl)
   for (const bad of ['http://user:pass@host', 'http://host/?a=1', 'ftp://host', 'http://host/#x'])
     expect(() => normalizeBaseUrl(bad)).toThrow()
+})
+
+/**
+ * ★ 会话日志根（`dshHomes`）—— 面板里唯一能改「统计范围」的地方。
+ *
+ * 四条必须钉住：
+ * 1. 保存后落盘，并**覆盖**部署配置（面板优先级最高，与间隔 / 位置同一套）；
+ * 2. 空输入 = **清掉覆盖**（回落部署配置 / 自动发现），不是「一个根都不要」；
+ * 3. 非法输入在本地就拦下，且盘上的原值一个字节不动；
+ * 4. GET 必须把「我存了什么」与「现在真的在读什么」**分开回**——
+ *    合成一个的话，用户永远分不清「保存成功了」与「真的生效了」。
+ */
+describe('会话日志根（面板里改统计范围）', () => {
+  const SIGNED = { ok: true, name: '张三' }
+
+  /** 建一个「有 sessions 目录」的 home（= 会被认成有效日志根）。 */
+  function liveRoot(): string {
+    const dir = tempDir()
+    mkdirSync(join(dir, 'sessions'), { recursive: true })
+    return dir
+  }
+
+  test('★ 保存后落盘，并且覆盖部署配置里的 dshHome / dshHomes', async () => {
+    const deployed = liveRoot()
+    const mine = liveRoot()
+    const run = handler(SIGNED, { config: { dshHome: deployed, dshHomes: [deployed] } })
+
+    // 保存前：生效的是部署配置下发的根
+    const before = await (await run(new Request('http://localhost/api/tokenReport.settings'))).json() as Record<string, unknown>
+    expect(before).toMatchObject({ dshHomes: [], rootsSource: 'config' })
+    expect(before['effectiveRoots']).toEqual([{ path: deployed, exists: true }])
+
+    // 保存面板设置的那一个根（没配凭证也照存）
+    const body = await (await run(request({ dshHomes: [mine] }))).json() as Record<string, unknown>
+    expect(body).toMatchObject({ ok: true, dshHomes: [mine], rootsSource: 'panel' })
+    expect(readConnection({ dshHome: home, dataDir }).dshHomes).toEqual([mine])
+
+    // ★ 面板的值覆盖部署配置（与间隔 / 位置同一套优先级）
+    const merged = withSavedConnection({ dshHome: deployed, dataDir, dshHomes: [deployed] })
+    expect(merged.dshHomes).toEqual([mine])
+    expect(resolveConfig(merged).dshHomes).toEqual([mine])
+
+    const after = await (await run(new Request('http://localhost/api/tokenReport.settings'))).json() as Record<string, unknown>
+    expect(after).toMatchObject({ dshHomes: [mine], rootsSource: 'panel' })
+    expect(after['effectiveRoots']).toEqual([{ path: mine, exists: true }])
+  })
+
+  test('★ 空列表 = 清掉覆盖（回落部署配置），而不是「一个根都不要」', async () => {
+    const deployed = liveRoot()
+    const mine = liveRoot()
+    const run = handler(SIGNED, { config: { dshHome: deployed, dshHomes: [deployed] } })
+
+    await run(request({ dshHomes: [mine] }))
+    expect(readConnection({ dshHome: home, dataDir }).dshHomes).toEqual([mine])
+
+    const body = await (await run(request({ dshHomes: [] }))).json() as Record<string, unknown>
+    expect(body).toMatchObject({ ok: true, dshHomes: [], rootsSource: 'config' })
+    // 盘上这一项整个消失（而不是留一个空数组）
+    expect(readConnection({ dshHome: home, dataDir }).dshHomes).toBeUndefined()
+    // 生效值于是回落部署配置 —— 不会变成「零个根」
+    expect(withSavedConnection({ dshHome: deployed, dataDir, dshHomes: [deployed] }).dshHomes).toEqual([deployed])
+  })
+
+  test('★ 非法列表在本地就拦下，盘上原值一个字节不动', async () => {
+    const kept = liveRoot()
+    const run = handler(SIGNED)
+    await run(request({ dshHomes: [kept] }))
+
+    for (const bad of ['/x', 5, true, null, { path: '/x' }, [5], ['/ok', 5]]) {
+      expect(await (await run(request({ dshHomes: bad }))).json()).toMatchObject({ ok: false })
+    }
+    const many = Array.from({ length: MAX_DSH_HOMES + 1 }, (_, i) => join(home, `root-${i}`))
+    expect(await (await run(request({ dshHomes: many }))).json()).toMatchObject({ ok: false })
+    // 一条校验请求都不该发出去，盘上也仍是原来那一个根
+    expect(readConnection({ dshHome: home, dataDir }).dshHomes).toEqual([kept])
+  })
+
+  test('空白行丢掉、重复项去重（粘贴多一行不该变成两个根）', async () => {
+    const root = tempDir()
+    const body = await handler(SIGNED)(request({ dshHomes: [`  ${root}  `, '', '   ', root] }))
+      .then((r) => r.json() as Promise<Record<string, unknown>>)
+    expect(body).toMatchObject({ ok: true, dshHomes: [root] })
+  })
+
+  test('没给这一项时不动已保存的根（部分客户端不会把它清空）', async () => {
+    const root = liveRoot()
+    await handler(SIGNED)(request({ dshHomes: [root] }))
+    await handler(SIGNED)(request({ appKey: '', position: 'both' }))
+    expect(readConnection({ dshHome: home, dataDir })).toMatchObject({ dshHomes: [root], position: 'both' })
+  })
+
+  test('★ 生效根的来源：面板 > 部署配置 > 环境变量 > 自动发现', () => {
+    const saved = { dshHomes: [liveRoot()] }
+    expect(dshHomesSourceOf({ saved, effective: { dshHome: '/deployed' }, env: {} })).toBe('panel')
+    expect(dshHomesSourceOf({ saved: {}, effective: { dshHomes: ['/deployed'] }, env: { DSH_HOME: '/env' } })).toBe('config')
+    expect(dshHomesSourceOf({ saved: {}, effective: { dshHome: '/deployed' }, env: { DSH_TOKEN_REPORT_DSH_HOMES: '/env' } })).toBe('config')
+    expect(dshHomesSourceOf({ saved: {}, effective: {}, env: { DSH_TOKEN_REPORT_DSH_HOMES: '/env' } })).toBe('env')
+    expect(dshHomesSourceOf({ saved: {}, effective: {}, env: { DSH_HOME: '/env' } })).toBe('env')
+    expect(dshHomesSourceOf({ saved: {}, effective: {}, env: {} })).toBe('auto')
+    // 面板那一份是空数组 = 没覆盖
+    expect(dshHomesSourceOf({ saved: { dshHomes: [] }, effective: {}, env: {} })).toBe('auto')
+  })
+
+  test('目录不存在也照收（先配好、再插硬盘是正常顺序），但存在性要如实带出去', async () => {
+    const present = liveRoot()
+    const gone = join(tempDir(), 'not-created-yet')
+    const run = handler(SIGNED)
+    await run(request({ dshHomes: [present, gone] }))
+
+    const get = await (await run(new Request('http://localhost/api/tokenReport.settings'))).json() as Record<string, unknown>
+    expect(get['dshHomes']).toEqual(expect.arrayContaining([present, gone]))
+    // 顺序由 core 的 `normalizeHomes()` 定（去重后按字典序），所以比对整张映射
+    expect(new Map((get['effectiveRoots'] as { path: string; exists: boolean }[]).map((r) => [r.path, r.exists])))
+      .toEqual(new Map([[present, true], [gone, false]]))
+  })
+
+  test('★ 手改坏的那一项整份忽略并告警（不许半份生效）', () => {
+    mkdirSync(dataDir, { recursive: true })
+    writeFileSync(join(dataDir, 'plugin-connection.json'), JSON.stringify({
+      dshHomes: ['/ok-but-half', 5],
+    }))
+    const warnings: string[] = []
+    const original = console.warn
+    console.warn = ((message: string) => void warnings.push(String(message))) as typeof console.warn
+    try {
+      expect(readConnection({ dshHome: home, dataDir })).toEqual({})
+    } finally {
+      console.warn = original
+    }
+    expect(warnings.some((line) => line.includes('dshHomes'))).toBe(true)
+  })
+
+  test('解析口径：非数组 / 非字符串项报错，空白与重复项不算错误', () => {
+    expect(parseDshHomes([' /a ', '/a', '', '  '])).toEqual({ ok: true, value: ['/a'] })
+    expect(parseDshHomes([])).toEqual({ ok: true, value: [] })
+    expect(parseDshHomes('x').ok).toBe(false)
+    expect(parseDshHomes(['/a', 5]).ok).toBe(false)
+    expect(parseDshHomes(['/a\0b']).ok).toBe(false)
+  })
 })

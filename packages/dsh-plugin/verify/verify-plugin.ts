@@ -13,19 +13,23 @@
  * 3. **身份文件 → Authorization 头** —— 身份从磁盘读到请求头的完整路径。
  * 4. **未署名时确实一个字节都不发**（合规底线，用真实 socket 验证）。
  * 5. **崩溃恢复** —— 手工造出 inflight 文件，看新进程是否补发。
+ * 6. **面板改「会话日志根」→ 同一进程里立刻按新根取数** —— 真装配 + 已注册的
+ *    配置/统计路由处理器（不起第二个 web 服务器），合成日志验证「改完立刻生效」。
  *
  * ⚠️ 全程用临时 `DSH_HOME` + 临时数据目录（`dataDir` 配置）与临时 outbox，
  *   **不碰**真实的 `~/.dsh`，也不碰真实的 `~/.ai-token-report` —— 后者是缺省
  *   数据目录，而它**刻意不跟随 `DSH_HOME`**（见 `core/src/home.ts`）。
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { zstdCompressSync } from 'node:zlib'
 
 import type { IngestPayload } from '@ai-token-report/shared'
 
 import { apply, type ApplyContext } from '../src/index.js'
+import { UI_SETTINGS_PATH, UI_STATS_PATH } from '../src/client/protocol.js'
 import type { SessionTelemetryRecord } from '@deepseek-ai/dsh-session-telemetry'
 
 let failures = 0
@@ -413,6 +417,125 @@ console.log('\n── 5. 统计工具与服务（真扫本机会话日志）─�
     const diag = await tools['token_usage_diagnostics']!.run({})
     check('诊断文本说明了上报地址', diag.includes('上报地址'))
     check('诊断文本不回显凭证', diag.includes('已配置（不回显）'))
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+}
+
+// ── 6. 面板改「会话日志根」→ 同一进程里立刻按新根取数 ───────────────────────
+console.log('\n── 6. 面板改会话日志根：同一进程就地生效（真装配 + 已注册的路由）──')
+{
+  const home = mkdtempSync(join(tmpdir(), 'atr-smoke-roots-'))
+  /** 有日志的 home（部署配置指向它）。 */
+  const logged = join(home, 'logged-home')
+  /** 有 `sessions` 目录但一条日志都没有的 home。 */
+  const empty = join(home, 'empty-home')
+  const dataDir = join(home, 'token-report')
+  try {
+    // ① 造一条合成会话日志（`sessions/<project>/<sessionId>/session.v3.jsonl.zstd`）
+    const file = join(logged, 'sessions', 'project', 'sess-roots', 'session.v3.jsonl.zstd')
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(file, zstdCompressSync(Buffer.from(`${JSON.stringify({
+      type: 'assistant/message', seq: 1, time: Date.now(),
+      data: {
+        turn: 1, step: 1,
+        message: { source: { provider: 'dashscope', model: 'deepseek-v4.1-flash' } },
+        usage: { inputTokens: 1_000, outputTokens: 10, cacheReadTokens: 100, cacheWriteTokens: 0, totalTokens: 1_110 },
+      },
+    })}\n`)))
+    mkdirSync(join(empty, 'sessions'), { recursive: true })
+
+    // ② 真装配：`connection` 用一个只登记路由的假服务 ——
+    //    这里刻意**不起第二个 web 服务器**，直接调它登记进来的处理器。
+    const routes = new Map<string, (request: Request) => Promise<Response>>()
+    const connection = {
+      fetch: {
+        register: (route: { path: string; fetch: (request: Request) => Promise<Response> }) => {
+          routes.set(route.path, route.fetch)
+          return () => {}
+        },
+      },
+    }
+    const provided: Record<string, unknown> = {}
+    const host = makeCtx()
+    apply(
+      {
+        ...host.ctx,
+        reflect: { provide: (name, value) => void (provided[name] = value) },
+        get: ((name: string) => (name === 'connection' ? connection : undefined)) as ApplyContext['get'],
+      } as ApplyContext,
+      {
+        appKey: 'atr-smoke-key',
+        // 部署配置：读有日志的那个 home（面板没设过时生效的就是它）
+        dshHome: logged,
+        dataDir,
+        // 直扫：让「到底读到了几处日志」直接反映在数字与输出里
+        localDb: false,
+        // 本段只关心统计面，不建上报后端（免得真往网上发东西）
+        features: { reporting: false },
+      },
+    )
+    host.collectEffects()
+
+    const settings = routes.get(UI_SETTINGS_PATH)
+    const statsRoute = routes.get(UI_STATS_PATH)
+    check('配置路由已挂在 /api 下', typeof settings === 'function')
+    check('统计路由已挂在 /api 下', typeof statsRoute === 'function')
+
+    const getSettings = async (): Promise<Record<string, unknown>> =>
+      await (await settings!(new Request(`http://localhost${UI_SETTINGS_PATH}`))).json() as Record<string, unknown>
+    const save = async (body: Record<string, unknown>): Promise<Record<string, unknown>> =>
+      await (await settings!(new Request(`http://localhost${UI_SETTINGS_PATH}`, {
+        method: 'POST', body: JSON.stringify(body),
+      }))).json() as Record<string, unknown>
+    const totalOf = async (): Promise<number> => {
+      const payload = await (await statsRoute!(new Request(`http://localhost${UI_STATS_PATH}?period=today`))).json() as
+        { totals?: { total?: number } }
+      return payload.totals?.total ?? -1
+    }
+
+    // ③ 改动前：面板里没有覆盖项，生效的是部署配置那一个根
+    const before = await getSettings()
+    check('GET 如实回「面板没设过」', Array.isArray(before['dshHomes']) && (before['dshHomes'] as unknown[]).length === 0)
+    check('生效根来自部署配置', before['rootsSource'] === 'config')
+    check(
+      '生效根逐项带存在性',
+      JSON.stringify(before['effectiveRoots']) === JSON.stringify([{ path: logged, exists: true }]),
+      JSON.stringify(before['effectiveRoots']),
+    )
+    check('改动前按部署配置的根取到数（1,110 token）', (await totalOf()) === 1_110)
+
+    // ④ 面板里把它改成一个没有日志的 home（只存偏好，不需要凭证）
+    const saved = await save({ dshHomes: [empty] })
+    check('保存成功并回报新范围', saved['ok'] === true && saved['rootsSource'] === 'panel',
+      JSON.stringify({ ok: saved['ok'], rootsSource: saved['rootsSource'] }))
+    check(
+      '保存响应里就是新生效的根',
+      JSON.stringify(saved['effectiveRoots']) === JSON.stringify([{ path: empty, exists: true }]),
+      JSON.stringify(saved['effectiveRoots']),
+    )
+    const connectionFile = join(dataDir, 'plugin-connection.json')
+    const savedFile = (): Record<string, unknown> =>
+      JSON.parse(readFileSync(connectionFile, 'utf8')) as Record<string, unknown>
+    // ⚠️ 比 JSON 而不是比子串：Windows 路径在 JSON 里是双反斜杠转义的
+    check('落盘到数据目录（plugin-connection.json）',
+      JSON.stringify(savedFile()['dshHomes']) === JSON.stringify([empty]))
+    check('★ 无需重启 DSH：同一次运行里的取数立刻换成新根（0 token）', (await totalOf()) === 0)
+
+    const tools = provided['tokenReportTools'] as Record<string, { run(a: Record<string, unknown>): Promise<string> }>
+    const afterText = await tools['token_usage']!.run({ period: 'today' })
+    check('★ `token_usage` 工具也按新根（未找到任何会话日志）', afterText.includes('未找到任何会话日志'))
+
+    // ⑤ 清空 = 清掉覆盖，回落部署配置（不是「一个根都不要」）
+    const cleared = await save({ dshHomes: [] })
+    check('清空后如实回报「回落到部署配置」', cleared['ok'] === true && cleared['rootsSource'] === 'config')
+    check('★ 清空后立刻又读到部署配置那个根（1,110 token）', (await totalOf()) === 1_110)
+
+    // ⑥ 非法输入在本地就被拦下，且盘上的范围原样不动
+    const textBeforeReject = readFileSync(connectionFile, 'utf8')
+    const rejected = await save({ dshHomes: 'not-a-list' })
+    check('非法列表被拒（说清原因）', rejected['ok'] === false && typeof rejected['reason'] === 'string')
+    check('被拒后盘上的连接文件一个字节没被改写', readFileSync(connectionFile, 'utf8') === textBeforeReject)
   } finally {
     rmSync(home, { recursive: true, force: true })
   }

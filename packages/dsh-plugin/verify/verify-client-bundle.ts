@@ -128,6 +128,7 @@ const host = (await import(join(pkgDir, hostExport.default))) as {
   UI_SETTINGS_PATH?: string
   UI_REPORTS_PATH?: string
   UI_DEFAULT_POSITION?: string
+  parseDshHomes?: unknown
 }
 check('宿主半导出了 UI_STATS_PATH', typeof host.UI_STATS_PATH === 'string', String(host.UI_STATS_PATH))
 check(
@@ -155,6 +156,13 @@ for (const [label, path] of [
     `宿主 = ${String(path)}`,
   )
 }
+
+// ★ 配置页的那一栏「会话日志根」必须真的在**产物**里：改完 `client/settings.tsx`
+//   忘了 `build` 的表现是「面板上根本没有这一栏」，而源码、类型检查与单测全都看不出来
+//   （它们跑的是 src/）。同一件事在宿主侧由 `parseDshHomes` 兜住。
+check('★ 浏览器半产物里有「会话日志根」这一栏（改完 settings.tsx 必须重新 build）', code.includes('会话日志根'))
+check('★ 浏览器半产物里有「当前生效」那一行（我存的 vs 真正在读的）', code.includes('当前生效'))
+check('宿主半导出了会话日志根的解析入口（面板保存要走它）', typeof host.parseDshHomes === 'function')
 
 // ── ④ 真的执行一遍 ──────────────────────────────────────────────────────
 console.log('\n── 执行产物（假 loader + 严格 require）──')

@@ -1,8 +1,8 @@
 /**
- * 插件配置页的宿主入口 —— 设置面有**四个字段**：
- * 服务端地址、appKey、上报间隔、面板位置。
+ * 插件配置页的宿主入口 —— 设置面有**五个字段**：
+ * 服务端地址、appKey、上报间隔、面板位置、**会话日志根**。
  *
- * ## 为什么是这四项
+ * ## 为什么是这几项
  *
  * 员工手上真正拿到的东西只有两样：部门平台的地址，和管理员发的一串 appKey。
  * 其余全部是派生的：
@@ -12,7 +12,24 @@
  * | 姓名 / 分组 | ★ **服务端校验结果**，不是用户填的（见下） |
  * | `/api/v1/identity/verify` | `baseUrl` + 固定路径 |
  * | `/api/v1/token-usage` | `baseUrl` + 固定路径 |
- * | 上报间隔 / 面板位置 | 纯本机偏好，只写本地文件 |
+ * | 上报间隔 / 面板位置 / 会话日志根 | 纯本机偏好，只写本地文件 |
+ *
+ * ## 会话日志根（`dshHomes`）为什么可以在这里改
+ *
+ * 面板上的数字来自**本机会话日志**，而一台机器上常常并存多套 DSH
+ * （命令行版 `~/.dsh` + Desktop 的 harness + 第三方客户端）。缺省是
+ * **自动发现**，但有两种情况必须能手填：
+ *
+ * 1. 某个客户端的目录名字不像 DSH（发现规则只提示、**绝不自动采用**），
+ *    使用者确认后要能自己加进来；
+ * 2. 想**只看其中几处**（例如只看工作机的 home，不算个人机器上的）。
+ *
+ * 面板里保存的值**覆盖部署配置**（与间隔 / 位置同一套优先级），
+ * 输入框留空 = 把这条覆盖清掉，回落到部署配置 / 自动发现。
+ *
+ * ⚠️ **改的是「日志从哪读」，不是「身份与库放哪」**——面板刻意**不**提供
+ *   `dataDir`：那个字段会同时换掉身份文件、本地库、outbox 与补报水位，
+ *   在面板里改等于「填完就把自己变成另一个人」，只能在部署配置 / 环境变量里给。
  *
  * 旧版面板让用户分别填「姓名 / 身份 Key / 完整上报地址 / appKey」——
  * 四栏里有两栏是同一个意思（身份 Key 与 appKey 都只是凭证），
@@ -38,7 +55,12 @@
 import { mkdirSync, readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { readIdentity, writeIdentity } from '@ai-token-report/core'
+import {
+  DSH_HOME_ENV,
+  DSH_HOMES_ENV,
+  readIdentity,
+  writeIdentity,
+} from '@ai-token-report/core'
 import {
   parseUiPosition,
   UI_POSITIONS,
@@ -75,12 +97,98 @@ export function parseFlushInterval(value: unknown): number | undefined {
 
 /** 落盘形状。`baseUrl` 是服务端根地址，不含任何 `/api/...` 后缀。 */
 interface SavedConnection {
-  baseUrl: string
-  appKey: string
+  /**
+   * 服务端根地址。**与 `appKey` 成对**（见 `readConnection`）。
+   *
+   * ⚠️ 两项都可选：面板允许只保存**本机偏好**（间隔 / 位置 / 会话日志根）——
+   *   一个还没配凭证、只想看本机用量的人，也该能固定自己的统计范围。
+   *   半份连接（只有地址没密钥）仍然不会被认，所以「只存偏好」是安全的。
+   */
+  baseUrl?: string
+  appKey?: string
   /** 定时冲刷间隔（毫秒）。缺省表示没设过。 */
   flushIntervalMillis?: number
   /** 面板落点。缺省表示没设过（此时用部署配置/默认值）。 */
   position?: UiPosition
+  /**
+   * ★ 会话日志根（面板里填的那一份）。缺省表示没设过 —— 跟随部署配置 / 自动发现。
+   *
+   * ⚠️ 它换的是**日志来源**（面板数字与历史补报都读它），不是数据目录。
+   */
+  dshHomes?: string[]
+}
+
+/**
+ * 面板上一次最多接受多少个会话日志根。
+ *
+ * 不是洁癖：每个根都是一次目录扫描的来源，误把一整个盘符列表粘进来
+ * 会让每次统计都去 `readdir` 一大堆不存在的位置。上限也顺带兜住
+ * 「请求体里塞一万个根」这种畸形输入。
+ */
+export const MAX_DSH_HOMES = 32
+
+/** 解析面板提交的会话日志根：合法的收下，非法的**说清原因**（不静默丢弃）。 */
+export type DshHomesParse = { ok: true; value: string[] } | { ok: false; reason: string }
+
+/**
+ * 收下面板提交的「会话日志根」数组。
+ *
+ * 三条口径：
+ * 1. **没给这个键** ≠ 给了空数组：前者是「这次不改这一项」，后者是
+ *    「把覆盖清掉」（回落到部署配置 / 自动发现）。两者都不在这里表达 ——
+ *    调用方据 `undefined` / `[]` 区分。
+ * 2. 空白项按「没写」处理（粘贴多了一行空行是常事），与插件 config 的
+ *    `toStringList()` 同口径；但**非字符串项直接报错**——
+ *    那是手搓请求，不是用户手滑。
+ * 3. 路径**不要求存在**：不存在/读不了的根会被如实报出（`effectiveRoots.exists`），
+ *    与 CLI 的「缺失根逐项报出」是同一条规矩。拒绝不存在的路径会让
+ *    「先配好、再插硬盘」这种正常顺序变得没法用。
+ */
+export function parseDshHomes(value: unknown): DshHomesParse {
+  if (!Array.isArray(value)) return { ok: false, reason: '会话日志根必须是一个路径列表' }
+  const out: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string') return { ok: false, reason: '会话日志根里有一项不是路径字符串' }
+    const path = item.trim()
+    if (path === '') continue
+    if (path.includes('\0')) return { ok: false, reason: '会话日志根里不能包含空字符' }
+    // 完全相同的两行只留一个：重复根不会多统计任何东西，只会让面板更难读
+    if (!out.includes(path)) out.push(path)
+  }
+  if (out.length > MAX_DSH_HOMES) {
+    return { ok: false, reason: `会话日志根最多 ${MAX_DSH_HOMES} 个（当前 ${out.length} 个）` }
+  }
+  return { ok: true, value: out }
+}
+
+/**
+ * 生效的会话日志根**来自哪一级** —— 面板上那行小字，回答「我改的为什么没生效」。
+ *
+ * 与 `core/src/home.ts` 的 `resolveDshHomes()` 优先级逐级对应：
+ * 面板保存的 > 部署配置（`dshHome` / `dshHomes`）> 环境变量 > 自动发现。
+ * 这个标签只用于**展示**：路径的真值仍然只有一个来源（`resolvePaths()`）。
+ */
+export type DshHomesSource = 'panel' | 'config' | 'env' | 'auto'
+
+/** 面板上「生效的根从哪来」的判据。 */
+export function dshHomesSourceOf(input: {
+  /** 面板保存过的那一份（空数组 = 没覆盖）。 */
+  saved: Partial<SavedConnection>
+  /** 生效配置里的两个字段（**已经含面板覆盖**）。 */
+  effective: { dshHome?: string; dshHomes?: readonly string[] }
+  env?: Record<string, string | undefined>
+}): DshHomesSource {
+  if (input.saved.dshHomes !== undefined && input.saved.dshHomes.length > 0) return 'panel'
+  // 走到这里说明面板没覆盖（或被清掉了）——那生效值只可能来自部署配置。
+  // ⚠️ 顺序必须与 core 的 `resolveDshHomes()` 一致：config > 环境变量 > 发现。
+  if ((input.effective.dshHomes?.length ?? 0) > 0) return 'config'
+  if (typeof input.effective.dshHome === 'string' && input.effective.dshHome.trim() !== '') return 'config'
+  const env = input.env ?? process.env
+  for (const key of [DSH_HOMES_ENV, DSH_HOME_ENV]) {
+    const value = env[key]
+    if (typeof value === 'string' && value.trim() !== '') return 'env'
+  }
+  return 'auto'
 }
 
 /**
@@ -165,6 +273,20 @@ export function readConnection(target?: PathInput): Partial<SavedConnection> {
       }
       if (out.baseUrl) out.appKey = value['appKey']
     }
+
+    // ★ 会话日志根是**纯本机偏好**：即使凭证还没配（或凭证不成对）也必须留下 ——
+    //   它不依赖任何连接，与间隔 / 位置同一类（见 SavedConnection 的注释）。
+    //   ⚠️ 写坏了（不是字符串数组 / 超过上限）时**整项丢掉并告警**，而不是
+    //   悄悄用其中几个：那份列表决定「面板上的数是哪些 home 的」，
+    //   半份生效会让人以为某个 home 已经加进来了，而它没有。
+    if (value['dshHomes'] !== undefined) {
+      const homes = parseDshHomes(value['dshHomes'])
+      if (homes.ok) {
+        if (homes.value.length > 0) out.dshHomes = homes.value
+      } else {
+        console.warn(`token-report: 本地配置里的 dshHomes 不可用（${homes.reason}），已忽略该项`)
+      }
+    }
     return out
   } catch (err) {
     if ((err as { code?: string }).code !== 'ENOENT') console.warn('token-report: 本地连接配置损坏，已回退部署配置')
@@ -176,8 +298,13 @@ export function readConnection(target?: PathInput): Partial<SavedConnection> {
  * 用户在配置页明确保存的偏好优先于部署默认值。
  *
  * - **连接**（地址 + appKey）：保存过就覆盖。
- * - **间隔 / 位置**：保存过就覆盖；它们只影响本机行为，与团队下发不冲突。
+ * - **间隔 / 位置 / 会话日志根**：保存过就覆盖；它们只影响本机行为，
+ *   与团队下发不冲突。
  * - **固定身份**仍由部署配置管理（`raw.user` 优先级最高，见 `resolveConfig`）。
+ *
+ * ⚠️ 会话日志根的**空数组 = 没有覆盖**（不是「一个根都不要」）：
+ *   一个根都没有的统计没有意义，所以「清空输入框」的正确语义是
+ *   「回落到部署配置 / 自动发现」，见 `parseDshHomes` 的口径 1。
  */
 export function withSavedConnection(raw: RawConfig): RawConfig {
   const saved = readConnection({ ...(raw.dshHome ? { dshHome: raw.dshHome } : {}), ...(raw.dataDir ? { dataDir: raw.dataDir } : {}) })
@@ -190,6 +317,9 @@ export function withSavedConnection(raw: RawConfig): RawConfig {
   }
   if (saved.position !== undefined) {
     next = { ...next, ui: { ...next.ui, position: saved.position } }
+  }
+  if (saved.dshHomes !== undefined && saved.dshHomes.length > 0) {
+    next = { ...next, dshHomes: [...saved.dshHomes] }
   }
   return next
 }
@@ -216,7 +346,7 @@ export interface SettingsState {
   config: EffectiveConfig
   /** 当前署名（服务端认下的那个），未署名为 `null`。 */
   identity: { name: string; group?: string } | null
-  /** 已保存的连接偏好（用于回填地址 / 间隔 / 位置）。 */
+  /** 已保存的连接偏好（用于回填地址 / 间隔 / 位置 / 会话日志根）。 */
   saved: Partial<SavedConnection>
   /** 上报此刻是否在跑。 */
   reporting: UiReportingStatus
@@ -270,6 +400,29 @@ export function createSettingsHandler(
   })
   let saving = false
 
+  /**
+   * 面板要显示的「会话日志根」三件套。
+   *
+   * - `dshHomes` —— **面板里存过的那一份**（空数组 = 没覆盖）→ 回填输入框；
+   * - `effectiveRoots` —— **此刻真正在用的根**，逐项带「有没有 sessions 目录」
+   *   → 用户改完能立刻看见生效的是哪几处，以及哪个根白写了；
+   * - `rootsSource` —— 这份生效值来自哪一级（面板 / 部署配置 / 环境变量 / 自动发现）。
+   *
+   * ⚠️ 三者必须一起回：只给输入框的值，用户永远分不清「我存的」与
+   *   「现在真的在读的」——而这两件事在本插件里恰好最容易不一致。
+   */
+  const rootsView = (state: SettingsState): {
+    dshHomes: string[]
+    effectiveRoots: { path: string; exists: boolean }[]
+    rootsSource: DshHomesSource
+  } => ({
+    dshHomes: state.saved.dshHomes ?? [],
+    // `path` 用 **home**（用户填的就是它），`exists` 是 `<home>/sessions` 在不在
+    // ——与 CLI `--discover` 逐根报的是同一件事。
+    effectiveRoots: reportPaths(state.config).sessionRoots.map((info) => ({ path: info.home, exists: info.exists })),
+    rootsSource: dshHomesSourceOf({ saved: state.saved, effective: state.config }),
+  })
+
   return async (request) => {
     const state = host.state()
     const paths = reportPaths(state.config)
@@ -291,6 +444,7 @@ export function createSettingsHandler(
         flushIntervalMillis: saved.flushIntervalMillis ?? state.config.batch.flushIntervalMillis,
         position: saved.position ?? state.config.ui.position,
         reporting: state.reporting,
+        ...rootsView(state),
       })
     }
     if (request.method !== 'POST') return json({ ok: false, reason: '不支持的请求方法' }, 405)
@@ -302,14 +456,22 @@ export function createSettingsHandler(
       const appKey = typeof raw['appKey'] === 'string' ? raw['appKey'].trim() : ''
       const previous = readConnection(state.config)
 
-      // ── 地址：新凭证必须自己带地址；只改偏好时地址必须原样不动 ─────────
-      let baseUrl: string
-      if (!appKey) {
-        // ★「只改偏好」这条路：凭证已经在盘上了，用户只是改间隔/位置，
-        //   不该被要求再粘一次密钥（那串东西往往已经不在手边）。
-        if (!previous.appKey || !previous.baseUrl) {
-          return json({ ok: false, reason: '请填写管理员发放的 appKey' })
+      // ── 地址：换凭证必须自己带地址；只改偏好时地址必须原样不动 ─────────
+      //
+      // ★「只改偏好」这条路**不要求先有凭证**：会话日志根 / 间隔 / 位置都是纯本机
+      //   偏好，一个还没配 appKey（只看本机用量、不上报）的人也该能固定统计范围。
+      //   此时**一个地址字节都不落盘**——半份连接（有地址没密钥）仍然不会
+      //   被 `readConnection` 认，所以不会留下「连接配好了但身份是旧的」这种状态。
+      let baseUrl: string | undefined
+      if (appKey) {
+        try {
+          baseUrl = normalizeBaseUrl(typeof raw['baseUrl'] === 'string' ? raw['baseUrl'] : '')
+        } catch {
+          return json({ ok: false, reason: '服务端地址无效：请填 http(s)://主机[:端口] 形式，例如 http://127.0.0.1:8787' })
         }
+      } else {
+        // 没有新凭证时，能接受的地址只有两种：没给，或「就是现在生效的那个」。
+        const current = previous.baseUrl ?? baseUrlOf(state.config.endpoint)
         const given = typeof raw['baseUrl'] === 'string' ? raw['baseUrl'].trim() : ''
         if (given) {
           let normalized: string
@@ -318,17 +480,12 @@ export function createSettingsHandler(
           } catch {
             return json({ ok: false, reason: '服务端地址无效：请填 http(s)://主机[:端口] 形式，例如 http://127.0.0.1:8787' })
           }
-          if (normalized !== previous.baseUrl) {
+          if (normalized !== current) {
             return json({ ok: false, reason: '修改服务端地址需要同时填写 appKey（要重新校验身份）' })
           }
         }
-        baseUrl = previous.baseUrl
-      } else {
-        try {
-          baseUrl = normalizeBaseUrl(typeof raw['baseUrl'] === 'string' ? raw['baseUrl'] : '')
-        } catch {
-          return json({ ok: false, reason: '服务端地址无效：请填 http(s)://主机[:端口] 形式，例如 http://127.0.0.1:8787' })
-        }
+        // 只有凭证**成对**存在时才沿用地址：否则这次保存与连接无关。
+        if (previous.baseUrl && previous.appKey) baseUrl = previous.baseUrl
       }
 
       // ── 本机偏好：给了就必须合法（非法值不许静默当成没给）────────────
@@ -353,14 +510,23 @@ export function createSettingsHandler(
         }
         position = parsed
       }
+      // 会话日志根：`undefined` = 这次不动它；`[]` = 把覆盖清掉（回落部署配置 / 自动发现）。
+      let dshHomes = previous.dshHomes
+      if (raw['dshHomes'] !== undefined) {
+        const parsed = parseDshHomes(raw['dshHomes'])
+        if (!parsed.ok) return json({ ok: false, reason: parsed.reason })
+        dshHomes = parsed.value
+      }
 
       const path = connectionPath(state.config)
       /** 这次要落盘的内容：**凭证来自本次输入，或原样沿用已保存的那一份**。 */
+      const credential = appKey || previous.appKey
       const saved: SavedConnection = {
-        baseUrl,
-        appKey: appKey || previous.appKey!,
+        // 地址与凭证**要么成对写、要么都不写**（见 SavedConnection 的注释）
+        ...(baseUrl !== undefined && credential ? { baseUrl, appKey: credential } : {}),
         ...(interval !== undefined ? { flushIntervalMillis: interval } : {}),
         ...(position !== undefined ? { position } : {}),
+        ...(dshHomes !== undefined && dshHomes.length > 0 ? { dshHomes } : {}),
       }
 
       /**
@@ -371,9 +537,10 @@ export function createSettingsHandler(
        */
       const commit = async (name: string, write = true): Promise<Response> => {
         if (write) atomicWrite(path, JSON.stringify(saved))
+        const endpoint = saved.baseUrl !== undefined ? endpointOf(saved.baseUrl) : state.config.endpoint
         // ── ★ 就地生效：保存完就能开始上报，不必重启 DSH ──────────────
         let reporting: UiReportingStatus = {
-          enabled: false, endpoint: endpointOf(saved.baseUrl), reason: '宿主未提供热生效入口，需重启 DSH',
+          enabled: false, endpoint, reason: '宿主未提供热生效入口，需重启 DSH',
         }
         let applied = false
         if (host.apply) {
@@ -382,14 +549,18 @@ export function createSettingsHandler(
             applied = true
           } catch {
             // 文件已经写对了；只是这个进程没能换过来 —— 下次启动会读到它。
-            reporting = { enabled: false, endpoint: endpointOf(saved.baseUrl), reason: '新配置未能就地生效，需重启 DSH' }
+            reporting = { enabled: false, endpoint, reason: '新配置未能就地生效，需重启 DSH' }
           }
         }
+        // ★ 生效的日志根在 `apply()` **之后**现读：这一刻宿主认的范围，才是
+        //   页面接下来会看到的范围。回给页面，省掉一次「保存完再 GET」的往返。
+        const after = host.state()
         return json({
           ok: true,
           name,
-          position: saved.position ?? state.config.ui.position,
-          flushIntervalMillis: saved.flushIntervalMillis ?? state.config.batch.flushIntervalMillis,
+          position: saved.position ?? after.config.ui.position,
+          flushIntervalMillis: saved.flushIntervalMillis ?? after.config.batch.flushIntervalMillis,
+          ...rootsView(after),
           reporting,
           applied,
           restartRequired: !applied,
@@ -399,10 +570,17 @@ export function createSettingsHandler(
       // ── 只改偏好：不重校验、不重写身份文件（凭证原样保留）────────────
       if (!appKey) return await commit(host.state().identity?.name ?? '')
 
+      // 走到这里 appKey 必非空，而「带 appKey」那条路一定归一出了地址
+      // （非法地址在更上面就被拦掉了）—— 这一句只是让类型收窄。
+      const verifyBase = baseUrl
+      if (verifyBase === undefined) {
+        return json({ ok: false, reason: '服务端地址无效：请填 http(s)://主机[:端口] 形式，例如 http://127.0.0.1:8787' })
+      }
+
       // ★ 校验用的是 appKey 自己：服务端按它解析出人员，姓名由此而来。
       let verified: { ok?: boolean; name?: unknown; group?: unknown; dept?: unknown; reason?: unknown }
       try {
-        const response = await fetchImpl(baseUrl + VERIFY_PATH, {
+        const response = await fetchImpl(verifyBase + VERIFY_PATH, {
           method: 'POST', redirect: 'error', signal: AbortSignal.timeout(8_000),
           headers: { 'content-type': 'application/json', authorization: `Bearer ${appKey}` },
           body: JSON.stringify({ token: appKey }),

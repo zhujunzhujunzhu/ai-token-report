@@ -67,6 +67,9 @@ dsh --profile web --no-open
 桌面端与命令行版走的是**同一条装配路**，只是 home 与 profile 换成了 Desktop 自己那套；
 但桌面端的**图形入口装不了本插件**，所以下面给的是命令行步骤。
 
+> 照着逐条执行、带核对与回滚的交付版在**仓内** `docs/桌面端安装交付清单.md`
+> （该文件不在 npm 包里，所以这里只写路径不写相对链接）；本节是同一套步骤的说明版。
+
 ### 为什么不能用桌面端的插件界面装
 
 | 入口 | 能不能装 | 原因 |
@@ -154,7 +157,9 @@ node $desktopDsh --profile web --dump-config | Select-String token-report
 
 ### 三个坑
 
-1. 🚨 **版本窗口**：当前代码里的 `peerDependencies` 是 `>=0.1.7-rc.2 <0.3.0-0`（放宽发生在 `0.6.1`），但**放宽后的版本还没发到 npm** —— 2026-09-30 实测 npm 上的 `latest` 仍是 `0.6.0`，那一版的 peer 钉的是精确 `0.1.7-rc.2`。所以想用放宽后的窗口，只能装本地构建的 tarball（见上一步）。Desktop 升到 `0.2.x` 之后，钉死精确版本的那一版会在启动时被**静默跳过** —— 日志只有一行 `skipping profile bundle …`，表现是「面板不见了 + 一条也不上报」，**不是报错**；要么换成放宽版，要么按 §9.1 最后一行用 `allow-version … --accept-risk`（自担风险，不等于已验证）。
+1. 🚨 **版本窗口**：当前 `peerDependencies` 是 `>=0.1.7-rc.2 <0.3.0-0`，**放宽后的窗口从 `0.7.0` 起就在 npm 上**（`latest` = `0.7.0`；`0.6.0` 及更早那一版钉的是精确 `0.1.7-rc.2`）。宿主启动时由 `dsh-app-boot` 的 `evaluatePluginCompatibility` 逐个 peer 做 `semver.satisfies(runtime, range, { includePrerelease: true })`，**任一不满足就跳过整个 bundle** —— 日志只有一行 `skipping profile bundle …`，表现是「面板不见了 + 一条也不上报」，**不是报错**。所以：
+   - Desktop 自带的 `0.1.7-rc.2`（以及 `0.2.x`）都在窗口内，**装 `@latest` 即可，不需要为了拿放宽窗口去手工打 tarball**（tarball 只在「装未发布版本」时才用得上）。
+   - 反过来，Desktop 升到 `0.3.0` 及以后会被跳过。那时要么等插件放宽并复验，要么按 §9.1 最后一行用 `allow-version … --accept-risk`（自担风险，不等于已验证）。
 2. **不要把仓内源码包 `@ai-token-report/dsh-plugin` 装进 Desktop**：它的 `main` 指向 `src/index.ts`，而宿主跑在 **Node**（只有 Bun 直接吃 ts），加载即失败。桌面端要用构建产物、tarball 或发布包。
 3. **升级 / 卸载走同一条路，不要只手改 `package.json`**：一旦 Desktop 的 generation 迁移成功，插件会被搬进不可变的 `.generations/live/<...>`，那时只有重新 `add` 才换得了版本（`plugin remove` 会走 Desktop 的 generation 下线流程）。
 
@@ -182,14 +187,16 @@ node $desktopDsh --profile web --dump-config | Select-String token-report
 
 ```
 <数据目录>/identity.json            ← 署名（token 就是 appKey）
-<数据目录>/plugin-connection.json   ← 面板里填的服务端地址 / appKey / 间隔 / 位置
+<数据目录>/plugin-connection.json   ← 面板里填的服务端地址 / appKey / 间隔 / 位置 / 会话日志根
 <数据目录>/usage.sqlite             ← 本地增量索引库（日志的派生物，可删可重建）
 <数据目录>/outbox/                  ← 磁盘 outbox（崩溃不丢数据）
 ```
 
-只有两种情况才需要写配置：想**钉住统计范围**（只看其中几处）用 `dshHomes`，
-想**让某套 DSH 单独用一份身份 / 库**用 `dataDir`（对应环境变量 `DSH_TOKEN_REPORT_DSH_HOMES` /
-`DSH_TOKEN_REPORT_DATA_DIR`）；完整清单与排查见源码仓库 README 的 §1.1。
+只有两种情况才需要动配置：想**钉住统计范围**（只看其中几处）用 `dshHomes` ——
+**面板里就能改**（齿轮「配置」→「会话日志根」，保存即生效），也可以用部署配置
+`dshHomes` 或环境变量 `DSH_TOKEN_REPORT_DSH_HOMES` 统一钉死；
+想**让某套 DSH 单独用一份身份 / 库**用 `dataDir`（对应环境变量 `DSH_TOKEN_REPORT_DATA_DIR`，
+**只能在部署配置 / 环境变量里给**，面板刻意不提供）。完整清单与排查见 §1.1。
 
 > 🚨 **不要用日志根去达到「分开身份」的目的**：`dshHome` / `dshHomes` 换掉的是**日志来源**，
 > 那会让面板少算另一套 DSH 的会话，而实时上报照常工作 —— 这个错误**不会**以「完全没数据」的形式暴露。
@@ -229,14 +236,15 @@ node $desktopDsh --profile web --dump-config | Select-String token-report
 
 ### 开启团队上报
 
-在详情面板右上角点击齿轮「配置」，**四个字段**：
+在详情面板右上角点击齿轮「配置」，**五个字段**：
 
 | 字段 | 说明 |
 |---|---|
 | 服务端地址 | 部门平台根地址（例如 `https://portal.example.com`，或本机自建的 `http://127.0.0.1:8787`）。上报地址由它推导（`<地址>/api/v1/token-usage`），不需要自己拼路径 |
-| appKey | 管理员在平台「appKey 管理」页签发的那一串。**已配置时留空 = 只改下面两项偏好**，不会重新校验、也不重写身份文件 |
+| appKey | 管理员在平台「appKey 管理」页签发的那一串。**已配置时留空 = 只改下面三项偏好**，不会重新校验、也不重写身份文件 |
 | 上报间隔 | 5 秒 / 10 秒（默认）/ 30 秒 / 1 分钟 / 5 分钟。这个数字直接决定部门服务端的请求密度，所以只给档位 |
 | 面板位置 | 见上一节；保存后**就地**换地方 |
+| 会话日志根 | 每行一个 DSH home；**留空 = 自动发现**。见下文「面板里改会话日志根」 |
 
 点击「验证并保存」后，插件用这个 appKey 向对应服务端的 `/api/v1/identity/verify` 校验身份，
 **姓名与分组以服务端返回值为准**（面板不再询问姓名 —— 它由 appKey 在服务端绑定的人决定）。
@@ -293,7 +301,7 @@ DSH 升级会保留旧格式日志作为备份；同一会话存在多个规范�
 | 多套 DSH 并集 | 缺省统计本机全部 DSH 的会话日志（互为镜像的会话按 event_id 去重，只算一次） |
 | 本地增量查询 | SQLite 增量索引；库不可用时自动回退日志扫描并提示 |
 | 上报连接 | 面板内填服务端地址 + appKey，验证后**立即生效**（无需重启） |
-| 上报偏好 | 面板内选上报间隔与面板位置；只改偏好时不必重填 appKey，保存后即时生效 |
+| 上报偏好 | 面板内选上报间隔、面板位置与会话日志根；只改偏好时不必重填 appKey，保存后即时生效 |
 | 实时上报 | 异步批量发送、磁盘 outbox、失败保留、重启重放 |
 | 历史补报 | 独立后台线程扫描全部历史，服务器确认后保存进度，失败持续重试 |
 | 上报调试 | 配置页「上报调试」页签：状态与原因、计数、**最近请求体原文与回执**、补报进度、立即上报 / 不发送预览 |
@@ -351,7 +359,7 @@ CLI（`dsh-token-report`）与本插件共用同一个数据目录，所以搬�
 
 ### 0.3.0 启动报 duplicate loader entry id: token-report
 
-插件树里重复挂载了相同 ID，Loader 在插件代码执行前就会失败。仅升级 JS 文件不能清理旧 profile。0.3.1 随包提供离线修复工具；先停止该 profile 的 DSH，再在 Windows PowerShell 运行：
+插件树里重复挂载了相同 ID，Loader 在插件代码执行前就会失败。仅升级 JS 文件不能清理旧 profile。离线修复工具**从 `0.4.0` 起随包提供**（开发期写作 `0.3.1`，但 npm 上并没有这个版本 —— 别去装它）；先停止该 profile 的 DSH，再在 Windows PowerShell 运行：
 
 ```powershell
 node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/repair-profile.mjs" --profile web
@@ -603,7 +611,7 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 <会话日志根>/sessions/                   ← 会话日志（只读，统计与历史补报的来源；**不在数据目录里**）
                                           （通常是好几个根：`~/.dsh`、Desktop 的 harness……按并集统计）
 <dataDir>/identity.json                  ← 署名（token 就是 appKey）
-<dataDir>/plugin-connection.json         ← 面板里填的服务端地址 / appKey / 间隔 / 位置
+<dataDir>/plugin-connection.json         ← 面板里填的服务端地址 / appKey / 间隔 / 位置 / 会话日志根
 <dataDir>/usage.sqlite                   ← 本地增量库（日志的派生物，可删可重建）
 <dataDir>/portal.sqlite                  ← 上报库（只有在这台机器跑部门服务端时才存在；**唯一副本，绝不删**）
 <dataDir>/state.json                     ← CLI 上报水位与 pending
@@ -976,15 +984,35 @@ DSH 的 web 服务器**不做任何鉴权**（`dsh-host-webserver` 的文档明�
 点击明细行展开四项 token 与会话数；明细每页展示 10 行，超过一页时显示翻页与总条数，切换分组或时间范围回到第一页。明细保留全部数据，短周期趋势保留最多 31 点，今年和自定义范围保留完整序列。
 切换时间时保留已有内容与范围标签，结果返回后整体更新；图表复用实例，弹框保持稳定高度。底部不再展示数据来源、耗时与读取时间，仅在查询失败或降级时提示原因。
 
-「配置」页有**四个字段**：服务端地址、appKey（管理员在平台「appKey 管理」页按人发放并复制）、
-**上报间隔**（5 秒～5 分钟档位）、**面板位置**（输入框上方 / 标题栏右上角 / 两处都要）。
+「配置」页有**五个字段**：服务端地址、appKey（管理员在平台「appKey 管理」页按人发放并复制）、
+**上报间隔**（5 秒～5 分钟档位）、**面板位置**（输入框上方 / 标题栏右上角 / 两处都要）、
+**会话日志根**（每行一个 DSH home，见下）。
 保存时若填了 appKey，先向 `<服务端地址>/api/v1/identity/verify` 校验，姓名与分组只认服务端返回值；
-**appKey 留空且地址没变 = 只更新间隔与位置**（不重校验、不重写身份文件）——
+**appKey 留空且地址没变 = 只更新间隔 / 位置 / 会话日志根**（不重校验、不重写身份文件）——
 那串密钥往往已经不在用户手边，只改偏好不该逼他再粘一次。
 未填 appKey 时仍可看本机统计，但不采集、不上报；已保存的 appKey 不回显。
 署名与本地 Web 共用**数据目录**下的 `identity.json`（缺省 `~/.ai-token-report/identity.json`；`token` 就是这串 appKey），
 连接与偏好保存到同目录的 `plugin-connection.json`（原子写入、0600）。
-用户保存的连接优先于部署默认连接；配置了固定 `user` 时页面只读。
+用户保存的连接/偏好优先于部署默认值；配置了固定 `user` 时页面只读。
+
+#### 面板里改「会话日志根」
+
+统计数字来自**本机会话日志**，缺省自动发现本机全部 DSH home。两种情况下自动发现
+帮不上忙，要能手填：① 某个客户端的目录名不像 DSH（发现规则只提示、**绝不自动采用**）；
+② 想**只看其中几处**（例如只看工作机的 home）。
+
+- 输入框**每行一个路径**，支持 `~`；**留空 = 不覆盖**，回落到部署配置 / 自动发现
+  （不是「一个根都不要」——那种统计没有意义）。
+- 面板里保存的值**覆盖部署配置**的 `dshHome` / `dshHomes`（与间隔 / 位置同一套优先级）。
+  想恢复部署配置，把输入框清空再保存即可。
+- 输入框下面是**当前真正生效**的那几个根，逐项标出「没有 sessions 目录」——
+  那是「这个根白写了」的唯一线索，也是「我改的到底生效没有」的答案。
+- ★ **保存即生效**：宿主半的统计上下文按**活配置**取路径，同一进程的下一次取数
+  就按新根查（面板、`token_usage` 工具、`ctx.tokenReport` 服务三处一致）；
+  历史补报线程也会按新范围重建（`runtime.ts` 的 `unitKey` 里带了 `dshHomes`）。
+- ⚠️ 它改的是**日志来源**，不是**身份与库的位置**。面板刻意**没有** `dataDir`：
+  那个字段会连身份文件、本地库、outbox 与补报水位一起换掉 ——
+  「填完就变成另一个人」不该发生在一个设置页上（要分开身份请在部署配置 / 环境变量里给）。
 
 **★ 保存后立即生效，不需要重启 DSH。** 宿主半的 `ReportRuntime` 会重新读一遍
 「已保存的连接 + 身份文件」并按需**换掉投递单元**（`runtime.ts`）：
@@ -992,8 +1020,14 @@ DSH 的 web 服务器**不做任何鉴权**（`dsh-host-webserver` 的文档明�
 | 变了什么 | 做什么 | 为什么 |
 |---|---|---|
 | 间隔 | 只 `reporter.setFlushInterval()` | 重建会丢掉内存队列里还没落盘的记录 |
-| 地址 / appKey / 姓名 / 分组 / outbox 设置 | 装新单元 + **后台**停旧单元 | 旧 endpoint 可能已不可达，不能让用户在设置页上等一次网络超时 |
+| 地址 / appKey / 姓名 / 分组 / outbox 设置 / **会话日志根** | 装新单元 + **后台**停旧单元 | 旧 endpoint 可能已不可达，不能让用户在设置页上等一次网络超时 |
 | 未署名 / 部署关掉了上报 | 停单元，并在诊断里如实报「已停止」 | 「还在跑」和「已停」必须是两句话 |
+
+> 「会话日志根」进的是 `unitKey`（`runtime.ts`）：它决定**历史补报读哪几处**，
+> 不进 key 就会出现「加了 home 却还在按旧范围补报」。统计侧（面板 / 工具 / 服务）
+> 走的是 `StatsContext` 的**活取值**，同一次运行里立刻按新根查；
+> UI 的 30 秒 TTL 缓存也按「库路径 + 数据目录 + 日志根」做了范围指纹，
+> 改完不会继续回旧范围的缓存（那看起来就是「改了没生效」）。
 
 后端（`SessionTelemetryCoordinator` 的监听器）**只装一次**：那些监听器挂在 fiber 上、
 不随服务注销撤销，重复装会让每次会话事件都被折叠两遍。
@@ -1149,11 +1183,11 @@ bun run --filter '@ai-token-report/dsh-plugin' build
 
 | 脚本 | 层次 | 断言数 | 验证什么 |
 |---|---|---|---|
-| `bun test packages/dsh-plugin` | 单元 | 369 | 折叠口径 / 配置优先级 / **面板位置与热切换** / outbox 崩溃不丢 / 热路径只入队 / **就地换连接（runtime）** / **上报实录的字节上限与截断** / **配置与调试路由与页面文案** / **界面：格式、取数状态机、挂载点、离屏渲染** |
-| `verify/verify-plugin.ts` | 端到端冒烟 | 55 | **真 HTTP 往返** + 真扫日志 + 崩溃恢复（假 ctx） |
+| `bun test packages/dsh-plugin` | 单元 | 435 | 折叠口径 / 配置优先级 / **面板位置与热切换** / outbox 崩溃不丢 / 热路径只入队 / **就地换连接（runtime）** / **上报实录的字节上限与截断** / **配置与调试路由与页面文案** / **会话日志根的落盘、清空与生效来源** / **界面：格式、取数状态机、挂载点、离屏渲染** |
+| `verify/verify-plugin.ts` | 端到端冒烟 | 70 | **真 HTTP 往返** + 真扫日志 + 崩溃恢复（假 ctx）+ **面板改会话日志根后同一进程就地生效** |
 | `verify/verify-cordis-load.ts` | 真实框架装载 | 10 | 打包产物挂进**真 cordis Context**，含 `inject` 形状 |
 | `verify/verify-resolution.ts` | **宿主语义** | 9 | 用 **Node**（不是 Bun）解析并加载打包产物 |
-| `verify/verify-client-bundle.ts` | **浏览器半产物** | 36 | 真跑 `lib/client.js`：信封形状 / **平台模块纯度** / 双半路由一致（含配置与调试两条新路由） / **三种位置各注册哪些 slot** / slot 注册 |
+| `verify/verify-client-bundle.ts` | **浏览器半产物** | 40 | 真跑 `lib/client.js`：信封形状 / **平台模块纯度** / 双半路由一致（含配置与调试两条新路由） / **会话日志根那一栏真的在产物里** / **三种位置各注册哪些 slot** / slot 注册 |
 | `verify/diagnose-boot.ts` | 排障工具 | — | profile 里哪个包 import 就炸，展开完整 cause 链 |
 
 另有三个辅助脚本：
@@ -1256,17 +1290,17 @@ bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败
 | `src/reporter.ts` | 内存队列 → 批量 → HTTP（热路径只入队）+ 上报间隔热更新 + 请求预览 |
 | `src/report-log.ts` | 上报实录（环形缓冲：请求体原文 + 回执，三层字节上限，UTF-8 边界截断） |
 | `src/runtime.ts` | ★ 运行时：状态判定（`evaluateStatus`）、就地换连接（换投递单元而不是换后端）、调试数据出口 |
-| `src/settings.ts` | 配置页的宿主半：GET/POST `/api/tokenReport.settings`（四个字段、校验、偏好更新、就地生效） |
+| `src/settings.ts` | 配置页的宿主半：GET/POST `/api/tokenReport.settings`（五个字段、校验、偏好更新、就地生效、生效日志根与来源） |
 | `src/reports.ts` | 调试页的宿主半：GET/POST `/api/tokenReport.reports`（状态 + 计数 + 实录 + 立即上报 / 不发送预览） |
 | `src/stats.ts` | 统计查询与渲染（**不实现任何公式**） |
 | `src/stats-worker-client.ts` / `src/stats-worker.ts` | 有界线程调度、日志变化合并及周期性完整对账 |
 | `src/identity.ts` | 身份解析（复用 core 的存储，与本地页共用同一份文件） |
-| `src/ui-bridge.ts` | 宿主侧 UI 数据通道：`/api/tokenReport.stats` + `/api/tokenReport.config`（**每次现读**面板位置）+ TTL 缓存 + 并发合并 |
-| `src/client/protocol.ts` | ★ **双半唯一契约**：载荷类型、周期、**面板位置枚举与配置解析**、间隔档位、响应解析（零依赖，两边都能 import） |
+| `src/ui-bridge.ts` | 宿主侧 UI 数据通道：`/api/tokenReport.stats` + `/api/tokenReport.config`（**每次现读**面板位置）+ TTL 缓存（**按取数范围指纹**，改日志根不残留旧范围）+ 并发合并 |
+| `src/client/protocol.ts` | ★ **双半唯一契约**：载荷类型、周期、**面板位置枚举与配置解析**、间隔档位、**会话日志根三件套**、响应解析（零依赖，两边都能 import） |
 | `src/client/store.ts` | 浏览器侧取数状态机（`fetch`/时钟可注入，因此可单测） |
 | `src/client/format.ts` | 纯展示格式（不是口径公式，见文件头注释） |
 | `src/client/components.tsx` | 两个挂载点的 React 组件 |
-| `src/client/settings.tsx` | 配置页：四个字段 + 「连接配置 / 上报调试」两个页签 |
+| `src/client/settings.tsx` | 配置页：五个字段 + 「连接配置 / 上报调试」两个页签（会话日志根是文本域，另有一行「当前生效的根」） |
 | `src/client/report-debug.tsx` | 上报调试页：状态、计数、最近请求体与回执、补报进度、立即上报 / 预览 |
 | `src/client/position.ts` | 面板落点的进程内信号总线（保存后**就地**重挂挂载点） |
 | `src/client/styles.ts` | `<style>` 注入（全部用 `--dsw-alias-*` 主题变量） |
@@ -1304,7 +1338,7 @@ bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败
 | `service "sessionTelemetry" has been registered at <OpenTelemetrySessionBackend>` | 与官方 OTel 后端冲突 | 见 §2.3 ④，disable 掉 OTel |
 | `ERR_UNKNOWN_BUILTIN_MODULE: bun:sqlite` | 构建时把 `@ai-token-report/*` external 出去了，或 bundler 把 `bun:sqlite` 提到顶层 | 见 §2.2 的构建命令 |
 | `ERR_UNSUPPORTED_ESM_URL_SCHEME` | `file:` 依赖写成了 Windows 路径 | 用 `file:D:/...` 正斜杠形式 |
-| `skipping profile bundle "dsh-plugin-token-report": … is incompatible with dsh <版本>: peerDependencies {…}` | 插件声明的 `peerDependencies` 与当前 DSH **不同代**。判定由宿主 `dsh-app-boot` 的 `evaluatePluginCompatibility` 做（`semver.satisfies(runtime, range, { includePrerelease: true })`），只检查 `@deepseek-ai/dsh` / `@deepseek-ai/dsh-*` 这些 peer，`@deepseek-ai/cordis` 不参与 | ① **首选**：升级插件 —— `0.6.1` 起 peer 写作 `>=0.1.7-rc.2 <0.3.0-0`，同时接受 `0.1.7-rc.2` 与 `0.2.x`；② 若你跑的是 `0.3` 及以后，等插件的下个版本（届时需重新验证宿主 API）；③ 明知风险仍要强跑：按提示 `dsh plugin allow-version dsh-plugin-token-report@<版本> --dsh-version <版本> --accept-risk`。**②③ 都不是「已验证」** —— 插件会被跳过时，DSH 仍能正常启动，只是没有用量面板与上报 |
+| `skipping profile bundle "dsh-plugin-token-report": … is incompatible with dsh <版本>: peerDependencies {…}` | 插件声明的 `peerDependencies` 与当前 DSH **不同代**。判定由宿主 `dsh-app-boot` 的 `evaluatePluginCompatibility` 做（`semver.satisfies(runtime, range, { includePrerelease: true })`），只检查 `@deepseek-ai/dsh` / `@deepseek-ai/dsh-*` 这些 peer，`@deepseek-ai/cordis` 不参与 | ① **首选**：升级插件到 `>=0.7.0` —— peer 写作 `>=0.1.7-rc.2 <0.3.0-0`，同时接受 `0.1.7-rc.2` 与 `0.2.x`（`0.6.0` 及更早钉的是精确 `0.1.7-rc.2`）；② 若你跑的是 `0.3` 及以后，等插件的下个版本（届时需重新验证宿主 API）；③ 明知风险仍要强跑：按提示 `dsh plugin allow-version dsh-plugin-token-report@<版本> --dsh-version <版本> --accept-risk`。**②③ 都不是「已验证」** —— 插件会被跳过时，DSH 仍能正常启动，只是没有用量面板与上报 |
 
 ### 9.2 运行期
 

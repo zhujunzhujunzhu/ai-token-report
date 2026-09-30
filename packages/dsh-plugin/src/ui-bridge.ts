@@ -265,6 +265,18 @@ export function createUiStatsProvider(options: {
    *   组合根传入的是上报器的 `enqueued` 计数 —— 一次属性读。
    */
   generation?: () => number
+  /**
+   * ★ **取数范围的指纹**（缺省恒为 `''`）。它参与缓存键。
+   *
+   * 🚨 为什么必须有它：会话日志根（以及库 / 数据目录）可以在**面板里就地改**
+   *   （见 `settings.ts` 的会话日志根）。没有这一项时，改完之后的取数会在
+   *   最长一个 TTL（30 秒）内继续命中旧范围的缓存 —— 表现为「改了没生效」，
+   *   而且它**不报错**：数字照样有，只是来自改之前的那几个 home。
+   *
+   * ⚠️ 只允许**纯内存读**（与 `generation` 同级）：它每次取数都会被调用。
+   *   组合根传的是「库路径 + 数据目录 + 全部会话日志根」拼出来的串。
+   */
+  scope?: () => string
 }): UiStatsProvider {
   const now = options.now ?? (() => Date.now())
   const ttlMs = options.ttlMs ?? DEFAULT_TTL_MS
@@ -335,10 +347,13 @@ export function createUiStatsProvider(options: {
         return { period, error: '请选择有效的开始和结束日期，开始日期不能晚于结束日期' }
       }
       const rangeKey = period === 'custom' ? `${period}:${dateRange!.since}:${dateRange!.until}` : period
-      const key = `${rangeKey}:${selection?.view ?? 'legacy'}:${selection?.by ?? 'provider-model'}:${selection?.page ?? 1}:${selection?.pageSize ?? UI_PAGE_SIZE}`
+      // ★ 范围指纹参与缓存键：面板里改完会话日志根之后，旧范围的缓存自然再也
+      //   命中不了（不需要任何「失效通知」这种会漏掉的机制）。
+      const prefix = `${options.scope?.() ?? ''}\u0000${rangeKey}:`
+      const key = `${prefix}${selection?.view ?? 'legacy'}:${selection?.by ?? 'provider-model'}:${selection?.page ?? 1}:${selection?.pageSize ?? UI_PAGE_SIZE}`
       if (force) {
         // 手动刷新当前范围时，其它页与摘要也应在下次读取时换成新快照。
-        for (const cachedKey of cache.keys()) if (cachedKey.startsWith(`${rangeKey}:`)) removeCached(cachedKey)
+        for (const cachedKey of cache.keys()) if (cachedKey.startsWith(prefix)) removeCached(cachedKey)
       }
       const hit = cache.get(key)
       // 🚨 命中条件**只有 TTL 一条**。
@@ -557,6 +572,10 @@ export function installUiRoute(
     // ★ 与 CLI `dsh-token` / `token_usage` 工具调用的是**同一个函数**，
     //   所以面板上的数与终端、与 Agent 报的数必然一致。
     run: (query) => queryUsage(stats, query),
+    // ★ 缓存跟着**取数范围**走：`StatsContext` 的三个路径都是活取值，
+    //   面板里改完会话日志根之后，下一次取数就该按新根查，
+    //   而不是继续回 TTL 内的旧结果（那看起来就像「改了没生效」）。
+    scope: () => [stats.dbPath, stats.dataDir, ...stats.sessionsRoots].join('\u0000'),
     ...(options.ttlMs !== undefined ? { ttlMs: options.ttlMs } : {}),
     ...(options.generation !== undefined ? { generation: options.generation } : {}),
   })

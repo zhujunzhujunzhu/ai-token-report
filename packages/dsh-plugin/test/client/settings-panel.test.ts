@@ -1,17 +1,25 @@
 /**
  * 设置页上**给人看的那几句话**。
  *
- * 这些字符串不是装饰：使用者唯一的判断依据就是它们。两句话最容易说反：
+ * 这些字符串不是装饰：使用者唯一的判断依据就是它们。三句话最容易说反：
  *
  * 1. 保存成功但上报**没**跑起来（未署名 / 部署关了上报 / 旧宿主需重启），
  *    却说成「已保存并开始上报」→ 人以为在跑，部门看板上却没有自己的数。
  * 2. 打开面板时把「未上报（原因）」说成「上报中」→ 同上，而且无处可查。
+ * 3. 「现在真的在读哪几个会话日志根」说错或干脆不说 → 用户改完统计范围，
+ *    分不清「保存成功了」与「真的生效了」（`exists: false` 的根更是只能靠它暴露）。
  *
  * 所以逐句钉住，包括「每 N 秒一批」里的那个 N 是不是真按毫秒换算过来的。
  */
 import { describe, expect, test } from 'bun:test'
 
-import { describeCurrent, describeSaved, intervalLabel } from '../../src/client/settings.js'
+import {
+  describeCurrent,
+  describeSaved,
+  intervalLabel,
+  parseDshHomesText,
+  rootsSummary,
+} from '../../src/client/settings.js'
 import { UI_DEFAULT_FLUSH_INTERVAL_MILLIS, type UiSettingsPayload } from '../../src/client/protocol.js'
 
 /** 一份「配好了、正在跑」的读取载荷，各用例只改自己关心的字段。 */
@@ -27,6 +35,9 @@ function loaded(overrides: Partial<UiSettingsPayload> = {}): UiSettingsPayload {
     flushIntervalMillis: 10_000,
     position: 'dock',
     reporting: { enabled: true, endpoint: 'http://127.0.0.1:8787/api/v1/token-usage' },
+    dshHomes: [],
+    effectiveRoots: [{ path: '/home/u/.dsh', exists: true }],
+    rootsSource: 'auto',
     ...overrides,
   }
 }
@@ -116,5 +127,33 @@ describe('间隔文案（也是下拉框里那一项的文字）', () => {
   test('部署配置写了个非预设值（例如 7 秒）→ 也得有个读得懂的说法', () => {
     expect(intervalLabel(7_000)).toBe('7 秒')
     expect(intervalLabel(90_000)).toBe('90 秒')
+  })
+})
+
+describe('会话日志根：输入框与「现在真的在读哪几处」', () => {
+  test('多行文本 → 路径数组：空行丢掉、两侧空白裁掉', () => {
+    expect(parseDshHomesText(' /a \n\n  /b  \r\n')).toEqual(['/a', '/b'])
+    expect(parseDshHomesText('')).toEqual([])
+    expect(parseDshHomesText('   \n  \n')).toEqual([])
+  })
+
+  test('★ 有根缺失时必须点名：那是「这个根白写了」的唯一线索', () => {
+    const text = rootsSummary(
+      [{ path: '/a', exists: true }, { path: '/gone', exists: false }],
+      'panel',
+    )
+    expect(text).toContain('2 个会话日志根')
+    expect(text).toContain('面板里设置的')
+    expect(text).toContain('1 个根下没有 sessions 目录')
+  })
+
+  test('都在时报「都在」，并说明生效值的来源', () => {
+    expect(rootsSummary([{ path: '/a', exists: true }], 'config')).toBe('当前生效 1 个会话日志根（部署配置下发的），都在。')
+    expect(rootsSummary([{ path: '/a', exists: true }], 'env')).toContain('环境变量指定的')
+    expect(rootsSummary([{ path: '/a', exists: true }], 'auto')).toContain('自动发现')
+  })
+
+  test('★ 宿主没给这个信息（旧宿主）→ 空串，调用方整行不显示，而不是说「0 个根」', () => {
+    expect(rootsSummary([], 'auto')).toBe('')
   })
 })

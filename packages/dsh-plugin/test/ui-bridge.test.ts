@@ -389,6 +389,49 @@ describe('★ TTL 缓存 + 在途合并（面板常驻，不能每个周期重�
     expect(calls).toBe(2)
     expect(gen).toBe(3)
   })
+
+  test('★ 取数范围变了（面板里改了会话日志根）→ 旧缓存立刻不再命中', async () => {
+    // 没有这一条时，「改了统计范围」会在最长一个 TTL 内继续返回旧范围的数
+    // —— 数字照样有，只是来自改之前的那几个 home，而且**不报错**。
+    let calls = 0
+    const clock = 1_000
+    let scope = '/a'
+    const provider = createUiStatsProvider({
+      run: async () => {
+        calls++
+        return sampleResult()
+      },
+      now: () => clock,
+      ttlMs: 30_000,
+      scope: () => scope,
+    })
+
+    await provider.get('today')
+    await provider.get('today')
+    expect(calls).toBe(1) // 范围没变 → TTL 内照常命中
+
+    scope = '/b'
+    await provider.get('today')
+    expect(calls).toBe(2) // 范围一变 → 必须重查
+  })
+
+  test('范围不变时 refresh=1 仍只清当前范围（其它周期留着）', async () => {
+    const seen: string[] = []
+    const provider = createUiStatsProvider({
+      run: async (query) => {
+        seen.push(String(query.period))
+        return sampleResult()
+      },
+      now: () => 1_000,
+      scope: () => '/a',
+    })
+    await provider.get('today')
+    await provider.get('month')
+    await provider.get('today', true)
+    await provider.get('month')
+    // month 仍命中缓存，today 被强制重查
+    expect(seen).toEqual(['today', 'month', 'today'])
+  })
 })
 
 describe('Fetch 处理器', () => {
