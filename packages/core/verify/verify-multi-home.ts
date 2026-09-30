@@ -38,6 +38,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { zstdCompressSync } from 'node:zlib'
 
+import { resolvePaths } from '../src/home.js'
 import { inspectSessionRoots, listSessionFiles, scanAll } from '../src/scanner.js'
 import { ingest } from '../src/db/ingest.js'
 import { openStats } from '../src/db/stats.js'
@@ -143,25 +144,28 @@ function rootAt(...segments: string[]): string {
  * 而多根与合并根的目录结构不同 —— 直接比数组会把「同一条记录」判成不同。
  * 逐字段展开（而不是只比 token 和）是为了让「哪条记录被换了」能一眼看出来。
  */
+/** 一条记录的可比指纹（逐字段展开，而不是只比 token 和：让「哪条被换了」一眼可见）。 */
+function recordLine(r: UsageRecord): string {
+  return [
+    r.eventId,
+    r.sessionId,
+    r.seq,
+    r.time,
+    r.provider,
+    r.model,
+    r.usage.input,
+    r.usage.output,
+    r.usage.cacheRead,
+    r.usage.cacheWrite,
+    r.usage.reasoning,
+    r.usage.total,
+  ].join('|')
+}
+
 function normalize(records: readonly UsageRecord[]): string[] {
   return [...records]
     .sort((a, b) => (a.eventId < b.eventId ? -1 : a.eventId > b.eventId ? 1 : 0))
-    .map((r) =>
-      [
-        r.eventId,
-        r.sessionId,
-        r.seq,
-        r.time,
-        r.provider,
-        r.model,
-        r.usage.input,
-        r.usage.output,
-        r.usage.cacheRead,
-        r.usage.cacheWrite,
-        r.usage.reasoning,
-        r.usage.total,
-      ].join('|'),
-    )
+    .map(recordLine)
 }
 
 function sumTokens(records: readonly UsageRecord[]): {
@@ -431,6 +435,80 @@ try {
   }
   check('规模下依然与合并根逐位相同', sameRecords(scaleUnion.records, scaleMergedScan.records))
   check('规模下依然不翻倍（相加会是 1800 条）', scaleUnion.records.length === 900)
+
+  // ── S13 真实日志（`--real`）：同样的等价关系，用真实的 sessionId / seq 分布再验一遍 ──
+  if (process.argv.includes('--real')) {
+    section('S13 真实日志：并集 ≡ 两个根各自扫描的手工并集')
+    const paths = resolvePaths()
+    const roots = paths.sessionsRoots
+    console.log(`  自动发现的根（${roots.length} 个）：`)
+    for (const root of roots) console.log(`    ${root}`)
+    console.log(`  数据目录：${paths.dataDir}（本脚本不写它，只读日志）`)
+
+    if (roots.length < 2) {
+      console.log('  只有 0~1 个根，跳过 S13（这条验证需要至少两个根）。')
+    } else {
+      const scanA = await scanAll([roots[0]!])
+      const scanB = await scanAll([roots[1]!])
+      const scanBoth = await scanAll(roots)
+
+      // 手工并集：先 A 后 B —— **与 `normalizeHomes` 的字典序一致**（同一 eventId 冲突时先到者胜）
+      const manual = new Map<string, string>()
+      for (const r of scanA.records) manual.set(r.eventId, recordLine(r))
+      for (const r of scanB.records) if (!manual.has(r.eventId)) manual.set(r.eventId, recordLine(r))
+      const actual = new Map(scanBoth.records.map((r) => [r.eventId, recordLine(r)] as const))
+
+      console.log(
+        `  A=${scanA.records.length} 条 / B=${scanB.records.length} 条 / 相加=${scanA.records.length + scanB.records.length} / 并集=${scanBoth.records.length} 条`,
+      )
+      check(
+        '并集 < 各根相加（镜像被 event_id 去重，不是漏扫）',
+        scanBoth.records.length < scanA.records.length + scanB.records.length,
+        `少 ${scanA.records.length + scanB.records.length - scanBoth.records.length} 条`,
+      )
+      // ★ 核心等价关系：手工并集的**每一条**都必须出现在并集里，且指纹逐位一致。
+      //
+      //   反过来（并集 ⊆ 手工并集）在真实日志上**不成立、也不该成立**：
+      //   这台机器上 DSH 正在写日志，`scanBoth` 比 `scanA` / `scanB` 晚几十秒，
+      //   期间新落盘的事件只可能出现在并集里。第一次跑这条就撞上了：
+      //   并集 22406 条而手工并集 22402 条 —— 多出的 4 条正是扫描期间写入的。
+      //   严格相等只在**静止**的合成场景（S1 / S12）里断言。
+      const missing = [...manual].filter(([key, line]) => actual.get(key) !== line)
+      check(
+        '★ 手工并集 ⊆ 并集，且每条指纹（时间 / 模型 / 四项 token）逐位一致',
+        missing.length === 0,
+        missing.length > 0
+          ? `${missing.length} 条缺失或对不上，例：${missing[0]![0]}`
+          : `手工 ${manual.size} 条全部命中`,
+      )
+      const extra = [...actual.keys()].filter((key) => !manual.has(key))
+      console.log(
+        `  并集比手工并集多 ${extra.length} 条 —— 真实日志是活的（DSH 正在写），` +
+          `这就是 scanA/scanB 之后新落盘的那部分。`,
+      )
+
+      // 并集**单调**：再扫一次，之前看到的每条都还在。
+      // 这条把「多出来的 = 日志在长」与「多根路径不一致」区分开 ——
+      // 后者会表现为两条路径的结果忽多忽少，而不是稳定只增。
+      const scanAgain = await scanAll(roots)
+      const again = new Map(scanAgain.records.map((r) => [r.eventId, recordLine(r)] as const))
+      const vanished = [...actual].filter(([key, line]) => again.get(key) !== line)
+      check(
+        '★ 再扫一次：并集只增不减（每个键都还在且指纹一致）→ 多出的部分是日志在长',
+        vanished.length === 0,
+        vanished.length > 0
+          ? `${vanished.length} 条消失或变化，例：${vanished[0]![0]}`
+          : `${actual.size} 条 → ${again.size} 条，全部保留`,
+      )
+      const manualSessions = new Set([...scanA.records, ...scanB.records].map((r) => r.sessionId))
+      check(
+        '并集会话数 == 手工并集的会话数（会话去重与事件去重一致）',
+        new Set(scanBoth.records.map((r) => r.sessionId)).size === manualSessions.size,
+        `${new Set(scanBoth.records.map((r) => r.sessionId)).size} vs ${manualSessions.size}`,
+      )
+      console.log('  ⚠️ 读的是本机真实日志（只读：不写库、不写 dataDir）—— 条数随使用情况变化。')
+    }
+  }
 
   // ── 汇总 ───────────────────────────────────────────────────────────────
   console.log('')

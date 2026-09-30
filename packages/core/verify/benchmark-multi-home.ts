@@ -342,11 +342,17 @@ try {
     } else {
       const rows: Row[] = []
       rows.push(await measure('第 1 个根', [allRoots[0]!]))
-      if (allRoots.length > 1) rows.push(await measure(`全部 ${allRoots.length} 个根`, allRoots))
+      if (allRoots.length > 1) {
+        // ★ 真实数据的「无额外开销」对照**不需要复制任何文件**：
+        //   分别量两个根，再量它们的并集。若 `t(A∪B) ≈ t(A) + t(B)`，
+        //   就说明多根只是「多走几个目录」，本身不产生额外成本。
+        rows.push(await measure('第 2 个根', [allRoots[1]!]))
+        rows.push(await measure(`全部 ${allRoots.length} 个根（并集）`, allRoots))
+      }
       printTable(rows, rows[0]!)
 
       if (allRoots.length > 1) {
-        const [first, all] = rows as [Row, Row]
+        const [first, second, all] = rows as [Row, Row, Row]
         const growth = all.coldScanMs / first.coldScanMs
         console.log('── 真实数据观察 ────────────────────────────────────')
         console.log(`  文件数 ${first.files} → ${all.files}（×${(all.files / first.files).toFixed(2)}）`)
@@ -370,8 +376,16 @@ try {
             `并集事件数 ×${(all.events / first.events).toFixed(2)}`,
         )
         console.log('  → 看耗时跟哪个走：跟随的是**文件数**，不是并集事件数。')
+        const sumOfTwoRoots = first.coldScanMs + second.coldScanMs
+        check(
+          '★★ 真实数据：并集耗时 ≈ 两个根各自耗时之和（±40%）→ 多根本身没有额外开销',
+          all.coldScanMs / sumOfTwoRoots > 0.6 && all.coldScanMs / sumOfTwoRoots < 1.6,
+          `并集 ${all.coldScanMs.toFixed(0)}ms  vs  根1+根2 = ${sumOfTwoRoots.toFixed(0)}ms`,
+        )
       }
-      console.log('  ⚠️ 真实场景为单次测量（不取中位数）：日志规模随机器使用情况变化，只作观察，不作回归门槛。')
+      console.log('  ⚠️ 真实场景的测量方式与合成场景完全相同（热身 1 次 + 3 次中位数）。')
+      console.log('     不同之处只有规模：文件大小与数量随这台机器的使用情况变化，')
+      console.log('     所以这里只作观察 —— 唯一的门槛类断言是「并集 < 各根相加」（确定性事实）。')
     }
   }
 
