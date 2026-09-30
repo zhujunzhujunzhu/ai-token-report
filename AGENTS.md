@@ -18,7 +18,7 @@ DSH token 用量统计平台。四种形态：**CLI / 本地页面 / 部门看�
 
 ```bash
 bun install
-bun test                        # 63 个文件 / 1184 个测试（设了 ATR_V4_TEST_MYSQL_URL 时 MySQL 用例实跑，否则跳过）
+bun test                        # 全仓 1367 pass / 14 skip / 0 fail（设了 ATR_V4_TEST_MYSQL_URL 时 MySQL 用例实跑，否则跳过）
 bun run typecheck               # 7 个包全部 exit 0
 bun run build                   # web-local + web-portal 均构建成功
 bun run stats -- --period today # 终端统计（读本地库，热态 ~50ms）
@@ -37,9 +37,9 @@ bun run packages/server/test/e2e-ingest.ts           # 服务端侧 POST /api/v1
 bun run packages/cli/verify/verify-report-ingest.ts  # ④整条链 CLI report → 服务端 → 库（28 项）
 
 # 人员管理与权限端到端（真 HTTP；改 admin 路由 / 数据库身份 / 角色后全跑）
-bun run packages/server/test/e2e-admin.ts            # 签发即刻生效 + 401/403 + 护栏 + appKey 列表 + 分组多对多 + 供应商归一化（165 项；`--mysql` 同款）
+bun run packages/server/test/e2e-admin.ts            # 签发即刻生效 + 401/403 + 护栏 + appKey 列表 + 分组多对多 + 供应商归一化 + 模型单价（182 项；`--mysql` 同款）
 
-# 分发面契约（79 项，含 S12.3 的静态托管断言与分组目录 / 供应商归一化 / 旧路径 404；改 app.ts / 路由 / 方法 / 状态码后必跑）
+# 分发面契约（97 项，含 S12.3 的静态托管断言与分组目录 / 供应商归一化 / 模型单价路由族 / 看板金额门禁 / 旧路径 404；改 app.ts / 路由 / 方法 / 状态码后必跑）
 bun test packages/server/test/http-contract.test.ts
 
 # 双轨对照验证（真实日志上跑 SQL vs 直扫，断言两者逐位一致）
@@ -48,9 +48,12 @@ bun run packages/cli/verify/verify-db-parity.ts
 # 双运行时驱动对照（Node 的 node:sqlite vs Bun 的 bun:sqlite，逐行比对）
 bun run --filter '@ai-token-report/core' verify:drivers
 
-# ★ 多 home 语义正确性（49 项）：并集 ≡ 把日志物理合并到一个根 / 顺序无关 / 嵌套 / 冲突 / 规模
+# ★ 多 home 语义正确性（62 项；加 `-- --real` 是 66 项）：并集 ≡ 把日志物理合并到一个根 /
+#   顺序无关 / 嵌套 / 冲突 / 规模 / 大小写变体 / 符号链接 / 「存在但读不了」vs「不存在」
 #   默认用合成日志（静止、可控，能断言严格相等）；`-- --real` 用本机真实日志只读复验
 #   （真实日志是**活的**：跨扫描的严格相等不成立，故按「手工并集 ⊆ 并集 + 并集单调」断言）
+#   本机构造不出的条件**如实跳过**（如 Windows 上 chmod 造不出 EACCES），不假装通过；
+#   发现的口径不一致按「观察项」列出，不计失败但会显现出来
 bun run --filter '@ai-token-report/core' verify:multi-home
 bun run --filter '@ai-token-report/core' verify:multi-home -- --real
 
@@ -83,6 +86,9 @@ bun run publish:cli:next   /   bun run publish:cli     # 真发：先 next，再
 bun run build:npm:plugin && bun run verify:npm:plugin  # 插件同款
 bun run publish:plugin:dry / :next / publish:plugin    # 插件同款
 bun run publish:dry                                   # 两个包一起 dry-run
+bun run publish:plugin:quick / publish:cli:quick       # 快速通道：只验目标包（构建 + verify:npm + tarball 真启动），
+                                                       # 跳过全仓单测 / e2e / 对账 / MySQL / 两种 Web；跳过项会逐条打印
+                                                       # 并写进 report.json（mode/skipped）。边界见 docs/发布检查与事故恢复.md
 
 # 部门服务端部署（本地构建 → 上传 → 切换 → 重启；见 docs/服务器部署.md）
 # ★ 与上面的 npm 发布是两件事：这条送产物到 117.72.173.21，那条发到 registry
@@ -95,11 +101,22 @@ bun run --filter '@ai-token-report/dsh-plugin' build
 bun run packages/dsh-plugin/verify/verify-plugin.ts         # 真 HTTP 往返（55 项）
 bun run packages/dsh-plugin/verify/verify-cordis-load.ts    # 真 cordis 装载（10 项）
 bun run packages/dsh-plugin/verify/verify-resolution.ts     # Node 语义解析（9 项）
-bun run packages/dsh-plugin/verify/verify-client-bundle.ts  # ★ 浏览器半产物（25 项）
+bun run packages/dsh-plugin/verify/verify-client-bundle.ts  # ★ 浏览器半产物（36 项，含金额只认字符串 / 不入账的未计价）
 bun run packages/dsh-plugin/verify/diagnose-boot.ts web     # 排障：哪个包 import 就炸
 
-# 部门看板（S7 + S8）：SSR 真执行组件树，断言门禁页 / 看板区块 / 不出现金额
+# 部门看板（S7 + S8）：SSR 真执行组件树，断言门禁页 / 看板区块 / 统计页不出现金额 / 计价页的单价口径 / 金额三态（无字段 / 未计价 / 有金额）
 bun run --filter '@ai-token-report/web-portal' verify
+
+# ★ 费用（估算）四形态的验收（改金额相关代码后按形态各跑一条）
+bun test packages/shared/test/price.test.ts               # 口径与格式化（含 modelPriceFromWire 的 NULL 语义）
+bun test packages/core/test/local-cost.test.ts            # 离线折叠：换价时刻 / 多币种 / 未计价 ≠ 0 / 快照四态
+bun test packages/server/test/local-api.test.ts           # 本地页三条接口的金额（SQL 与直扫逐位一致）
+bun run --filter '@ai-token-report/web-local' verify      # 本地页 SSR + 明细表费用列（模板层）
+bun test packages/cli                                     # --cost（默认关）+ pricing sync（44 项）
+bun run --filter '@ai-token-report/cli' verify:npm        # ★ 发布产物在 Node 与 Bun 上的金额路径
+bun test packages/server/test/reconcile-bill.test.ts      # 月度对账（61 项：窗口边界 / 表头 / 退出码）
+# 月度账单对账（账单数字**只**出现在这个脚本的输出里，绝不进页面 / 接口 / CLI 统计输出）
+bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv> --period 2026-01
 ```
 
 ✅ 四种形态全部落地。`/api/v1/stats/*` 查询接口（S7）与部门看板页面（S8）
@@ -113,12 +130,12 @@ bun run --filter '@ai-token-report/web-portal' verify
 |---|---|
 | `packages/shared` | **契约单一真源**：上报 DTO、查询响应、口径公式 |
 | `packages/core` | **内核**：decode / scanner / aggregate / range / state / format / types / home / identity-store |
-| `packages/core/src/db` | ★ **本地 SQLite 增量库**（独立入口 `@ai-token-report/core/db`）：schema / ingest / query / stats / **portal（上报库只读查询）** |
-| `packages/cli` | **命令入口**：`cli.ts` / `deliver.ts` / `report.ts` |
+| `packages/core/src/db` | ★ **本地 SQLite 增量库**（独立入口 `@ai-token-report/core/db`）：schema / ingest / query / stats / **portal（上报库只读查询）** / **cost（离线金额折叠 + `pricing.json` 快照）** |
+| `packages/cli` | **命令入口**：`cli.ts` / `deliver.ts` / `report.ts` / **`cost-view.ts`（`--cost` 三态渲染，零金额算术）** / **`pricing-sync.ts`（`pricing sync`）** |
 | `packages/server` | 上报接收 + 本地直查 + 部门统计（含**分组目录与 `by=group` 分组维度**）+ **数据库身份、账号、会话、人员与分组（多对多）管理** + 静态托管 |
 | `packages/web-local` | 本地页面（`/api/local/*`） |
-| `packages/web-portal` | 部门看板：人员排行 / 趋势 / 分布 / 明细 / 诊断 + **人员管理页（按权限）** + **appKey 管理页（列表按人呈现归属）** + **分组管理页（`/groups`，需 `groups:manage`）** + **供应商归一化页（`/providers`，需 `providers:read`）**，后台账号登录，数据来自 `/api/v1/stats/*`（含分组候选项 `/api/v1/stats/groups` 与人员候选项 `/api/v1/stats/members`）、`/api/v1/admin/members*`、`/api/v1/admin/appkeys`、`/api/v1/admin/groups*` 与 `/api/v1/admin/provider-aliases*` |
-| `packages/dsh-plugin` | DSH 插件：实时上报 + `token_usage` 工具 + `ctx.tokenReport` 服务 + **界面用量面板（宿主半 + 浏览器半）**。见其 `README.md` |
+| `packages/web-portal` | 部门看板：人员排行 / 趋势 / 分布 / 明细 / 诊断 + **金额（估算）**（概览卡片 / 排行与分布的费用列 / 明细逐条金额 / 趋势费用指标；趋势金额在**多币种或一条价都没配上时禁用并说明原因，不画线**） + **人员管理页（按权限）** + **appKey 管理页（列表按人呈现归属）** + **分组管理页（`/groups`，需 `groups:manage`）** + **供应商归一化页（`/providers`，需 `providers:read`）** + **模型单价页（`/pricing`，需 `pricing:manage`，按供应商分组、逐模型配四类单价与生效区间）**。后台账号登录。看板数据来自 `/api/v1/stats/*`（含分组候选项 `/api/v1/stats/groups` 与人员候选项 `/api/v1/stats/members`）；管理页数据来自 `/api/v1/admin/members*`、`/api/v1/admin/appkeys`、`/api/v1/admin/groups*`、`/api/v1/admin/provider-aliases*` 与 `/api/v1/admin/pricing*`；看板金额的**解释材料**走 `/api/v1/stats/pricing`（`cost:read`，只读单价快照、不含任何用量） |
+| `packages/dsh-plugin` | DSH 插件：实时上报 + `token_usage` 工具 + `ctx.tokenReport` 服务 + **界面用量面板（宿主半 + 浏览器半）**。金额（估算）由宿主算好**格式化成字符串**再透传（浏览器半一个 workspace 包都不 import，只排版）；**面板刻意没有金额曲线**（多币种不相加那条规则的唯一实现在部门看板）。见其 `README.md` |
 
 > 迁移期旧目录（`dsh-token-stats/`、`p0-verify/`）**已删除**。
 > `dsh-session-inspector/` 也已移除（它是与本项目无关的独立插件）。
@@ -139,7 +156,7 @@ bun run --filter '@ai-token-report/web-portal' verify
 | **DSH 插件**（配置 / 安装 / 排障 / 为什么不能碰私有字段） | `packages/dsh-plugin/README.md` |
 | **server 层分层 / 要不要引入第三方库** | `docs/server架构重构方案.md` + `.agents/skills/repo-conventions/SKILL.md` |
 | **部门上报库接 MySQL（方言坑 / 部署 / 备份）** | `docs/mysql上报库.md` |
-| **Portal v6 部署 / v4→v5→v6 显式迁移 / 身份导入** | `docs/数据库部署与迁移.md` + `docs/数据库重设计.md` |
+| **Portal v7 部署 / v4→v5→v6→v7 显式迁移 / 身份导入** | `docs/数据库部署与迁移.md` + `docs/数据库重设计.md` |
 | **供应商归一化（查询期口径 / 按查看者解析）** | `packages/core/src/db/provider-alias.ts` + `docs/数据库重设计.md` §4.3.1 |
 | **分组（多对多）/ 归属展开** | `docs/数据库重设计.md` + `ARCHITECTURE.md` §4.5；归属权威是关联表 `member_group_assignments`，`usage_event.group_name` 只是文本快照 |
 
@@ -185,6 +202,24 @@ bun run --filter '@ai-token-report/web-portal' verify
   `sessionTelemetry` 服务。装插件必须在 profile 里
   `- id: session-telemetry-otel` + `disabled: true`，
   否则 DSH 启动直接失败（报 service already registered）。
+- **🚨 插件的 `peerDependencies` 是「兼容窗口」，不是「同版本」**（当前
+  `@deepseek-ai/dsh-{session,session-telemetry,agent}` = `>=0.1.7-rc.2 <0.3.0-0`）。
+  宿主启动时由 `dsh-app-boot` 的 `evaluatePluginCompatibility` 逐个 `@deepseek-ai/dsh*`
+  peer 做 `semver.satisfies(runtime, range, { includePrerelease: true })`，
+  **任一不满足就跳过整个 bundle**（`@deepseek-ai/cordis` 不参与这个判定）——
+  表现是「面板不见了 + 一条也不上报」，启动日志只有一行
+  `skipping profile bundle …`，**不是报错**。所以钉死精确版本会在每次 DSH 升版时
+  把全队变成静默不采集。
+  - 范围有**两份真源**（`packages/dsh-plugin/package.json` 与
+    `scripts/build-npm.ts` 的发布清单），由 `verify:npm:plugin` 的两条断言钉住：
+    两份必须一致；且用**宿主自己那个函数**逐个代际打分 —— 已实测的代际必须被接受、
+    未验证的代际（`0.1.6-alpha.2` / `0.3.0-rc.1`）必须被拒，上下界都要钉。
+  - 放开范围前必须自己复验这两条实测结论（0.1.7-rc.2 → 0.2.0-rc.2 已复核）：
+    ① `@deepseek-ai/dsh-session-telemetry` 的导出/`SessionTelemetryCoordinator`
+    签名**只是纯增量**（多一个可选 `sourceEvent`）；② `dsh-session-format*` 全树
+    实现文件**逐字节相同**（即落盘日志格式没变，`core` 的 scanner 口径不受影响）。
+    复验办法：把新版宿主 `npm install` 到临时目录，用 `ATR_DSH_MODULES` 指向它跑
+    `verify:npm:plugin` 与 `verify-profile-boot.ts`。
 - **🚨 浏览器半只能 `require` DSH 预置的 9 个模块**（react / react-dom /
   cordis / client-store / ui-slots / ui-primitives / ui-dockkit 这几个）。
   前端只预置这一张表，越界会在**物化阶段**抛错，表现为「插件没起来」。
@@ -241,7 +276,7 @@ bun run --filter '@ai-token-report/web-portal' verify
   写事务锁住 `portal_identity_state` 后重新鉴权，跨进程签发/撤权立即生效，不能用内存长期缓存替代数据库事实。
 - **稳定归属使用 `member_id` UUID**；显示姓名允许重复、用户名仍唯一。
   改名或轮换 Token 不改写旧事件快照。历史引用使用 RESTRICT；最后一个仍有管理入口的管理员不可停用、降级或失去最后有效凭证。
-- **`credentials.json` 只作为显式离线导入源**：先完成 v6 结构迁移（v4 是冻结基线，v3 库先迁 v4、再迁 v5、最后 v6），再运行 `packages/server/scripts/import-credentials.ts`。
+- **`credentials.json` 只作为显式离线导入源**：先完成 v7 结构迁移（v4 是冻结基线，v3 库先迁 v4、再迁 v5、再迁 v6、最后 v7），再运行 `packages/server/scripts/import-credentials.ts`。
   `credentials.ts` / `member-admin.ts` 和 `LegacyPortalAuth` 仅保留历史兼容测试；生产启动拒绝 `credentialsPath`，不双写文件。
 - **首次管理员初始化只允许空身份库执行一次**：`ATR_ADMIN_USERNAME` / `ATR_ADMIN_PASSWORD` 成对配置，
   `ATR_ADMIN_TOKEN` 可作为初始化输入；密码仅哈希、Token 仅摘要入库。已有初始化标记后重启不会从环境变量复活停用身份。
@@ -258,7 +293,82 @@ bun run --filter '@ai-token-report/web-portal' verify
   名册接口失败**不拖垮看板**（回落成用量候选），但 401 仍要让会话过期。
   只有「未署名 / 待确认历史」目录里表达不出来，仍由用量行补上。
   实现只此一处：`web-portal/src/types/portal.ts` 的 `memberFilterOptions()`。
-- **不展示金额**（已确认决策）：无单价来源，只展示 token 数。
+- **🚨 金额一律在查询期现算，绝不存 `cost` 列**（v7 起有了单价来源：`model_price` 表 +
+  `packages/shared/src/price.ts`，故旧的「不展示金额」决策**已作废**）：
+  - **部门看板现在会显示金额**：`/api/v1/stats/*` 在 `cost:read` 下会下发 `cost` 字段；
+    没有这个权限时**整个字段不下发**（不是 0），页面按「字段在不在」决定出不出现。
+    而 `packages/web-portal/verify/verify-render.ts` 里那条「统计页不包含金额或旧 mock」断言
+    **必须保留** —— 它渲染的统计页数据里**不带 `cost`**，验的正是「没有 `cost:read` 时一位金额都不显示」；
+    `/pricing` 页刻意不进那个拼接串。
+  - **单价粒度是 `(provider, model)` 精确匹配**，且匹配的是**上报原值**
+    （不是归一化后的展示名 —— 供应商归一化只是查询期口径）；同一供应商下不同模型各配各的价。
+  - 金额是**整数微元 / 千 token**（1 微 = 1e-6 货币单位）：
+    `cost = input×p_in + output×p_out + cacheRead×p_cr + cacheWrite×p_cw`，
+    **四类必须分开乘**（`cacheRead` 占总量 94% 以上，合成一个价等于让绝大部分用量算错）。
+  - **概览金额必须先按 `(provider, model)` 分组算完再求和**，
+    **绝不能用「总量 × 均价」** —— 世上没有「平均单价」。
+  - **多币种各自累加，绝不换算、绝不相加**（页面上用 ` + ` 连接不同币种）。
+  - **趋势金额在多币种时禁用，而不是画线**（一条价都没配上时同样禁用）：
+    指标照常出现，但点不动并说明「本次区间内有 N 种币种，金额绝不跨币种相加，请看分布表的费用列」。
+    把跨币种求和画出来（或画一条全 0 的线）看起来像「花得很少 / 没花钱」——
+    那是把一个口径错误伪装成结论。曲线上的值仍是**服务端下发的整数微元原值**，
+    只换刻度与悬浮提示的格式化（`formatCostMicro`），画图层不做任何单位换算。
+  - 🚨 **`unpricedRate` 必须显式给出，绝不把未计价当 0** ——
+    这是最危险的误读：未定价看起来像「省了钱」。
+  - **生效区间不得重叠**：应用层 `findPriceConflicts` 兜住并回 `409`；数据库的 UNIQUE 索引
+    只拦「`effective_from_ms` 完全相同」那一类，**拦不住 `[1,100]` vs `[50,200]`**。
+    区间两端都是**含**的。
+  - `cost:read`（能看金额）与 `pricing:manage`（能看 / 改计价）是**两件事**，不互相附带；
+    **单价目录读也要求 `pricing:manage`**（它是配置，不是「看一眼的数字」）。
+    而看数据时的**只读单价快照**另走 `GET /api/v1/stats/pricing`（`cost:read`）——
+    它与 `/api/v1/admin/pricing` 是**两条接口两道门**：前者只读 `model_price`、
+    回答「这个金额是按哪个价算的」，**不含任何用量**；后者才是配置面。
+  - 口径与格式化只在 `packages/shared/price.ts`；页面 / CLI / 插件**不得重算**。
+    单价与总额的格式化是**两个函数**（`formatUnitPriceMicro` 与 `formatCostMicro`）——
+    50 微 / 千 token 用总额那个会显示成 `0.0001`（差 500 倍）。
+    **单价一律按「货币单位 / 百万 token」呈现与录入**（与各家价目表同单位，
+    官方页就是「元 / 百万 tokens」），库里仍存整数微元 / 千 token，两者差 1000
+    （换算只在 `web-portal/src/utils/unitPrice.ts` 一处，`× 1000` / `÷ 1000` 是整数倍）；
+    内置种子价是**人民币官方高峰价**（Flash 缓存命中 ¥0.04 / 未命中 ¥2 / 输出 ¥8，
+    Pro ¥0.30 / ¥9 / ¥27，均为「元 / 百万 token」）。
+  - **自建计价 ≠ 财务账单**（折扣 / 预付 / 赠送额度不在单价里）；账单金额只允许出现在
+    月度对账脚本里，**绝不进页面 / 接口 / CLI 输出**。
+  - **离线端（本地页 / CLI / 插件）的价来自数据目录下的 `pricing.json` 快照**
+    （`dsh-token-report pricing sync --portal <根地址> --token <带 cost:read 的凭证>`
+    从 `GET /api/v1/stats/pricing` 拉，写盘前用**读取方同一个解析器**回读校验）；
+    没有该文件或解析失败就退回**内置种子价**并把原因写进 `note`。
+    所以 `pricingSource` 只有 `'snapshot' | 'builtin'`（离线端不可能有 `'db'`），
+    且**必须与金额同时展示** —— 离线端与看板读的不是同一份价，
+    **同一个时间窗会给出不同的金额**。实测：内置种子价只覆盖 `deepseek-official`，
+    真实数据是 `dashscope` 时命中率为 0，`unpricedRate` 必然是 100%。
+  - **折叠公共件是 `packages/core/src/db/cost.ts`**（离线端唯一实现）：
+    `loadLocalPricing` / `priceResolver` / `costTotalsOf` / `costByGroupOf` /
+    `recordCostOf` / `unpricedTargetsOf`。它**逐条事件按事件时刻取价**
+    （换价那一刻两侧各用各的价），分组键复用 `aggregate.ts` 的 `groupKey()`。
+    ⚠️ 代价是每次统计都要 `records()`（本机实测 2.37 万条 +56ms）——
+    **刻意接受**：省掉它的那条路正是「分组总量 × 一个价」。
+  - **CLI 的 `--cost` 默认关**，关着时**连计价函数都不调用**（不是算了再丢）；
+    `pricing sync` 必须在「有没有会话目录」的检查**之前**分派 ——
+    一台还没装 DSH 的机器正是最需要先同步单价的机器。
+  - **插件面板的金额由宿主格式化成字符串后放进载荷**：浏览器半只能 `require`
+    DSH 预置的 9 个模块，**进不去 `@ai-token-report/shared`**。
+    于是行金额只有「非空字符串」与「缺字段（= 未计价）」两种形态，
+    顶部 `cost` 整块**缺字段 = 老宿主**（整块不出现）、`text: null` = 一条价都没配上
+    （写「未计价」）。**面板与 `token_usage` 的表格金额共用 `formatRowCost()`**
+    （返回 `null` = 未计价，以 `*` 结尾 = 只有部分 token 配上了价）。
+    面板**刻意没有金额曲线** —— 多币种不相加那条规则的唯一实现在
+    `web-portal/src/utils/cost.ts` 的 `costSeriesOf`，照抄一遍就是第二个实现。
+  - **月度对账脚本 `packages/server/scripts/reconcile-bill.ts`**（`bun run reconcile:bill`）
+    是全仓**唯一**允许出现账单金额的地方，且**只读**（不写库、不写文件）。
+    它不自己算钱：估算侧取 `costTotals()` / `costByGroup('provider-model')`，
+    唯一的减法是同币种内的「估算 − 账单」（`sameCurrencyDiff()`）。
+    账单 CSV 表头前 3 列 `period,currency,amount` 逐字相符，后 3 列必须是
+    `provider,model,note` 的**前缀**；坏行一律报错并回**退出码 2**（绝不跳过：
+    跳一行会让「少比了一行」看起来像「完全一致」）。退出码 `1` **只**表示有差额。
+    ⚠️ `openPortalStats()` 对**不存在的 SQLite 路径会静默新建空库**，
+    把「路径写错」伪装成「这个月没有用量」—— 脚本用 `assertPortalTargetExists()`
+    兜住，**core 未改**（服务端启动本来就要初始化空库）。
+  - 细节见 `docs/费用统计方案.md`。
 - **本地身份文件解析失败降级为未署名并告警**；生产数据库损坏、不可用或版本不符则明确失败，不能退回空文件身份或另一个数据库。
 - **`Bun.serve` 必须显式设 `idleTimeout`**：默认 10 秒太短 —— 首次冷建库
   要约 15 秒，客户端会看到 `ECONNRESET` 而**服务端一条日志都没有**。
@@ -268,6 +378,25 @@ bun run --filter '@ai-token-report/web-portal' verify
   也绝不返回 `SUM(input+output+...)` 当 total。派生指标一律交给
   `core/types.ts` 的 `derive()` / `shared/metrics.ts`。SQL 里一旦出现公式，
   就存在第二个口径实现 —— 它不会报错，只会让某个数字悄悄不对。
+- **🚨 金额取数同样只做 `SUM(原始列)`**（口径仍在 `packages/shared/price.ts`）：
+  `LEFT JOIN (SELECT price_id, provider AS mp_provider, model AS mp_model, … FROM model_price) mp`
+  按 `(分组键, price_id, currency)` 分组 —— 四类分价相乘全部在 JS 侧交给
+  `costMicroOf()` / `summarizeCosts()`。未定价那一撮天然落进 `price_id IS NULL` 的行，
+  所以**不需要 `SUM(CASE WHEN …)`**：条件聚合等于把「这一行有没有价」也变成 SQL 里的判定，
+  而那是口径。
+- **🚨 单价表与用量表有同名列（`provider` / `model`），JOIN 前必须先把单价表的列起别名**：
+  直接 JOIN 会让维度表达式里的**裸列名变成歧义列**
+  （实测 SQLite `ambiguous column name: provider`，MySQL errno 1052），
+  于是「按供应商 / 按模型看金额」整条路径直接不可用。**两个后端都会报，它不是方言差异**，
+  别归进「只有活体 MySQL 才会暴露」那两份清单里。
+- **单价行的 snake_case → 契约映射只有一份**（`server/src/identity/model-price-row.ts`
+  的 `modelPriceFromRow()` / `priceShapeFromRow()`）：管理面与看板的只读快照共用。
+  各写一份的结果是「同一行价在管理页与看板解释里显示得不一样」，而它不会报错。
+- **🚨 没有 `cost:read` 时 core 连算都不算金额**（不是算完再丢掉）：由
+  `openPortalStats(target, filter, loadAliases, withCost)` 的第 4 个参数决定要不要查。
+  无权限时 `costTotals()` 返回 `null`、`costByGroup()` 返回空表，趋势点与明细行
+  **根本没有 `cost` 字段**。「先算再丢」在响应上看起来完全一样，
+  但它让一个不该有金额的进程真的读了单价表 —— 权限不该只体现在序列化那一步。
 - **🚨 时间分桶（`day`/`hour`）必须在 JS 侧做**，不要用 SQL 的
   `strftime(..., 'localtime')`。实测 SQLite 按**操作系统时区**、JS 按
   **进程 TZ 解析**，在 `bun test` 下两者相差 8 小时（JS 被强制成 UTC），
@@ -300,7 +429,7 @@ bun run --filter '@ai-token-report/web-portal' verify
   两边必然漂移且不会报错。
 - **🚨 server 的路由与中间件只在 `server/src/app.ts` 一份**（S12 起用 Hono，4.13.9 精确锁版）。
   改任何路径 / 方法 / 状态码，先跑 `packages/server/test/http-contract.test.ts`
-  （79 项契约断言，重构前 `bun test` 完全不覆盖分发面）。
+  （97 项契约断言，重构前 `bun test` 完全不覆盖分发面）。
   四条实测踩出来的坑，改这里之前必读 `app.ts` 的注释：
   1. **Hono 不做 405**，方法不匹配默认回**纯文本 404**且无 `Allow` ——
      405 靠 `hono/method-not-allowed` 读 `app.routes` 反查；
@@ -356,14 +485,22 @@ bun run --filter '@ai-token-report/web-portal' verify
   差额就是他们 —— 页面必须能说清这一点。看板的分组候选项走 `GET /api/v1/stats/groups`
   （`stats:read`），**不要**让页面去读管理接口 `/api/v1/admin/groups`（那是 `groups:read`）；
   人员候选项同理走 `GET /api/v1/stats/members`（`stats:read`），不是 `/api/v1/admin/members`。
-- **上报库的 schema 变更绝不能自愈**：portal 当前是 v6（**v4 是冻结基线**：v3 库先经
-  `portal-schema-v4.ts` 迁到 v4，再依次走 v4→v5、v5→v6；v5 的 `usage_event` 去掉了一列并把 `dept`
-  改名 `group_name`；**v6 只增表** `provider_alias` 与两个权限码，不改既有列、不重建事实表），
-  本地 `usage.sqlite` 仍为 v3。
+- **上报库的 schema 变更绝不能自愈**：portal 当前是 v7（**v4 是冻结基线**：v3 库先经
+  `portal-schema-v4.ts` 迁到 v4，再依次走 v4→v5、v5→v6、v6→v7；v5 的 `usage_event` 去掉了一列并把 `dept`
+  改名 `group_name`；**v6 只增表** `provider_alias` 与两个权限码；**v7 同样只增表** `model_price`
+  与两个权限码（`cost:read` = `...114`、`pricing:manage` = `...115`），
+  两步都不改既有列、不重建事实表），本地 `usage.sqlite` 仍为 v3。
+  - **当前版本的受控 DDL 恒在 `portal-schema-v5.ts`**（v5 结构 + `_V6_ADDITIONS` + `_V7_ADDITIONS`），
+    **不要新建 `portal-schema-v7.ts`** —— 分成两个文件会让「哪些表属于当前版本」变成两处各自维护，
+    而它们必然漂移。
+  - **v6 的校验和已冻结**为 `portalSchemaChecksumV6(kind)`，用来把「已经是 v6」的库识别成
+    **可迁移起点**；不冻结它，已迁到 v6 的库会从「起点」退化成 `unsupported`。
+  - ⚠️ `type SchemaVersion = 4 | 5` **刻意没有扩到 6/7**：`tableStatement(kind, table, version)`
+    把 ≠5 一律映射到 v4 的 DDL，加上 6 会让它**静默返回 v4 DDL**。
   空 portal 库可初始化；旧库/半完成迁移拒绝普通业务写入，只能通过 `packages/server/scripts/migrate-db.ts`
   显式 inspect/migrate/resume。SQLite 先一致性备份（v5 在 SQLite 分支**必须重建事实表**才能去掉列，
   所以按备份流程执行），MySQL 需离线确认和备份证明；迁移前后逐位校验事件指纹，**不改写任何事件原值**。
-- **🚨 MySQL 的 v5/v6 结构迁移有五条「只有活体 MySQL 才会暴露」的坑**（SQLite 一条都不会报，
+- **🚨 MySQL 的 v5/v6/v7 结构迁移有六条「只有活体 MySQL 才会暴露」的坑**（SQLite 一条都不会报，
   所以「SQLite 上测过了」在这里**不构成证据** —— 它们全是靠本机 Docker MySQL 才抓出来的）：
   1. **`DROP COLUMN` / `RENAME COLUMN` 会被引用该列的 CHECK 约束挡住**
      （errno 3959 `Check constraint 'x' uses column 'y', hence column cannot be dropped or renamed`）。
@@ -390,6 +527,20 @@ bun run --filter '@ai-token-report/web-portal' verify
      **不由数据库保证**，只有 `repository.ts` 的 `findProviderAlias()` 显式查重兜住 ——
      不要写「数据库会拒」的断言（那是假承诺），也不要用生成列 `COALESCE(member_id,'')`
      去补（受控 DDL 逐列核对，多一列会在迁移最后一步判成结构不符）。
+  6. **`CREATE UNIQUE INDEX` 语句此前没有任何迁移路径会执行它** —— `ensureIndex` 的正则与两处
+     `startsWith('CREATE INDEX')` 过滤都跳过了 `CREATE UNIQUE INDEX`，于是迁移出来的库缺少
+     `idx_provider_alias_member`（v7 会缺 `idx_model_price_span`）。SQLite 的 `verifyCurrent`
+     只比对 `sqlite_master.sql` 全文、**从不比对索引**，所以本地全绿；MySQL 的
+     `verifyUniqueConstraints` 会在**最后一步**报「表 provider_alias 的唯一约束与主键不一致」
+     → 表现为「迁移明明做完了却不算成功」。修法是 `isCreateIndex()` +
+     `ensureControlledIndexes()`（扫 `portalV6Statements` / `portalV7Statements` 兜住全部受控索引）。
+     **新增受控索引时必须确认它在某条迁移路径里真的被执行过**，别只写进 DDL 就算完。
+     🚨 而且**建索引必须排在 `verifyTable` 之前**（`upgradeV5ToV6` / `upgradeV6ToV7` 里就是
+     `ensureControlledIndexes()` 在前、`verifyTable()` 在后）：MySQL 分支的 `verifyTable`
+     会把独立 `CREATE UNIQUE INDEX` 也算进「期望的唯一约束」，**先校验后建索引 ⇒ 真实 MySQL 上
+     v5→v6 的第一步就报同一条错，整个迁移一步都走不动**（2026-09-30 线上 v5 库实测卡在这里）。
+     反向验证：`packages/core/test/portal-v5.test.ts` 的「v4→v5 真实迁移」用例能复现，
+     所以改这两处后**必须带 `ATR_V4_TEST_MYSQL_URL` 实跑**——只跑 `bun test` 会整段跳过。
 - **🚨 resume 只看版本号判断「v4 基线是否就绪」会让 MySQL 库永久卡死**：v5 结构已经就位、
   但 v5 账本行被标成 `started`/`failed` 的库（迁移中途崩过之后就是这副样子）版本号已经是 5，
   只按版本判断会得出「基线还没做」→ 重跑 v3→v4 → 而那时 `dept` 早已改名 `group_name`，
@@ -419,8 +570,22 @@ bun run --filter '@ai-token-report/web-portal' verify
     插件诊断打印全部根；`inspectSessionRoots()` 回答「这次统计到底读了哪几处」。
     配了但不存在的根**逐项报出**，绝不静默 —— 否则「加了 home 数字没变」分不清是
     镜像去重还是那个根根本没读到（两种情况的数字看起来一模一样）。
+    ⚠️ **已知缺口（未修）**：「存在但读不了」（EACCES，或根路径被一个同名**文件**占住 → ENOTDIR）
+    能在 `inspectSessionRoots` 里报出来（`exists=true` + `error`），但**取数路径**
+    （`ingest` / `stats`）只按 `existsSync` 分流 —— 它既不算 `missingRoots`，也没有别的诊断字段，
+    会被**当成空 home**。于是「这个 home 是空的」与「这个 home 读不到」在 `stats` 输出里
+    仍然不可区分，而 `SessionsRootInspection` 的注释明确承诺这是两件事。
+    `verify-multi-home.ts` 的 S15 把这条作为**观察项**列出（不计失败）。修复方向是让
+    `ingest` / `stats` 也做一次 `readdir` 探测，或干脆复用 `inspectSessionRoots` 的判定。
     注意 `dshHomes` / `--dsh-home` / `DSH_TOKEN_REPORT_DSH_HOMES` 收的是 **home 目录**
     （路径层自己拼 `<home>/sessions`）；写错成 sessions 目录会得到「全部缺失」而不是静默 0。
+  - **路径去重只在 home 层，而且只归一小写**（`normalizeHomes` 的 `dedupeKey`，Windows 上
+    `toLowerCase`）；`listSessionFiles` 的列表去重是**按 `filePath` 字符串**、**不做 `realpath`**。
+    所以同一份日志经由「大小写变体」「符号链接 / junction」「嵌套父子目录」都会**被列两次、
+    解析两次**，最终只靠 `event_id` 主键兜住（本机实测：junction 的两个根列出 2 个文件而事件
+    仍是 3 条；大小写变体列出 2 个文件而事件仍是 2 条）。这是**刻意的取舍** ——
+    realpath 解析要给每个根加一次全量 `stat`，而正确性已由 `event_id` 保证；
+    代价就是 benchmark 里那条「成本随**文件数**走」。
   - **日志根的结构是固定三层** `sessions/<project>/<sessionId>/<file>`：`listSessionFilesInRoot`
     只做两层 `readdir` 就找 `session*.jsonl.zstd`，`sessionFilesFromPaths` 也逐字校验
     「三段式」（`candidate.length !== 3`）。自己搭测试 / 演练目录时多一级会让它
@@ -464,7 +629,7 @@ bun run --filter '@ai-token-report/web-portal' verify
 - **🚨 上报库（`portal.sqlite`）是唯一副本，绝不自动重建**：它由
   `openPortalDb()` 打开，schema 版本不符时**抛错**（不是 `rebuildSchema`）。
   客户端投递成功后已清掉自己的 pending / outbox，删掉 = 全员历史用量永久消失。
-  本地 v3 走 `openDatabaseForIngest()`（可重建），服务端独立 v6 走
+  本地 v3 走 `openDatabaseForIngest()`（可重建），服务端独立 v7 走
   `openPortalStore()`（不可重建），**两个入口和版本不能混用**。
   上报库还必须与本地库 `usage.sqlite` 分开：混用后无法事后拆开。
 - **🚨 `server/src/serve-node.ts` 必须动态 `import('node:http')`**：
@@ -545,9 +710,13 @@ bun run --filter '@ai-token-report/server' test
 
 发布必须通过根目录 `publish:plugin:dry` / `publish:plugin:next` / `publish:plugin`
 （CLI 同款），统一入口 `scripts/release.ts`。禁止用直接发布 dist 绕过验证。
+**迭代期**可以用 `publish:plugin:quick` / `publish:cli:quick`（= `--quick`）：
+它只保留 `typecheck` + 目标包构建 + `verify:npm` + tarball 真启动，
+跳过全仓单测 / e2e / 对账 / MySQL / 两种 Web，跳过的步骤逐条打印并落进 `report.json`；
+改动涉及内核 / 口径 / 上报链路 / 数据库 / 插件装载，或对外首发时，仍必须走完整通道。
 插件 bundle 是 `token-report` 的唯一 insert 来源，用户 profile 只能按 id 覆盖；
-改发布或安装链路必须通过真实 tarball 的 `verify-profile-boot.ts`。
-完整范围与 0.3.0 事故恢复见 `docs/发布检查与事故恢复.md`。
+改发布或安装链路必须通过真实 tarball 的 `verify-profile-boot.ts`（两条通道都会跑它）。
+完整范围、两条通道的边界与 0.3.0 事故恢复见 `docs/发布检查与事故恢复.md`。
 
 ```bash
 bun test && bun run typecheck
