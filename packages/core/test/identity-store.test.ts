@@ -20,11 +20,15 @@ import {
 } from '../src/identity-store.js'
 
 let home: string
+let dataDir: string
 let path: string
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'atr-identity-'))
-  path = identityPath(home)
+  // 显式给数据目录：缺省值在家目录下（`~/.ai-token-report`），
+  // 测试若走缺省就会**覆盖使用者真实的身份文件**。
+  dataDir = join(home, 'token-report')
+  path = identityPath(home, dataDir)
 })
 
 afterEach(() => {
@@ -32,8 +36,8 @@ afterEach(() => {
 })
 
 describe('写入与读取', () => {
-  test('路径落在 $DSH_HOME/token-report/identity.json', () => {
-    expect(path).toBe(join(home, 'token-report', 'identity.json'))
+  test('路径落在 <dataDir>/identity.json', () => {
+    expect(path).toBe(join(dataDir, 'identity.json'))
   })
 
   test('写入后能读回，且字段一致', () => {
@@ -54,7 +58,7 @@ describe('写入与读取', () => {
   })
 
   test('目录不存在时自动创建', () => {
-    expect(existsSync(join(home, 'token-report'))).toBe(false)
+    expect(existsSync(dataDir)).toBe(false)
     writeIdentity(path, { name: '张三', token: 'tok-abc' })
     expect(existsSync(path)).toBe(true)
   })
@@ -77,7 +81,7 @@ describe('写入与读取', () => {
   })
 
   test('★ 兼容旧文件：只含 dept 的对象读出来是 group', () => {
-    mkdirSync(join(home, 'token-report'), { recursive: true })
+    mkdirSync(dataDir, { recursive: true })
     writeFileSync(
       path,
       JSON.stringify({ name: '张三', token: 'tok-abc', dept: '研发一部', createdAt: 1, updatedAt: 2 }),
@@ -99,7 +103,7 @@ describe('写入与读取', () => {
   })
 
   test('同时含 group 与 dept 时以 group 为准（旧值不会盖掉新值）', () => {
-    mkdirSync(join(home, 'token-report'), { recursive: true })
+    mkdirSync(dataDir, { recursive: true })
     writeFileSync(
       path,
       JSON.stringify({ name: '张三', token: 'tok-abc', group: '新分组', dept: '旧部门', createdAt: 1, updatedAt: 2 }),
@@ -163,7 +167,7 @@ describe('损坏降级（关键：不能抛错）', () => {
   })
 
   test('字段类型不对 → 视为损坏', () => {
-    mkdirSync(join(home, 'token-report'), { recursive: true })
+    mkdirSync(dataDir, { recursive: true })
     writeFileSync(path, JSON.stringify({ name: 123, token: null }), 'utf8')
     const got = readIdentity(path)
     expect(got.identity).toBeNull()
@@ -171,7 +175,7 @@ describe('损坏降级（关键：不能抛错）', () => {
   })
 
   test('字段在但值为空 → 视为未署名（不是损坏）', () => {
-    mkdirSync(join(home, 'token-report'), { recursive: true })
+    mkdirSync(dataDir, { recursive: true })
     writeFileSync(path, JSON.stringify({ name: '', token: '' }), 'utf8')
     const got = readIdentity(path)
     expect(got.identity).toBeNull()
@@ -191,7 +195,7 @@ describe('损坏降级（关键：不能抛错）', () => {
 describe('原子性', () => {
   test('写入后不残留临时文件', () => {
     writeIdentity(path, { name: '张三', token: 'tok-abc' })
-    const files = readdirSync(join(home, 'token-report'))
+    const files = readdirSync(dataDir)
     expect(files).toEqual(['identity.json'])
   })
 

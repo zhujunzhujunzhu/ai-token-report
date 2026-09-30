@@ -49,11 +49,11 @@
 
 import type { Database } from './driver.js'
 import { readLocalRollup, readLocalRollupSummary, type LocalRollupSnapshot } from './local-rollup.js'
-import { rmSync } from 'node:fs'
+import { existsSync, rmSync } from 'node:fs'
 
 import { aggregate, timeSeries, totalOf, type GroupDimension, type GroupRow } from '../aggregate.js'
 import { resolveRange } from '../range.js'
-import { scanAll } from '../scanner.js'
+import { scanAll, sessionsRootList, type SessionsRootInput } from '../scanner.js'
 import type { ScanDiagnostics, TokenCounts, UsageRecord } from '../types.js'
 import { ingest, openDatabaseForIngest, readWatermarks } from './ingest.js'
 import {
@@ -71,8 +71,13 @@ export type StatsSource = 'sql' | 'scan'
 
 /** 打开统计会话的选项。 */
 export interface OpenStatsOptions {
-  /** 会话日志根目录。 */
-  sessionsRoot: string
+  /**
+   * 会话日志根。**一组**（同一台机器上并存多套 DSH）或单个（兼容老调用点）。
+   *
+   * ★ 库路径与直扫路径吃的是**同一个**入参：多根合并的口径只有一份实现，
+   *   否则「库给出并集、直扫只给单根」会变成同一台机器上两个数字。
+   */
+  sessionsRoot: SessionsRootInput
   /** 本地库路径。 */
   dbPath: string
   /** 具名周期（与 CLI `--period` 同义）。缺省 = 全部时间。 */
@@ -113,6 +118,15 @@ export class StatsSession {
   readonly untilMs?: number
   /** 库路径（sql 路径才有）。 */
   readonly dbPath?: string
+  /** ★ 本次统计**实际读取**的会话日志根（多套 DSH 时会有多个）。 */
+  readonly sessionsRoots: string[]
+  /**
+   * 配置里给了、但目录不存在因而被跳过的根。
+   *
+   * 与 `sessionsRoots` 分开是刻意的：「加了 home 数字没变」既可能是正确的
+   * 镜像去重，也可能是那个根根本不存在 —— 两者必须能分辨。
+   */
+  readonly missingRoots: string[]
 
   readonly #providers: string[]
   readonly #models: string[]
@@ -146,6 +160,8 @@ export class StatsSession {
     diagnostics: ScanDiagnostics | null
     rollup?: LocalRollupSnapshot
     summaryCounts?: TokenCounts
+    sessionsRoots?: string[]
+    missingRoots?: string[]
   }) {
     this.source = init.source
     this.scannedAt = init.scannedAt
@@ -154,6 +170,8 @@ export class StatsSession {
     if (init.sinceMs !== undefined) this.sinceMs = init.sinceMs
     if (init.untilMs !== undefined) this.untilMs = init.untilMs
     if (init.dbPath) this.dbPath = init.dbPath
+    this.sessionsRoots = init.sessionsRoots ?? []
+    this.missingRoots = init.missingRoots ?? []
     this.#providers = init.providers
     this.#models = init.models
     this.#db = init.db
@@ -290,6 +308,15 @@ export class StatsSession {
  * —— 静默降级会让人以为「库没生效」，带上原因才能排查。
  */
 export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
+  // ★ 存在性只在这里判一次，库路径与直扫路径共用同一份结果：
+  //   两条路径必须对「读了哪几个根」给出完全一致的答案。
+  const presentRoots: string[] = []
+  const missingRoots: string[] = []
+  for (const root of sessionsRootList(opts.sessionsRoot)) {
+    if (existsSync(root)) presentRoots.push(root)
+    else missingRoots.push(root)
+  }
+
   const range = resolveRange({
     ...(opts.period ? { period: opts.period } : {}),
   })
@@ -303,7 +330,7 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
 
   // ── 直扫路径（显式强制，或作为降级目标）──────────────────────────
   const scanPath = async (degradedReason?: string): Promise<StatsSession> => {
-    const { records, sessions, diagnostics } = await scanAll(opts.sessionsRoot, {
+    const { records, sessions, diagnostics } = await scanAll(presentRoots, {
       providers,
       models,
       ...(sinceMs !== undefined ? { sinceMs } : {}),
@@ -325,6 +352,8 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
       //   文件数会包含「有文件但这段时间没调用」的会话，让卡片虚高。
       sessions: new Set(records.map((r) => r.sessionId)).size,
       diagnostics,
+      sessionsRoots: presentRoots,
+      missingRoots,
     })
   }
 
@@ -341,7 +370,7 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
     if (!opts.readOnly) {
       // ★ ingest 前置：热态约 9 ms，把「库旧于日志」的窗口压到最小
       await ingest({
-        sessionsRoot: opts.sessionsRoot,
+        sessionsRoot: presentRoots,
         dbPath: opts.dbPath,
         db,
         ...(opts.changedFiles ? { changedFiles: opts.changedFiles } : {}),
@@ -373,6 +402,8 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
       ...(summary ? { summaryCounts: summary.counts } : {}),
       ...(rollup ? { rollup } : {}),
       diagnostics: null,
+      sessionsRoots: presentRoots,
+      missingRoots,
     })
   } catch (err) {
     // 库不可用 ⇒ 降级直扫。原因必须带出去，否则用户无法判断

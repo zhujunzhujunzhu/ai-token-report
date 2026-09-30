@@ -29,10 +29,12 @@
 
 import type { Database } from './driver.js'
 import { Buffer } from 'node:buffer'
+import { existsSync } from 'node:fs'
 import { basename, dirname } from 'node:path'
 
 import { scanIncremental, listSessionFiles, listSessionFilesFromPaths, sessionLogVersion, SESSION_SCAN_REVISION,
-  type ScanOptions, type FileCursor, type WatermarkLookup } from '../scanner.js'
+  sessionsRootList, type ScanOptions, type FileCursor, type WatermarkLookup,
+  type SessionsRootInput } from '../scanner.js'
 import type { ScanDiagnostics, SessionMeta, UsageRecord } from '../types.js'
 import type { WireTokenRecord } from '@ai-token-report/shared'
 import { portalDialect, type PortalStore } from './portal-db.js'
@@ -56,11 +58,22 @@ export interface IngestResult {
   ingestedAt: number
   /** 本轮真正读取的压缩字节数，热态应为 0。 */
   bytesRead: number
+  /**
+   * 配置里给了、但**目录不存在**因而被跳过的会话日志根。
+   *
+   * 必须带出去而不是静默吞掉：「我加了一个 home 数字没变」既可能是正确的
+   * 镜像去重，也可能是那个根根本读不到 —— 使用者要能分辨这两者。
+   */
+  missingRoots: string[]
 }
 
 export interface IngestOptions {
-  /** 会话日志根目录。 */
-  sessionsRoot: string
+  /**
+   * 会话日志根。**一组**（同一台机器上并存多套 DSH）或单个（兼容老调用点）。
+   *
+   * 多根时按 `event_id` 主键天然去重：同名会话在多处的镜像副本只入库一次。
+   */
+  sessionsRoot: SessionsRootInput
   /** 实际上库路径（已由调用方解析）。 */
   dbPath: string
   /** 进度回调（长扫描时给页面/终端反馈）。 */
@@ -89,6 +102,19 @@ export interface IngestOptions {
 export async function ingest(options: IngestOptions): Promise<IngestResult> {
   const started = Date.now()
   const ownsDb = options.db === undefined
+
+  // ★ 先把**不存在**的根摘掉再扫描。
+  //   重建分支用 `strictErrors: true`（宁可整轮失败也不写半份数据），而多根里
+  //   任何一个暂时不存在的 home（外接盘没插、第三方客户端刚卸载）都会让
+  //   **每一轮重建永久失败**；本地库是日志的派生物，为它卡住划不来。
+  //   缺失的根不静默：由 `missingRoots` 带出去展示。
+  const presentRoots: string[] = []
+  const missingRoots: string[] = []
+  for (const root of sessionsRootList(options.sessionsRoot)) {
+    if (existsSync(root)) presentRoots.push(root)
+    else missingRoots.push(root)
+  }
+
   const db = options.db ?? openDatabaseForIngest(options.dbPath)
 
   try {
@@ -99,22 +125,22 @@ export async function ingest(options: IngestOptions): Promise<IngestResult> {
     ensureLocalCursorSchema(db)
     ensureLocalScanSchema(db)
     let files = options.changedFiles === undefined
-      ? await listSessionFiles(options.sessionsRoot)
-      : await listSessionFilesFromPaths(options.sessionsRoot, options.changedFiles)
+      ? await listSessionFiles(presentRoots)
+      : await listSessionFilesFromPaths(presentRoots, options.changedFiles)
     const revisionChanged = db.query<{ revision: number }>('SELECT revision FROM local_scan_meta WHERE id = 1').get()?.revision !== SESSION_SCAN_REVISION
     let sources = changedScanSources(db, files)
     const reset = (revisionChanged && (countEvents(db) > 0 ||
       db.query('SELECT 1 FROM file_watermark LIMIT 1').get() != null)) || sources.some(source => source.previous !== undefined)
     if (reset) {
       // 先完整解析、后在写事务里替换。扫描失败时旧缓存仍在，不留下半重建的数字。
-      files = await listSessionFiles(options.sessionsRoot, { strictErrors: true })
+      files = await listSessionFiles(presentRoots, { strictErrors: true })
       sources = scanSources(files).map(source => ({ ...source, previous: undefined }))
     }
     const watermarks: WatermarkLookup = reset ? {
       sizeOf: () => undefined, frameCountOf: () => undefined, lastSeqOf: () => undefined,
     } : readWatermarks(db, options.changedFiles === undefined ? undefined : files)
 
-    const scan = await scanIncremental(options.sessionsRoot, {
+    const scan = await scanIncremental(presentRoots, {
       watermarks,
       sessionFiles: files,
       ...(options.onProgress ? { onProgress: options.onProgress } : {}),
@@ -129,7 +155,8 @@ export async function ingest(options: IngestOptions): Promise<IngestResult> {
     if (!reset && !revisionChanged && sources.length === 0 && scan.records.length === 0 &&
       !scan.files.some((f) => f.changed) && scan.diagnostics.filesFailed === 0) {
       return { inserted: 0, duplicates: 0, filesScanned: 0, skippedUnchanged: scan.skippedUnchanged,
-        diagnostics: scan.diagnostics, elapsedMs: Date.now() - started, ingestedAt: Date.now(), bytesRead: scan.bytesRead }
+        diagnostics: scan.diagnostics, elapsedMs: Date.now() - started, ingestedAt: Date.now(),
+        bytesRead: scan.bytesRead, missingRoots }
     }
 
     // ── 单事务：写数据 + 推水位线 + 更新诊断 ──────────────────────────
@@ -280,6 +307,7 @@ export async function ingest(options: IngestOptions): Promise<IngestResult> {
       elapsedMs: Date.now() - started,
       ingestedAt: now,
       bytesRead: scan.bytesRead,
+      missingRoots,
     }
   } finally {
     // 只关闭自己打开的连接；外部传入的由调用方管理

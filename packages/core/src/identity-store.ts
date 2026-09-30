@@ -4,10 +4,13 @@
  * ## 文件位置
  *
  * ```
- * $DSH_HOME/token-report/identity.json
+ * ~/.ai-token-report/identity.json
  * ```
  *
- * 与 DSH 自身的数据放在一起，卸载 DSH 时自然一并清理。
+ * 落在**家目录下**而不是某个 DSH home 里：同一台机器上可能同时跑着命令行版
+ * （`~/.dsh`）与 DSH Desktop（`%APPDATA%\dsh-desktop\harness`），而「我是谁」
+ * 只有一份 —— 见 `home.ts` 文件头。位置可经 `dataDir` / `DSH_TOKEN_REPORT_DATA_DIR`
+ * 改到别处。
  *
  * ## 三条实现约束
  *
@@ -20,7 +23,7 @@
  */
 
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname } from 'node:path'
 
 import {
   isSigned,
@@ -28,14 +31,23 @@ import {
   type Identity,
 } from '@ai-token-report/shared'
 
-/** 身份文件所在目录名。 */
-const DIR_NAME = 'token-report'
-/** 身份文件名。 */
-const FILE_NAME = 'identity.json'
+import { resolvePaths } from './home.js'
 
-/** 解析身份文件的路径。 */
-export function identityPath(dshHome: string): string {
-  return join(dshHome, DIR_NAME, FILE_NAME)
+/**
+ * 解析身份文件的路径。
+ *
+ * ⚠️ 走 `resolvePaths()` 而不是自己拼目录名：数据目录的缺省值只在 `home.ts`
+ *   一处定义。这里再拼一遍就会出现「身份在 A 目录、本地库在 B 目录」而
+ *   **两边都不报错**的局面。
+ *
+ * @param dshHome - 会话日志根；只影响 `dataDir` 的**缺省基准之外**的语义（现在不影响它）。
+ * @param dataDir - 数据目录；给了就完全覆盖缺省。
+ */
+export function identityPath(dshHome?: string, dataDir?: string): string {
+  return resolvePaths({
+    ...(dshHome ? { dshHome } : {}),
+    ...(dataDir ? { dataDir } : {}),
+  }).identityPath
 }
 
 /** 读取结果，附带「为什么没有」的信息，便于给出准确提示。 */

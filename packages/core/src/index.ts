@@ -15,12 +15,18 @@
  * | `state.ts` | 增量水位线（文件大小 / 帧数 / seq 三层） |
  * | `format.ts` | 终端表格渲染 |
  * | `types.ts` | 用量与计费记录类型 |
- * | `home.ts` | DSH home 路径解析 |
+ * | `home.ts` | DSH home / 会话日志根 / token-report **数据目录**的路径解析 |
  * | `identity-store.ts` | 本地身份存储 |
  * | `db/` | ★ 本地 SQLite 增量库（**独立入口**，见下） |
  *
  * HTTP 投递（`deliver.ts`）与上报编排（`report.ts`）**不在 core**——
  * 它们是 CLI 职责，见 `packages/cli/src/`。
+ *
+ * ## ⚠️ 会话日志根 ≠ 数据目录
+ *
+ * `dshHome` 决定**会话日志从哪读**，`dataDir` 决定**token-report 自己的状态放哪**。
+ * 默认互不相干（数据目录在**家目录**下 `~/.ai-token-report`，**刻意不跟随 `DSH_HOME`**），
+ * 于是两套 DSH（Desktop 与命令行版）天然共用一份身份、各自统计自己的会话 —— 详见 `home.ts` 文件头。
  *
  * ## ⚠️ `db/` 为什么不在这个入口里 re-export
  *

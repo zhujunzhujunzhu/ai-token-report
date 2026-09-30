@@ -27,9 +27,9 @@
  */
 
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname } from 'node:path'
 
-import { resolveDshHome } from './home.js'
+import { resolvePaths } from './home.js'
 import type { UsageRecord } from './types.js'
 import type { FileCursor } from './scanner.js'
 
@@ -109,13 +109,20 @@ export function statsOf(state: ReportState): StateStats {
 }
 
 /**
- * 状态文件路径。默认 `$DSH_HOME/token-report/state.json`。
+ * 状态文件路径。默认 `<dataDir>/state.json`（即 `~/.ai-token-report/state.json`）。
  *
- * 放进 DSH home 而不是系统临时目录：它是长期状态，且应当和设备上的
+ * 放进 token-report 数据目录而不是系统临时目录：它是长期状态，且应当和设备上的
  * 会话日志同生命周期（用户清空 home 时一起清掉才合理）。
+ *
+ * ⚠️ 走 `resolvePaths()` 而不是自己拼 `token-report/`：数据目录可以经
+ *   `dataDir` 换成共享目录（见 `home.ts` 文件头），这里再拼一次就会把
+ *   「档位文件」写到另一个地方，而两边都不报错。
+ *
+ * @param dshHome - 会话日志所在的 DSH home（**不再影响数据目录**，仅为兼容旧调用点保留）。
+ * @param dataDir - token-report 数据目录；给了就完全覆盖缺省值。
  */
-export function resolveStatePath(dshHome?: string): string {
-  return join(resolveDshHome(dshHome), 'token-report', 'state.json')
+export function resolveStatePath(dshHome?: string, dataDir?: string): string {
+  return resolvePaths({ ...(dshHome ? { dshHome } : {}), ...(dataDir ? { dataDir } : {}) }).statePath
 }
 
 /**

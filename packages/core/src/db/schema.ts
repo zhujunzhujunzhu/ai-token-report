@@ -197,7 +197,7 @@ CREATE TABLE IF NOT EXISTS ingest_run (
 export function openDb(dbPath: string): Database {
   // ⚠️ SQLite **不会**自动创建父目录，父目录不存在时直接抛
   //   `SQLiteError: unable to open database file`。
-  //   而默认路径 `$DSH_HOME/token-report/` 在「从未用过 token-report
+  //   而默认路径 `~/.ai-token-report/` 在「从未用过 token-report
   //   任何功能」的机器上是不存在的 —— 首次运行必然踩到。
   //   这里主动建目录，与 `state.ts` 的 `saveState()` 行为保持一致。
   mkdirSync(dirname(dbPath), { recursive: true })
@@ -259,13 +259,13 @@ export function rebuildSchema(db: Database): void {
   ensureSchema(db)
 }
 
-/** 本地库的默认路径：`$DSH_HOME/token-report/usage.sqlite`。 */
+/** 本地库的默认路径：`~/.ai-token-report/usage.sqlite`。 */
 export function dbFileName(): string {
   return 'usage.sqlite'
 }
 
 /**
- * 服务端上报库的默认文件名：`$DSH_HOME/token-report/portal.sqlite`。
+ * 服务端上报库的默认文件名：`~/.ai-token-report/portal.sqlite`。
  *
  * ⚠️ **必须与本地库 `usage.sqlite` 分开**：本地库存的是「这台机器的日志派生数据」，
  *   服务端库存的是「全员上报数据」。两个文件一旦是同一个，全员数据与本机数据

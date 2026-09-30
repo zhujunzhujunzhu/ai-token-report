@@ -3,6 +3,7 @@
  * 解码并把 `assistant/message` 事件折叠为计费记录。
  */
 
+import { existsSync } from 'node:fs'
 import { open, readFile, readdir, stat } from 'node:fs/promises'
 import type { Dirent, Stats } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
@@ -55,8 +56,49 @@ export function selectSessionLogFiles(entries: readonly string[]): string[] {
     (sessionLogVersion(entry) === null || sessionLogVersion(entry) === highest))
 }
 
-/** 列出 sessions 根目录下所有会话日志文件。 */
-export async function listSessionFiles(sessionsRoot: string, options: { strictErrors?: boolean } = {}): Promise<SessionMeta[]> {
+/**
+ * 会话日志根的入参：**单根（兼容老调用点）** 或 **一组根**（同一台机器上并存多套 DSH）。
+ *
+ * 两种写法在下游走完全相同的代码路径：多根只是把「列目录」重复几次再合并去重。
+ * 之所以不让调用方自己循环再合并，是因为合并必须**去重且顺序确定**（见
+ * {@link listSessionFiles}）——那是口径的一部分，散到各调用点必然漂移。
+ */
+export type SessionsRootInput = string | readonly string[]
+
+/** 归一成一组根。单根写法与多根写法在下游不可区分。 */
+export function sessionsRootList(input: SessionsRootInput): string[] {
+  return typeof input === 'string' ? [input] : [...input]
+}
+
+/**
+ * 列出**一组** sessions 根目录下的所有会话日志文件。
+ *
+ * ## 多根为什么必须去重、且顺序必须确定
+ *
+ * 同一台机器上并存多套 DSH 时，两个 home 的会话可能是**同一批的镜像**
+ * （实测 224 个同名 sessionId）。更极端的是两个根互为父子、或其中一个是 symlink ——
+ * 那时同一个文件会被列两次：
+ *
+ * - **去重**（按绝对路径）保证同一条日志只被解析一次；
+ * - **顺序确定**（根序由调用方给定并已排序，合并取首次出现）保证
+ *   `event_id = sessionId:seq` 在库里主键冲突时「先到者胜」的结果**可复现**。
+ *   顺序随环境变量书写方式变化 = 同一批数据两次运行给出不同结果。
+ */
+export async function listSessionFiles(sessionsRoot: SessionsRootInput, options: { strictErrors?: boolean } = {}): Promise<SessionMeta[]> {
+  const roots = sessionsRootList(sessionsRoot)
+  if (roots.length === 1) return listSessionFilesInRoot(roots[0]!, options)
+
+  const merged = new Map<string, SessionMeta>()
+  for (const root of roots) {
+    for (const meta of await listSessionFilesInRoot(root, options)) {
+      if (!merged.has(meta.filePath)) merged.set(meta.filePath, meta)
+    }
+  }
+  return [...merged.values()]
+}
+
+/** 单个根的列举实现。多根只是把它重复几次。 */
+async function listSessionFilesInRoot(sessionsRoot: string, options: { strictErrors?: boolean } = {}): Promise<SessionMeta[]> {
   const out: SessionMeta[] = []
 
   let projects: Dirent[]
@@ -121,17 +163,28 @@ export async function listSessionFiles(sessionsRoot: string, options: { strictEr
 }
 
 /** 文件监听器已知具体变更路径时不再遍历历史目录；目录变更由调用方触发完整扫描。 */
-export function sessionFilesFromPaths(sessionsRoot: string, paths: readonly string[]): SessionMeta[] {
-  const root = resolve(sessionsRoot)
+export function sessionFilesFromPaths(sessionsRoot: SessionsRootInput, paths: readonly string[]): SessionMeta[] {
+  const roots = sessionsRootList(sessionsRoot).map((root) => resolve(root))
   const files = new Map<string, SessionMeta>()
   for (const path of paths) {
     if (!isAbsolute(path)) throw new Error(`变更日志路径必须是绝对路径：${path}`)
     const filePath = resolve(path)
-    const rel = relative(root, filePath)
-    const parts = rel.split(/[\\/]/)
-    const [projectDir, sessionId, entry] = parts
-    if (isAbsolute(rel) || parts.length !== 3 || parts.some((part) => part === '..' || part === '') ||
-      !entry?.startsWith('session') || !entry.endsWith('.jsonl.zstd')) {
+
+    // ★ 多根：变更路径属于哪个根**事先不知道**，只能逐个根试 ——
+    //   命中第一个能解析出「<project>/<sessionId>/<file>」三段式的根即为它的来源。
+    //   跨盘符时 `relative()` 会回一个绝对路径，必须显式排除（否则 `D:` 会被当成项目名）。
+    let parts: string[] | undefined
+    for (const root of roots) {
+      const rel = relative(root, filePath)
+      if (isAbsolute(rel)) continue
+      const candidate = rel.split(/[\\/]/)
+      if (candidate.length !== 3 || candidate.some((part) => part === '..' || part === '')) continue
+      parts = candidate
+      break
+    }
+
+    const [projectDir, sessionId, entry] = parts ?? []
+    if (parts === undefined || !entry?.startsWith('session') || !entry.endsWith('.jsonl.zstd')) {
       throw new Error(`变更日志路径不属于会话目录结构：${path}`)
     }
     files.set(filePath, { sessionId: sessionId!, projectDir: projectDir!, filePath, cwd: null, createdAt: null })
@@ -140,7 +193,7 @@ export function sessionFilesFromPaths(sessionsRoot: string, paths: readonly stri
 }
 
 /** 定向扫描也核对同目录的标准格式；监听到旧副本时只刷新当前格式，不把旧记录带回来。 */
-export async function listSessionFilesFromPaths(sessionsRoot: string, paths: readonly string[]): Promise<SessionMeta[]> {
+export async function listSessionFilesFromPaths(sessionsRoot: SessionsRootInput, paths: readonly string[]): Promise<SessionMeta[]> {
   const requested = sessionFilesFromPaths(sessionsRoot, paths)
   const groups = new Map<string, SessionMeta[]>()
   for (const meta of requested) {
@@ -353,9 +406,96 @@ function collectEvents(
   }
 }
 
-/** 扫描整个 sessions 目录，返回全部计费记录。 */
+/** 单个会话日志根的巡检结果 —— 「这次统计到底读了哪几处」。 */
+export interface SessionsRootInspection {
+  /** 会话日志根（`<home>/sessions`）。 */
+  root: string
+  /** 目录是否存在。 */
+  exists: boolean
+  /** 含日志文件的会话目录数。 */
+  sessions: number
+  /** 候选日志文件数（按格式代际筛选后）。 */
+  files: number
+  /** 最近一次写入时间（epoch ms）；无文件或不可读时为 `null`。 */
+  latestMs: number | null
+  /** 不可用时的原因。**存在但读不了**与**根本不存在**是两件事，所以与 `exists` 分开。 */
+  error?: string
+}
+
+/**
+ * 逐个巡检会话日志根。
+ *
+ * 多根统计之后，「这个数字来自哪几个根」必须能被回答 —— 否则
+ * 「我加了一个 home 但数字没变」既可能是镜像去重（正确），也可能是
+ * 那个根根本读不到（错误），使用者无法区分。
+ *
+ * ⚠️ 会 stat 每个日志文件（这是 `latestMs` 的代价）。**不要**在每次取数的热路径上调用，
+ *   只用于 `--discover`、诊断输出与「来源」展示。
+ */
+export async function inspectSessionRoots(sessionsRoot: SessionsRootInput): Promise<SessionsRootInspection[]> {
+  const out: SessionsRootInspection[] = []
+
+  for (const root of sessionsRootList(sessionsRoot)) {
+    if (!existsSync(root)) {
+      out.push({ root, exists: false, sessions: 0, files: 0, latestMs: null, error: '会话日志根不存在' })
+      continue
+    }
+
+    let projects: Dirent[]
+    try {
+      projects = await readdir(root, { withFileTypes: true })
+    } catch (error) {
+      out.push({
+        root, exists: true, sessions: 0, files: 0, latestMs: null,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      continue
+    }
+
+    let sessions = 0
+    let files = 0
+    let latestMs: number | null = null
+    for (const project of projects) {
+      if (!project.isDirectory() && !project.isSymbolicLink()) continue
+      const projPath = join(root, project.name)
+      let sessionIds: Dirent[]
+      try {
+        sessionIds = await readdir(projPath, { withFileTypes: true })
+      } catch {
+        continue
+      }
+      for (const session of sessionIds) {
+        if (!session.isDirectory() && !session.isSymbolicLink()) continue
+        const sessPath = join(projPath, session.name)
+        let entries: string[]
+        try {
+          entries = await readdir(sessPath)
+        } catch {
+          continue
+        }
+        let counted = false
+        for (const entry of selectSessionLogFiles(entries)) {
+          counted = true
+          files++
+          try {
+            const st = await stat(join(sessPath, entry))
+            if (latestMs === null || st.mtimeMs > latestMs) latestMs = st.mtimeMs
+          } catch {
+            // 单个文件 stat 失败只影响 latestMs，不该让整个巡检失败
+          }
+        }
+        if (counted) sessions++
+      }
+    }
+    out.push({ root, exists: true, sessions, files, latestMs })
+  }
+
+  return out
+}
+
+/** 扫描整个（一组）sessions 目录，返回全部计费记录。 */
 export async function scanAll(
-  sessionsRoot: string,
+  sessionsRoot: SessionsRootInput,
   options: ScanOptions = {},
 ): Promise<{ records: UsageRecord[]; sessions: SessionMeta[]; diagnostics: ScanDiagnostics }> {
   const diagnostics = emptyDiagnostics()
@@ -502,7 +642,7 @@ async function readTail(path: string, previous: FileCursor | undefined) {
  * 「静默跳过」安全得多，代价只是一个文件的重复解析。
  */
 export async function scanIncremental(
-  sessionsRoot: string,
+  sessionsRoot: SessionsRootInput,
   options: IncrementalScanOptions,
 ): Promise<IncrementalScanResult> {
   const diagnostics = emptyDiagnostics()
