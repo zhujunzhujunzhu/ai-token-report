@@ -238,6 +238,21 @@ try {
   const selfLongLived = selfTokens.find((token: any) => token.expires_at_ms === null)
   assert(selfLongLived); checks++
   equal((await request(a, 'admin/members/tokens/expiry', adminToken, { member_id: self.member_id, token_id: selfLongLived.token_id, expected_version: selfLongLived.version, expires_at_ms: season })).status, 409, '唯一长期管理凭证不能被改成会过期')
+  // ── ★ 删除凭证：只在「从未被引用」时放行，其余必须说清该改用吊销 ──
+  // 用一对对照：`expiring` 已吊销且从未上报（可删），`appKeyIssue` 上报过（删不掉）。
+  const expiringVersion = dated.data.token.version + 1
+  equal((await request(a, 'admin/members/tokens/delete', null, { member_id: appKeyMember.member_id, token_id: expiring.token.token_id, expected_version: expiringVersion })).status, 401, '未认证不能删除凭证')
+  equal((await request(b, 'admin/members/tokens/delete', appKeySecret, { member_id: appKeyMember.member_id, token_id: expiring.token.token_id, expected_version: expiringVersion })).status, 403, 'appKey 不能删除凭证')
+  equal((await request(a, 'admin/members/tokens/delete', adminToken, { member_id: appKeyMember.member_id, token_id: expiring.token.token_id, expected_version: expiringVersion + 1 })).status, 409, '旧版本不能删除凭证')
+  equal((await request(a, 'admin/members/tokens/delete', adminToken, { member_id: first.member_id, token_id: expiring.token.token_id, expected_version: expiringVersion })).status, 404, '不能跨人员删除凭证')
+  const reportedDelete = await request(a, 'admin/members/tokens/delete', adminToken, { member_id: appKeyMember.member_id, token_id: appKeyIssue.data.token.token_id, expected_version: renewed.data.token.version })
+  equal([reportedDelete.status, reportedDelete.data.code], [409, 'token_referenced'], '已上报过的凭证删不掉，原因是「被引用」而不是版本冲突')
+  assert(String(reportedDelete.data.reason).includes('吊销')); checks++
+  equal((await request(a, 'admin/appkeys')).data.appkeys.some((entry: any) => entry.token.token_id === appKeyIssue.data.token.token_id), true, '被拒的删除没有留下半删状态')
+  equal((await request(a, 'admin/members/tokens/delete', adminToken, { member_id: appKeyMember.member_id, token_id: expiring.token.token_id, expected_version: expiringVersion })).data.ok, true, '已吊销但从未上报的凭证可以物理删除')
+  equal((await request(a, 'admin/appkeys')).data.appkeys.some((entry: any) => entry.token.token_id === expiring.token.token_id), false, '删除后列表里不再有这一行')
+  equal((await request(a, `admin/members/tokens?member_id=${appKeyMember.member_id}`)).data.tokens.some((token: any) => token.token_id === expiring.token.token_id), false, '按人查凭证也看不到已删除的行')
+  equal((await request(a, 'admin/members/tokens/delete', adminToken, { member_id: appKeyMember.member_id, token_id: expiring.token.token_id, expected_version: expiringVersion })).status, 404, '再删一次是 404，不静默成功')
 
   // ── ★ v6 供应商归一化规则：配一次，全库的「供应商视角」立刻跟着变 ──
   // 这一段的重点是**归一化作用在查询期**：库里 `usage_event.provider` 始终是原值，

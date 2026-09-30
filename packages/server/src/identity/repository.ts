@@ -755,6 +755,47 @@ export class IdentityRepository {
       return { ok: true as const, token: await this.token(tx, t.token_id) }
     })
   }
+  /**
+   * ★ 物理删除一把凭证 —— **仅限从未被引用过**的凭证。
+   *
+   * 与「吊销」是两件事：吊销保留整行（`status = 'revoked'`），历史用量仍指向它，
+   * 页面照旧看得到「谁被吊销过」；删除让这一行彻底消失，只留一条 `token.delete` 审计。
+   * 所以它回答的是「这把 key 发错了、从没被用过，把它清掉」，而不是「让它失效」——
+   * 后者任何情况下都该用吊销。
+   *
+   * 🚨 引用者不是「顺带检查」，而是**库层面删不掉**：`usage_event.report_token_id`
+   *   与 `admin_audit_log.actor_token_id` 都是 RESTRICT 外键，硬删会让历史用量失去
+   *   归属、让审计指向空号。所以这里先查引用再决定，把「删不掉」变成一条说明原因的
+   *   409，而不是等数据库抛一句外键约束错误（那句话在 SQLite 与 MySQL 上还不一样，
+   *   页面只会渲染成没有内容的「操作失败」）。
+   *
+   * ⚠️ 已**吊销**或已**到期**的凭证照旧可删：发错之后先吊销、再清掉这一行是最常见的
+   *   顺序，所以这里不用 `checkedToken`（它会以「凭证已经吊销」拒掉吊销后的行）。
+   * ⚠️ 操作者正在使用的那把凭证不能删：本事务随后要写的审计行指向 `actor_token_id`，
+   *   而它同样是 RESTRICT —— 删了自曝身份，整笔事务会在最后一步才失败。
+   * ⚠️ 最后管理入口护栏照常生效（`mutate` 提交前重算可恢复管理员），但它排在上面两条
+   *   引用检查**之后**：唯一那把长期管理凭证通常正是刚刚签发过东西的那把，于是先看到的
+   *   是「已经执行过管理操作」。两条都不是误报，只是谁先说话。
+   */
+  async deleteToken(actor: Principal, input: MutationInput) {
+    const tokenId = idField(input, 'token_id'), memberId = idField(input, 'member_id')
+    if (actor.auth.kind === 'token' && actor.auth.tokenId === tokenId) {
+      throw new IdentityError(409, '不能删除当前正在使用的凭证，请换一个管理身份，或先吊销它')
+    }
+    return this.mutate(actor, 'tokens:manage', 'token.delete', 'token', tokenId, async (tx) => {
+      const t = await this.token(tx, tokenId)
+      if (t.member_id !== memberId) throw new IdentityError(404, '凭证不属于指定人员')
+      this.checkVersion(input, t.version)
+      const reported = num((await tx.get<Row>('SELECT COUNT(*) AS c FROM usage_event WHERE report_token_id = $id', { $id: tokenId })) ?? {}, 'c')
+      if (reported > 0) throw new IdentityError(409, `这把凭证已经上报过 ${reported} 条用量，删除会让这些记录失去归属；请改用「吊销」`, 'token_referenced')
+      const acted = num((await tx.get<Row>('SELECT COUNT(*) AS c FROM admin_audit_log WHERE actor_token_id = $id', { $id: tokenId })) ?? {}, 'c')
+      if (acted > 0) throw new IdentityError(409, `这把凭证执行过 ${acted} 次管理操作，审计需要保留指向；请改用「吊销」`, 'token_referenced')
+      // 先删范围行：`report_token_scopes.token_id` 也是 RESTRICT，不先删就删不掉本体。
+      await tx.run('DELETE FROM report_token_scopes WHERE token_id = $id', { $id: tokenId })
+      await tx.run('DELETE FROM report_tokens WHERE token_id = $id', { $id: tokenId })
+      return { ok: true as const }
+    })
+  }
   private async group(tx: PortalStore, id: string): Promise<PortalGroup> {
     const r = await tx.get<Row>('SELECT * FROM member_groups WHERE group_id = $id', { $id: id })
     if (!r) throw new IdentityError(404, '分组不存在')

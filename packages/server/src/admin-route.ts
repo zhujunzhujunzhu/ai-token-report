@@ -13,6 +13,7 @@
  * | POST | `/api/v1/admin/members/revoke` | 吊销（本人此后无法上报与看看板） |
  * | POST | `/api/v1/admin/members/appkey` | ★ 签发 appKey（范围固定为上报 + 获取统计） |
  * | POST | `/api/v1/admin/members/tokens/expiry` | ★ 改凭证有效期（`null` = 长期有效，其余须是未来时刻） |
+ * | POST | `/api/v1/admin/members/tokens/delete` | ★ 物理删除凭证（仅限从未上报 / 未被审计引用的） |
  *
  * 响应结构来自 `shared/src/protocol.ts`，前端与之共用。
  * 请求体的**形状校验**来自 `shared/src/schemas.ts`（zod，走子路径
@@ -233,6 +234,7 @@ export class DatabaseAdminRoute {
       'POST members/tokens/expiry': 'tokens:manage',
       // ★ 删除与吊销共用权限：都是「处置一把已有凭证」，而删除比吊销更狠
       //   （吊销留痕，删除让整行消失）。能吊销的人本来就能让它立刻失效。
+      'POST members/tokens/delete': 'tokens:manage',
       // ★ appKey 的权限范围由服务端固定（见 `issueAppKey`），但它们仍然是
       //   「签凭证」这件事，所以与其它签发动作共用同一个权限。
       'POST members/appkey': 'tokens:manage',
@@ -314,6 +316,7 @@ export class DatabaseAdminRoute {
         case 'POST members/tokens/revoke': return mutate(parsePortalBody(portalTokenVersionSchema, body), input => r.revokeToken(actor, input))
         case 'POST members/tokens/scopes': return mutate(parsePortalBody(portalTokenScopesSchema, body), input => r.setTokenScopes(actor, input))
         case 'POST members/tokens/expiry': return mutate(parsePortalBody(portalTokenExpirySchema, body), input => r.setTokenExpiry(actor, input))
+        case 'POST members/tokens/delete': return mutate(parsePortalBody(portalTokenVersionSchema, body), input => r.deleteToken(actor, input))
         case 'POST groups': return mutate(parsePortalBody(portalCreateGroupSchema, body), input => r.createGroup(actor, input))
         case 'POST groups/update': return mutate(parsePortalBody(portalUpdateGroupSchema, body), input => r.updateGroup(actor, input))
         case 'POST groups/status': return mutate(parsePortalBody(portalGroupStatusSchema, body), input => r.setGroupStatus(actor, input))

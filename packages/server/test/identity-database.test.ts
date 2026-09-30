@@ -139,6 +139,64 @@ describe('数据库权威身份', () => {
     const plain = await r.issueToken(admin, { member_id: owner.member_id, label: '普通' })
     await expect(r.listAppKeys((await r.resolveBearer(plain.token_secret))!)).rejects.toMatchObject({ status: 403 })
   })
+  test('★ 删除凭证只放行「从未被引用」的，护栏与吊销分工明确', async () => {
+    const { repository: r, admin } = await fixture()
+    const owner = (await r.createMember(admin, { name: '误发 key 的人', role_ids: [MEMBER_ROLE_ID] })).member!
+    const unused = await r.issueAppKey(admin, { member_id: owner.member_id })
+    const revoked = await r.issueAppKey(admin, { member_id: owner.member_id })
+    const used = await r.issueAppKey(admin, { member_id: owner.member_id })
+    // 让第三把 key 真的上报过一条用量：`usage_event.report_token_id` 是 RESTRICT 外键，
+    // 所以「删不掉」是**数据库事实**，而不是本函数里一句 if 的礼貌。
+    await r.systemWrite((tx) => tx.run(
+      'INSERT INTO usage_event (event_id,session_id,seq,ts,provider,model,member_id,report_token_id,user_name,received_at_ms) VALUES ($id,$session,1,$now,$provider,$model,$member,$token,$name,$now)',
+      { $id: 'delete:1', $session: 'delete', $now: Date.now(), $provider: 'fixture', $model: 'model', $member: owner.member_id, $token: used.token!.token_id, $name: owner.name },
+    ))
+    // 归属与版本校验与其它凭证动作同一条：跨人员不可删、旧版本不可删。
+    await expect(r.deleteToken(admin, { member_id: admin.memberId, token_id: unused.token!.token_id, expected_version: unused.token!.version }))
+      .rejects.toMatchObject({ status: 404 })
+    await expect(r.deleteToken(admin, { member_id: owner.member_id, token_id: unused.token!.token_id, expected_version: unused.token!.version + 1 }))
+      .rejects.toMatchObject({ status: 409, code: 'version_conflict' })
+    // ★ 已上报的那把：409 + 说明「改用吊销」，并且**一行都没少**（不是删到一半才失败）
+    await expect(r.deleteToken(admin, { member_id: owner.member_id, token_id: used.token!.token_id, expected_version: used.token!.version }))
+      .rejects.toMatchObject({ status: 409, code: 'token_referenced' })
+    expect((await r.listAppKeys(admin)).appkeys.map((entry) => entry.token.token_id)).toContain(used.token!.token_id)
+    // ★ 已**吊销**但从未上报的可以删：发错之后先吊销、再清掉这一行，是最常见的顺序
+    await r.revokeToken(admin, { member_id: owner.member_id, token_id: revoked.token!.token_id, expected_version: revoked.token!.version })
+    await r.deleteToken(admin, { member_id: owner.member_id, token_id: revoked.token!.token_id, expected_version: revoked.token!.version + 1 })
+    expect((await r.listAppKeys(admin)).appkeys.map((entry) => entry.token.token_id)).not.toContain(revoked.token!.token_id)
+    // ★ 没被用过的：摘要、范围行与列表里的那一行一起消失，凭证立刻不再生效
+    expect(await r.resolveBearer(unused.token_secret)).not.toBeNull()
+    await r.deleteToken(admin, { member_id: owner.member_id, token_id: unused.token!.token_id, expected_version: unused.token!.version })
+    expect(await r.resolveBearer(unused.token_secret)).toBeNull()
+    expect((await r.listAppKeys(admin)).appkeys.map((entry) => entry.token.token_id)).not.toContain(unused.token!.token_id)
+    // 范围行不能被留下：`report_token_scopes` 与本体的外键也是 RESTRICT，
+    // 只删本体根本删不掉，而「留下孤儿范围行」在下一次签发时不会报错。
+    expect(await r.read((tx) => tx.all('SELECT token_id FROM report_token_scopes WHERE token_id = $id', { $id: unused.token!.token_id }))).toEqual([])
+    // 再删一次是 404（行真的没了），而不是静默成功
+    await expect(r.deleteToken(admin, { member_id: owner.member_id, token_id: unused.token!.token_id, expected_version: unused.token!.version }))
+      .rejects.toMatchObject({ status: 404 })
+  })
+  test('★ 删除凭证不得自曝身份，也不能删掉审计指向的凭证', async () => {
+    // 只配 adminToken 的初始化（fixture 的身份解析只认这个 token 串）：这个管理员
+    // **没有登录账号**，恢复入口就是它手上那把长期凭证。
+    const { repository: r, admin } = await fixture({ adminToken: 'test-bootstrap-secret', adminName: '独苗管理员' })
+    const bootstrap = (await r.listTokens(admin, admin.memberId)).tokens[0]!
+    // 再签一把带到期时间的窄凭证当操作者：有到期时间的不算「恢复入口」，
+    // 所以它能行使 tokens:manage，又不会把护栏的计算搅乱。
+    const temp = await r.issueToken(admin, { member_id: admin.memberId, label: '临时管理', scopes: ['tokens:manage'], expires_at_ms: Date.now() + 86_400_000 })
+    const actor = (await r.resolveBearer(temp.token_secret!))!
+    // 自己删自己：本事务随后要写的审计行指向已删除的 actor_token_id（同样 RESTRICT），
+    // 所以必须在**动手之前**拒绝，而不是等在最后一步抛外键错误。
+    await expect(r.deleteToken(actor, { member_id: admin.memberId, token_id: temp.token!.token_id, expected_version: temp.token!.version }))
+      .rejects.toMatchObject({ status: 409 })
+    expect(await r.resolveBearer(temp.token_secret!)).not.toBeNull()
+    // ★ 用过管理动作的凭证删不掉：审计要靠 `actor_token_id` 指回它（同样是 RESTRICT）。
+    //   顺带说明为什么「最后管理入口」那条护栏在这里几乎轮不到 —— 能签发、能改人的
+    //   凭证必然已经当过审计的操作者，它先被这一条挡下（两条护栏是先后，不是二选一）。
+    await expect(r.deleteToken(actor, { member_id: admin.memberId, token_id: bootstrap.token_id, expected_version: bootstrap.version }))
+      .rejects.toMatchObject({ status: 409, code: 'token_referenced' })
+    expect(await r.resolveBearer('test-bootstrap-secret')).not.toBeNull()
+  })
   test('窄管理Token不能经签发、轮换、角色或密码绕过scope', async () => {
     const { repository: r, admin } = await fixture()
     const narrow = await r.issueToken(admin, { member_id: admin.memberId, label: '限制管理', scopes: ['tokens:manage', 'roles:assign', 'accounts:manage'] })

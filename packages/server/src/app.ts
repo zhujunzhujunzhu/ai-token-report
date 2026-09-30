@@ -337,7 +337,7 @@ export function createApp(deps: AppDeps): Hono {
     for (const path of [
       'members', 'members/update', 'members/roles', 'members/status', 'members/login',
       'members/login/status', 'members/tokens', 'members/tokens/rotate', 'members/tokens/revoke',
-      'members/tokens/scopes', 'members/tokens/expiry', 'members/appkey', 'groups', 'groups/update', 'groups/status',
+      'members/tokens/scopes', 'members/tokens/expiry', 'members/tokens/delete', 'members/appkey', 'groups', 'groups/update', 'groups/status',
       'roles', 'roles/update', 'roles/status',
       'legacy-attributions/confirm',
       // v6 供应商归一化规则：写规则也是 POST 子路径（与上面几条同一形状），

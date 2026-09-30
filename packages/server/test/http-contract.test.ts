@@ -430,6 +430,14 @@ describe('现状契约：/api/v1/admin/members*', () => {
     expect(r.allow).toBe('POST')
   })
 
+  // ★ 与上一条同款：`app.ts` 的 POST 子路径是**枚举**注册的，漏写一条的表现是
+  //   404（而不是打到下一个处理器），所以「删凭证」这条也要有一条契约钉住它。
+  test('GET /members/tokens/delete → 405 且 Allow 恰好是 POST', async () => {
+    const r = await call(dept, 'GET', '/api/v1/admin/members/tokens/delete')
+    expect(r.status).toBe(405)
+    expect(r.allow).toBe('POST')
+  })
+
   test('★ POST /members/issue → 404 并指路（签发挂在 /members 上）', async () => {
     const r = await call(dept, 'POST', '/api/v1/admin/members/issue', {
       headers: { ...JSON_HEADERS, ...ADMIN },
