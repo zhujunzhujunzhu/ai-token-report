@@ -317,6 +317,42 @@ export const portalGroupStatusSchema = z.strictObject({
   ...groupVersion, status: z.enum(['active', 'disabled']),
 })
 /**
+ * 供应商名（原始名与归一化名各一套规则）。
+ *
+ * ⚠️ 规则必须与 core 的 `providerNameError()` / `aliasNameError()` **同值**：
+ *   前端在提交前先拦一次是为了给出即时反馈，服务端那一次才是安全边界。
+ *   两处不一致的表现是「页面说不行、接口说行」（或反过来），
+ *   而使用者只会觉得这个功能时好时坏。
+ */
+const invisibleCharacters = /[\u0000-\u001f\u007f\u00a0\u1680\u2000-\u200f\u2028\u2029\u202f\u205f\u3000\ufeff]/
+const providerName = z.string().min(1, { error: '供应商名不能为空' }).max(128, { error: '供应商名不能超过 128 个字符' })
+  .refine((value) => !invisibleCharacters.test(value), { error: '供应商名不能包含空格以外的空白或不可见字符' })
+  .refine((value) => /^[A-Za-z0-9](?:[A-Za-z0-9 ._:/+-]{0,126}[A-Za-z0-9._:/+-])?$/.test(value), {
+    error: '供应商名需要以字母或数字开头和结尾，只能包含字母、数字与空格 . _ : / + -',
+  })
+/** ★ 归一化名允许中文 —— 它是给人看的名字，而 `阿里百炼` 比 `bailian-tpp` 更好读。 */
+const aliasName = z.string().min(1, { error: '归一化名不能为空' }).max(128, { error: '归一化名不能超过 128 个字符' })
+  .refine((value) => !invisibleCharacters.test(value), { error: '归一化名不能包含空格以外的空白或不可见字符' })
+  .refine((value) => !/^ | $/.test(value), { error: '归一化名首尾不能是空格' })
+  .refine((value) => !value.includes('/'), { error: '归一化名不能包含 /（它是 provider 与 model 的分隔符）' })
+/**
+ * 设置一条归一化规则（upsert）。
+ *
+ * ★ `member_id` 只在 `scope='member'` 时有意义，这里做成可选而不是联锁校验：
+ *   真正的联锁在服务端（`setProviderAlias` 按 scope 决定取值），
+ *   在这一层做「scope 与 member_id 必须同时出现」会让前端多写一段状态机，
+ *   而它并不比服务端那一行更可靠。
+ */
+export const portalSetProviderAliasSchema = z.strictObject({
+  scope: z.enum(['global', 'member']),
+  member_id: portalId.optional(),
+  provider: providerName,
+  alias: aliasName,
+  enabled: z.boolean().optional(),
+})
+export const portalProviderAliasIdSchema = z.strictObject({ alias_id: portalId })
+export const portalProviderAliasStatusSchema = z.strictObject({ alias_id: portalId, enabled: z.boolean() })
+/**
  * 角色标识。
  *
  * ★ 建后不可改，所以这里必须一次卡死格式：它是稳定标识，将来若允许中文或大写，

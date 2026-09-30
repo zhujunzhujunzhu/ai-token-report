@@ -257,7 +257,20 @@ export interface RecordRow {
   /** 上报当时客户端自己填的分组文本快照。 */
   group_name_snapshot?: string | null
   attribution_status?: import('./portal-identity.js').PortalAttributionStatus
+  /**
+   * 供应商的**展示名**：已经按 `provider_alias` 规则归一化过。
+   * 没配规则时等于 `providerRaw`。
+   */
   provider: string
+  /**
+   * 上报当时的供应商**原值**。
+   *
+   * ★ 明细是唯一能核对「规则配得对不对」的地方：只显示展示名的话，
+   *   一条把 `dashscope` 错配成 `bailian-tpp` 的规则会表现得完全正常 ——
+   *   总量对、名字错，没有任何地方能看出来。
+   * 两者相同时前端不必展示它（页面本来就该干净）。
+   */
+  providerRaw?: string
   model: string
   totalTokens: number
   inputTokens: number

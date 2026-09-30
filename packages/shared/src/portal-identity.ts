@@ -344,3 +344,59 @@ export interface PortalLegacyResult extends PortalMutationResult {
   mapping?: PortalLegacyAttribution
   updated_events?: number
 }
+
+/**
+ * 一条供应商归一化规则（v6）。
+ *
+ * ★ 这是**查询期**的展示映射，不是对历史数据的改写：`usage_event.provider`
+ *   永远是上报当时的原值，规则只决定「分组与筛选时按哪个名字算」。
+ *   所以新增、修改、停用、删除都是即时生效且可逆的，没有回填这一步。
+ */
+export interface PortalProviderAlias {
+  alias_id: string
+  /** `global` 对所有人生效；`member` 只对该人员生效，逐条覆盖全局。 */
+  scope: 'global' | 'member'
+  /** `scope='member'` 时是那个人；`global` 时为 `null`。 */
+  member_id: string | null
+  /** 归属人姓名，仅用于列表展示（`scope='global'` 时为 `null`）。 */
+  member_name: string | null
+  /** 上报里出现的**原始** provider（大小写敏感的精确匹配）。 */
+  provider: string
+  /** 归一化后的展示名。 */
+  alias: string
+  /** 停用后这一条不参与归一化，但规则行仍在（可以随时启用回来）。 */
+  enabled: boolean
+  created_at_ms: number
+  updated_at_ms: number
+}
+
+export interface PortalProviderAliasListResponse {
+  aliases: PortalProviderAlias[]
+}
+
+export interface PortalProviderAliasResult extends PortalMutationResult {
+  alias?: PortalProviderAlias
+}
+
+/**
+ * 设置一条规则（upsert）。
+ *
+ * ⚠️ 同一 `(scope, member_id, provider)` 只有一条：再次提交是**改**而不是新增，
+ *   否则同一个 provider 会有两条规则、结果取决于读取顺序。
+ */
+export interface PortalSetProviderAliasRequest {
+  scope: 'global' | 'member'
+  member_id?: string
+  provider: string
+  alias: string
+  enabled?: boolean
+}
+
+export interface PortalProviderAliasIdRequest {
+  alias_id: string
+}
+
+export interface PortalProviderAliasStatusRequest {
+  alias_id: string
+  enabled: boolean
+}
