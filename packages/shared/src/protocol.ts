@@ -308,6 +308,36 @@ export interface StatsGroupsResponse {
   groups: StatsGroupOption[]
 }
 
+/**
+ * 筛选栏与人员排行用的人员候选项（`GET /api/v1/stats/members`）。
+ *
+ * ★ 刻意由**看板接口**提供（`stats:read`）而不是让页面去读管理接口
+ *   `/api/v1/admin/members`（那是 `members:read`）：能看数据的人不一定能读
+ *   人员目录，而「按谁筛选」是看板自身的能力。
+ *
+ * ★ 它是下拉里**唯一**能列出「当前时间窗内没有用量的人」的来源。
+ *   从用量行里取候选时，刚入职、休假、只在别的窗口用过的人都不会出现，
+ *   选中一个分组之后整个下拉会直接空掉 —— 那看起来像数据丢了，
+ *   而不像「这段时间没人用」。
+ *
+ * ⚠️ 只回筛选要用的三样：稳定 ID、显示名、**当前**所属分组 ID。
+ *   角色、权限、登录账号属于管理面，不因为看得见用量就一起下发。
+ * ⚠️ 已停用人员**照样列出**并标注（与分组候选同款）：停用只影响
+ *   「以后还能不能选他」，历史用量仍然在他名下。
+ */
+export interface StatsMemberOption {
+  member_id: string
+  name: string
+  /** 与人员管理页同一种状态枚举（含 `archived`）—— 两处不能各写一份。 */
+  status: import('./portal-identity.js').PortalMemberStatus
+  /** 当前所属分组 ID（多对多；未分组 = 空数组）。 */
+  group_ids: string[]
+}
+
+export interface StatsMembersResponse {
+  members: StatsMemberOption[]
+}
+
 /** 当前实例的入口队列观测；完成计数包含业务拒绝，不代表成功落库条数。 */
 export interface IngestQueueStatusResponse {
   scope: 'process'
