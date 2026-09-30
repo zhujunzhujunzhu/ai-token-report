@@ -23,7 +23,7 @@ import { existsSync, readFileSync, mkdirSync, statSync, writeFileSync } from 'no
 import { dirname, resolve } from 'node:path'
 import type { Database } from './driver.js'
 import { describePortalTarget, openRawPortalStore, type PortalStore, type PortalTarget } from './portal-connection.js'
-import { PORTAL_SCHEMA_VERSION, PORTAL_SQLITE_INGEST_SQL, PORTAL_MYSQL_INGEST_SQL, portalSchemaChecksum, portalSchemaStatements, portalV6Statements, portalV6TableStatement } from './portal-schema-v5.js'
+import { PORTAL_SCHEMA_VERSION, PORTAL_SQLITE_INGEST_SQL, PORTAL_MYSQL_INGEST_SQL, portalSchemaChecksum, portalSchemaChecksumV6, portalSchemaStatements, portalV6Statements, portalV6TableStatement, portalV7Statements, portalV7TableStatement } from './portal-schema-v5.js'
 import { PORTAL_SQLITE_V4_INGEST_SQL, PORTAL_MYSQL_V4_INGEST_SQL, portalSchemaChecksumV4, portalSchemaStatementsV4 } from './portal-schema-v4.js'
 import { checkExpressions, sameChecks, normalizeTrigger } from './portal-catalog.js'
 
@@ -37,9 +37,14 @@ import { checkExpressions, sameChecks, normalizeTrigger } from './portal-catalog
 const BASELINE_VERSION = 4
 /**
  * v5 的**结构**版本号。它的账本行仍然要能被认出来（那是「基线已就绪」的证据），
- * 而 `PORTAL_SCHEMA_VERSION` 已经是 6。
+ * 而 `PORTAL_SCHEMA_VERSION` 已经是 7。
  */
 const V5_VERSION = 5
+/**
+ * v6 的**结构**版本号。与 v5 同理：v7 的账本行是当前版本，
+ * 而 v6 行必须能被认出来 —— 那是「这个库是完整的上一版、可以原地升 v7」的证据。
+ */
+const V6_VERSION = 6
 type SchemaVersion = 4 | 5
 
 export interface PortalInspection {
@@ -104,6 +109,7 @@ async function readPortalState(store: PortalStore): Promise<Omit<PortalInspectio
    *   都失败。v5 账本行一旦存在，基线步骤就早已过去。
    */
   const v5Row = await migrationRow(store, tables, V5_VERSION)
+  const v6Row = await migrationRow(store, tables, V6_VERSION)
   let status: PortalInspection['status'] = 'unsupported'
   if (tables.length === 0 && version === 0) status = 'empty'
   else if (version === 0 && tables.length === 1 && tables[0] === 'portal_schema_migrations' && !current && !baseline) status = 'incomplete'
@@ -114,10 +120,16 @@ async function readPortalState(store: PortalStore): Promise<Omit<PortalInspectio
   // v3：一条账本行都没有的老库，先迁到 v4 基线再升 v5。
   else if (version === 3 && tables.includes('usage_event') && !current && !baseline) status = 'legacy'
   // ★ v5：结构是「分组多对多」，但受控 DDL 已经追加了 provider_alias。
-  //   它的 digest 必然对不上 —— 落进 legacy，必须显式迁移到 v6。
+  //   它的 digest 必然对不上 —— 落进 legacy，必须显式迁移到当前版本。
   else if (version === V5_VERSION && v5Row?.status === 'completed' && !current) status = 'legacy'
-  // v5/v6 账本存在但 checksum 不符（程序换了 SQL 或库被改过）会落到 'unsupported'，绝不冒充 current。
-  return { kind: store.kind, label: store.label, version, status, tables, migration: current ?? v5Row ?? baseline }
+  // ★ v6：结构 = v5 + provider_alias，但受控 DDL 已经追加了 model_price。
+  //   这里额外比对**冻结的 v6 摘要**（`portalSchemaChecksumV6`）：只有
+  //   「确实是本程序发布出去的那一版 v6」才放行。少了它，一个被手工改过结构的
+  //   v6 库会冒充成「结构完好、只差一次追加迁移」，而 v7 是纯追加 ——
+  //   它会一路升上去、把手工改动留在库里，且没有任何一步会报错。
+  else if (version === V6_VERSION && v6Row?.status === 'completed' && v6Row.checksum === portalSchemaChecksumV6(store.kind) && !current) status = 'legacy'
+  // v5/v6/v7 账本存在但 checksum 不符（程序换了 SQL 或库被改过）会落到 'unsupported'，绝不冒充 current。
+  return { kind: store.kind, label: store.label, version, status, tables, migration: current ?? v6Row ?? v5Row ?? baseline }
 }
 async function inspectStore(store: PortalStore): Promise<PortalInspection> {
   const state = await readPortalState(store)
@@ -284,11 +296,15 @@ async function verifyBaseline(store: PortalStore): Promise<void> {
 }
 
 /**
- * 核验**终态 v5**。
+ * 核验**终态**（当前受控定义 = v5 结构 + v6 追加 + v7 追加）。
  *
  * ★ 与 v4 核验最大的差别：这里**每一张表都按受控定义逐列比对**，
  *   不再有「usage_event 只增列所以跳过」的例外 —— v5 的 usage_event
  *   是被重建过的完整结构。少了这个例外，任何一列的类型漂移都会立刻被发现。
+ *
+ * ⚠️ SQLite 分支只比对**表定义文本**，不比对索引 —— 所以「迁移少建了一个索引」
+ *   在 SQLite 上永远测不出来（`idx_provider_alias_member` 就这么漏了两个版本），
+ *   而 MySQL 分支走 `verifyUniqueConstraints` 会当场判失败。
  */
 async function verifyCurrent(store: PortalStore, checkHistory = true): Promise<void> {
   const tables = await tablesOf(store)
@@ -470,11 +486,14 @@ export async function migratePortalDatabase(target: PortalTarget, options: Porta
       const v5Bookkeeping = state.migration?.version === V5_VERSION || state.tables.includes('provider_alias')
       const baselineReady = v5Bookkeeping || (state.version === BASELINE_VERSION && baselineRow?.status === 'completed' && baselineRow.checksum === portalSchemaChecksumV4(store.kind))
       if (!baselineReady) await migrateToBaseline(connection, target, state, options)
-      // 基线到位后升 v5，再追加 v6。每一步都自检目标状态，所以 resume 直接重跑即可。
-      // ⚠️ `state.migration?.version === V5_VERSION` 才能说明「库里**原本就有** v5 账本行」：
-      //   在 v6 之上重跑时 `migration` 是 v6 行，此时 v5 行要么在（老 v5 库）、要么不存在
-      //   （v4 库刚走上来）—— 两者对「要不要补写 v5 账本行」的处理必须不同。
-      await upgradeV4ToV5(connection, target, options, state.migration?.version === V5_VERSION)
+      // 基线到位后升 v5，再依次追加 v6、v7。每一步都自检目标状态，所以 resume 直接重跑即可。
+      // 🚨 「要不要补写 v5 账本行」必须**直接查 v5 行在不在**，不能用 `state.migration`：
+      //   从 v6/v7 起点重跑时那个字段已经是更高版本的行，按它判断会得出
+      //   「库里原本没有 v5 行」→ 补写一条 —— 而老库早就有那一行，
+      //   轻则多出一行重复账本，重则直接撞 `version` 的唯一约束，
+      //   表现成「一个结构完好、只差一次追加迁移的库永远迁不动」。
+      const v5RowPresent = (await migrationRow(connection, state.tables, V5_VERSION)) !== null
+      await upgradeV4ToV5(connection, target, options, v5RowPresent)
     })
     return await inspectStore(store)
   } finally { await store.close() }
@@ -607,9 +626,7 @@ async function mysqlIndexExists(store: PortalStore, table: string, name: string)
 
 /** 建齐 v5 的受控索引（已存在的逐列核对，缺失的补建）。 */
 async function ensureV5Indexes(store: PortalStore): Promise<void> {
-  for (const sql of portalSchemaStatements(store.kind)) {
-    if (sql.startsWith('CREATE INDEX')) await ensureIndex(store, sql, true)
-  }
+  await ensureControlledIndexes(store, portalSchemaStatements(store.kind))
 }
 
 /**
@@ -623,6 +640,12 @@ async function ensureV5Indexes(store: PortalStore): Promise<void> {
  *
  * `provider_alias` 表 + 权限码 `providers:*`。事实表一个字节都不动 ——
  * 供应商归一化是**查询时**应用的（见 `provider-alias.ts` 的文件头）。
+ *
+ * ## v7 步骤：同样只追加
+ *
+ * `model_price` 表 + 权限码 `cost:read` / `pricing:manage`。事实表同样一个字节都不动 ——
+ * 费用是**查询期**用 token 数与生效单价现算的（见 `shared/price.ts`）。
+ * 三处「纯追加」的好处是可重入且无需备份证明：没有会被改写的对象。
  *
  * ★ **每一步都自检目标状态**（表/列是否存在），所以重复执行是安全的：
  *   MySQL 的 DDL 会隐式提交，中途崩溃后 resume 必须能接着跑下去，
@@ -683,6 +706,10 @@ async function upgradeV4ToV5(store: PortalStore, target: PortalTarget, options: 
     //   而错误信息完全不提「是 v6 的表还没建」。
     //   先建这张空表没有任何副作用：它此时必然是空的（v6 才引入）。
     await upgradeV5ToV6(store)
+    // v7 同样只增表，也不引用 members，所以放在 v5 重建之前或之后都可以。
+    // 放在这里是为了让「全部结构追加」集中在重建之前 —— 重建期间
+    // `PRAGMA foreign_key_check` 会扫描**所有**表，新表越早到位越好核对。
+    await upgradeV6ToV7(store)
     if (!v5Ready) {
       if (kind === 'sqlite') await runV5Sqlite(store)
       else await runV5Mysql(store)
@@ -732,10 +759,37 @@ async function upgradeV5ToV6(store: PortalStore): Promise<void> {
   const table = portalV6TableStatement(store.kind, 'provider_alias')
   if (!(await tablesOf(store)).includes('provider_alias')) await store.exec(table)
   await verifyTable(store, 'provider_alias', table)
+  // ⚠️ 必须用 `ensureControlledIndexes()`（它认 `CREATE UNIQUE INDEX`）。
+  //   早先这里写的是 `sql.startsWith('CREATE INDEX')`，于是
+  //   `idx_provider_alias_member` 从来没被建出来过 —— 见 `isCreateIndex()` 的注释。
+  await ensureControlledIndexes(store, portalV6Statements(store.kind))
   for (const sql of portalV6Statements(store.kind)) {
-    if (sql.startsWith('CREATE INDEX')) await ensureIndex(store, sql, true)
+    if (sql.startsWith('INSERT')) await store.exec(sql)
   }
-  for (const sql of portalV6Statements(store.kind)) {
+}
+
+/**
+ * v6 → v7：**只追加** `model_price` 与权限码 `cost:read` / `pricing:manage`。
+ *
+ * 与 v5→v6 完全同构，因此同样安全：
+ * 1. 建 `model_price`（先看目标状态，幂等）；
+ * 2. 建它的索引（含**唯一**索引 `idx_model_price_span`，走 `ensureControlledIndexes`）；
+ * 3. 补权限行（`WHERE NOT EXISTS`，幂等）。
+ *
+ * 🚨 **事实表一个字节都不动**，所以这一步**不需要**再比对一次事件指纹。
+ *   「费用」是查询期用 token 数与单价现算的，库里的历史用量从不因计价而改写 ——
+ *   改单价、补历史价都不会动 `usage_event`（这正是「绝不存金额」的收益）。
+ *
+ * ⚠️ **这一步不要求备份证明**：`upgradeV4ToV5` 里 `v5Ready` 为真时
+ *   （v6 库必然是这种情况）本就不做备份 —— 没有会被改写的对象，
+ *   索要备份只会在运维流程里多一次手工步骤。真正的回退位是「删掉这张表」。
+ */
+async function upgradeV6ToV7(store: PortalStore): Promise<void> {
+  const table = portalV7TableStatement(store.kind, 'model_price')
+  if (!(await tablesOf(store)).includes('model_price')) await store.exec(table)
+  await verifyTable(store, 'model_price', table)
+  await ensureControlledIndexes(store, portalV7Statements(store.kind))
+  for (const sql of portalV7Statements(store.kind)) {
     if (sql.startsWith('INSERT')) await store.exec(sql)
   }
 }
@@ -1016,8 +1070,31 @@ async function correctLegacyCollation(store: PortalStore): Promise<void> {
   }
 }
 
+/**
+ * 受控 DDL 里的建索引语句 —— **含 `CREATE UNIQUE INDEX`**。
+ *
+ * 🚨 早先这里与 `ensureIndex()` 都只认 `CREATE INDEX`，于是
+ *   `provider_alias` 的 `CREATE UNIQUE INDEX idx_provider_alias_member`
+ *   在**任何迁移路径里都没被执行过**（只有全新库的建库路径会整条 `exec`）。
+ *   后果是「迁移出来的库」与「新建的库」在同一个版本号下**索引集不同**：
+ *   实测 SQLite 侧完全看不出来（`verifyCurrent` 对 SQLite 只比对表定义文本，
+ *   不比对索引），而 MySQL 侧会在最后一步 `verifyCurrent` 判
+ *   「表 provider_alias 的唯一约束与主键不一致」—— 迁移做完了却不算成功。
+ *   这正是「SQLite 上测过了不构成证据」那条的又一个实例。
+ */
+function isCreateIndex(sql: string): boolean {
+  return /^CREATE (?:UNIQUE )?INDEX /.test(sql)
+}
+
+/** 建齐受控索引（已存在的逐列核对，缺失的补建）。 */
+async function ensureControlledIndexes(store: PortalStore, statements: string[]): Promise<void> {
+  for (const sql of statements) {
+    if (isCreateIndex(sql)) await ensureIndex(store, sql, true)
+  }
+}
+
 async function ensureIndex(store: PortalStore, sql: string, createMissing = true): Promise<void> {
-  const match = /^CREATE INDEX (\w+) ON (\w+) \(([^)]+)\)/.exec(sql)
+  const match = /^CREATE (?:UNIQUE )?INDEX (\w+) ON (\w+) \(([^)]+)\)/.exec(sql)
   if (!match) throw new Error('不支持的受控索引定义')
   const [, name, table, columns] = match
   const existing = store.kind === 'sqlite'

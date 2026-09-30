@@ -1,22 +1,26 @@
 /**
  * 在真实 SQLite / 可选隔离 MySQL 上验证上报库闸门、事务与**无损迁移**。
  *
- * ## 当前版本是 v6，本文件覆盖 v5 与 v6 两段
+ * ## 当前版本是 v7，本文件覆盖 v4 / v5 / v6 / v7 四段
  *
  * | 版本 | 结构 | 本文件里的覆盖 |
  * |---|---|---|
  * | v4 | 冻结基线 | 逐字比对 `docs/database-v4/*.sql` |
  * | v5 | 分组多对多 | v4→v5 / v3→v5 迁移、指纹逐位不变、触发器清空 |
- * | **v6** | ★ **当前终态**：追加 `provider_alias` + `providers:*` | 新库表数、v5→v6 追加迁移 |
+ * | v6 | 供应商归一化（`provider_alias`） | 作为**可迁移起点**被认出来、追加迁移不动事实表 |
+ * | **v7** | ★ **当前终态**：追加 `model_price` + `cost:read` / `pricing:manage` | 新库表数、受控索引（**含唯一索引**）全在位 |
  *
- * 本轮（供应商归一化）新增的两块覆盖：
- * 1. **v6 契约**：新库直接建成 v6（20 张表）、多出 `provider_alias` 与两条权限码；
- * 2. ★ **v5 → v6 追加迁移**：只建表与补权限行，**事实表一个字节都不动**
- *    （同样要算出逐位相同的事件指纹）；
- * 3. ★ **v3 → v6 一次迁移**：v4 是冻结基线，中间态也要留下自己的恢复点（两份备份）。
+ * ★ v6 与 v7 都是**纯追加**：只建表 / 建索引 / 补权限行，事实表一个字节都不动 ——
+ *   所以两段迁移都不要求备份证明，也不需要重新比对事件指纹
+ *   （费用与供应商归一化一样是**查询期**口径，库里的历史用量从不因它们改写）。
  *
- * ⚠️ 契约文件（`docs/database-v5/*.sql`）与跨进程子脚本都在**仓库根**下。
- *   从 `packages/core` 直接 `bun test test/portal-v5.test.ts` 时
+ * 🚨 **受控索引必须逐条核对（含 `CREATE UNIQUE INDEX`）**：SQLite 分支的
+ *   `verifyCurrent` 只比对表定义文本、不看索引，所以「迁移少建了一个索引」
+ *   在这里永远暴露不出来，而 MySQL 分支会在最后一步直接判失败。
+ *   本文件因此显式断言迁移后 `PRAGMA index_list` 的结果。
+ *
+ * ⚠️ 契约文件（`docs/database-v4/*.sql`、`docs/database-v5/*.sql`）与跨进程子脚本
+ *   都在**仓库根**下。从 `packages/core` 直接 `bun test test/portal-v5.test.ts` 时
  *   `process.cwd()` 不是仓库根，写死相对路径会让契约断言与子进程用例一起假失败 ——
  *   所以这里用 `import.meta.dir` 反推仓库根，让测试与运行目录无关。
  */
@@ -31,7 +35,7 @@ import { openPortalStore, inspectPortalDatabase, preparePortalDatabase, migrateP
 import { openRawPortalStore } from '../src/db/portal-connection.js'
 import { insertAttributedRecords, insertAttributedRecordsInTransaction, type IngestRecord } from '../src/db/ingest.js'
 import { PORTAL_MYSQL_V4_SQL, PORTAL_SQLITE_V4_SQL, PORTAL_MYSQL_V4_INGEST_SQL, PORTAL_SQLITE_V4_INGEST_SQL, portalSchemaChecksumV4, portalSchemaStatementsV4 } from '../src/db/portal-schema-v4.js'
-import { PORTAL_MYSQL_V5_SQL, PORTAL_SQLITE_V5_SQL, PORTAL_SCHEMA_VERSION, portalSchemaStatements } from '../src/db/portal-schema-v5.js'
+import { PORTAL_MYSQL_V5_SQL, PORTAL_SQLITE_V5_SQL, PORTAL_SCHEMA_VERSION, portalSchemaChecksumV6, portalSchemaStatements } from '../src/db/portal-schema-v5.js'
 import { closeAllMysqlBackends, openMysqlBackend } from '../src/db/mysql.js'
 import { canonicalCheck } from '../src/db/portal-catalog.js'
 import { ensurePortalReady } from '../src/db/portal-migrations.js'
@@ -196,6 +200,31 @@ async function verifyWrites(t: PortalTarget): Promise<void> {
   } finally { await store.close() }
 }
 
+/**
+ * 把一个刚建好的当前版本库**退回真实 v6 的形状**：删掉 v7 的表与账本行、
+ * 删掉两条 v7 权限行、补一条 v6 账本行（checksum 用**冻结的 v6 摘要**）、
+ * 把 `user_version` 设回 6。
+ *
+ * ★ 这就是现网「已经迁到 v6」的那些库的形状。用它才能验到 v7 新增的那条判定：
+ *   `readPortalState()` 必须把它认成 `legacy`（可迁移的起点），而不是 `unsupported`
+ *   —— 后者会让服务端拒绝启动、迁移脚本也拒绝接手，而 v7 明明只加一张表。
+ *   不冻结 `portalSchemaChecksumV6` 就必定是这个下场。
+ */
+async function downgradeToV6(t: PortalTarget): Promise<void> {
+  const store = await openRawPortalStore(t)
+  const v7Permissions = ['00000000-0000-4000-8000-000000000114', '00000000-0000-4000-8000-000000000115']
+  try {
+    await store.exec('DROP TABLE model_price')
+    await store.run(`DELETE FROM role_permissions WHERE permission_id IN ('${v7Permissions[0]}','${v7Permissions[1]}')`, {})
+    await store.run(`DELETE FROM permissions WHERE permission_id IN ('${v7Permissions[0]}','${v7Permissions[1]}')`, {})
+    await store.run('DELETE FROM portal_schema_migrations WHERE version=$version', { $version: PORTAL_SCHEMA_VERSION })
+    // ⚠️ 账本行必须补上：真实 v6 库的那一行是当时的程序写的，
+    //   少了它这个库就是「结构在、账本不在」的半初始化态，那是另一种（不可迁移的）形状。
+    await store.run("INSERT INTO portal_schema_migrations (migration_id,version,checksum,status,last_completed_step,checkpoint_json,started_at_ms,completed_at_ms) VALUES ($id,6,$hash,'completed',1,$checkpoint,1,1)", { $id: randomUUID(), $hash: portalSchemaChecksumV6('sqlite'), $checkpoint: JSON.stringify({ sourceVersion: 0, historyHash: '', historyCount: 0 }) })
+    await store.exec('PRAGMA user_version=6')
+  } finally { await store.close() }
+}
+
 test('v5 运行时 SQL 与设计契约逐字一致，v4 基线仍逐字冻结', () => {
   expect(PORTAL_SQLITE_V5_SQL).toBe(readFileSync(join(repoRoot, 'docs/database-v5/schema.sqlite.sql'), 'utf8'))
   expect(PORTAL_MYSQL_V5_SQL).toBe(readFileSync(join(repoRoot, 'docs/database-v5/schema.mysql.sql'), 'utf8'))
@@ -203,22 +232,65 @@ test('v5 运行时 SQL 与设计契约逐字一致，v4 基线仍逐字冻结', 
   expect(PORTAL_SQLITE_V4_SQL).toBe(readFileSync(join(repoRoot, 'docs/database-v4/schema.sqlite.sql'), 'utf8'))
   expect(PORTAL_MYSQL_V4_SQL).toBe(readFileSync(join(repoRoot, 'docs/database-v4/schema.mysql.sql'), 'utf8'))
 })
-test('SQLite 新库 v6、FULL、20 表及旧诊断表', async () => {
+test('SQLite 新库 v7、FULL、21 表及旧诊断表', async () => {
   const t = target()
   const info = await preparePortalDatabase(t)
   expect(info.status).toBe('current')
   expect(info.version).toBe(PORTAL_SCHEMA_VERSION)
-  // ★ v6 = v5 的 19 张表 + 供应商归一化规则表 provider_alias（实跑确认，不是照抄文档）。
-  expect(info.tables.length).toBe(20)
+  // ★ v7 = v6 的 20 张表 + 模型单价表 model_price（实跑确认，不是照抄文档）。
+  expect(info.tables.length).toBe(21)
   expect(info.tables).toContain('member_groups')
   expect(info.tables).toContain('member_group_assignments')
   expect(info.tables).toContain('provider_alias')
+  expect(info.tables).toContain('model_price')
   expect(info.tables).not.toContain('departments')
   const store = await openPortalStore(t)
   expect(await store.get<Record<string, unknown>>('PRAGMA synchronous')).toEqual({ synchronous: 2 })
   expect(await store.get<Record<string, unknown>>('SELECT initialized_at_ms FROM portal_identity_state')).toEqual({ initialized_at_ms: null })
   await store.close()
   await verifyWrites(t)
+})
+test('SQLite v6 库是可迁移起点：只追加 model_price 与两条权限码，事实表逐位不变', async () => {
+  const t = target()
+  await preparePortalDatabase(t)
+  // 先落两条真实事件：纯追加迁移必须**一条都不改写**。
+  const seed = await openPortalStore(t)
+  try {
+    await insertAttributedRecords(seed, [record('v6:1'), record('v6:2')], { userId: '姓名', userName: '姓名', groupName: '分组快照', ...(await addMember(seed)), receivedAtMs: 1000 })
+  } finally { await seed.close() }
+  const before = eventFingerprint(t.sqlitePath, 'group_name')
+  await downgradeToV6(t)
+
+  // ★ 核心断言：v6 库必须被认成「结构完整的上一版、可原地迁移」。
+  const state = await inspectPortalDatabase(t)
+  expect(state.status).toBe('legacy')
+  expect(state.version).toBe(6)
+  expect(state.tables).not.toContain('model_price')
+
+  const migrated = await migratePortalDatabase(t)
+  expect(migrated.status).toBe('current')
+  expect(migrated.version).toBe(PORTAL_SCHEMA_VERSION)
+  expect(migrated.eventCount).toBe(before.count)
+  // 纯追加：历史用量逐位不变（这就是「只存单价、绝不存金额」换来的性质）。
+  expect(eventFingerprint(t.sqlitePath, 'group_name')).toEqual(before)
+
+  const after = await openRawPortalStore(t)
+  try {
+    expect(await after.get<{ name: string }>("SELECT name FROM sqlite_master WHERE type='table' AND name='model_price'")).toEqual({ name: 'model_price' })
+    // ★ 唯一索引必须在位 —— 这正是迁移路径曾经整个漏掉的东西（见 `isCreateIndex()`）。
+    expect((await after.all<{ name: string; unique: number; origin: string }>('PRAGMA index_list(model_price)')).filter(row => row.origin === 'c').map(row => `${row.name}:${row.unique}`).sort()).toEqual(['idx_model_price_span:1', 'idx_model_price_target:0'])
+    // 两条权限码补齐，且只授给内置管理员角色（普通成员不该默认可见金额）。
+    expect(await after.all<{ code: string }>("SELECT code FROM permissions WHERE code LIKE 'cost:%' OR code LIKE 'pricing:%' ORDER BY code")).toEqual([{ code: 'cost:read' }, { code: 'pricing:manage' }])
+    expect(await after.all<{ role_id: string; permission_id: string }>("SELECT role_id,permission_id FROM role_permissions WHERE permission_id IN ('00000000-0000-4000-8000-000000000114','00000000-0000-4000-8000-000000000115') ORDER BY permission_id")).toEqual([
+      { role_id: '00000000-0000-4000-8000-000000000001', permission_id: '00000000-0000-4000-8000-000000000114' },
+      { role_id: '00000000-0000-4000-8000-000000000001', permission_id: '00000000-0000-4000-8000-000000000115' },
+    ])
+    // 账本：一条未完成的都不许有，v6 那一行的 checksum 必须**仍是冻结的 v6 摘要**
+    // （历史账本一经 completed 就不该被改写 —— 它是「当时确实迁到了 v6」的证据）。
+    const ledger = await after.all<{ version: number; status: string; checksum: string }>('SELECT version,status,checksum FROM portal_schema_migrations ORDER BY version')
+    expect(ledger.map(row => `${row.version}:${row.status}`)).toEqual([`5:completed`, `6:completed`, `${PORTAL_SCHEMA_VERSION}:completed`])
+    expect(ledger.find(row => row.version === 6)!.checksum).toBe(portalSchemaChecksumV6('sqlite'))
+  } finally { await after.close() }
 })
 test('SQLite 多连接同时首次启动只初始化一次', async () => {
   const t = target()
@@ -333,6 +405,16 @@ test('SQLite v4→v5：分组改名、归属搬进关联表、权限码保 ID、
       { code: 'groups:read', permission_id: v4Permissions[1]!.permission_id },
     ])
     expect(Number((await after.get<{ c: number }>("SELECT COUNT(*) AS c FROM permissions WHERE code LIKE 'departments:%'"))?.c)).toBe(0)
+    // ★ 受控索引必须**逐条**在位，包括唯一索引。
+    //   🚨 这一条抓的是一个真实缺口：`ensureIndex()` 与它的调用点早先只认 `CREATE INDEX`，
+    //   于是 `CREATE UNIQUE INDEX idx_provider_alias_member` 在**任何迁移路径里都没被
+    //   执行过**（只有全新库的建库路径会整条 exec）。后果是同一个版本号下，
+    //   「迁移来的库」与「新建的库」索引集不同 —— SQLite 侧完全看不出来
+    //   （verifyCurrent 对 SQLite 只比对表定义文本），而 MySQL 侧会在最后一步
+    //   `verifyCurrent` 判「表 provider_alias 的唯一约束与主键不一致」，
+    //   表现成「迁移做完了却不算成功」。所以这里两边都显式钉住。
+    expect((await after.all<{ name: string; unique: number; origin: string }>('PRAGMA index_list(provider_alias)')).filter(row => row.origin === 'c').map(row => `${row.name}:${row.unique}`).sort()).toEqual(['idx_provider_alias_alias:0', 'idx_provider_alias_member:1', 'idx_provider_alias_scope:0'])
+    expect((await after.all<{ name: string; unique: number; origin: string }>('PRAGMA index_list(model_price)')).filter(row => row.origin === 'c').map(row => `${row.name}:${row.unique}`).sort()).toEqual(['idx_model_price_span:1', 'idx_model_price_target:0'])
   } finally { await after.close() }
 
   // g. 备份：一份 .v4-backup-*.sqlite + 同名 manifest；manifest.sha256 必须与文件实际值相等。
