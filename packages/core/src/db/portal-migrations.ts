@@ -758,11 +758,18 @@ async function upgradeV4ToV5(store: PortalStore, target: PortalTarget, options: 
 async function upgradeV5ToV6(store: PortalStore): Promise<void> {
   const table = portalV6TableStatement(store.kind, 'provider_alias')
   if (!(await tablesOf(store)).includes('provider_alias')) await store.exec(table)
-  await verifyTable(store, 'provider_alias', table)
   // ⚠️ 必须用 `ensureControlledIndexes()`（它认 `CREATE UNIQUE INDEX`）。
   //   早先这里写的是 `sql.startsWith('CREATE INDEX')`，于是
   //   `idx_provider_alias_member` 从来没被建出来过 —— 见 `isCreateIndex()` 的注释。
+  // 🚨 **建索引必须早于 `verifyTable`**：MySQL 分支的 `verifyTable` 会把
+  //   `CREATE UNIQUE INDEX … ON <表>` 也算进「期望的唯一约束」（见那里的注释），
+  //   而唯一索引在受控 DDL 里是**独立语句**、不在 `CREATE TABLE` 文本内。
+  //   先校验后建索引 ⇒ 在任何真实 MySQL 上 v5→v6 的第一步必然报
+  //   「表 provider_alias 的唯一约束与主键不一致」，整个迁移一步都走不动；
+  //   而 SQLite 分支只比 `sqlite_master.sql` 全文、根本不看索引，
+  //   所以这个顺序错误在本地 SQLite 测试里永远看不见。
   await ensureControlledIndexes(store, portalV6Statements(store.kind))
+  await verifyTable(store, 'provider_alias', table)
   for (const sql of portalV6Statements(store.kind)) {
     if (sql.startsWith('INSERT')) await store.exec(sql)
   }
@@ -787,8 +794,11 @@ async function upgradeV5ToV6(store: PortalStore): Promise<void> {
 async function upgradeV6ToV7(store: PortalStore): Promise<void> {
   const table = portalV7TableStatement(store.kind, 'model_price')
   if (!(await tablesOf(store)).includes('model_price')) await store.exec(table)
-  await verifyTable(store, 'model_price', table)
+  // 🚨 同 v5→v6：**建索引必须早于 `verifyTable`**。`idx_model_price_span` 是受控 DDL 里的
+  //   独立 `CREATE UNIQUE INDEX`，而 MySQL 分支的 `verifyTable` 会把它算进期望的唯一约束 ——
+  //   先校验后建索引会让 v6→v7 的第一步也报「唯一约束与主键不一致」。
   await ensureControlledIndexes(store, portalV7Statements(store.kind))
+  await verifyTable(store, 'model_price', table)
   for (const sql of portalV7Statements(store.kind)) {
     if (sql.startsWith('INSERT')) await store.exec(sql)
   }
