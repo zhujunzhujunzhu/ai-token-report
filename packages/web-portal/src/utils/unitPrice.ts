@@ -30,6 +30,37 @@ import { isPriceEffective } from '@ai-token-report/shared'
 export const MICRO_PER_UNIT = 1_000_000
 
 /**
+ * 页面的默认币种 —— **人民币**（本部门按元结算，内置种子价也是人民币官方价）。
+ *
+ * ★ 只影响「默认选中哪个」，**不是**计价口径：库里一行价记的就是它自己的
+ *   `currency`，多币种各算各的、绝不相加那条规则一个字都没变。
+ */
+export const DEFAULT_CURRENCY = 'CNY'
+
+/**
+ * 新增单价时预选的币种。
+ *
+ * ★ 默认 CNY（见 {@link DEFAULT_CURRENCY}）。
+ * ⚠️ 表里**一条 CNY 都没有**时不硬套：那会让人不假思索地存进一条与其余价目
+ *   不同币种的价，而它在页面上只表现为一个 tag。此时跟随已在用的币种；
+ *   表是空的（一条价都没有）才回到 CNY。
+ */
+export function defaultCurrencyForNewPrice(currenciesInUse: readonly string[]): string {
+  return currenciesInUse.includes(DEFAULT_CURRENCY) ? DEFAULT_CURRENCY : (currenciesInUse[0] ?? DEFAULT_CURRENCY)
+}
+
+/**
+ * 币种筛选的默认值。
+ *
+ * ★ 与 {@link defaultCurrencyForNewPrice} 同口径默认 CNY，但「表里没有 CNY」时
+ *   返回空串（= 全部币种）而**不是**挑一个：把筛选默认切到一个一条都没有的币种上，
+ *   会让表格直接空掉 —— 看起来像「价都没了」，而这只是筛选条件选错了。
+ */
+export function defaultCurrencyForFilter(currenciesInUse: readonly string[]): string {
+  return currenciesInUse.includes(DEFAULT_CURRENCY) ? DEFAULT_CURRENCY : ''
+}
+
+/**
  * 界面单位（百万 token）与库里单位（千 token）之间的倍数。
  *
  * ★ 因为 1 微元/千 token 恰好 = 1 货币单位/百万 token，所以这一步是**整数倍**，

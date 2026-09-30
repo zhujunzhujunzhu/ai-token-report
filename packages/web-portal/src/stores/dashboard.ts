@@ -18,6 +18,7 @@ import {
   fetchGroupOptions,
   fetchMemberOptions,
   fetchOverview,
+  fetchProviderOptions,
   fetchRecords,
   fetchSeries,
   type PortalFilter,
@@ -26,11 +27,22 @@ import {
   bucketFor,
   CUSTOM_PERIOD,
   memberFilterOptions,
+  newCustomProviders,
+  providerFilterOptions,
   userLabel,
   type MemberFilterOption,
+  type ProviderFilterOption,
 } from '../types/portal.js'
+import {
+  CUSTOM_PROVIDERS_LIMIT,
+  readCustomProviders,
+  writeCustomProviders,
+} from '../utils/providerCatalog.js'
+import { costSeriesOf } from '../utils/cost.js'
+import { trendSeriesOf } from '../utils/trend.js'
 import { useSessionStore } from './session.js'
 
+export type StatsSection = 'overview' | 'analysis' | 'records' | 'diagnostics'
 /**
  * 趋势图的分层维度。
  *
@@ -41,10 +53,16 @@ import { useSessionStore } from './session.js'
 export type TrendStack = 'none' | 'user' | 'model'
 /** 趋势图上看哪个指标。 */
 export type TrendMetric = 'totalTokens' | 'cost' | 'calls'
-export type StatsSection = 'overview' | 'analysis' | 'records' | 'diagnostics'
 export interface DashboardFilters {
   period: string
-  provider: string
+  /**
+   * 供应商筛选（多选 = OR）。
+   *
+   * ⚠️ 与 `users` / `groups` 不同，它**没有候选项约束**：服务端是子串匹配，
+   *   页面允许使用者手输一个新名字（`allow-create`），所以这里的值可能
+   *   完全不在任何目录里 —— 那是合法的筛选条件，不是脏数据。
+   */
+  providers: string[]
   model: string
   users: string[]
   /**
@@ -67,7 +85,7 @@ export interface UserDetail {
 export const PAGE_SIZE = 20
 const initialFilters = (): DashboardFilters => ({
   period: 'last7d',
-  provider: '',
+  providers: [],
   model: '',
   users: [],
   groups: [],
@@ -82,7 +100,8 @@ export function buildFilter(input: DashboardFilters): {
   span?: number
 } {
   const filter: PortalFilter = {
-    provider: input.provider.trim(),
+    // 供应商是多选 OR：去重 + 去空，语义原样交给服务端（仍是子串匹配）。
+    providers: [...new Set(input.providers.map((name) => name.trim()).filter(Boolean))],
     model: input.model.trim(),
     // 分组是多选 OR（见 PortalFilter.groups）：这里只做去重，不改变语义。
     groups: [...new Set(input.groups)],
@@ -107,6 +126,7 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
   const session = useSessionStore()
   const filters = ref(initialFilters())
   const section = ref<StatsSection | null>(null)
+  const breakdownBy = ref<GroupBy>('provider-model')
   /**
    * 趋势图的**分层维度**（合计 / 按用户 / 按模型）。
    *
@@ -116,7 +136,6 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
   const stackBy = ref<TrendStack>('none')
   /** 趋势图的指标（token / 元 / 调用次数），同样跨页保留。 */
   const trendMetric = ref<TrendMetric>('totalTokens')
-  const breakdownBy = ref<GroupBy>('provider-model')
   const overview = ref<OverviewResponse | null>(null)
   const series = ref<SeriesResponse | null>(null)
   const ranking = ref<BreakdownRow[]>([])
@@ -151,6 +170,7 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
    *   而看板使用者不一定有管理目录的权限。也刻意**不带筛选**，
    *   否则选中一个分组后下拉会塌缩成一项（自锁定）。
    */
+  const groupOptions = ref<StatsGroupOption[]>([])
   /**
    * 供应商目录（`GET /api/v1/stats/providers`，`stats:read`）。
    *
@@ -178,7 +198,6 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
   const providerChoices = computed<ProviderFilterOption[]>(() =>
     providerFilterOptions(providerOptions.value, customProviders.value),
   )
-  const groupOptions = ref<StatsGroupOption[]>([])
   /**
    * 人员下拉的选项 = 名册 ∪ 用量派生键，再按所选分组收窄。
    *
@@ -208,10 +227,72 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
   const granularity = computed(() =>
     bucketFor(filters.value.period, buildFilter(filters.value).span),
   )
+  /**
+   * 服务端请求用的 `stack` 参数：`'none'` → **不传**。
+   *
+   * ★ 传空串或 `all` 会让服务端多一条「未知取值」的分支，而它在日志里
+   *   与「没传」长得一模一样 —— 这一层刻意只做「有没有」的翻译。
+   */
+  const trendStackParam = computed<'user' | 'model' | undefined>(() =>
+    stackBy.value === 'none' ? undefined : stackBy.value,
+  )
+  /**
+   * 趋势点上的金额序列（`utils/cost.ts` 的唯一实现）。
+   *
+   * ★ `null` = 整段连 `cost` 字段都没有（没有 `cost:read`）：此时页面上
+   *   连金额这个指标选项都不该出现。非空但带 `disabledReason` = 多币种 /
+   *   一条价都没配 —— 指标**在，但点不动**，并说明原因。
+   */
+  const costSeries = computed(() => costSeriesOf(series.value?.points ?? []))
+  /**
+   * 分层载荷里是否**逐层**带了金额（金额口径的可用性，不是数值是否为 0）。
+   *
+   * ★ 缺这一列的原因只有两个：没有 `cost:read`，或区间内不止一种币种 ——
+   *   两者都绝不允许页面自己挑一个币种去画。
+   */
+  const stackCostAvailable = computed(() => {
+    const items = series.value?.stack?.items ?? []
+    return items.length > 0 && items.every((item) => item.cost)
+  })
+  /**
+   * 实际生效的指标。
+   *
+   * 🚨 三种情况必须**自动退回 token**，否则页面会画出一张假图：
+   *   - 指标是金额但整个字段缺席（无 `cost:read`）；
+   *   - 金额不可用（多币种 / 一条价都没配）；
+   *   - 展开成按用户 / 按模型，而分层载荷里**没有**金额那一列。
+   * 数据刷新（例如从单币种变成多币种）时使用者可能正停在金额上，所以这必须
+   * 是 computed 而不是切换时判一次。
+   */
+  const activeMetric = computed<TrendMetric>(() => {
+    if (trendMetric.value !== 'cost') return trendMetric.value
+    if (!costSeries.value || costSeries.value.disabledReason) return 'totalTokens'
+    if (stackBy.value !== 'none' && !stackCostAvailable.value) return 'totalTokens'
+    return 'cost'
+  })
+  /** 图上的分层序列；空数组 = 单序列（含金额整块缺席的回落）。 */
+  const trendSeries = computed(() =>
+    stackBy.value === 'none' ? [] : trendSeriesOf(series.value?.stack, activeMetric.value),
+  )
+  /**
+   * 选了「按用户 / 按模型」，但这次响应里**根本没有** `stack` 字段。
+   *
+   * ★ 这是旧版服务端的形状。它必须被说出来：静默画一条合计线会让使用者
+   *   以为自己看到的就是「按用户展开」，而图上没有任何迹象说明它没展开。
+   * ⚠️ 判据是**字段在不在**，不是「items 空不空」：窗口里确实没有用量时
+   *   `stack` 仍然在（只是 `items` 为空），那种情况该显示的是空态而不是这条告警。
+   */
+  const stackUnavailable = computed(
+    () => stackBy.value !== 'none' && series.value !== null && !series.value.stack,
+  )
+  /** 被合并进「其余」的层数；`0` = 没有截断。 */
+  const stackMergedCount = computed(() =>
+    stackBy.value === 'none' ? 0 : (series.value?.stack?.mergedCount ?? 0),
+  )
   const dirty = computed(
     () =>
       !!(
-        filters.value.provider ||
+        filters.value.providers.length ||
         filters.value.model ||
         filters.value.users.length ||
         filters.value.groups.length
@@ -267,6 +348,10 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
       filters.value,
       section.value,
       breakdownBy.value,
+      // ★ 分层维度必须进 key：切换「合计 / 按用户」时合计值往往**一模一样**，
+      //   不进 key 就会沿用上一份载荷，于是「点了切换但图和表都没变」。
+      stackBy.value,
+      trendMetric.value,
       page.value,
     ])
     if (key !== dataKey) {
@@ -298,8 +383,9 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
         candidates,
         groupCandidates,
         memberCandidates,
+        providerCandidates,
         active === 'overview' || active === 'analysis'
-          ? fetchSeries(filter, granularity.value)
+          ? fetchSeries(filter, granularity.value, trendStackParam.value)
           : null,
         active === 'overview'
           ? filter.users.length ? fetchBreakdown(filter, 'user') : candidates
@@ -341,12 +427,20 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
       handleFailure(mo)
       return
     }
+    // ★ 供应商目录同款：它只是下拉的候选，失败时回落成「使用者自建的 + 现敲现用」，
+    //   绝不因为一个下拉把整页数字变成错误提示。
+    //   ⚠️ 401 同样必须让会话过期（同 `/api/v1/stats/members`）。
+    if (!pv.ok && pv.status === 401) {
+      handleFailure(pv)
+      return
+    }
     if (ov.ok) overview.value = ov.data
     if (opts.ok) usageUsers.value = opts.data.rows
     // ★ 先分组目录后人员名册：人员选项的展示名要用分组 ID 翻名字，
     //   反过来的话首帧会闪一次「未知分组」。
     if (gopts.ok) groupOptions.value = gopts.data.groups ?? []
     if (mo.ok) memberDirectory.value = mo.data.members ?? []
+    if (pv.ok) providerOptions.value = pv.data.providers ?? []
     if (se?.ok) series.value = se.data
     if (rank?.ok) ranking.value = rank.data.rows
     if (groupRank?.ok) groupRanking.value = groupRank.data.rows
@@ -369,19 +463,62 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     filters.value = {
       ...next,
       groups,
-      // ★ 选了分组之后，把**分组外**的人员从筛选里去掉。
-      //   服务端按 AND 叠加：留下一个不在所选分组里的人，查询必然是 0，
-      //   而页面上只看到一片空数字 —— 看不出是筛选条件在打架。
-      //   ⚠️ 只在名册可用时收窄。名册取不到（旧服务端 / 请求失败）时我们
-      //   并不知道谁属于哪个分组，此时按原样保留 —— 不能凭一份空名册
-      //   删掉使用者的选择。
-      users: memberDirectory.value.length > 0
-        ? pruneUsers(next.users, groups)
-        : [...next.users],
+      // 🚨 只看自己的身份**永远不带人员筛选**：服务端一律把它收窄成本人，
+      //   所以这里留着一个「别人」的键只会在下一轮查询里变成 403（见
+      //   `stats-route.ts` 的 `applyDataScope()`）。人员下拉本来就没画
+      //   （`FilterBar.vue`），这里是第二道：从别处（旧链接 / 残留状态）
+      //   塞进来的键同样清掉。
+      users: session.scopedToSelf
+        ? []
+        : // ★ 选了分组之后，把**分组外**的人员从筛选里去掉。
+          //   服务端按 AND 叠加：留下一个不在所选分组里的人，查询必然是 0，
+          //   而页面上只看到一片空数字 —— 看不出是筛选条件在打架。
+          //   ⚠️ 只在名册可用时收窄。名册取不到（旧服务端 / 请求失败）时我们
+          //   并不知道谁属于哪个分组，此时按原样保留 —— 不能凭一份空名册
+          //   删掉使用者的选择。
+          memberDirectory.value.length > 0
+          ? pruneUsers(next.users, groups)
+          : [...next.users],
     }
+    // ★ 手输出来的供应商名记进本机目录（下次打开下拉直接可选）。
+    //   在这里而不是在组件的 change 回调里：`applyFilters` 是**所有**筛选
+    //   入口的收敛点（按钮 / 回车 / 其它调用方），只挂在组件上早晚会漏一条。
+    rememberProviders(next.providers)
     page.value = 1
     await load()
     return true
+  }
+  /**
+   * 把「手输出来的」供应商名记进本机目录，并写回 `localStorage`。
+   *
+   * 🚨 **不写数据库**（理由见 `utils/providerCatalog.ts` 的文件头）：
+   *   供应商名是用量行上的事实，库里那份可编辑配置是归一化规则。
+   * ⚠️ 记满了（{@link CUSTOM_PROVIDERS_LIMIT}）就**不再记新的**，但**不改动**
+   *   使用者的选择：筛选照旧生效，只是这个名字下次不在候选里。
+   *   悄悄丢掉他刚选的筛选项是绝对不能做的。
+   */
+  function rememberProviders(selected: readonly string[]): void {
+    const added = newCustomProviders(
+      selected,
+      providerOptions.value,
+      customProviders.value,
+    )
+    if (added.length === 0) return
+    customProviders.value = [...customProviders.value, ...added].slice(
+      0,
+      CUSTOM_PROVIDERS_LIMIT,
+    )
+    writeCustomProviders(customProviders.value)
+  }
+  /**
+   * 清掉本机记下的自定义供应商名（已选中的筛选值**照旧生效**）。
+   *
+   * ★ 这是「记错了 / 不想再看到它」唯一的出口：没有它，下拉里会永久留着
+   *   一个再也不会用到的名字，而页面不提供任何删除方式。
+   */
+  function clearCustomProviders(): void {
+    customProviders.value = []
+    writeCustomProviders([])
   }
   /**
    * 去掉在当前分组下选不到的归属键（分组外的成员、以及不属于任何分组的
@@ -411,6 +548,27 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
   async function setBreakdown(value: GroupBy): Promise<void> {
     breakdownBy.value = value
     await load()
+  }
+  /**
+   * 切换趋势的分层维度。
+   *
+   * ⚠️ 切回「合计」也要重新取数：载荷里 `stack` 的**有无**本身就是状态，
+   *   沿用上一份会让图上留着上一次的堆叠层。
+   */
+  async function setStack(value: TrendStack): Promise<void> {
+    if (stackBy.value === value) return
+    stackBy.value = value
+    await load()
+  }
+  /**
+   * 切换趋势指标。
+   *
+   * ★ 不用重新取数：三种指标的值都在同一份 `series` 载荷里
+   *   （金额在 `points[].cost`、分层金额在 `stack.items[].cost`）——
+   *   再发一次请求只会让切换变慢，还会多一次可能失败的往返。
+   */
+  function setTrendMetric(value: TrendMetric): void {
+    trendMetric.value = value
   }
   async function activate(value: StatsSection): Promise<void> {
     section.value = value
@@ -463,31 +621,29 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
         label,
         overview: ov.data,
         series: se.data,
-      // 🚨 只看自己的身份**永远不带人员筛选**：服务端一律把它收窄成本人，
-      //   所以这里留着一个「别人」的键只会在下一轮查询里变成 403（见
-      //   `stats-route.ts` 的 `applyDataScope()`）。人员下拉本来就没画
-      //   （`FilterBar.vue`），这里是第二道：从别处（旧链接 / 残留状态）
-      //   塞进来的键同样清掉。
-      users: session.scopedToSelf
-        ? []
-        : // ★ 选了分组之后，把**分组外**的人员从筛选里去掉。
-          //   服务端按 AND 叠加：留下一个不在所选分组里的人，查询必然是 0，
-          //   而页面上只看到一片空数字 —— 看不出是筛选条件在打架。
-          //   ⚠️ 只在名册可用时收窄。名册取不到（旧服务端 / 请求失败）时我们
-          //   并不知道谁属于哪个分组，此时按原样保留 —— 不能凭一份空名册
-          //   删掉使用者的选择。
-          memberDirectory.value.length > 0
-          ? pruneUsers(next.users, groups)
-          : [...next.users],
+        models: bd.data.rows,
+      }
+  }
+
+  watch(
+    () => session.generation,
+    () => {
+      ++requestSeq
+      closeUser()
       pending = false
       loading.value = false
       clearData()
       usageUsers.value = []
       memberDirectory.value = []
       groupOptions.value = []
+      providerOptions.value = []
+      // ⚠️ 自定义供应商**刻意不清**：它是「这台机器上的使用习惯」，
+      //   与登录身份 / 数据范围无关（退出登录后重进，候选应该还在）。
       filters.value = initialFilters()
       page.value = 1
       breakdownBy.value = 'provider-model'
+      stackBy.value = 'none'
+      trendMetric.value = 'totalTokens'
       error.value = null
       rangeError.value = null
       dataKey = ''
@@ -499,12 +655,22 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     filters,
     section,
     breakdownBy,
+    stackBy,
+    trendMetric,
+    activeMetric,
+    costSeries,
+    trendSeries,
+    stackMergedCount,
+    stackUnavailable,
     overview,
     series,
     ranking,
     groupRanking,
     userOptions,
     groupOptions,
+    providerOptions,
+    providerChoices,
+    customProviders,
     breakdown,
     diagnostics,
     records,
@@ -521,188 +687,14 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     dirty,
     load,
     applyFilters,
+    clearCustomProviders,
     setPage,
     setBreakdown,
+    setStack,
+    setTrendMetric,
     activate,
     deactivate,
     openUser,
     closeUser,
   }
 })
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

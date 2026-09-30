@@ -56,8 +56,8 @@ const theme = {
   surface: '#ffffff',
   border: '#e8e8e8',
   title: '#1a1a1a',
-  series: ['#111111', '#222222', '#333333'],
   fontFamily: 'sans-serif',
+  series: ['#111111', '#222222', '#333333'],
 }
 
 try {
@@ -109,6 +109,7 @@ try {
     '⚠️ 折线不做平滑插值（平滑会在两个低点之间鼓出不存在的峰值）',
     areaSet.tension === 0,
   )
+
   // ── 1b. 分层（堆叠柱 / 多条折线）────────────────────────────────
   //
   // ★ 这一节验的是「按用户 / 按模型展开」的全部实现：柱状图必须**堆叠**，
@@ -180,7 +181,6 @@ try {
     fallback.options?.plugins?.tooltip?.displayColors === false &&
     fallback.options?.scales?.y?.stacked === undefined)
 
-
   // ── 2. 渲染层 ────────────────────────────────────────────────────
   const { default: TrendChart } = (await server.ssrLoadModule('/src/components/TrendChart.vue')) as {
     default: unknown
@@ -207,13 +207,13 @@ try {
   check('无数据时显示空态文案', empty.includes('这段时间没有数据'))
   check('无数据时不渲染 canvas', !empty.includes('<canvas'))
   check('合计值原样展示（口径不由前端算）', withData.includes('569,124'))
+
   const layeredHtml: string = await renderToString(
     createSSRApp({ render: () => h(TrendChart as never, { ...props, series: layered }) }),
   )
   check('分层模式的 canvas 无障碍名说明按几层展开',
     layeredHtml.includes('3 个分层堆叠'))
   check('单序列的无障碍名不提分层', !withData.includes('个分层堆叠'))
-
 
   console.log('')
   if (failures.length > 0) {

@@ -252,6 +252,8 @@ async function startServer(opts: {
   await seedDatabaseIdentity({ sqlitePath: opts.dbPath, ...(opts.mysqlUrl ? { mysqlUrl: opts.mysqlUrl } : {}) }, [
     { token: TOKENS.zhang, name: '张三', group: '研发一部' },
     { token: TOKENS.li, name: '李四', group: '研发二部' },
+    // ★ 显式种一个管理员：看板对照读的是**全部门**，而这里必须有一个能看全员的身份。
+    { token: TOKENS.admin, name: '验收管理员', role: 'admin' },
   ])
   // ★ 生产入口：凭证表、三条路由、应用装配、端口重试全在里面。
   //   身份的唯一真值是 portal 数据库（`seedDatabaseIdentity` 已经种好）；
@@ -260,8 +262,6 @@ async function startServer(opts: {
   const handle = await createServer({
     port: opts.port,
     host: '127.0.0.1',
-    // ★ 显式种一个管理员：看板对照读的是**全部门**，而这里必须有一个能看全员的身份。
-    { token: TOKENS.admin, name: '验收管理员', role: 'admin' },
     dshHome: home,
     dataDir,
     dbPath: opts.dbPath,
@@ -299,7 +299,9 @@ async function stats(
 ): Promise<Record<string, unknown>> {
   const qs = new URLSearchParams(params).toString()
   const res = await fetch(`${server.url}/api/v1/stats/${sub}${qs ? `?${qs}` : ''}`, {
-    headers: { Authorization: `Bearer ${TOKENS.zhang}` },
+    // 🚨 用管理员凭证：本脚本逐位比对的是**全部门**的看板响应，
+    //   而非管理员的凭证只会看到自己（见 `TOKENS.admin` 的注释）。
+    headers: { Authorization: `Bearer ${TOKENS.admin}` },
   })
   const body = (await res.json()) as Record<string, unknown>
   if (res.status !== 200) {
@@ -309,9 +311,7 @@ async function stats(
 }
 
 let sqlite: RunningServer | null = null
-    // 🚨 用管理员凭证：本脚本逐位比对的是**全部门**的看板响应，
-    //   而非管理员的凭证只会看到自己（见 `TOKENS.admin` 的注释）。
-    headers: { Authorization: `Bearer ${TOKENS.admin}` },
+let mysql: RunningServer | null = null
 let mysqlStore: PortalStore | null = null
 /** 跑之前 MySQL 里 `ingest_run.last_ingest_ms` 的原值（跑完要还回去）。 */
 let previousIngestMoment: number | null = null
@@ -471,18 +471,6 @@ try {
   same('records 逐位一致（含 (ts, seq) 定序结果）', recordsLite, recordsMy)
   check('records 总数正确', recordsMy['total'] === EXPECTED.events, JSON.stringify(recordsMy['total']))
 
-  // ★ 人员候选目录（`/api/v1/stats/members`）**不能逐位比对**：两侧的
-  //   `member_id` / `group_id` 由各自的隔离库随机生成，逐位比对必然不等。
-  //   要比的是「这句查询在两个后端上等价」：名册（显示名 + 状态）与分组关联条数。
-  //   方言写错（保留字、`ORDER BY` 的列名）时这里要么抛错、要么条数对不上，
-  //   而它在 SQLite 上永远是对的 —— 只有活体 MySQL 才算证据。
-  const rosterOf = (rows: Record<string, unknown>[]): string[] =>
-    rows
-      .map((row) => `${row['name']}:${row['status']}:${(row['group_ids'] as string[]).length}`)
-      .sort()
-  const membersLite = (await stats(sqlite, 'members'))['members'] as Record<string, unknown>[]
-  const membersMy = (await stats(mysql, 'members'))['members'] as Record<string, unknown>[]
-  check(
   // ★ 供应商候选目录（`/api/v1/stats/providers`）：这句 SQL 只有两个后端都写对
   //   才成立（`DISTINCT` + `ORDER BY` 一个列），而它**只在活体 MySQL 上才算证据**。
   //   候选名字逐个对得上，才说明「页面上能选到的供应商」在两种部署下一致。
@@ -496,7 +484,19 @@ try {
     JSON.stringify(providersMy),
   )
 
-
+  // ★ 人员候选目录（`/api/v1/stats/members`）**不能逐位比对**：两侧的
+  //   `member_id` / `group_id` 由各自的隔离库随机生成，逐位比对必然不等。
+  //   要比的是「这句查询在两个后端上等价」：名册（显示名 + 状态）与分组关联条数。
+  //   方言写错（保留字、`ORDER BY` 的列名）时这里要么抛错、要么条数对不上，
+  //   而它在 SQLite 上永远是对的 —— 只有活体 MySQL 才算证据。
+  const rosterOf = (rows: Record<string, unknown>[]): string[] =>
+    rows
+      .map((row) => `${row['name']}:${row['status']}:${(row['group_ids'] as string[]).length}`)
+      .sort()
+  const membersLite = (await stats(sqlite, 'members'))['members'] as Record<string, unknown>[]
+  const membersMy = (await stats(mysql, 'members'))['members'] as Record<string, unknown>[]
+  check(
+    '★ members 两个后端的名册一致（人员候选目录）',
     JSON.stringify(rosterOf(membersLite)) === JSON.stringify(rosterOf(membersMy)),
     `\n     SQLite: ${JSON.stringify(rosterOf(membersLite))}\n     MySQL : ${JSON.stringify(rosterOf(membersMy))}`,
   )
@@ -601,4 +601,3 @@ if (failed === 0) {
 }
 console.log('='.repeat(72))
 process.exit(failed > 0 ? 1 : 0)
-

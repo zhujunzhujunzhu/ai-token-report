@@ -30,8 +30,8 @@ const chartLabels = computed(() =>
  * 图上的数值。
  *
  * ⚠️ 三个指标的数值**全部来自服务端**：金额取 `costSeries.values` 的同一批
- *   展开成按用户 / 按模型时取分层载荷（`utils/trend.ts` 是唯一的取列实现）。
  *   整数微元（下标与 `seriesPoints` 一一对应），画图层不做任何口径换算。
+ *   展开成按用户 / 按模型时取分层载荷（`utils/trend.ts` 是唯一的取列实现）。
  */
 const chartValues = computed(() =>
   seriesPoints.value.map((p, index) => {
@@ -56,13 +56,13 @@ const chartMetricLabel = computed(() =>
     : dashboard.activeMetric === 'cost'
       ? COST_LABEL
       : '计费总量',
+)
 /**
  * 图表标题行兼无障碍名，把「前 N 名 + 其余合并」说清楚。
  *
  * ★ 少了这句，使用者会把图上那几层当成全部 —— 而堆叠柱的总高其实仍等于总量，
  *   两者对不上时他只会去查一个并不存在的 bug。
  */
-)
 const chartHint = computed(() => {
   const grain = dashboard.granularity === 'hour' ? '按小时统计' : '按天统计'
   if (dashboard.stackBy === 'none') {
@@ -80,6 +80,7 @@ const chartFormatter = computed(() =>
   dashboard.activeMetric === 'cost'
     ? costTickFormatter(dashboard.costSeries?.currency ?? 'CNY')
     : undefined,
+)
 /**
  * 金额指标**现在能不能点**。
  *
@@ -91,7 +92,6 @@ const onMetric = (value: string | number | boolean | undefined): void =>
   dashboard.setTrendMetric(value as TrendMetric)
 const onStack = (value: string | number | boolean | undefined): void =>
   void dashboard.setStack(value as TrendStack)
-)
 </script>
 <template>
   <el-card shadow="never"
@@ -147,8 +147,8 @@ const onStack = (value: string | number | boolean | undefined): void =>
     </p>
     <TrendChart
       :labels="chartLabels"
-      :series="dashboard.trendSeries"
       :values="chartValues"
+      :series="dashboard.trendSeries"
       :total="chartTotal"
       :metric-label="chartMetricLabel"
       :hint="chartHint"
@@ -180,4 +180,3 @@ const onStack = (value: string | number | boolean | undefined): void =>
     <BreakdownTable :rows="dashboard.breakdown?.rows ?? []" />
   </el-card>
 </template>
-

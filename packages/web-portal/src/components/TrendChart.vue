@@ -25,8 +25,8 @@ import {
   BarElement,
   CategoryScale,
   Chart,
-  Legend,
   Filler,
+  Legend,
   LineController,
   LineElement,
   LinearScale,
@@ -44,8 +44,8 @@ import {
 
 import {
   buildTrendChartConfig,
-  type TrendChartSeries,
   readTrendChartTheme,
+  type TrendChartSeries,
 } from './trendChartConfig.js'
 
 /**
@@ -64,8 +64,8 @@ Chart.register(
   PointElement,
   CategoryScale,
   LinearScale,
-  Legend,
   Tooltip,
+  Legend,
   Filler,
 )
 
@@ -81,6 +81,7 @@ const props = withDefaults(
     /** 数据说明，作为标题与无障碍名。 */
     hint?: string
     /** 悬浮提示里的指标名，如「计费总量」。 */
+    metricLabel: string
     /**
      * 分层序列（堆叠柱 / 多条折线）。
      *
@@ -88,7 +89,6 @@ const props = withDefaults(
      *   与「金额整块缺席」的回落点，两条路都退回原来那张图。
      */
     series?: TrendChartSeries[]
-    metricLabel: string
     /**
      * 数值格式化（悬浮提示用），缺省千分位。
      * ★ 画金额时传 `formatCostMicro` 的包装：曲线的数值仍是**微元原值**，
@@ -126,8 +126,8 @@ function draw(): void {
     values: props.values,
     kind: props.kind,
     metricLabel: props.metricLabel,
-    series: props.series,
     theme: readTrendChartTheme(el),
+    series: props.series,
     ...(props.valueFormatter ? { valueFormatter: props.valueFormatter } : {}),
     ...(props.tickFormatter ? { tickFormatter: props.tickFormatter } : {}),
   })
@@ -230,4 +230,3 @@ onBeforeUnmount(() => {
   text-align: center;
 }
 </style>
-

@@ -121,8 +121,9 @@ export function bucketFor(period: string, spanMs?: number): 'day' | 'hour' {
 /**
  * 时间范围下拉变更后是否可以立即查询。
  *
- * ★ 两个下拉（时间范围 / 人员）是离散选择，**选中即筛**，不必再点「查询」；
- *   厂商 / 模型是子串输入，逐字符查询没有意义，仍由按钮或回车提交。
+ * ★ 三个多选 / 单选下拉（时间范围 / 分组 / 人员 / 厂商）是离散选择，
+ *   **选中即筛**，不必再点「查询」；模型是子串输入，逐字符查询没有意义，
+ *   仍由按钮或回车提交。
  *
  * ⚠️ 自定义区间例外：切过去的那一瞬间两个输入框必然是空的，
  *   此时查询只会换来一句「请选择开始与结束时间」（`buildFilter` 的错误，
@@ -135,6 +136,86 @@ export function periodReadyForQuery(
   to: string,
 ): boolean {
   return period !== CUSTOM_PERIOD || (!!from && !!to)
+}
+
+/**
+ * 供应商下拉里的一项。
+ *
+ * ★ 与人员候选（`MemberFilterOption`）是同一个形状思路：页面只关心
+ *   「值、显示名、是不是使用者自己建的」。
+ */
+export interface ProviderFilterOption {
+  /** 筛选时原样发给服务端的名字。 */
+  value: string
+  label: string
+  /**
+   * `true` = 使用者手动创建的（`allow-create`），只存在本机浏览器里。
+   *
+   * ⚠️ 它与「库里有这个供应商」是两件事：自定义项**不写库**，也**不保证有用量**。
+   *   它的用途只有一个：把名字记下来，下次不用再手输。
+   */
+  custom: boolean
+}
+
+/**
+ * 供应商下拉的候选集合：**库里的目录 ∪ 使用者自建的**。
+ *
+ * ★ 目录（`GET /api/v1/stats/providers`）给的是**归一化后**的展示名，与筛选的
+ *   匹配口径同一份 —— 页面不在这里做任何名字变换。
+ * ★ 自建项排在目录之后，并在 `custom` 上标出来：同名的以目录为准
+ *   （库里真的有这个名字，它就不是「自定义」）。
+ *
+ * ⚠️ 服务端对每个值仍是**子串**匹配，所以「输入一半的名字」也能筛 ——
+ *   这是既有语义（CLI `--provider` 同款），不是这里引入的。下拉的可搜索
+ *   （`filterable`）只是把这件事变得看得见：搜到的每一项都能直接选。
+ */
+export function providerFilterOptions(
+  catalog: readonly string[],
+  custom: readonly string[],
+): ProviderFilterOption[] {
+  const options: ProviderFilterOption[] = []
+  const seen = new Set<string>()
+  for (const name of catalog) {
+    const value = name.trim()
+    if (!value || seen.has(value)) continue
+    seen.add(value)
+    options.push({ value, label: value, custom: false })
+  }
+  for (const name of custom) {
+    const value = name.trim()
+    // ★ 与目录重名的不再列为自定义：那会让人以为有两个不同的选项，
+    //   而筛选发出去的是同一个字符串。
+    if (!value || seen.has(value)) continue
+    seen.add(value)
+    options.push({ value, label: value, custom: true })
+  }
+  return options
+}
+
+/**
+ * 从当前选择里挑出**刚刚手输出来的**名字（去掉目录里已有的与已经记过的）。
+ *
+ * ★ 判据是「既不在目录、也不在已有自定义里」：下拉里能选到的值都来自这两处，
+ *   所以剩下的只可能是使用者刚敲进去并回车的那一个 —— 把它记下来，
+ *   下次打开下拉就能直接选，而不用再输一遍。
+ * ⚠️ 副产物是「输入一半的子串」也会被记下来（服务端本来就是子串匹配）。
+ *   这是刻意的：那是使用者自己建的一个筛选项，页面没有资格替他判断它「不完整」。
+ *   不想要了用「清除自定义」——页面必须给出这个出口。
+ */
+export function newCustomProviders(
+  selected: readonly string[],
+  catalog: readonly string[],
+  custom: readonly string[],
+): string[] {
+  const known = new Set<string>([...catalog, ...custom].map((name) => name.trim()))
+  const added: string[] = []
+  for (const name of selected) {
+    const value = name.trim()
+    if (!value || known.has(value)) continue
+    known.add(value)
+    added.push(value)
+  }
+  return added
 }
 
 /**

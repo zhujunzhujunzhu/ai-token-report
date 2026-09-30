@@ -74,7 +74,7 @@ async function overview(member?: number): Promise<OverviewResponse> {
   //   - 带 `member_id` → 那个人**自己的** appKey：顺带钉住「点名自己的 ID 允许」。
   const token = member === undefined ? adminSecret : members[member]!.token
   return http(`/api/v1/stats/overview?period=last7d&identity_view=member${selector}`, token)
-
+}
 function verifyOverview(value: OverviewResponse, calls: number): void {
   const expected = {
     calls, inputTokens: calls * usage.input, outputTokens: calls * usage.output,
@@ -182,4 +182,3 @@ try {
   if (!location || location.startsWith('..') || !location.startsWith('atr-ingest-performance-')) throw new Error('临时目录不在本次压测范围，拒绝清理')
   rmSync(tempRoot, { recursive: true, force: true })
 }
-

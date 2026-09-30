@@ -173,9 +173,9 @@ function todayAt(hour: number, minute = 0): number {
 async function get(
   sub: string,
   params: Record<string, string> = {},
-  auth: string | null = 'Bearer tok-zhang',
   // 缺省用**管理员**凭证：这些断言看的是全部门聚合（见 `STORE` 的注释）。
   auth: string | null = 'Bearer tok-admin',
+  store: CredentialStore = STORE,
 ): Promise<StatsRouteResult> {
   return stats(store).handle(sub, new URLSearchParams(params), auth)
 }
@@ -215,8 +215,6 @@ describe('部门看板鉴权', () => {
   })
 })
 
-describe('部门总览口径', () => {
-  test('四项 token 分列，total 等于四项之和', async () => {
 /**
  * ★ 数据范围（S7 之后的收紧）：**非内置管理员只能看到自己**。
  *
@@ -388,6 +386,8 @@ describe('★ 数据范围（非内置管理员只看本人）', () => {
   })
 })
 
+describe('部门总览口径', () => {
+  test('四项 token 分列，total 等于四项之和', async () => {
     await report('tok-zhang', [
       rec('e1', { seq: 1, input_tokens: 100, output_tokens: 20, cache_read_tokens: 900 }),
       rec('e2', { seq: 2, input_tokens: 300, output_tokens: 40, cache_read_tokens: 700 }),
@@ -563,6 +563,7 @@ describe('★ 人员排行（部门看板的核心诉求）', () => {
     expect((upper.body as Record<string, number>)['calls']).toBe(1)
     const byModel = await get('overview', { period: 'today', model: 'gpt-4o' })
     expect((byModel.body as Record<string, number>)['calls']).toBe(1)
+  })
 
   /**
    * ★ 供应商多选：**重复的同名参数**（页面走的就是这条路）与逗号分隔都生效。
@@ -605,7 +606,6 @@ describe('★ 人员排行（部门看板的核心诉求）', () => {
       'Bearer tok-admin',
     )
     expect((duplicates.body as Record<string, number>)['calls']).toBe(1)
-  })
   })
 })
 
@@ -722,6 +722,15 @@ describe('参数校验（不许静默兜底）', () => {
     expect(res.status).toBe(400)
   })
 
+  test('未知 stack 回 400（不许静默退回单序列）', async () => {
+    // 静默退回合计会让「按用户展开」的页面画出一条合计线，
+    // 而图上没有任何迹象说明它没展开 —— 与非法 bucket 是同一类陷阱。
+    for (const value of ['', 'provider', 'users']) {
+      const res = await get('series', { bucket: 'day', stack: value })
+      expect(res.status).toBe(400)
+    }
+  })
+
   test('非法的 from / to 回 400（不能被当成「没给」）', async () => {
     const res = await get('overview', { from: 'abc' })
     expect(res.status).toBe(400)
@@ -779,6 +788,7 @@ describe('人员候选目录（GET /api/v1/stats/members）', () => {
    *   整个下拉会空掉 —— 那看起来像数据丢了，而不像「这段时间没人用」。
    */
   async function roster() {
+    const repository = new IdentityRepository({ sqlitePath: dbPath })
     await repository.initialize({
       adminToken: 'tok-admin',
       adminName: '管理员',
@@ -850,6 +860,85 @@ describe('人员候选目录（GET /api/v1/stats/members）', () => {
     expect(res.status).toBe(200)
     expect((res.body as StatsMembersResponse).members).toEqual([])
   })
+})
+
+/**
+ * 供应商候选目录（`GET /api/v1/stats/providers`）。
+ *
+ * ## 这些断言在守什么
+ *
+ * 1. ★ **候选是完整集合**：不带时间窗、不带任何筛选。只列「当前窗口用过的」
+ *    时候，上个月用过的供应商会从下拉里消失 —— 那看起来像数据丢了。
+ * 2. ★ 名字是**归一化后的展示名**，与查询期的筛选口径是**同一份映射**：
+ *    页面按它筛必须筛得出来（否则使用者会以为筛选坏了）。
+ * 3. 只回名字，**不含任何用量数字**，因此不跟着数据范围收窄（同分组 / 人员候选）。
+ */
+describe('供应商候选目录（GET /api/v1/stats/providers）', () => {
+  test('★ 列出库里出现过的供应商（去重、升序），且不受时间窗影响', async () => {
+    await report('tok-zhang', [
+      rec('pv1', { provider: 'openai', model: 'gpt-4o' }),
+      // 昨天的一条：`period=today` 覆盖不到它，但候选必须照样列出
+      rec('pv2', { seq: 2, ts: todayAt(10) - 86_400_000, provider: 'historic-gw', model: 'm-1' }),
+      // 同名的两条只出现一次
+      rec('pv3', { seq: 3, provider: 'openai', model: 'gpt-4o-mini' }),
+    ])
+    const res = await get('providers', { period: 'today' })
+    expect(res.status).toBe(200)
+    expect((res.body as StatsProvidersResponse).providers).toEqual([
+      'historic-gw',
+      'openai',
+    ])
+    // ★ 只回名字：整份响应体就这一个字段（没有条数、没有 token）
+    expect(Object.keys(res.body as object)).toEqual(['providers'])
+  })
+
+  test('★ 名字按归一化后的展示名给（与筛选用的是同一份映射）', async () => {
+    await report('tok-zhang', [
+      rec('al1', { provider: 'dashscope', model: 'deepseek-v4.1-flash' }),
+      rec('al2', { seq: 2, provider: 'bailian', model: 'qwen-max' }),
+    ])
+    const repository = new IdentityRepository({ sqlitePath: dbPath })
+    await repository.initialize({
+      adminToken: 'tok-admin',
+      adminName: '管理员',
+      adminUsername: 'admin',
+      adminPassword: 'test-password-2026',
+    })
+    const admin = (await repository.resolveBearer('tok-admin'))!
+    // 两个原始名折叠成同一个展示名：候选里只能出现一次
+    await repository.setProviderAlias(admin, {
+      scope: 'global',
+      provider: 'dashscope',
+      alias: 'bailian-tpp',
+    })
+    await repository.setProviderAlias(admin, {
+      scope: 'global',
+      provider: 'bailian',
+      alias: 'bailian-tpp',
+    })
+    const route = new StatsRoute({ identityStore: repository, dbPath })
+    const res = await route.handle('providers', new URLSearchParams(), 'Bearer tok-admin')
+    expect(res.status).toBe(200)
+    expect((res.body as StatsProvidersResponse).providers).toEqual(['bailian-tpp'])
+    // ★ 按页面上看到的名字筛，两条都筛得到（候选与筛选共用同一份口径）
+    const filtered = await route.handle(
+      'overview',
+      new URLSearchParams({ period: 'today', provider: 'bailian-tpp' }),
+      'Bearer tok-admin',
+    )
+    expect((filtered.body as Record<string, number>)['calls']).toBe(2)
+  })
+
+  test('缺 Authorization → 401（与其它看板接口同一道门）', async () => {
+    expect((await get('providers', {}, null)).status).toBe(401)
+  })
+
+  test('★ 空库回空候选而不是抛错（页面只列自定义项）', async () => {
+    const res = await get('providers')
+    expect(res.status).toBe(200)
+    expect((res.body as StatsProvidersResponse).providers).toEqual([])
+  })
+})
 
 /**
  * 趋势分层（`series?stack=user|model`）。
@@ -894,15 +983,6 @@ describe('★ 趋势分层（按用户 / 按模型）', () => {
     const res = await get('series', { bucket: 'hour', period: 'today', stack: 'model' })
     expect(res.status).toBe(200)
     const body = res.body as SeriesResponse
-  test('未知 stack 回 400（不许静默退回单序列）', async () => {
-    // 静默退回合计会让「按用户展开」的页面画出一条合计线，
-    // 而图上没有任何迹象说明它没展开 —— 与非法 bucket 是同一类陷阱。
-    for (const value of ['', 'provider', 'users']) {
-      const res = await get('series', { bucket: 'day', stack: value })
-      expect(res.status).toBe(400)
-    }
-  })
-
     expect(body.stack?.by).toBe('model')
     // 按窗口总量降序：b-model 200 > a-model 150
     expect(body.stack!.items.map((item) => item.key)).toEqual(['b-model', 'a-model'])
@@ -1151,266 +1231,3 @@ describe('★ 趋势分层（按用户 / 按模型）', () => {
     expectStackSumsToTotals(body)
   })
 })
-})
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

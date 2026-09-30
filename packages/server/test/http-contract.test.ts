@@ -409,6 +409,20 @@ describe('现状契约：GET /api/v1/stats/*', () => {
     expect(r.status).toBe(200)
     expect(r.body).toHaveProperty('members')
   })
+
+  /**
+   * ★ 供应商候选目录同款：`stats:read` 一道门，且**不是** `providers:read`。
+   *
+   * 筛选下拉只需要「库里出现过哪些供应商名」；把供应商归一化的读权限
+   * 绑到看板上，等于让一个下拉具备配置面的权限。
+   */
+  test('★ 供应商候选目录是看板接口：缺 Authorization → 401，带 token → 200', async () => {
+    expect((await call(dept, 'GET', '/api/v1/stats/providers')).status).toBe(401)
+    const r = await call(dept, 'GET', '/api/v1/stats/providers', { headers: MEMBER })
+    expect(r.status).toBe(200)
+    expect(r.body).toHaveProperty('providers')
+  })
+
   /**
    * ★ 数据范围的分发面契约：**非内置管理员只能查自己**。
    *
@@ -443,7 +457,7 @@ describe('现状契约：GET /api/v1/stats/*', () => {
     )
     expect(allowed.status).toBe(200)
   })
-
+})
 
 // ─────────────────────────────────────────────────────────────
 describe('现状契约：看板金额与单价快照（v7 / cost:read）', () => {
@@ -1125,4 +1139,3 @@ describe('S12.3 静态托管：ETag / 304 / Cache-Control / HEAD / 压缩', () =
     },
   )
 })
-

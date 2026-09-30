@@ -287,6 +287,7 @@ export interface SeriesPoint {
   /** 该点的费用（同样只在有 `cost:read` 时下发）。 */
   cost?: StatsCostTotals
 }
+
 /**
  * 趋势图的**分层维度**（堆叠柱 / 多条折线按谁展开）。
  *
@@ -346,9 +347,9 @@ export interface SeriesStack {
   mergedCount: number
 }
 
-
 export interface SeriesResponse {
   bucket: Bucket
+  points: SeriesPoint[]
   /**
    * 分层明细，**只在请求带了 `stack=user|model` 时才下发**。
    *
@@ -356,7 +357,6 @@ export interface SeriesResponse {
    *   还是堆叠图。回一个空 `items` 会让「旧服务端」与「真的没有用量」长得一样。
    */
   stack?: SeriesStack
-  points: SeriesPoint[]
 }
 
 /** 分组排行的一行。 */
@@ -484,6 +484,28 @@ export interface StatsMemberOption {
 
 export interface StatsMembersResponse {
   members: StatsMemberOption[]
+}
+
+/**
+ * 筛选栏要用的供应商候选项（`GET /api/v1/stats/providers`）。
+ *
+ * ★ 同样由**看板接口**提供（`stats:read`），不是供应商归一化的管理接口
+ *   `/api/v1/admin/provider-aliases`（那是 `providers:read`）：
+ *   「按哪个供应商筛数据」是看板自身的能力，一个筛选下拉不该顺带具备
+ *   配置面的读权限。
+ *
+ * ★ 名字是**归一化后**的展示名，与筛选的匹配口径逐字同一份
+ *   （`core/db/query.ts` 的 `providerFilterExpression()`）：使用者看到
+ *   `bailian-tpp`，筛 `bailian-tpp` 就必须把 `dashscope` 那些原值一起筛出来。
+ *   回原始名会造出「按页面上看到的名字筛，一行都筛不出来」这种查不出原因的坑。
+ *
+ * ⚠️ 只回名字，**不含任何用量数字**（没有条数、没有 token），因此它是一份
+ *   **目录**：与分组 / 人员候选一样**不跟着数据范围收窄**（`applyDataScope()`
+ *   只管用量查询）。
+ */
+export interface StatsProvidersResponse {
+  /** 去重、升序的展示名（多条规则指向同一个名字时只出现一次）。 */
+  providers: string[]
 }
 
 /** 当前实例的入口队列观测；完成计数包含业务拒绝，不代表成功落库条数。 */
@@ -823,12 +845,16 @@ export interface VerifyTokenResponse {
  *
  * 旧客户端和导入格式的兼容角色。生产授权查数据库当前 permissions，
  * Bearer 再与 Token scopes 取交集；姓名绝不能作为授权依据。
+ *
+ * ★ 它同时是**数据范围**的判据（`server/src/stats-route.ts` 的
+ *   `applyDataScope()`）：只有内置 `admin` 角色能看到全部门的用量，
+ *   其余身份一律只看得到自己。这里比对的是**内置角色码**，不是权限码。
  */
 export type UserRole = 'admin' | 'member'
 
 /** 管理员：可看全部门看板，并可在管理页发放 / 重置 / 吊销 token。 */
 export const ROLE_ADMIN: UserRole = 'admin'
-/** 普通成员：可看全部门看板，看不到管理页。 */
+/** 普通成员：**只看得到自己的统计**（数据范围由服务端强制），看不到管理页。 */
 export const ROLE_MEMBER: UserRole = 'member'
 
 /** 判断一个任意值是否是合法角色。 */
@@ -845,10 +871,6 @@ export interface AdminMember {
   username?: string | null
   login_enabled?: boolean
   /**
- *
- * ★ 它同时是**数据范围**的判据（`server/src/stats-route.ts` 的
- *   `applyDataScope()`）：只有内置 `admin` 角色能看到全部门的用量，
- *   其余身份一律只看得到自己。这里比对的是**内置角色码**，不是权限码。
    * 身份 token。
    *
    * ★ 这里**刻意返回明文**：管理页的用途就是「把 token 发给本人」与
@@ -858,7 +880,7 @@ export interface AdminMember {
    */
   token: string
   name: string
-/** 普通成员：**只看得到自己的统计**（数据范围由服务端强制），看不到管理页。 */
+  group: string | null
   role: UserRole
   /** token 发放时刻（epoch ms）。手工写进文件的凭证没有这个字段 → null。 */
   createdAt: number | null
@@ -961,30 +983,3 @@ export interface AdminMemberResponse {
   /** 本次操作涉及的人员（含**新签发的 token**，供管理员复制转发）。 */
   member?: AdminMember
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

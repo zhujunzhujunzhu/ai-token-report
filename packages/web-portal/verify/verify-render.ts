@@ -179,13 +179,13 @@ try {
     '分组排行',
   ])
     check(`总览含 ${label}`, dashboardHtml.includes(label))
+  check('总览直接展示接口总量', dashboardHtml.includes('1,500'))
   // ★ 趋势图上的两个开关必须真的渲染出来：没有它们，使用者只能看到一条合计线，
   //   而「按用户 / 按模型」这件事在页面上根本无从表达。
   for (const label of ['合计', '按用户', '按模型', 'Token 用量'])
     check(`总览趋势含开关：${label}`, dashboardHtml.includes(label))
   check('总览：没有 cost 字段（无 cost:read）时金额开关不出现',
     dashboardHtml.includes('费用（估算）') === false)
-  check('总览直接展示接口总量', dashboardHtml.includes('1,500'))
   // ★ 多对多的口径说明必须**真的渲染出来**：它是「各分组之和 > 总量」这一定义
   //   在页面上唯一的解释，少一句就会被当成 bug 去查。
   check('分组排行附多对多口径说明',
@@ -210,10 +210,10 @@ try {
     check(`分析页含 ${label}`, analysisHtml.includes(label))
   // ★ 金额指标同样按「服务端有没有下发 `cost`」出现/消失，三种状态分别钉住。
   check('分析页：趋势点没有金额（无 cost:read）时不出现费用指标',
+    analysisHtml.includes('费用（估算）') === false)
   // 分层维度开关在分析页同样必须在（折线图的多条线由它决定）
   for (const label of ['合计', '按用户', '按模型'])
     check(`分析页趋势含分层开关：${label}`, analysisHtml.includes(label))
-    analysisHtml.includes('费用（估算）') === false)
   const costPoints = [
     {
       bucket: '2026-09-20',
@@ -423,11 +423,87 @@ try {
       filterHtml.includes('分组筛选') &&
       filterHtml.includes('时间范围'),
   )
+  /**
+   * ★ 厂商是**多选 + 可搜索 + 可新建**的下拉，而不是一个自由输入框。
+   *
+   * ⚠️ 判据里**不能**出现候选项文本（`dashscope` 之类）：Element Plus 的下拉
+   *   内容是 `<teleport>` 出去的，SSR 产物里只有一个空的 teleport ——
+   *   拿选项文本当判据会得到一条永远失败（或永远通过）的断言。
+   *   「候选 = 库里的目录 ∪ 使用者自建的」由 `test/stores.test.ts` 的
+   *   `providerChoices` 断言钉住（那里是纯数据，不经过 teleport）。
+   *
+   * 所以这里验的是**控件形状**与**说清自定义项存在哪里**：
+   * 一个带 `role="combobox"` 的筛选控件（`el-select` 才有）+ 可新建的占位提示。
+   */
+  dashboard.providerOptions = ['dashscope', 'bailian-tpp']
+  dashboard.customProviders = ['my-gateway']
+  const providerHtml = await render('/src/components/FilterBar.vue')
+  check(
+    '★ 厂商是多选下拉（combobox）并提示可以新建',
+    providerHtml.includes('data-testid="provider-filter"') &&
+      providerHtml.includes('aria-label="厂商筛选"') &&
+      providerHtml.includes('role="combobox"') &&
+      providerHtml.includes('全部厂商（可输入后回车新建）'),
+  )
+  check(
+    '★ 自定义项说明它存在本机并提供清除入口',
+    providerHtml.includes('不写入数据库') && providerHtml.includes('清除'),
+  )
+  // 清回原状：下面的断言看的仍是同一份 store。
+  dashboard.providerOptions = []
+  dashboard.customProviders = []
   dashboard.filters = { ...dashboard.filters, period: 'custom' }
   const customHtml = await render('/src/components/FilterBar.vue')
   check(
     '自定义范围提供起止输入',
     customHtml.includes('开始时间') && customHtml.includes('结束时间'),
+  )
+
+  /**
+   * 🚨 只看自己的身份**没有人员下拉**，也**不写任何数据范围提示**。
+   *
+   * 留一个筛不了任何东西的下拉，只会让人以为自己筛到了别人；而把
+   * 「只看本人（不是管理员）」写在筛选栏里，等于占着一个筛不了控件的位置去讲
+   * 一件与筛选无关的事 —— 使用者的身份不该由筛选栏来宣布。
+   * 真正的收窄在服务端（`stats-route.ts` 的 `applyDataScope()`），页面这一层
+   * 只是不再画一个假控件、也不解释它。其余筛选（分组 / 厂商 / 模型 / 时间）照旧。
+   */
+  const administrator = session.identity
+  session.identity = {
+    member_id: '00000000-0000-4000-8000-000000000002',
+    name: '普通成员',
+    username: 'member',
+    role: 'member',
+    permissions: ['stats:read', 'groups:read'],
+  }
+  session.generation++
+  const scopedFilterHtml = await render('/src/components/FilterBar.vue')
+  check(
+    '★ 普通成员没有人员下拉，也不写数据范围提示',
+    // ⚠️ 判据用 `aria-label` / `data-testid` / 那句原文：SSR 会把模板注释一起渲染
+    //   出来，而注释里恰好也有「全部人员」「只看本人」这类字样（拿文本当判据会误判），
+    //   所以这里同时钉住「那行提示真的没了」，而不是只看下拉在不在。
+    !scopedFilterHtml.includes('人员筛选') &&
+      !scopedFilterHtml.includes('data-testid="scope-note"') &&
+      !scopedFilterHtml.includes('只看本人'),
+  )
+  check(
+    '普通成员保留分组、厂商、模型与时间筛选',
+    scopedFilterHtml.includes('分组筛选') &&
+      scopedFilterHtml.includes('厂商筛选') &&
+      scopedFilterHtml.includes('模型筛选') &&
+      scopedFilterHtml.includes('时间范围'),
+  )
+  const scopedLayoutHtml = await render('/src/layouts/PortalLayout.vue')
+  // ⚠️ 判据是身份块里那个 `<small>` 的**内容**，不是「整页有没有出现过这四个字」：
+  //   SSR 会把模板注释一起渲染出来，而注释里也会提到「管理员」。
+  check('身份标签跟着数据范围走', /<small>\s*普通成员\s*<\/small>/.test(scopedLayoutHtml))
+  session.identity = administrator
+  session.generation++
+  const restoredLayoutHtml = await render('/src/layouts/PortalLayout.vue')
+  check(
+    '管理员仍有人员下拉与管理员标签',
+    filterHtml.includes('人员筛选') && /<small>\s*管理员\s*<\/small>/.test(restoredLayoutHtml),
   )
 
   const members = useMembersStore(pinia)
@@ -611,4 +687,3 @@ try {
   disposePinia(pinia)
   await server.close()
 }
-

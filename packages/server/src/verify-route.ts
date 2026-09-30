@@ -170,7 +170,7 @@ export function resolveIngestIdentity(
  *   而**不是**由姓名白名单决定 —— 姓名是可以随便改的显示值。
  *   数据范围：**只有内置 `admin` 角色能看到全部门的用量**，其余身份一律被
  *   `stats-route.ts` 的 `applyDataScope()` 收窄成「只看自己」。
-
+ */
 export function resolveViewerIdentity(
   store: CredentialStore,
   authorization: string | null | undefined,
@@ -214,4 +214,3 @@ export function resolveIdentity(
 
   return { ok: true, ...viewerFrom(r) }
 }
-

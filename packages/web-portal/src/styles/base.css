@@ -43,6 +43,16 @@
   --c-chart-bar-strong: #3275ed;
   --c-chart-area-stroke: #3275ed;
   --c-chart-area-fill: #c1d8ff;
+  /* 堆叠 / 多序列的配色（按用量降序取用）。相邻两色在明度上刻意拉开，
+     灰度打印时也分得开；canvas 不认 var()，由 trendChartConfig 解析成具体色值。 */
+  --c-chart-series-1: #3275ed;
+  --c-chart-series-2: #21a68e;
+  --c-chart-series-3: #9274df;
+  --c-chart-series-4: #c78b27;
+  --c-chart-series-5: #37a5c3;
+  --c-chart-series-6: #dc5961;
+  --c-chart-series-7: #5b7ba6;
+  --c-chart-series-8: #8cc152;
 }
 * {
   box-sizing: border-box;
@@ -485,20 +495,31 @@ code {
 }
 .filter-actions {
   display: flex;
+  /* ★ 恒定独占一行（与 `.custom-range` 同款）：画布上少一个控件（「只看自己」的身份
+     没有人员下拉）时，按钮不该因此跳到第一行最右 —— 位置随身份变来变去会让人
+     以为筛选栏「变了」。 */
+  grid-column: 1 / -1;
   padding-bottom: 1px;
 }
 .filter-actions .el-button {
   min-height: 36px;
+}
+/* 厂商框下的说明行：自定义供应商存在哪里（本机浏览器）+ 清除入口。
+   ⚠️ 它必须挂在**字段里**而不是弹窗里：使用者会以为「我配了一个供应商」，
+   而那只是一条本机记忆 —— 换台机器就没有了。 */
+.filter-note {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.4;
 }
 .custom-range {
   grid-column: 1 / -1;
   display: flex;
   align-items: end;
   gap: 14px;
-  /* ★ 恒定独占一行（与 `.custom-range` 同款）：画布上少一个控件（「只看自己」的身份
-     没有人员下拉）时，按钮不该因此跳到第一行最右 —— 位置随身份变来变去会让人
-     以为筛选栏「变了」。 */
-  grid-column: 1 / -1;
 }
 .custom-range > span {
   padding-bottom: 10px;
@@ -547,6 +568,19 @@ code {
   font-size: 12px;
   color: #8997aa;
 }
+/* 趋势卡片标题右侧的一组控件（指标 / 分层维度 + 跳转链接）。
+   允许换行：窄屏下两组单选按钮 + 链接挤在一行会溢出卡片。 */
+.trend-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+/* 金额指标不可用时的说明行：它必须紧跟图表上方，而不是藏在卡片角落。 */
+.cost-trend-note {
+  margin: 0 0 10px;
+}
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -572,7 +606,7 @@ code {
   font-size: 17px;
 }
 .metric-icon.blue {
-
+  color: #4d89ef;
   background: #edf4ff;
 }
 .metric-icon.green {
@@ -1410,4 +1444,3 @@ code {
   line-height: 1.8;
   margin-top: 6px;
 }
-

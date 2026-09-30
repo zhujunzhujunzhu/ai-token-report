@@ -14,8 +14,8 @@ import MetricCardGrid from '../components/MetricCardGrid.vue'
 import RankingTable from '../components/RankingTable.vue'
 import BreakdownTable from '../components/BreakdownTable.vue'
 import TrendChart from '../components/TrendChart.vue'
-import { COST_LABEL, costText, costTickFormatter } from '../utils/cost.js'
 import { formatBucket, formatCount } from '../utils/format.js'
+import { COST_LABEL, costText, costTickFormatter } from '../utils/cost.js'
 import { groupLabelOf } from '../types/portal.js'
 const dashboard = useDashboardStore()
 /**
@@ -26,6 +26,7 @@ const dashboard = useDashboardStore()
  *   这里只做展示映射，不参与任何数值计算。
  */
 const groupName = (row: BreakdownRow): string =>
+  groupLabelOf(row, dashboard.groupOptions)
 /** 趋势点（同一份数组同时喂给标签与数值，保证两个序列**按下标对齐**）。 */
 const seriesPoints = computed(() => dashboard.series?.points ?? [])
 const chartLabels = computed(() =>
@@ -88,7 +89,6 @@ const onMetric = (value: string | number | boolean | undefined): void =>
   dashboard.setTrendMetric(value as TrendMetric)
 const onStack = (value: string | number | boolean | undefined): void =>
   void dashboard.setStack(value as TrendStack)
-  groupLabelOf(row, dashboard.groupOptions)
 </script>
 <template>
   <MetricCardGrid :overview="dashboard.overview" />
@@ -99,9 +99,52 @@ const onStack = (value: string | number | boolean | undefined): void =>
           <h2>用量趋势</h2>
           <p>团队 Token 使用情况</p>
         </div>
-        <router-link to="/analysis" class="text-link">查看分析 →</router-link>
-      </div></template
-    >
+        <div class="trend-controls">
+          <el-radio-group
+            :model-value="dashboard.trendMetric"
+            size="small"
+            @update:model-value="onMetric"
+            ><el-radio-button value="totalTokens">Token 用量</el-radio-button>
+            <!--
+              ★ 金额这个选项**只在服务端给了 `cost` 字段时**才出现（没有 `cost:read`
+                时连按钮都不该有）；多币种 / 一条价都没配时按钮在、但**禁用并给出原因**。
+            -->
+            <el-radio-button
+              v-if="dashboard.costSeries"
+              value="cost"
+              :disabled="!!dashboard.costSeries.disabledReason"
+              :title="
+                dashboard.costSeries.disabledReason ??
+                '按每笔事件发生时刻的单价估算'
+              "
+              >{{ COST_LABEL }}</el-radio-button
+            ></el-radio-group
+          >
+          <!--
+            ★ 分层维度与指标是两个**独立**的开关：柱状图堆叠、折线图多条，
+              鼠标落在任意横坐标上都会把这一槽的每一层一起列出来。
+          -->
+          <el-radio-group
+            :model-value="dashboard.stackBy"
+            size="small"
+            @update:model-value="onStack"
+            ><el-radio-button value="none">合计</el-radio-button
+            ><el-radio-button value="user">按用户</el-radio-button
+            ><el-radio-button value="model">按模型</el-radio-button></el-radio-group
+          >
+          <router-link to="/analysis" class="text-link">查看分析 →</router-link>
+        </div></div></template
+      >
+    <p v-if="dashboard.costSeries?.disabledReason" class="cost-trend-note muted">
+      {{ dashboard.costSeries.disabledReason }}
+    </p>
+    <!--
+      ★ 服务端没给 `stack` 字段时（旧版接口）必须说出来：静默画一条合计线会让人
+        以为自己看到的就是「按用户展开」。
+    -->
+    <p v-if="dashboard.stackUnavailable" class="cost-trend-note muted">
+      服务端这次没有返回分层数据（接口版本较旧），当前显示的是合计。
+    </p>
     <TrendChart
       :labels="chartLabels"
       :values="chartValues"
@@ -148,5 +191,4 @@ const onStack = (value: string | number | boolean | undefined): void =>
       一名成员可属于多个分组，同一笔用量会同时计入其所属的每个分组，因此各分组之和可能大于总量；未分组的成员不计入任何分组行。
     </p>
   </el-card>
-
 </template>

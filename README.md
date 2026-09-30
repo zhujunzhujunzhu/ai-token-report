@@ -54,7 +54,33 @@ bun run report -- --endpoint http://<服务端>:8787/api/v1/token-usage --token 
 | `packages/server` | 后端：上报接收 + 本地直查 + 部门统计（含分组目录与分组维度查询）+ **数据库身份、人员与分组管理** + 静态托管 |
 | `packages/web-local` | **本地页面**：只看本机，数据来自 `/api/local/*` |
 | `packages/web-portal` | **部门看板 + 人员管理页 + 分组管理页**：看全员，数据来自 `/api/v1/stats/*`（含分组候选项 `/api/v1/stats/groups` 与人员候选项 `/api/v1/stats/members`）、`/api/v1/admin/members*` 与 `/api/v1/admin/groups*`（数据库会话鉴权） |
-| `packages/dsh-plugin` | **DSH 插件**：实时上报 |
+| `packages/dsh-plugin` | **DSH 插件**：实时上报 + 界面用量面板（安装含 **DSH Desktop 桌面端**，见 [`docs/桌面端安装交付清单.md`](./docs/桌面端安装交付清单.md)） |
+
+## DSH 插件安装
+
+```bash
+# 命令行版 DSH：一条命令，`add` 会自动登记到 profile 的 dsh.profile.bundles
+dsh plugin --profile web add dsh-plugin-token-report@latest
+```
+
+**DSH Desktop（桌面端）的图形入口装不了本插件** —— 侧边栏「插件」市场只接受
+[awesome-dsh-plugin](https://awesome-dsh-plugin.com) 精选列表内的来源，本插件不在其中。
+走命令行，把 home / pnpm 换成 Desktop 自己那一套即可：
+
+```powershell
+$env:DSH_HOME = "$env:APPDATA\dsh-desktop\harness"
+$env:PATH     = "$env:DSH_HOME\.desktop-bin;$env:PATH"   # ★ 用 Desktop 自己的 pnpm / node
+node "<安装目录>\resources\app.asar.unpacked\node_modules\@deepseek-ai\dsh\lib\bin.js" `
+  plugin --profile web add dsh-plugin-token-report@latest
+```
+
+逐条步骤、核对命令、日志取证与回滚见 [`docs/桌面端安装交付清单.md`](./docs/桌面端安装交付清单.md)，
+插件自身的配置与排障见 [`packages/dsh-plugin/README.md`](./packages/dsh-plugin/README.md)。
+
+> 🚨 三件事必须同时成立，否则症状是「面板不见了、而且一条也不上报」，**不是报错**：
+> ① 官方 OTel 后端已 `disabled: true`（同一时刻只能有一个 `sessionTelemetry`）；
+> ② 装的是**发布包 / 构建产物**，不是仓内源码包（它的 `main` 指向 `src/index.ts`，Node 加载即失败）；
+> ③ 宿主的 `@deepseek-ai/dsh*` 落在插件的 peer 兼容窗口 `>=0.1.7-rc.2 <0.3.0-0` 内。
 
 ## 三条铁律
 
@@ -88,6 +114,11 @@ DSH Desktop 与命令行版 DSH **缺省就共用这份署名**（数据目录�
 及至少 32 个字符的 `ATR_CAPTCHA_HMAC_KEY`；MySQL 再配置 `ATR_MYSQL_URL`。
 管理员配置只初始化一次，后续以数据库为准。MySQL 正式部署建议使用已验证的
 Node/mysql2 入口，完整命令见 [数据库部署与迁移](./docs/数据库部署与迁移.md)。
+
+**本机自用不必手配这些**：`bun run server` 在「本机 SQLite 上报库 + 监听 `127.0.0.1`」
+时，会把缺失的验证码密钥与**随机生成**的管理员口令写进数据目录下的 `server.env`
+（缺省 `~/.ai-token-report/server.env`），下次启动直接复用 —— 配了 `--mysql` /
+`ATR_MYSQL_URL`（共享库）或 `--host` 非回环地址时**不**自动生成，仍按上面显式配置。
 
 管理员登录后创建人员，分配**分组（一个人可同属多个分组）**和角色，再按需要开通登录或签发上报 Token。
 默认 Token 只有署名与上报权限，明文只显示一次。轮换、撤销和停用立即生效。

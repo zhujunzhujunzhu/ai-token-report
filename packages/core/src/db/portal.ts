@@ -71,8 +71,8 @@ import {
   recordProjection,
   seriesFromRows,
   sessionCountQuery,
-  stackRowsQuery,
   sortGroupRows,
+  stackRowsQuery,
   timeBoundsQuery,
   timeBucketRowsQuery,
   toNumber,
@@ -85,8 +85,8 @@ import {
   type QueryFilter,
   type QueryGroupRow,
   type RawCostRow,
-  type StackRow,
   type RawGroupRow,
+  type StackRow,
   type TimeBucketRow,
 } from './query.js'
 import { providerNormalizer, type ProviderAliasMap, type ProviderNormalizer } from './provider-alias.js'
@@ -100,6 +100,7 @@ import {
   costMicroOf,
   resolvePrice,
   summarizeCosts,
+  UNATTRIBUTED_USER,
   type BillableUsage,
   type CostPart,
   type CostSummary,
@@ -179,6 +180,7 @@ const numOrNull = toNumberOrNull
 export interface PortalSeriesPoint extends SeriesPointCounts {
   cost?: CostTotals
 }
+
 /**
  * 堆叠趋势里的一层（一个用户 / 一个模型）—— {@link PortalStatsSession.stackSeries} 的产出。
  *
@@ -208,7 +210,6 @@ export interface PortalStackSeries {
    */
   costByBucket?: Map<string, CostTotals>
 }
-
 
 /** 明细行的金额：`currency` 为 `null` = **未计价**（不是 0 元）。 */
 export interface PortalRecordCost {
@@ -731,6 +732,7 @@ export class PortalStatsSession {
     // 而不是让 `cost` 时有时无：后者会让页面在「有金额」和「没金额」之间闪。
     return filled.map((point) => ({ ...point, cost: this.summarize(parts.get(point.bucket) ?? []) }))
   }
+
   /**
    * 堆叠趋势：按**人 / 模型**把每个时间桶拆开。
    *
@@ -910,7 +912,6 @@ export class PortalStatsSession {
     return map
   }
 
-
   /** 明细分页（最新在前）。返回总行数供页面算分页。 */
   async records(limit: number, offset: number): Promise<{ total: number; rows: PortalRecordRow[] }> {
     const { sql, params } = buildWhere(this.#filter, this.#normalize)
@@ -1038,4 +1039,3 @@ export class IdentityViewRequiredError extends Error {
   readonly code = 'identity_view_required'
   constructor() { super('当前归属无法用旧版人员视图准确表达，请使用 identity_view=member') }
 }
-

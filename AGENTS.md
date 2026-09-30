@@ -18,7 +18,7 @@ DSH token 用量统计平台。四种形态：**CLI / 本地页面 / 部门看�
 
 ```bash
 bun install
-bun test                        # 全仓 1367 pass / 14 skip / 0 fail（设了 ATR_V4_TEST_MYSQL_URL 时 MySQL 用例实跑，否则跳过）
+bun test                        # 全仓 1446 pass / 13 skip / 0 fail（设了 ATR_V4_TEST_MYSQL_URL 时 MySQL 用例实跑，否则跳过）
 bun run typecheck               # 7 个包全部 exit 0
 bun run build                   # web-local + web-portal 均构建成功
 bun run stats -- --period today # 终端统计（读本地库，热态 ~50ms）
@@ -27,7 +27,7 @@ bun run stats -- --discover               # 本机有哪些 DSH home（逐根会
 bun run stats -- --dsh-home ~/.dsh --dsh-home "$env:APPDATA/dsh-desktop/harness"   # 固定多根
 bun run stats -- --dsh-homes "$HOME/.dsh;$HOME/AppData/Roaming/dsh-desktop/harness"  # 一次给多个
 bun run web                     # 本地页面（需先 bun run build:local）
-bun run --filter '@ai-token-report/server' start   # 部门服务端 → 8787/api/health
+bun run --filter '@ai-token-report/server' start   # 部门服务端 → 8787/api/health（本机 SQLite + 回环时自动备好 <数据目录>/server.env）
 bun run dev:local               # web-local 开发服务器
 bun run build:portal            # 部门看板构建产物（server 自动托管 packages/web-portal/dist）
 bun run dev:portal              # web-portal 开发服务器（5198，/api 代理到 8787）
@@ -37,9 +37,9 @@ bun run packages/server/test/e2e-ingest.ts           # 服务端侧 POST /api/v1
 bun run packages/cli/verify/verify-report-ingest.ts  # ④整条链 CLI report → 服务端 → 库（28 项）
 
 # 人员管理与权限端到端（真 HTTP；改 admin 路由 / 数据库身份 / 角色后全跑）
-bun run packages/server/test/e2e-admin.ts            # 签发即刻生效 + 401/403 + 护栏 + appKey 列表 + 分组多对多 + 供应商归一化 + 模型单价（182 项；`--mysql` 同款）
+bun run packages/server/test/e2e-admin.ts            # 签发即刻生效 + 401/403 + 护栏 + appKey 列表 + 分组多对多 + 供应商归一化 + 模型单价 + 数据范围（185 项；`--mysql` 同款）
 
-# 分发面契约（97 项，含 S12.3 的静态托管断言与分组目录 / 供应商归一化 / 模型单价路由族 / 看板金额门禁 / 旧路径 404；改 app.ts / 路由 / 方法 / 状态码后必跑）
+# 分发面契约（99 项，含 S12.3 的静态托管断言与分组目录 / 供应商归一化 / 模型单价路由族 / 看板金额门禁 / **看板数据范围** / 旧路径 404；改 app.ts / 路由 / 方法 / 状态码后必跑）
 bun test packages/server/test/http-contract.test.ts
 
 # 双轨对照验证（真实日志上跑 SQL vs 直扫，断言两者逐位一致）
@@ -98,10 +98,10 @@ bun run deploy:server:apply      # 真部署：备份 → 切换 → 重启 → 
 
 # DSH 插件：构建 + 五层验证（从内到外逐层接近真实，改插件后全跑）
 bun run --filter '@ai-token-report/dsh-plugin' build
-bun run packages/dsh-plugin/verify/verify-plugin.ts         # 真 HTTP 往返（55 项）
+bun run packages/dsh-plugin/verify/verify-plugin.ts         # 真 HTTP 往返 + 面板改会话日志根的就地生效（70 项）
 bun run packages/dsh-plugin/verify/verify-cordis-load.ts    # 真 cordis 装载（10 项）
 bun run packages/dsh-plugin/verify/verify-resolution.ts     # Node 语义解析（9 项）
-bun run packages/dsh-plugin/verify/verify-client-bundle.ts  # ★ 浏览器半产物（36 项，含金额只认字符串 / 不入账的未计价）
+bun run packages/dsh-plugin/verify/verify-client-bundle.ts  # ★ 浏览器半产物（40 项，含金额只认字符串 / 不入账的未计价 / 会话日志根那一栏真的在产物里）
 bun run packages/dsh-plugin/verify/diagnose-boot.ts web     # 排障：哪个包 import 就炸
 
 # 部门看板（S7 + S8）：SSR 真执行组件树，断言门禁页 / 看板区块 / 统计页不出现金额 / 计价页的单价口径 / 金额三态（无字段 / 未计价 / 有金额）
@@ -154,6 +154,7 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
 | 目录分工 / 数据通路 | `ARCHITECTURE.md` |
 | 插件方案（历史） | `docs/插件方案.md` |
 | **DSH 插件**（配置 / 安装 / 排障 / 为什么不能碰私有字段） | `packages/dsh-plugin/README.md` |
+| **DSH Desktop 桌面端安装**（命令行步骤 / peer 版本窗口 / 验收 / 回滚） | `docs/桌面端安装交付清单.md` + `packages/dsh-plugin/README.md` |
 | **server 层分层 / 要不要引入第三方库** | `docs/server架构重构方案.md` + `.agents/skills/repo-conventions/SKILL.md` |
 | **部门上报库接 MySQL（方言坑 / 部署 / 备份）** | `docs/mysql上报库.md` |
 | **Portal v7 部署 / v4→v5→v6→v7 显式迁移 / 身份导入** | `docs/数据库部署与迁移.md` + `docs/数据库重设计.md` |
@@ -236,6 +237,13 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
 - **🚨 浏览器半不得重算任何口径**。载荷里的 `metrics` 由宿主用
   `shared/metrics.ts` 算好后透传；页面只做格式化与排版。
   在组件里写一遍除法 = 第二个口径实现，且它不会报错。
+- **🚨 插件的 `StatsContext` 三个路径必须是「活取值」，不能改回启动时的快照**。
+  面板的「会话日志根」（齿轮「配置」里的文本域，落 `plugin-connection.json` 的
+  `dshHomes`，覆盖部署配置；留空 = 清掉覆盖）保存后走 `runtime.refresh()`，
+  统计侧靠 getter 现读 `runtime.config()`，UI 的 30 秒 TTL 缓存另有「取数范围指纹」
+  （`ui-bridge.ts` 的 `scope`）兜住 —— 三处缺一，表现都是「改完没生效」而**不报错**。
+  另：面板刻意**没有** `dataDir`（那会连身份 / 库 / outbox 一起换掉，等于填完变成另一个人），
+  它只能在部署配置 / 环境变量里给；面板里也不许出现「算一遍再丢」的金额相关逻辑。
 - **插件的 `connection` 是可选依赖，绝不能写进 `inject`**。`inject` 的语义是
   「等它就绪」，而 headless profile 永远不提供它 —— 写进去等于**上报功能在
   headless 下直接不激活**。用 `ctx.get()` 试一次 + `ctx.inject()` 等它出现。
@@ -280,7 +288,7 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
   `credentials.ts` / `member-admin.ts` 和 `LegacyPortalAuth` 仅保留历史兼容测试；生产启动拒绝 `credentialsPath`，不双写文件。
 - **首次管理员初始化只允许空身份库执行一次**：`ATR_ADMIN_USERNAME` / `ATR_ADMIN_PASSWORD` 成对配置，
   `ATR_ADMIN_TOKEN` 可作为初始化输入；密码仅哈希、Token 仅摘要入库。已有初始化标记后重启不会从环境变量复活停用身份。
-  后台验证码需要所有实例共享至少 32 字符的 `ATR_CAPTCHA_HMAC_KEY`，密钥不入数据库。
+  后台验证码需要所有实例共享至少 32 字符的 `ATR_CAPTCHA_HMAC_KEY`，密钥不入数据库；**唯一例外是本机自用**：`bun run server` 在本机 SQLite + 回环监听时会把缺失的密钥与随机管理员初始化值写进 `<数据目录>/server.env`（`src/local/dev-env.ts`），配了 `--mysql` / `ATR_MYSQL_URL` 或 `--host` 非回环地址**一律不生成**（各实例各生成一把＝「验证码永远错」，且不报错）。
 - **看板的人员筛选是精确匹配、可多选**：新页面使用 `identity_view=member` 及稳定 ID；旧 `user` 视图有同名歧义时明确拒绝，不能静默合并。
   provider / model 才是子串匹配。页面上的**人员候选不带任何筛选参数**（自锁定）：
   从已筛选结果里取候选，选中一个人之后下拉会塌缩成一个选项，使用者再也加不回别人。
@@ -293,6 +301,20 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
   名册接口失败**不拖垮看板**（回落成用量候选），但 401 仍要让会话过期。
   只有「未署名 / 待确认历史」目录里表达不出来，仍由用量行补上。
   实现只此一处：`web-portal/src/types/portal.ts` 的 `memberFilterOptions()`。
+  ⚠️ 人员下拉**只对能看到全员的人出现**（`session.scopedToSelf` 为假）；
+  只看自己的身份**既没有这个下拉，也没有任何替代提示** —— 页面不替服务端解释数据范围，
+  更不在筛选栏里宣布使用者的身份（真正的收窄在 `applyDataScope()`，与页面画了什么无关）。
+- **看板的厂商筛选是「多选 + 可搜索 + 可新建」，每个值仍是子串匹配**：
+  候选 = `GET /api/v1/stats/providers`（`stats:read`；库里出现过的名字，**按查看者
+  归一化后的展示名**，与筛选匹配共用同一份映射）**∪ 使用者在本机浏览器里自建的名字**
+  （`allow-create`，落 `localStorage`；合并规则只在
+  `web-portal/src/types/portal.ts` 的 `providerFilterOptions()`，同名以目录为准）。
+  🚨 **自建项绝不写库**：供应商名是用量行上的事实，库里那份可编辑配置是归一化规则
+  （`provider_alias`）—— 往库里插一个没有用量、没有价格的「供应商」只会得到一个
+  永远查不出数据的幽灵选项，而且没有任何地方能删掉它。
+  线上是**一值一个同名参数**（`?provider=a&provider=b`，服务端也接受逗号分隔）；
+  候选目录**不带任何筛选**，否则选中一项后下拉会塌缩成一项（自锁定）。
+  目录失败**不拖垮看板**（回落成「自建的 + 现敲现用」），但 401 仍要让会话过期。
 - **🚨 金额一律在查询期现算，绝不存 `cost` 列**（v7 起有了单价来源：`model_price` 表 +
   `packages/shared/src/price.ts`，故旧的「不展示金额」决策**已作废**）：
   - **部门看板现在会显示金额**：`/api/v1/stats/*` 在 `cost:read` 下会下发 `cost` 字段；
@@ -301,9 +323,6 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
     **必须保留** —— 它渲染的统计页数据里**不带 `cost`**，验的正是「没有 `cost:read` 时一位金额都不显示」；
     `/pricing` 页刻意不进那个拼接串。
   - **单价粒度是 `(provider, model)` 精确匹配**，且匹配的是**上报原值**
-  ⚠️ 人员下拉**只对能看到全员的人出现**（`session.scopedToSelf` 为假）；
-  只看自己的身份**既没有这个下拉，也没有任何替代提示** —— 页面不替服务端解释数据范围，
-  更不在筛选栏里宣布使用者的身份（真正的收窄在 `applyDataScope()`，与页面画了什么无关）。
     （不是归一化后的展示名 —— 供应商归一化只是查询期口径）；同一供应商下不同模型各配各的价。
   - 金额是**整数微元 / 千 token**（1 微 = 1e-6 货币单位）：
     `cost = input×p_in + output×p_out + cacheRead×p_cr + cacheWrite×p_cw`，
@@ -656,6 +675,17 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
 - **🚨 看板只读上报库，`stats-route.ts` 不写一个字节**。它由
   `openPortalStats()`（内部走 `openPortalDb()`）打开，schema 版本不符时
   **抛错而不是重建**；这里**没有降级直扫这条退路** —— 上报库没有可重扫的真值。
+- **🚨 看板的数据范围只认内置 `admin` 角色**（`stats-route.ts` 的 `applyDataScope()`）：
+  只有它能看**全部门**，其余任何角色（含自定义角色）一律被**服务端**收窄成
+  「只看自己」——即非管理员即使手拼 `?member_id=<别人>` 也拿不到别人的数字。
+  判据刻意是**角色码**而不是权限码：`members:read` 是人员目录、`stats:read` 是能不能进看板、
+  `cost:read` 是金额，它们回答的都是「能做什么操作」；拿它们当数据范围会把
+  「能管名册」与「能看全员用量」绑成一件事，而那种绑定在页面上看不出来。
+  三条硬规矩：① 显式点名别人 / 要未署名 / 要旧姓名子集一律 `403`，**绝不静默替换成「我」**
+  （那会给出一个看起来正常的错答案）；② 数据库身份按稳定 `member_id` 收窄；
+  ③ 兼容凭证表身份没有稳定 ID 时也 `403`，**绝不按姓名兜底**（同名会把两个人并成一个）。
+  页面侧只有 `session.scopedToSelf` → 隐藏人员下拉并写明「只看本人」，
+  **那不是权限**：手拼查询串一样会被服务端挡住。
 - **未归属对外使用 `UNATTRIBUTED_USER`（`'unknown'`）**。portal 新视图（v4 起）区分稳定人员、
   legacy 待确认和真正未归属；旧历史标记为 `received_at_ms IS NULL`，legacy selector 只查这一子集。
   旧 `user` 视图保留原姓名键语义，有歧义时报错；禁止将待确认历史当成匿名或自动映射同名人员。
@@ -678,18 +708,7 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
   的维度集合，而日志里根本没有归属，塞进去只会多一个恒为 `unknown` 的选项。
 - **看板前端不得重算任何口径**（同浏览器半那条）。页面上的算术只有两处，
   且都只是排版、不参与数字展示：排行条的宽度比例，以及图表里「值 → 像素」
-- **🚨 看板的数据范围只认内置 `admin` 角色**（`stats-route.ts` 的 `applyDataScope()`）：
-  只有它能看**全部门**，其余任何角色（含自定义角色）一律被**服务端**收窄成
-  「只看自己」——即非管理员即使手拼 `?member_id=<别人>` 也拿不到别人的数字。
-  判据刻意是**角色码**而不是权限码：`members:read` 是人员目录、`stats:read` 是能不能进看板、
-  `cost:read` 是金额，它们回答的都是「能做什么操作」；拿它们当数据范围会把
-  「能管名册」与「能看全员用量」绑成一件事，而那种绑定在页面上看不出来。
-  三条硬规矩：① 显式点名别人 / 要未署名 / 要旧姓名子集一律 `403`，**绝不静默替换成「我」**
-  （那会给出一个看起来正常的错答案）；② 数据库身份按稳定 `member_id` 收窄；
-  ③ 兼容凭证表身份没有稳定 ID 时也 `403`，**绝不按姓名兜底**（同名会把两个人并成一个）。
-  页面侧只有 `session.scopedToSelf` → 隐藏人员下拉并写明「只看本人」，
-  **那不是权限**：手拼查询串一样会被服务端挡住。
-
+  的换算（由 Chart.js 完成）。
 - **趋势图用 Chart.js 4**（`web-portal/src/components/trendChartConfig.ts`），
   与 DSH 插件界面同一个库。两条容易踩的：canvas **不认 `var(--c-chart-*)`**，
   颜色必须先经 `readTrendChartTheme()` 解析；悬浮提示靠
@@ -739,7 +758,6 @@ bun test && bun run typecheck
 两者都必须过（`bun test` 全绿 + 7 个包全部 exit 0）。
 typecheck 是契约漂移的主要拦截点 ——
 前后端字段对不上时它会直接编译失败，而不是等运行时看到空图表。
-
 
 
 

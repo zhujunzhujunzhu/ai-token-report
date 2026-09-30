@@ -765,6 +765,7 @@ export function timeBucketRowsQuery(
   ].join(', ')
   return { sql: `SELECT ${cols}\n       FROM ${EVENT_TABLE}${sql}`, params }
 }
+
 /**
  * 堆叠趋势（按人 / 按模型展开）用的**原始行**。
  *
@@ -828,7 +829,6 @@ export function stackRowsQuery(
     params,
   }
 }
-
 
 /**
  * `project` 维度的第一段：按 cwd 聚合。
@@ -1525,4 +1525,3 @@ function countRows(db: Database): number {
     db.query<{ c: number }, []>(`SELECT COUNT(*) AS c FROM ${EVENT_TABLE}`).get()?.c ?? 0
   )
 }
-

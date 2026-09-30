@@ -11,6 +11,7 @@
  * | `/api/v1/stats/records?limit&offset` | 明细（分页） |
  * | `/api/v1/stats/groups` | ★ **分组候选项**（筛选下拉用） |
  * | `/api/v1/stats/members` | ★ **人员候选项**（筛选下拉用；带当前分组 ID） |
+ * | `/api/v1/stats/providers` | ★ **供应商候选项**（筛选下拉用；已归一化的展示名） |
  * | `/api/v1/stats/diagnostics` | 覆盖率 / 未归属 / 数据边界 |
  *
  * 响应结构全部来自 `shared/src/protocol.ts`，前端与之共用 —— 字段对不上时
@@ -28,7 +29,6 @@
  *
  * ⚠️ **只读**：本路由一个字节都不写库。它只回答「库里现在有什么」。
  *
- * ## 口径
  * ## 🚨 数据范围：非管理员只看得到自己
  *
  * 看板里装的是**每个人的用量**，而能登录的人不都是管理员。所以除了「认人」，
@@ -48,6 +48,7 @@
  *   而不是安全边界 —— 手拼 `?member_id=<别人>` 同样只能拿到自己的数据（或者 403）。
  *   「前端过滤 = 权限」是本项目明令禁止的那类错误。
  *
+ * ## 口径
  *
  * 本文件**不出现任何公式**：`cacheHitRate` / `avgTokensPerCall` /
  * `unattributedRate` 全部调用 `shared/metrics.ts`。四项 token 由
@@ -55,13 +56,14 @@
  */
 
 import {
+  EVENT_TABLE,
   loadProviderAliases,
   openPortalStats,
   openPortalStore,
-  type CostTotals,
   resolvePortalTarget,
-  type PortalStackSeries,
+  type CostTotals,
   type PortalRecordRow,
+  type PortalStackSeries,
   type PortalStatsSession,
   type PortalStore,
   type PortalTarget,
@@ -72,8 +74,8 @@ import {
   cacheHitRate,
   computeTotal,
   summarizeCosts,
-  SERIES_STACK_MERGED_KEY,
   unattributedRate,
+  SERIES_STACK_MERGED_KEY,
   UNATTRIBUTED_USER,
   type BreakdownResponse,
   type Bucket,
@@ -82,16 +84,16 @@ import {
   type OverviewResponse,
   type RecordRow,
   type RecordsResponse,
+  type SeriesResponse,
   type SeriesStackBy,
   type SeriesStackItem,
-  type SeriesResponse,
   type StatsCostTotals,
   type StatsGroupOption,
   type StatsGroupsResponse,
   type StatsMemberOption,
   type StatsMembersResponse,
-  type StatsProvidersResponse,
   type StatsPricingResponse,
+  type StatsProvidersResponse,
 } from '@ai-token-report/shared'
 
 import type { CredentialStore } from './credentials.js'
@@ -112,7 +114,6 @@ import { VIEWER_AUTH_MESSAGES } from './verify-route.js'
  */
 function hasCostRead(viewer: unknown): boolean {
   // ⚠️ 形参是 `unknown` 而不是 `{ permissions?: string[] }`：两种身份的形状
-  type StatsProvidersResponse,
   //   （数据库 `Principal` 与旧凭证的 `UserRole`）**没有公共字段**，
   //   写成结构化类型会让整个 `viewer` 联合类型不可赋值 —— 于是这里的判空
   //   会变成调用点的类型体操，而不是一行明确的运行时判断。
@@ -121,26 +122,8 @@ function hasCostRead(viewer: unknown): boolean {
 }
 
 /**
- * 某一行没查到金额时的兜底：一份**零用量**的金额。
+ * 内置管理员角色码。
  *
- * 正常情况不会走到（分组键与金额键由同一份实现产出），留着是为了让
- * 「有这一行就一定有 `cost` 字段」成立 —— 字段时有时无会让页面在
- * 「有金额」和「没金额」之间闪，而截图时它恰好是哪种完全看运气。
- */
-function emptyCost(session: PortalStatsSession): StatsCostTotals {
-  return { ...summarizeCosts([]), pricing: session.pricingProvenance }
-}
-
-/**
- * 可用的分组维度（协议里的 `GroupBy`）。
- *
- * ★ 是**列表而不是 switch 的兜底**：新增维度时忘记改这里会得到 400，
- *   而不是一个静默返回全部数据的接口。
- */
-const GROUP_BYS: readonly GroupBy[] = [
-  'provider',
-  'model',
-  'provider-model',
  * ★ 数据范围只看它，不看权限码（理由见模块注释里的那张表）。
  * ⚠️ 它是 `roles.code` 的稳定标识，且内置角色**不能改名**
  *   （`assertEditableRole()` 挡住），所以这里比对字面量是安全的。
@@ -219,6 +202,27 @@ function applyDataScope(
   }
 }
 
+/**
+ * 某一行没查到金额时的兜底：一份**零用量**的金额。
+ *
+ * 正常情况不会走到（分组键与金额键由同一份实现产出），留着是为了让
+ * 「有这一行就一定有 `cost` 字段」成立 —— 字段时有时无会让页面在
+ * 「有金额」和「没金额」之间闪，而截图时它恰好是哪种完全看运气。
+ */
+function emptyCost(session: PortalStatsSession): StatsCostTotals {
+  return { ...summarizeCosts([]), pricing: session.pricingProvenance }
+}
+
+/**
+ * 可用的分组维度（协议里的 `GroupBy`）。
+ *
+ * ★ 是**列表而不是 switch 的兜底**：新增维度时忘记改这里会得到 400，
+ *   而不是一个静默返回全部数据的接口。
+ */
+const GROUP_BYS: readonly GroupBy[] = [
+  'provider',
+  'model',
+  'provider-model',
   'user',
   // ★ `group` 是**多对多维度**：一条事件计入它的人员所属的每个分组，
   //   所以各分组之和 > 总量是定义（见 core/db/portal.ts 的注释）。
@@ -231,6 +235,16 @@ function applyDataScope(
 /** 明细分页上限。给足但不放任：单页 2000 行已远超任何人会看的量。 */
 const MAX_RECORDS_LIMIT = 2000
 const DEFAULT_RECORDS_LIMIT = 100
+
+/**
+ * 堆叠趋势最多画这么多层，其余的合并成「其余 N 个」。
+ *
+ * ★ 取舍的理由：几十个人各占一条柱子之后，每一层都细到看不见，
+ *   而**合计仍然要等于总量** —— 所以尾部不是被丢掉，而是折进一项
+ *   `merged: true` 的「其余」。页面据此说明「其余 12 个」，
+ *   使用者既看得清主要的几层，也不会以为少了数据。
+ */
+const SERIES_STACK_TOP = 8
 
 /** 路由处理结果：状态码 + 响应体。`index.ts` 的 `fromRoute()` 直接吃这个形状。 */
 export interface StatsRouteResult {
@@ -305,6 +319,13 @@ export class StatsRoute {
     //   鉴权已经在上面做完了，401/503 的语义与其它子路径完全一致。
     if (sub === 'groups') return await this.#groups()
     if (sub === 'members') return await this.#members()
+    // ★ 供应商候选同样是**目录**，与时间窗 / 用量筛选全都无关，所以也在
+    //   开统计会话之前（同分组 / 人员候选）。
+    //   ⚠️ 归一化要**按查看者**解析（全局规则 + 他个人的规则），所以这里
+    //   把身份里的稳定人员 ID 传进去 —— 与查询期的口径必须是同一份。
+    if (sub === 'providers') {
+      return await this.#providers('memberId' in auth.viewer ? auth.viewer.memberId : undefined)
+    }
     // ★ 单价只读快照：门是 `cost:read`（不是管理接口那道 `pricing:manage`）。
     //   能看金额的人必须能看到这份金额是按哪份单价算出来的 —— 看不到单价，
     //   他就只能相信这一屏上的数字，而「自建计价 ≠ 财务账单」正是要提醒的。
@@ -320,7 +341,13 @@ export class StatsRoute {
     const window = parseWindow(params)
     if ('error' in window) return { status: 400, body: { ok: false, reason: window.error } }
 
-    const filter = window.filter
+    // ── 2.5 数据范围（🚨 非管理员一律只看本人，见模块注释）──────────
+    // ★ 放在参数解析**之后**：非法参数照旧回 400，不要让它变成 403。
+    //   收窄的结果只喂给取数层，`window`（时间窗标签）保持不变。
+    const scoped = applyDataScope(auth.viewer, params, window)
+    if ('result' in scoped) return scoped.result
+
+    const filter = scoped.filter
 
     // ★ `openPortalStats()` 内部就是 `await openPortalStore(target)`：
     //   它决定了连 SQLite 还是 MySQL，本文件**看不到**这个差别。
@@ -373,7 +400,12 @@ export class StatsRoute {
     }
   }
 
-  /** `GET /api/v1/stats/series?bucket=day|hour` */
+  /**
+   * `GET /api/v1/stats/series?bucket=day|hour[&stack=user|model]`
+   *
+   * `stack` 是可选的：带上它才会多算一趟「每个桶 × 每个分层」的交叉值
+   * （见 `#stack()`）。不带就是原来那条单序列 —— 老客户端一个字节都不用改。
+   */
   async #series(session: PortalStatsSession, params: URLSearchParams): Promise<StatsRouteResult> {
     const raw = params.get('bucket') ?? 'day'
     if (raw !== 'day' && raw !== 'hour') {
@@ -382,6 +414,7 @@ export class StatsRoute {
       return { status: 400, body: { ok: false, reason: `bucket 只支持 day 或 hour，收到 "${raw}"` } }
     }
     const bucket: Bucket = raw
+
     // ⚠️ 与 `by` / `bucket` 同一套规矩：未知取值必须 400，不许静默退回单序列 ——
     //   那样「按用户展开」的页面会画出一条合计线，而图上没有任何迹象说明它没展开。
     const rawStack = params.get('stack')
@@ -389,7 +422,6 @@ export class StatsRoute {
       return { status: 400, body: { ok: false, reason: `stack 只支持 user 或 model，收到 "${rawStack}"` } }
     }
     const stackBy: SeriesStackBy | null = rawStack
-
 
     const points = (await session.series(bucket, true)).map((p) => ({
       bucket: p.bucket,
@@ -439,13 +471,7 @@ export class StatsRoute {
         attribution_status: row.attributionStatus,
       } : {}),
       totalTokens: row.counts.total,
-    // ── 2.5 数据范围（🚨 非管理员一律只看本人，见模块注释）──────────
-    // ★ 放在参数解析**之后**：非法参数照旧回 400，不要让它变成 403。
-    //   收窄的结果只喂给取数层，`window`（时间窗标签）保持不变。
-    const scoped = applyDataScope(auth.viewer, params, window)
-    if ('result' in scoped) return scoped.result
-
-    const filter = scoped.filter
+      inputTokens: row.counts.input,
       outputTokens: row.counts.output,
       cacheReadTokens: row.counts.cacheRead,
       cacheWriteTokens: row.counts.cacheWrite,
@@ -558,6 +584,11 @@ export class StatsRoute {
    * ⚠️ 只回筛选要用的三样（稳定 ID / 显示名 / 当前分组 ID）。角色、权限、
    *   登录账号一律不下发：它们属于管理面，`/api/v1/admin/members` 才是那份答案。
    * ⚠️ 已停用人员照样列出（同分组候选）：停用只影响「以后还能不能选他」。
+   *
+   * ★ 它**不跟着数据范围收窄**（`applyDataScope()` 只管用量）：这是一份**目录**，
+   *   里面一个用量数字都没有，而分组下拉的联动（见 `memberFilterOptions()`）
+   *   要靠它才能工作。页面在「只看自己」时不渲染人员下拉，也就不需要它 ——
+   *   但那属于页面的呈现决定，不是这条接口的授权边界。
    */
   async #members(): Promise<StatsRouteResult> {
     let store: PortalStore
@@ -594,6 +625,60 @@ export class StatsRoute {
           group_ids: groupIds.get(String(row.member_id)) ?? [],
         })),
       }
+      return { status: 200, body }
+    } catch (err) {
+      if (this.#identityStore) return { status: 503, body: { ok: false, reason: '统计数据库暂时不可用，请稍后重试' } }
+      return { status: 500, body: { ok: false, reason: `查询失败: ${msg(err)}` } }
+    } finally {
+      await store.close()
+    }
+  }
+
+  /**
+   * `GET /api/v1/stats/providers` —— 看板的供应商候选项。
+   *
+   * ★ 权限是 `stats:read`（与其它看板接口同一道门），**不是** `providers:read`：
+   *   筛选下拉只需要知道「库里出现过哪些供应商名」，让一个下拉顺带具备
+   *   供应商归一化的读权限，等于把配置面变成看板的副作用（同分组 / 人员候选）。
+   *
+   * ★ 名字按**查看者**的归一化规则（全局 + 他个人的规则逐条覆盖）映射成
+   *   **展示名**，与查询期的筛选口径是同一份映射 —— 否则使用者会「按页面上
+   *   看到的名字筛，却一行都筛不出来」。多条规则指向同一个名字时去重在 JS 侧做，
+   *   因为那是**规则**的结果，不是库里的列。
+   *
+   * ⚠️ 刻意**不带时间窗、不带任何筛选**：候选必须始终是完整集合，
+   *   否则「上个月用过的供应商」会从下拉里消失 —— 那看起来像数据丢了，
+   *   而不像「这段时间没人用」。
+   * ⚠️ 只回名字、不回任何用量数字，所以**不按数据范围收窄**（同分组 / 人员候选）。
+   *   供应商名不属于任何一个人，`usage_event.provider` 上也没有人。
+   *
+   * 🚨 只读，且不出现任何公式 / 金额：本接口回答的是「有哪些名字」。
+   */
+  async #providers(viewerId: string | null | undefined): Promise<StatsRouteResult> {
+    let store: PortalStore
+    try {
+      store = await openPortalStore(this.#target)
+    } catch (err) {
+      if (this.#identityStore) return { status: 503, body: { ok: false, reason: '统计数据库暂时不可用，请稍后重试' } }
+      return { status: 500, body: { ok: false, reason: `上报库不可用: ${msg(err)}` } }
+    }
+
+    try {
+      // ★ 归一化必须走与查询同一条路（`loadProviderAliases`）：页面上的
+      //   下拉项与筛选匹配的名字只能是同一个，否则筛选会静默筛空。
+      const aliases = await loadProviderAliases(store, viewerId)
+      // `DISTINCT` 交给 SQL（两个后端写法一致），去重后的映射在 JS 侧做 ——
+      // 多条规则可能把不同的原值折叠成同一个展示名。
+      const rows = await store.all<{ provider: string }>(
+        `SELECT DISTINCT provider FROM ${EVENT_TABLE} ORDER BY provider`,
+      )
+      const names = new Set<string>()
+      for (const row of rows) {
+        const raw = String(row.provider ?? '')
+        if (!raw) continue
+        names.add(aliases.get(raw) ?? raw)
+      }
+      const body: StatsProvidersResponse = { providers: [...names].sort() }
       return { status: 200, body }
     } catch (err) {
       if (this.#identityStore) return { status: 503, body: { ok: false, reason: '统计数据库暂时不可用，请稍后重试' } }
@@ -650,6 +735,7 @@ export class StatsRoute {
     }
   }
 }
+
 /**
  * 堆叠趋势的载荷：把「每个桶 × 每个分层」的交叉值对齐到 `points` 的下标。
  *
@@ -688,10 +774,6 @@ async function buildStack(
   const currencies = new Set<string>()
   for (const row of stacks) {
     for (const totals of row.costByBucket?.values() ?? []) {
-   * ★ 它**不跟着数据范围收窄**（`applyDataScope()` 只管用量）：这是一份**目录**，
-   *   里面一个用量数字都没有，而分组下拉的联动（见 `memberFilterOptions()`）
-   *   要靠它才能工作。页面在「只看自己」时不渲染人员下拉，也就不需要它 ——
-   *   但那属于页面的呈现决定，不是这条接口的授权边界。
       for (const entry of totals.costs) currencies.add(entry.currency)
     }
   }
@@ -756,7 +838,6 @@ async function buildStack(
   return { by, items, mergedCount: rest.length }
 }
 
-
 /** 已实现的子路径。写成常量而不是散落的 if，便于一处看清「有哪些接口」。 */
 const KNOWN_SUBS: readonly string[] = [
   'overview',
@@ -764,10 +845,10 @@ const KNOWN_SUBS: readonly string[] = [
   'breakdown',
   'records',
   'groups',
+  'members',
   // ★ 供应商候选项（筛选下拉用）。与分组 / 人员候选同类：它是一份**目录**，
   //   不带时间窗、不带筛选，也不含任何用量数字。
   'providers',
-  'members',
   'diagnostics',
   // ★ 单价只读快照（`cost:read`）。与管理的 `/api/v1/admin/pricing` 是两件事：
   //   那条是**配置**（读也要求 `pricing:manage`），这条是**看数据时的解释材料** ——
@@ -928,7 +1009,13 @@ function parseWindow(params: URLSearchParams): ParsedWindow | { error: string } 
   }
 
   const users = splitList(params.get('user'))
-  const providers = splitList(params.get('provider'))
+  // ★ 供应商筛选：多选（OR）。同时接受重复的同名参数
+  //   （`?provider=a&provider=b`）与逗号分隔（`?provider=a,b`）——
+  //   两种写法在真实前端里都会出现，而「只认其中一种」的表现是
+  //   「筛了一个供应商却像没筛」。与 `group_id` 同款。
+  //   ⚠️ 匹配仍是**子串**（`core/db/query.ts` 的 LIKE）：这是 CLI `--provider`
+  //   的既有语义，改成精确匹配会让「页面筛 dashscope 得到 0 条、命令行却有一堆」。
+  const providers = [...new Set(splitList(params.getAll('provider').join(',')))]
   const models = splitList(params.get('model'))
   // ★ 分组筛选：`group_id` 是多选（逗号分隔），与人员一样是**精确匹配**。
   //   同时接受重复的同名参数（`?group_id=a&group_id=b`）—— 两种写法在
@@ -1016,199 +1103,3 @@ function intParam(params: URLSearchParams, name: string): number | undefined | '
 function msg(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

@@ -29,6 +29,14 @@
  *    把它烧进查询结果等于给历史数字埋雷。
  * 3. **未定价 ≠ 0 元**：没有价的那部分用量是「未计价」，不是「没花钱」。
  *    把它显示成 0，会让「漏配了价」看起来像「省下了钱」。
+ *
+ * ## 默认币种是人民币
+ *
+ * 筛选下拉与新增 / 编辑弹框都默认 **CNY**（`utils/unitPrice.ts` 的
+ * `DEFAULT_CURRENCY`）—— 本部门按元结算，内置种子价也是人民币官方价。
+ * ⚠️ 默认只在**表里确实有 CNY 的价**时才套到筛选上，且**只在首次取数后套一次**：
+ *    否则要么把一张全是别的币种的目录筛空（看起来像「价都没了」），要么把使用者
+ *    手动切回的「全部币种」反复改掉。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { Delete, Edit, Plus, Refresh, Search, MagicStick } from '@element-plus/icons-vue'
@@ -43,7 +51,8 @@ import * as api from '../api/admin.js'
 import { useSessionStore } from '../stores/session.js'
 import { formatFullDateTime } from '../utils/format.js'
 import {
-  PRICE_STATUS_TEXT, groupPricesByProvider, microToRateText, priceSpanText, priceStatusOf, rateTextToMicro,
+  DEFAULT_CURRENCY, PRICE_STATUS_TEXT, defaultCurrencyForFilter, defaultCurrencyForNewPrice,
+  groupPricesByProvider, microToRateText, priceSpanText, priceStatusOf, rateTextToMicro,
 } from '../utils/unitPrice.js'
 
 const session = useSessionStore()
@@ -52,7 +61,15 @@ const loading = ref(false)
 const busy = ref(false)
 const error = ref<string | null>(null)
 const search = ref('')
+/**
+ * 币种筛选：**默认 CNY**（见 `utils/unitPrice.ts` 的 `DEFAULT_CURRENCY`）。
+ *
+ * ⚠️ 默认值在**首次成功取数之后**才套一次（`currencyFilterInitialized`）：
+ *   一开始就写死 `'CNY'`，在「一条 CNY 的价都没有」的库上会让表格空掉；
+ *   而每次 `load()` 都套一遍，会把使用者手动切回的「全部币种」反复改掉。
+ */
 const currencyFilter = ref('')
+let currencyFilterInitialized = false
 const onlyEffective = ref(false)
 const showForm = ref(false)
 const selected = ref<PortalModelPrice | null>(null)
@@ -63,7 +80,7 @@ const nowMs = ref(Date.now())
 const canManage = computed(() => session.can('pricing:manage'))
 
 const draft = reactive({
-  provider: '', model: '', currency: 'CNY',
+  provider: '', model: '', currency: DEFAULT_CURRENCY,
   input: '', output: '', cacheRead: '', cacheWrite: '',
   from: '', to: '', note: '',
 })
@@ -89,6 +106,14 @@ const groups = computed(() => groupPricesByProvider(prices.value, {
 }))
 
 const currenciesInUse = computed(() => [...new Set(prices.value.map((row) => row.currency))].sort())
+/**
+ * 筛完之后真正列出来的行数。
+ *
+ * ★ 必须与「共 N 条价」一起显示：币种筛选**默认就选着 CNY**，所以「表里有几条」
+ *   与「现在看到几条」从打开这一页起就可能不是同一个数 —— 只报总数会让人以为
+ *   自己看到的就是全部，而少掉的那些恰好是别的币种的价。
+ */
+const visibleCount = computed(() => groups.value.reduce((total, group) => total + group.rows.length, 0))
 /** `el-table` 的插槽把行给成宽类型，这里收窄回契约类型。 */
 const rowPrice = (row: unknown): PortalModelPrice => row as PortalModelPrice
 const spanText = (row: PortalModelPrice): string => priceSpanText(row, formatFullDateTime)
@@ -106,7 +131,15 @@ async function load(): Promise<void> {
   const result = await api.fetchModelPrices()
   if (result.status === 401) { session.expire('登录已失效，请重新登录'); loading.value = false; return }
   if (!result.ok) error.value = result.reason ?? '单价加载失败'
-  else prices.value = result.data.prices
+  else {
+    prices.value = result.data.prices
+    // 默认币种只套一次（见 `currencyFilterInitialized` 的注释），且只在**真取到数**之后。
+    if (!currencyFilterInitialized) {
+      currencyFilterInitialized = true
+      const preferred = defaultCurrencyForFilter(currenciesInUse.value)
+      if (preferred) currencyFilter.value = preferred
+    }
+  }
   loading.value = false
 }
 
@@ -114,7 +147,8 @@ function openForm(row: PortalModelPrice | null = null): void {
   selected.value = row
   draft.provider = row?.provider ?? ''
   draft.model = row?.model ?? ''
-  draft.currency = row?.currency ?? (currenciesInUse.value[0] ?? 'CNY')
+  // 编辑时用这条价自己的币种；新增时默认 CNY（见 `defaultCurrencyForNewPrice`）。
+  draft.currency = row?.currency ?? defaultCurrencyForNewPrice(currenciesInUse.value)
   draft.input = row ? microToRateText(row.input_micro_per_ktok) : ''
   draft.output = row ? microToRateText(row.output_micro_per_ktok) : ''
   draft.cacheRead = row ? microToRateText(row.cache_read_micro_per_ktok) : ''
@@ -140,6 +174,18 @@ function fillSame(): void {
   draft.output = value
   draft.cacheRead = value
   draft.cacheWrite = value
+}
+
+/**
+ * 清空全部筛选条件（含**默认就选着的币种**）。
+ *
+ * ⚠️ 清空后不再套回默认币种：这是使用者刚做的显式选择，重新选上等于把
+ *   「我要看全部」改回「只看 CNY」，而页面不会有任何提示。
+ */
+function clearFilters(): void {
+  search.value = ''
+  currencyFilter.value = ''
+  onlyEffective.value = false
 }
 
 async function save(): Promise<void> {
@@ -264,7 +310,9 @@ onMounted(() => { void load() })
           <el-option v-for="code in currenciesInUse" :key="code" :label="code" :value="code" />
         </el-select>
         <el-switch v-model="onlyEffective" active-text="只看当前生效" aria-label="只看当前生效" />
-        <span class="muted">共 {{ prices.length }} 条价 · {{ groups.length }} 个供应商</span>
+        <span class="muted">
+          共 {{ prices.length }} 条价 · {{ groups.length }} 个供应商<template v-if="visibleCount !== prices.length">（当前筛选出 {{ visibleCount }} 条）</template>
+        </span>
       </div>
       <el-skeleton v-if="loading && !prices.length" :rows="5" animated />
       <template v-else-if="groups.length">
@@ -303,6 +351,9 @@ onMounted(() => { void load() })
           </el-table>
         </section>
       </template>
+      <el-empty v-else-if="prices.length" description="当前筛选条件下没有单价：表里是有价的，只是被搜索、币种或「只看当前生效」滤掉了">
+        <el-button @click="clearFilters">清除筛选条件</el-button>
+      </el-empty>
       <el-empty v-else description="还没有任何单价：费用统计会把全部用量标成「未计价」，而不是 0 元">
         <el-button v-if="canManage" type="primary" :icon="Plus" :disabled="busy" @click="openForm()">新增第一条单价</el-button>
         <el-button v-if="canManage" :icon="MagicStick" :disabled="busy" @click="seed">用内置种子价初始化</el-button>
@@ -352,6 +403,7 @@ onMounted(() => { void load() })
             <el-select v-model="draft.currency" filterable allow-create default-first-option placeholder="选择或填写币种" aria-label="币种">
               <el-option v-for="code in CURRENCIES" :key="code" :label="code" :value="code" />
             </el-select>
+            <p class="muted">默认人民币（CNY），按别的币种结算的供应商请在这里改。币种只用来分组呈现，绝不换算、绝不相加。</p>
           </el-form-item>
           <el-form-item label="四类单价">
             <el-button :disabled="busy || !draft.input.trim()" @click="fillSame">四类同价（按输入价填满）</el-button>

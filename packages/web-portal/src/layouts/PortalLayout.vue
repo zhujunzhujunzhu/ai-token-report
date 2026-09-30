@@ -166,12 +166,12 @@ async function signOut(): Promise<void> {
               --><span class="identity-copy"
                 ><strong>{{ session.identity?.name }}</strong
                 ><small>{{
-                  session.isAdmin ? '管理员' : '普通成员'
+                  session.scopedToSelf ? '普通成员' : '管理员'
                 }}</small></span
               ><el-icon><ArrowDown /></el-icon>
             </button>
-                  session.scopedToSelf ? '普通成员' : '管理员'
-
+            <template #dropdown
+              ><el-dropdown-menu
                 ><el-dropdown-item command="logout" :icon="SwitchButton"
                   >退出登录</el-dropdown-item
                 ></el-dropdown-menu
@@ -187,4 +187,3 @@ async function signOut(): Promise<void> {
     </div>
   </div>
 </template>
-

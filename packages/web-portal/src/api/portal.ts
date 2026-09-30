@@ -21,6 +21,7 @@ import type {
   SeriesResponse,
   StatsGroupsResponse,
   StatsMembersResponse,
+  StatsProvidersResponse,
 } from '@ai-token-report/shared'
 
 import { request, type ApiResult } from './request.js'
@@ -47,7 +48,16 @@ export interface PortalFilter {
   from?: number
   /** 自定义区间终点（epoch 毫秒，含）。 */
   to?: number
-  provider?: string
+  /**
+   * 供应商（多选 = OR）。
+   *
+   * ⚠️ 服务端对每个值仍是**子串**匹配（与 CLI 的 `--provider` 同义）：
+   *   「选了什么就发什么」，页面不把选项翻译成精确匹配 —— 那会造出第二套口径。
+   * ⚠️ 线上是**重复的同名参数**（`?provider=a&provider=b`），与 `member_id` /
+   *   `group_id` 一致。值里出现逗号会被服务端当成两个名字（那是逗号分隔那种
+   *   写法的既有语义），所以页面不做任何拼接。
+   */
+  providers?: string[]
   model?: string
   /** 服务端返回的不透明归属键：人员 UUID / legacy:… / unknown。 */
   users?: string[]
@@ -69,8 +79,13 @@ function toQuery(filter: PortalFilter): string {
   if (filter.period) params.set('period', filter.period)
   if (filter.from !== undefined) params.set('from', String(filter.from))
   if (filter.to !== undefined) params.set('to', String(filter.to))
-  if (filter.provider) params.set('provider', filter.provider)
   if (filter.model) params.set('model', filter.model)
+  // 供应商是多选：同一参数重复出现，服务端按 OR 展开（协议里的 `providers?: string[]`）。
+  // ⚠️ 不做 `join(',')`：一个值里带逗号时两种写法的含义不同，
+  //   而页面没有理由替使用者决定那件事。
+  for (const provider of new Set(filter.providers ?? [])) {
+    if (provider) params.append('provider', provider)
+  }
   for (const key of new Set(filter.users ?? [])) {
     if (key === 'unknown') params.set('unattributed', 'true')
     else params.append(key.startsWith('legacy:') ? 'legacy_user' : 'member_id', key)
@@ -106,6 +121,20 @@ export function fetchMemberOptions(): Promise<ApiResult<StatsMembersResponse>> {
   return request<StatsMembersResponse>('/api/v1/stats/members')
 }
 
+/**
+ * 供应商候选项（`GET /api/v1/stats/providers`）。
+ *
+ * ★ 同样走**看板接口**（`stats:read`）而不是供应商归一化的管理接口
+ *   `/api/v1/admin/provider-aliases`（那是 `providers:read`）：筛选栏只需要
+ *   知道「库里出现过哪些供应商名」，能看数据的人不一定能读那份配置。
+ * ★ 名字已经是**归一化后**的展示名 —— 它就是筛选可以用的名字（同一份映射）。
+ * ⚠️ 与分组 / 人员候选同理，**不带任何筛选参数**：候选必须始终是完整集合，
+ *   否则选中一个供应商之后下拉会塌缩成一项（自锁定）。
+ */
+export function fetchProviderOptions(): Promise<ApiResult<StatsProvidersResponse>> {
+  return request<StatsProvidersResponse>('/api/v1/stats/providers')
+}
+
 /** 顶部指标卡片。 */
 export function fetchOverview(
   filter: PortalFilter,
@@ -122,8 +151,8 @@ export function fetchOverview(
  */
 export function fetchSeries(
   filter: PortalFilter,
-  stack?: 'user' | 'model',
   bucket: 'day' | 'hour',
+  stack?: 'user' | 'model',
 ): Promise<ApiResult<SeriesResponse>> {
   const params = new URLSearchParams(toQuery(filter))
   params.set('bucket', bucket)
@@ -160,4 +189,3 @@ export function fetchDiagnostics(
     `/api/v1/stats/diagnostics?${toQuery(filter)}`,
   )
 }
-

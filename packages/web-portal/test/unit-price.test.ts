@@ -9,7 +9,8 @@ import { describe, expect, test } from 'bun:test'
 import { MAX_MICRO_PER_KTOK, formatUnitPriceMicro } from '@ai-token-report/shared'
 import type { PortalModelPrice } from '@ai-token-report/shared'
 import {
-  PRICE_STATUS_TEXT, groupPricesByProvider, microToRateText, priceSpanText, priceStatusOf, rateTextToMicro,
+  DEFAULT_CURRENCY, PRICE_STATUS_TEXT, defaultCurrencyForFilter, defaultCurrencyForNewPrice,
+  groupPricesByProvider, microToRateText, priceSpanText, priceStatusOf, rateTextToMicro,
 } from '../src/utils/unitPrice.js'
 
 const price = (over: Partial<PortalModelPrice> = {}): PortalModelPrice => ({
@@ -73,6 +74,32 @@ describe('单价文本（元 / 百万 token）→ 整数微元/千', () => {
     // 用 `formatCostMicro` 会显示成 `¥0.0001` —— 一个差 500 倍、且看起来正常的数字。
     expect(formatUnitPriceMicro(50, 'CNY')).toBe('¥0.05 / 百万 token')
     expect(formatUnitPriceMicro(2_000, 'CNY')).toBe('¥2 / 百万 token')
+  })
+})
+
+describe('默认币种是人民币（CNY）', () => {
+  test('两处默认值同口径：有 CNY 就选 CNY', () => {
+    expect(DEFAULT_CURRENCY).toBe('CNY')
+    expect(defaultCurrencyForNewPrice(['CNY', 'USD'])).toBe('CNY')
+    expect(defaultCurrencyForFilter(['CNY', 'USD'])).toBe('CNY')
+    // 只有 CNY 时也照旧（现实里最多的一种）。
+    expect(defaultCurrencyForNewPrice(['CNY'])).toBe('CNY')
+    expect(defaultCurrencyForFilter(['CNY'])).toBe('CNY')
+  })
+
+  test('★ 表里一条 CNY 都没有时不硬套：新增跟随已有币种，筛选留在「全部币种」', () => {
+    // 新增时套 CNY 会让人不假思索地存进一条与其余价目不同币种的价；
+    // 筛选时套 CNY 会**把整张表筛空**，看起来像「价都没了」。
+    expect(defaultCurrencyForNewPrice(['EUR', 'USD'])).toBe('EUR')
+    expect(defaultCurrencyForFilter(['EUR', 'USD'])).toBe('')
+    // 一条价都没有（空表）时新增回到 CNY —— 那正是首次录入的场景。
+    expect(defaultCurrencyForNewPrice([])).toBe('CNY')
+    expect(defaultCurrencyForFilter([])).toBe('')
+  })
+
+  test('输入顺序不影响判定（币种集合来自接口，不保证有序）', () => {
+    expect(defaultCurrencyForNewPrice(['USD', 'CNY'])).toBe('CNY')
+    expect(defaultCurrencyForFilter(['USD', 'CNY'])).toBe('CNY')
   })
 })
 

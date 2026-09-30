@@ -16,6 +16,7 @@
  * - **`interaction: { mode: 'index', intersect: false }`**：整条时间槽都可命中，
  *   0 值和很矮的柱子同样能悬浮出数值。默认的 `intersect: true` 要求鼠标
  *   精确压在图形上，矮柱子几乎点不到。
+ *
  * ## ★ 分层（堆叠柱 / 多条折线）
  *
  * 传了 `series` 时每个分层是一条 dataset：
@@ -28,7 +29,6 @@
  * 两种图形都靠 `interaction.mode: 'index'` 让**同一横坐标上的每一层**一起进提示框，
  * 这就是「鼠标移上去看到每个用户 / 每个模型的用量」的全部实现。
  *
- *
  * ⚠️ canvas **不认 `var(--c-chart-bar)`**：把 CSS 变量名直接当颜色传进去会得到
  *   一块黑。所以颜色必须先经 `readTrendChartTheme()` 解析成具体色值。
  *
@@ -38,10 +38,10 @@
  */
 import type { ChartConfiguration } from 'chart.js'
 
+import { formatCompact, formatCount } from '@/utils/format'
 import type { TrendChartSeries } from '@/utils/trend'
 
 export type { TrendChartSeries }
-import { formatCompact, formatCount } from '@/utils/format'
 
 /** 从页面上解析出来的具体色值。 */
 export interface TrendChartTheme {
@@ -54,6 +54,7 @@ export interface TrendChartTheme {
   surface: string
   border: string
   title: string
+  fontFamily: string
   /**
    * 分层配色（按顺序取，超出就循环）。
    *
@@ -61,8 +62,8 @@ export interface TrendChartTheme {
    *   使用者在两个模式之间切换时会以为图没变。
    */
   series: string[]
-  fontFamily: string
 }
+
 /**
  * 分层配色的兜底表。
  *
@@ -80,7 +81,6 @@ const SERIES_FALLBACK = [
   '#5b7ba6',
   '#8cc152',
 ] as const
-
 
 /**
  * 读 CSS 变量并给出兜底色值。
@@ -104,10 +104,10 @@ export function readTrendChartTheme(el: HTMLElement): TrendChartTheme {
     border: read('--c-border', '#e8e8e8'),
     title: read('--c-text-primary', '#1a1a1a'),
     // 图表文字要跟随页面字体，否则提示框里的中文会掉进 Helvetica 的兜底字形
+    fontFamily: css.fontFamily || 'sans-serif',
     series: SERIES_FALLBACK.map((fallback, index) =>
       read(`--c-chart-series-${index + 1}`, fallback),
     ),
-    fontFamily: css.fontFamily || 'sans-serif',
   }
 }
 
@@ -123,9 +123,9 @@ function withAlpha(color: string, alpha: number): string {
   const value = Number.parseInt(hex, 16)
   return `rgba(${(value >> 16) & 0xff}, ${(value >> 8) & 0xff}, ${value & 0xff}, ${alpha})`
 }
+
 /** 堆叠柱共用的 stack id；名字本身无意义，只要所有层一致。 */
 const STACK_ID = 'total'
-
 
 export interface TrendChartInput {
   /** 每个点的标签（已格式化，如 `09-21` / `14:00`）。 */
@@ -140,6 +140,7 @@ export interface TrendChartInput {
   kind: 'bar' | 'area'
   /** 提示框里的指标名，如「计费总量」。 */
   metricLabel: string
+  theme: TrendChartTheme
   /**
    * 分层序列（堆叠柱 / 多条折线）。空数组或省略 = 单序列。
    *
@@ -147,7 +148,6 @@ export interface TrendChartInput {
    *   以及给了但金额整块缺席，都会走到这里，两者都该退回单序列。
    */
   series?: TrendChartSeries[]
-  theme: TrendChartTheme
   /**
    * 数值的**逐点**格式化（悬浮提示用），缺省千分位。
    *
@@ -166,11 +166,11 @@ export function buildTrendChartConfig(
   const { labels, values, kind, metricLabel, theme } = input
   const valueFormatter = input.valueFormatter ?? formatCount
   const tickFormatter = input.tickFormatter ?? formatCompact
+  const isArea = kind === 'area'
   const series = input.series ?? []
   const layered = series.length > 0
   const colorAt = (index: number): string =>
     theme.series[index % theme.series.length] ?? theme.areaStroke
-  const isArea = kind === 'area'
 
   const datasets = layered
     ? series.map((entry, index) => {
@@ -261,10 +261,10 @@ export function buildTrendChartConfig(
           },
         },
         y: {
+          beginAtZero: true,
           // ★ 只有堆叠柱需要 `stacked`：折线是各画各的，堆叠折线会让
           //   「最上面那条 = 合计、下面几条 = 各自的值」这件事不再成立
           ...(layered && !isArea ? { stacked: true } : {}),
-          beginAtZero: true,
           border: { display: false },
           grid: { color: theme.grid, drawTicks: false },
           ticks: {
@@ -277,6 +277,7 @@ export function buildTrendChartConfig(
           },
         },
       },
+      plugins: {
         // ★ 多序列必须有图例：没有它，提示框里的名字和柱子颜色的对应关系
         //   只能靠鼠标一个个试出来。单序列不显示（一个色块纯属噪音）。
         legend: {
@@ -292,7 +293,6 @@ export function buildTrendChartConfig(
             font: { size: 11, family: theme.fontFamily },
           },
         },
-      plugins: {
         tooltip: {
           backgroundColor: theme.surface,
           titleColor: theme.title,
@@ -309,10 +309,10 @@ export function buildTrendChartConfig(
           usePointStyle: true,
           titleMarginBottom: 6,
           titleFont: { size: 12, family: theme.fontFamily, weight: 600 },
+          bodyFont: { size: 12, family: theme.fontFamily },
           footerFont: { size: 12, family: theme.fontFamily, weight: 600 },
           footerColor: theme.title,
           footerMarginTop: 6,
-          bodyFont: { size: 12, family: theme.fontFamily },
           callbacks: {
             // 标签与数值都取自父组件透传的原始数组：显示的是**服务端的数**，
             // 不经过 Chart.js 的解析结果，少一次可能出偏差的转换
@@ -342,4 +342,3 @@ export function buildTrendChartConfig(
     },
   }
 }
-

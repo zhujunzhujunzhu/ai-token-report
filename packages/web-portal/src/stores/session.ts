@@ -115,6 +115,7 @@ export const useSessionStore = defineStore('portal-session', () => {
     error,
     signedIn,
     isAdmin,
+    scopedToSelf,
     can,
     signIn,
     signOut,
@@ -122,12 +123,3 @@ export const useSessionStore = defineStore('portal-session', () => {
     restore,
   }
 })
-
-
-
-
-
-
-
-    scopedToSelf,
-

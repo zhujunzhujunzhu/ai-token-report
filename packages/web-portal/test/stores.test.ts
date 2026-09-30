@@ -45,6 +45,13 @@ function signIn(role: 'admin' | 'member' = 'member'): void {
 beforeEach(() => {
   pinia = createPinia()
   setActivePinia(pinia)
+  // ★ 自定义供应商存在**本机**（`localStorage`）里：用例之间必须清干净，
+  //   否则上一个用例手输的名字会漏进下一个的候选 —— 而失败信息看起来毫不相关。
+  try {
+    localStorage.clear()
+  } catch {
+    /* 没有 localStorage 的环境（Node / SSR）无需清理 */
+  }
 })
 afterEach(() => {
   disposePinia(pinia)
@@ -52,13 +59,6 @@ afterEach(() => {
 })
 
 describe('登录状态', () => {
-  test('登录使用同源 Cookie 和防跨站请求头，不发送 Bearer Token', async () => {
-    let captured: RequestInit | undefined
-    respond((_url, init) => {
-      captured = init
-      return json({ ok: true, viewer: { name: '成员', username: 'member' } })
-    })
-    expect(await useSessionStore().signIn(loginInput)).toBe(true)
   test('★ 数据范围只认内置管理员角色（不是权限码，缺 role 一律按 member）', async () => {
     respond(() =>
       json({ ok: true, viewer: { name: '服务端姓名', username: 'test-user' } }),
@@ -76,6 +76,13 @@ describe('登录状态', () => {
     session.identity = { name: '管理员', username: 'admin', role: 'admin', permissions: [] }
     expect(session.scopedToSelf).toBe(false)
   })
+  test('登录使用同源 Cookie 和防跨站请求头，不发送 Bearer Token', async () => {
+    let captured: RequestInit | undefined
+    respond((_url, init) => {
+      captured = init
+      return json({ ok: true, viewer: { name: '成员', username: 'member' } })
+    })
+    expect(await useSessionStore().signIn(loginInput)).toBe(true)
     expect(captured?.credentials).toBe('same-origin')
     expect(new Headers(captured?.headers).get('x-portal-request')).toBe('1')
     expect(new Headers(captured?.headers).has('authorization')).toBe(false)
@@ -181,9 +188,12 @@ describe('统计状态', () => {
     //   不是管理接口 `/api/v1/admin/groups`（那是 `groups:read`）。
     // ★ 人员名册同理走 `/api/v1/stats/members`：它是「窗口内没有用量的人」
     //   唯一的来源（只从用量行里取候选时，选了分组下拉会整个空掉）。
-    expect(urls).toHaveLength(6)
+    // ★ 供应商目录走 `/api/v1/stats/providers`：下拉要能列出「库里出现过的
+    //   供应商名」，而不是只列当前窗口里用过的。
+    expect(urls).toHaveLength(7)
     expect(urls.filter((url) => url.pathname.endsWith('/api/v1/stats/groups'))).toHaveLength(1)
     expect(urls.filter((url) => url.pathname.endsWith('/api/v1/stats/members'))).toHaveLength(1)
+    expect(urls.filter((url) => url.pathname.endsWith('/api/v1/stats/providers'))).toHaveLength(1)
     const by = (url: URL, value: string) =>
       url.pathname.endsWith('breakdown') && url.searchParams.get('by') === value
     // ★ 全员排行复用候选请求：`by=user` 只发一次；另一次是分组排行 `by=group`。
@@ -269,7 +279,7 @@ describe('统计状态', () => {
     expect(dashboard.detailLoading).toBe(false)
   })
   test('候选不含人员筛选；分页只取当前页面所需接口', async () => {
-    signIn()
+    signIn('admin')
     const urls: URL[] = []
     respond((raw) => {
       const url = new URL(raw, 'http://test')
@@ -290,25 +300,28 @@ describe('统计状态', () => {
     const breakdown = lastOf((u) => u.pathname.endsWith('breakdown'))
     const records = lastOf((u) => u.pathname.endsWith('records'))
     expect(breakdown?.searchParams.has('member_id')).toBe(false)
-    // ★ 分组 / 人员候选必须始终是完整集合：带上筛选就会让下拉在选中后塌缩成一项。
+    // ★ 分组 / 人员 / 供应商候选必须始终是完整集合：带上筛选就会让下拉在选中后塌缩成一项。
     const candidates = urls.filter(
       (u) =>
         u.pathname.endsWith('/api/v1/stats/groups') ||
-        u.pathname.endsWith('/api/v1/stats/members'),
+        u.pathname.endsWith('/api/v1/stats/members') ||
+        u.pathname.endsWith('/api/v1/stats/providers'),
     )
-    signIn('admin')
+    expect(candidates).toHaveLength(9)
     expect(candidates.every((u) => u.searchParams.size === 0)).toBe(true)
     expect(records?.searchParams.get('member_id')).toBe(
       '00000000-0000-4000-8000-000000000003',
     )
     expect(
       // 候选目录是唯一**完全不带查询参数**的请求：它们只回答「有哪些分组、
-      // 名册上有谁」，一旦带上筛选就会自锁定，所以排除在「都带 identity_view」之外。
+      // 名册上有谁、库里有哪几个供应商」，一旦带上筛选就会自锁定，
+      // 所以排除在「都带 identity_view」之外。
       urls
         .filter(
           (u) =>
             !u.pathname.endsWith('/api/v1/stats/groups') &&
-            !u.pathname.endsWith('/api/v1/stats/members'),
+            !u.pathname.endsWith('/api/v1/stats/members') &&
+            !u.pathname.endsWith('/api/v1/stats/providers'),
         )
         .every((u) => u.searchParams.get('identity_view') === 'member'),
     ).toBe(true)
@@ -329,7 +342,7 @@ describe('统计状态', () => {
    * 而页面上只看到一片空数字 —— 看不出是筛选条件在打架。
    */
   test('人员下拉随分组收窄，分组外的人选一并清掉', async () => {
-    signIn()
+    signIn('admin')
     const inGroup = '00000000-0000-4000-8000-00000000000a'
     const outGroup = '00000000-0000-4000-8000-00000000000b'
     respond((raw) => {
@@ -359,7 +372,37 @@ describe('统计状态', () => {
     expect(dashboard.userOptions[0]?.label).toBe('张三 · 研发组 · 00000000')
   })
 
-    signIn('admin')
+  /**
+   * ★ 只看自己的身份**不带人员筛选**。
+   *
+   * 服务端对非管理员一律把范围收窄成本人（`stats-route.ts` 的 `applyDataScope()`），
+   * 所以留在筛选里的「别人」只会在下一轮查询里变成 403。人员下拉本来就不画，
+   * 这里是第二道：从别处（旧状态 / 残留）塞进来的键同样清掉。
+   */
+  test('★ 只看自己的身份不会把人员筛选带进查询', async () => {
+    signIn()
+    const urls: URL[] = []
+    respond((raw) => {
+      const url = new URL(raw, 'http://test')
+      urls.push(url)
+      if (url.pathname.endsWith('overview')) return json(overview)
+      if (url.pathname.endsWith('/api/v1/stats/members')) return json({ members: [] })
+      return json({ rows: [], points: [] })
+    })
+    const dashboard = useDashboardStore()
+    await dashboard.activate('overview')
+    urls.length = 0
+    await dashboard.applyFilters({
+      ...dashboard.filters,
+      users: ['00000000-0000-4000-8000-000000000003'],
+    })
+    expect(dashboard.filters.users).toEqual([])
+    // 一个 `member_id` 都不许发出去（点名自己也不行 —— 页面根本不知道要发谁）
+    expect(urls.length).toBeGreaterThan(0)
+    expect(urls.every((url) => !url.searchParams.has('member_id'))).toBe(true)
+  })
+
+  /**
    * ★ 人员名册是**候选来源**，不是数字来源。
    *
    * 旧版服务端还没有这个接口，不能为它把整个看板变成错误提示 ——
@@ -442,7 +485,7 @@ describe('统计状态', () => {
       period: 'custom',
       customFrom: '2026-09-20T10:00',
       customTo: '2026-09-20T11:00',
-      provider: '',
+      providers: [],
       model: '',
       users: [],
     })
@@ -460,6 +503,125 @@ describe('统计状态', () => {
         users: [],
       }).error,
     ).not.toBeNull()
+  })
+
+  /**
+   * ★ 供应商是多选 OR，且**每个值各发一个 `provider` 参数**。
+   *
+   * 逗号分隔的写法在服务端也认，但一个值里带逗号时两种写法含义不同，
+   * 而页面没有理由替使用者决定那件事（见 `api/portal.ts` 的注释）。
+   */
+  test('供应商多选逐值发参、去重去空，且不改动子串语义', async () => {
+    signIn('admin')
+    const urls: URL[] = []
+    respond((raw) => {
+      const url = new URL(raw, 'http://test')
+      urls.push(url)
+      if (url.pathname.endsWith('/api/v1/stats/providers'))
+        return json({ providers: ['dashscope', 'bailian-tpp'] })
+      if (url.pathname.endsWith('overview')) return json(overview)
+      return json({ rows: [], points: [], members: [], groups: [] })
+    })
+    const dashboard = useDashboardStore()
+    await dashboard.activate('overview')
+    // 目录就是候选（此时还没有任何手输的名字）
+    expect(dashboard.providerOptions).toEqual(['dashscope', 'bailian-tpp'])
+    expect(dashboard.providerChoices.map((option) => option.value)).toEqual([
+      'dashscope',
+      'bailian-tpp',
+    ])
+    urls.length = 0
+    await dashboard.applyFilters({
+      ...dashboard.filters,
+      providers: ['dashscope', 'openai', '  dashscope  ', ''],
+    })
+    const filtered = urls.filter((url) => url.searchParams.has('provider'))
+    expect(filtered.length).toBeGreaterThan(0)
+    for (const url of filtered)
+      expect(url.searchParams.getAll('provider')).toEqual(['dashscope', 'openai'])
+    // 值原样发出（服务端是子串匹配，页面不做任何翻译）
+    expect(filtered[0]?.searchParams.get('provider')).toBe('dashscope')
+    // 候选目录仍然只有一条请求，且**不带**供应商筛选（否则下拉会自锁定）
+    const catalogs = urls.filter((url) =>
+      url.pathname.endsWith('/api/v1/stats/providers'),
+    )
+    expect(catalogs).toHaveLength(1)
+    expect(catalogs[0]?.searchParams.size).toBe(0)
+    // `openai` 库里没有 → 记成本机自定义项（只影响候选，不写库）
+    expect(dashboard.customProviders).toEqual(['openai'])
+    expect(dashboard.providerChoices.map((option) => option.value)).toEqual([
+      'dashscope',
+      'bailian-tpp',
+      'openai',
+    ])
+  })
+
+  /**
+   * ★ 手输出来的名字记进**本机**目录（不写库），并给出清除出口。
+   *
+   * 供应商名是用量行上的事实：往上报库里插一个「供应商」会得到一个永远
+   * 查不出数据、也没有地方能删掉的幽灵选项（见 `utils/providerCatalog.ts`）。
+   */
+  test('★ 手输的供应商名记在本机目录里，可清除，且不发任何写请求', async () => {
+    signIn('admin')
+    const calls: string[] = []
+    respond((raw, init) => {
+      const url = new URL(raw, 'http://test')
+      calls.push(`${init?.method ?? 'GET'} ${url.pathname}`)
+      if (url.pathname.endsWith('/api/v1/stats/providers'))
+        return json({ providers: ['dashscope'] })
+      if (url.pathname.endsWith('overview')) return json(overview)
+      return json({ rows: [], points: [], members: [], groups: [] })
+    })
+    const dashboard = useDashboardStore()
+    await dashboard.activate('overview')
+    await dashboard.applyFilters({
+      ...dashboard.filters,
+      providers: ['dashscope', 'my-gateway'],
+    })
+    // 目录里有的不重复记；只有手输的那个进自定义列表
+    expect(dashboard.customProviders).toEqual(['my-gateway'])
+    expect(dashboard.providerChoices).toEqual([
+      { value: 'dashscope', label: 'dashscope', custom: false },
+      { value: 'my-gateway', label: 'my-gateway', custom: true },
+    ])
+    // 🚨 记忆不落库：整轮一个写请求都没有
+    expect(calls.every((call) => call.startsWith('GET '))).toBe(true)
+    // 清除只影响候选，**不影响已选中的筛选值**（那个照旧生效）
+    dashboard.clearCustomProviders()
+    expect(dashboard.customProviders).toEqual([])
+    expect(dashboard.filters.providers).toEqual(['dashscope', 'my-gateway'])
+    expect(dashboard.providerChoices.map((option) => option.value)).toEqual([
+      'dashscope',
+    ])
+  })
+
+  /** 供应商目录失败不拖垮看板（回落成「现敲现用」），但 401 仍要让会话过期。 */
+  test('供应商目录失败不拖垮看板，401 仍然让会话过期', async () => {
+    signIn()
+    respond((raw) => {
+      const url = new URL(raw, 'http://test')
+      if (url.pathname.endsWith('/api/v1/stats/providers'))
+        return json({ reason: '未找到' }, 404)
+      if (url.pathname.endsWith('overview')) return json(overview)
+      if (url.pathname.endsWith('/api/v1/stats/members')) return json({ members: [] })
+      if (url.pathname.endsWith('/api/v1/stats/groups')) return json({ groups: [] })
+      return json({ rows: [], points: [] })
+    })
+    const dashboard = useDashboardStore()
+    await dashboard.activate('overview')
+    expect(dashboard.overview?.totalTokens).toBe(101)
+    expect(dashboard.error).toBeNull()
+    expect(dashboard.providerChoices).toEqual([])
+    respond((raw) => {
+      const url = new URL(raw, 'http://test')
+      if (url.pathname.endsWith('/api/v1/stats/providers'))
+        return json({ reason: '失效' }, 401)
+      if (url.pathname.endsWith('overview')) return json(overview)
+      return json({ rows: [], points: [], members: [], groups: [] })
+    })
+    await dashboard.load()
+    expect(useSessionStore().signedIn).toBe(false)
   })
   test('下拉选中即筛：具名周期随时可查，自定义区间要等起止填齐', () => {
     // 时间范围 / 人员是离散选择，选中即应用，不再依赖「查询」按钮。
@@ -502,7 +664,7 @@ describe('人员管理状态', () => {
     calls.length = 0
     await admin.load('groups')
     expect(calls).toEqual(['/api/v1/groups'])
-      providers: [],
+    calls.length = 0
     admin.clear()
     await admin.load()
     expect(calls).toEqual(memberRequests)
@@ -644,183 +806,3 @@ describe('人员管理状态', () => {
     expect(admin.storage).toBeNull()
   })
 })
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
