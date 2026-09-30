@@ -168,9 +168,9 @@ export function resolveIngestIdentity(
  *
  * ⚠️ **角色由凭证表决定**（`role` 列，见 `credentials.ts`），
  *   而**不是**由姓名白名单决定 —— 姓名是可以随便改的显示值。
- *   数据范围上：任何有效 token 都能查看**全部门**（部门看板是组内公开的用量页），
- *   角色只决定「能不能进管理页发 token」（见 `admin-route.ts`）。
- */
+ *   数据范围：**只有内置 `admin` 角色能看到全部门的用量**，其余身份一律被
+ *   `stats-route.ts` 的 `applyDataScope()` 收窄成「只看自己」。
+
 export function resolveViewerIdentity(
   store: CredentialStore,
   authorization: string | null | undefined,
@@ -214,3 +214,4 @@ export function resolveIdentity(
 
   return { ok: true, ...viewerFrom(r) }
 }
+

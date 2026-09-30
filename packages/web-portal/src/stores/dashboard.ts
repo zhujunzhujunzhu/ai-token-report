@@ -463,15 +463,22 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
         label,
         overview: ov.data,
         series: se.data,
-        models: bd.data.rows,
-      }
-  }
-
-  watch(
-    () => session.generation,
-    () => {
-      ++requestSeq
-      closeUser()
+      // 🚨 只看自己的身份**永远不带人员筛选**：服务端一律把它收窄成本人，
+      //   所以这里留着一个「别人」的键只会在下一轮查询里变成 403（见
+      //   `stats-route.ts` 的 `applyDataScope()`）。人员下拉本来就没画
+      //   （`FilterBar.vue`），这里是第二道：从别处（旧链接 / 残留状态）
+      //   塞进来的键同样清掉。
+      users: session.scopedToSelf
+        ? []
+        : // ★ 选了分组之后，把**分组外**的人员从筛选里去掉。
+          //   服务端按 AND 叠加：留下一个不在所选分组里的人，查询必然是 0，
+          //   而页面上只看到一片空数字 —— 看不出是筛选条件在打架。
+          //   ⚠️ 只在名册可用时收窄。名册取不到（旧服务端 / 请求失败）时我们
+          //   并不知道谁属于哪个分组，此时按原样保留 —— 不能凭一份空名册
+          //   删掉使用者的选择。
+          memberDirectory.value.length > 0
+          ? pruneUsers(next.users, groups)
+          : [...next.users],
       pending = false
       loading.value = false
       clearData()
@@ -522,4 +529,180 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     closeUser,
   }
 })
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 

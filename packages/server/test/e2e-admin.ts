@@ -296,6 +296,10 @@ try {
   //   「以谁的身份归一化」：否则任何有 `stats:read` 的人都能套用别人的口径。
   //   要验证这一点，就必须真的拿那个人的凭证去请求 —— 用管理员的 token 查
   //   `member_id=` 得到的是**管理员自己的**口径。
+  // ★ 数据范围（v7 起）：非管理员**只看得到自己**。所以两个人的对照必须落在
+  //   「同一家供应商、各自名下的事件」上 —— 一边dashscope 事件按全局规则折成
+  //   `bailian-tpp`，另一边同样的 dashscope 事件按他自己的规则折成 `我的百炼`。
+  //   这正是这条断言要证明的东西：口径按查看者走，而不是按数据走。
   const viewerA = first.member_id
   const viewerB = (await request(a, 'admin/members', adminToken, { name: '看全局的人', role_ids: [memberRole] })).data.member.member_id
   const keyA = (await request(a, 'admin/members/appkey', adminToken, { member_id: viewerA, label: '归一化A' })).data.token_secret
@@ -304,14 +308,18 @@ try {
   equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'member', member_id: viewerA, provider: 'dashscope', alias: '我的百炼' })).status, 200, '可以给某个人单独配规则')
   const keysA = (await request(a, 'stats/breakdown?identity_view=member&by=provider', keyA)).data.rows.map((entry: any) => entry.key)
   const keysB = (await request(a, 'stats/breakdown?identity_view=member&by=provider', keyB)).data.rows.map((entry: any) => entry.key)
-  assert(keysA.includes('我的百炼') && !keysA.includes('bailian-tpp')); checks++
+  equal((await request(b, 'token-usage', keyB, { schemaVersion: 1, client: {}, generatedAt: new Date().toISOString(), records: [{ ...event('v6:alias:B'), provider: 'dashscope' }] })).data.accepted, 1, '另一把 appKey 上报的数据归属另一个人（同一家供应商，两套口径才对照得上）')
   equal(keysA.includes('验收供应商'), true, '人员规则没提的 provider 仍回落全局（逐条覆盖）')
   assert(keysB.includes('bailian-tpp') && !keysB.includes('我的百炼')); checks++
   // 个人规则只对该人员生效：他自己那把 appKey 上报的数据也按他来归一化。
   equal((await request(a, 'stats/records?identity_view=member', keyA)).data.rows.find((row: any) => row.eventId === 'v6:alias:2').provider, '我的百炼', '按人覆盖对这个人自己的明细也生效')
 
   // ── 改规则立即生效（不需要回填历史） ──
-  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: 'fixture', alias: 'fixture-tpp' })).status, 200, '同一 provider 再配一次是覆盖')
+  // 🚨 收窄发生在服务端：这些凭证各自只拿得到自己那一行，点名别人一律 403。
+  equal((await request(a, 'stats/breakdown?identity_view=member&by=user', keyA)).data.rows.length, 1, '★ 非管理员凭证只看得到自己一行')
+  equal((await request(a, `stats/breakdown?identity_view=member&by=user&member_id=${viewerB}`, keyA)).status, 403, '★ 点名别人一律 403，绝不静默替换成自己')
+  equal((await request(a, 'stats/overview?identity_view=member&unattributed=true', keyA)).status, 403, '★ 未署名用量不属于任何个人，同样拒绝')
+
   const coveredKeys = (await request(a, 'stats/breakdown?identity_view=member&by=provider')).data.rows.map((entry: any) => entry.key)
   assert(coveredKeys.includes('fixture-tpp') && !coveredKeys.includes('验收供应商')); checks++
   equal((await request(a, 'admin/provider-aliases')).data.aliases.length, 3, '列表里是全局两条 + 人员一条（upsert 没有多出行）')
@@ -373,3 +381,4 @@ try {
   await isolation?.dispose()
   rmSync(home, { recursive: true, force: true })
 }
+

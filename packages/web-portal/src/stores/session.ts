@@ -19,6 +19,20 @@ export const useSessionStore = defineStore('portal-session', () => {
   const signedIn = computed(() => identity.value !== null)
   function can(permission: string): boolean { return identity.value?.permissions?.includes(permission) ?? false }
   const isAdmin = computed(() => can('members:read'))
+  /**
+   * 当前身份**只能看到自己的用量**（页面据此隐藏人员下拉并说明数据范围）。
+   *
+   * ★ 判据与**服务端**逐字同一条：只有内置 `admin` 角色能看全部门
+   *   （`server/src/stats-route.ts` 的 `applyDataScope()`）。前端这一份只决定
+   *   「要不要画那个下拉」，**不是**安全边界 —— 手拼 `?member_id=<别人>`
+   *   在服务端同样只会拿到自己的数据，或者一个 403。
+   * ⚠️ 缺 `role` 字段时按 `member` 处理（`accept()` 里已经归一），所以「字段改名 /
+   *   旧服务端」会落到这一侧：宁可少画一个下拉，也不要让人以为自己能筛别人。
+   * ⚠️ 与 `isAdmin`（= 有 `members:read`）**刻意不是同一个判据**：后者回答的是
+   *   「能不能进人员管理」，而数据范围只认内置管理员角色。一个只有人员目录
+   *   权限的自定义角色仍会落进「只看自己」。
+   */
+  const scopedToSelf = computed(() => identity.value?.role !== 'admin')
   let revision = 0
   let restoring: Promise<void> | null = null
 
@@ -108,3 +122,12 @@ export const useSessionStore = defineStore('portal-session', () => {
     restore,
   }
 })
+
+
+
+
+
+
+
+    scopedToSelf,
+

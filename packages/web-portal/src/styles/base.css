@@ -495,6 +495,10 @@ code {
   display: flex;
   align-items: end;
   gap: 14px;
+  /* ★ 恒定独占一行（与 `.custom-range` 同款）：画布上少一个控件（「只看自己」的身份
+     没有人员下拉）时，按钮不该因此跳到第一行最右 —— 位置随身份变来变去会让人
+     以为筛选栏「变了」。 */
+  grid-column: 1 / -1;
 }
 .custom-range > span {
   padding-bottom: 10px;
@@ -568,7 +572,7 @@ code {
   font-size: 17px;
 }
 .metric-icon.blue {
-  color: #4d89ef;
+
   background: #edf4ff;
 }
 .metric-icon.green {
@@ -1406,3 +1410,4 @@ code {
   line-height: 1.8;
   margin-top: 6px;
 }
+

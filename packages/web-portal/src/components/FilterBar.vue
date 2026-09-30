@@ -5,6 +5,14 @@
  * 厂商 / 模型是子串输入，逐字符查询没有意义，仍由按钮或回车提交。
  *
  * ★ 分组在人员**之前**：它是人员的上一位筛选（见模板里的说明）。
+ * ⚠️ 「人员」只对能看到全员的人渲染（`session.scopedToSelf` 为假）——
+ *   少一个筛不了的控件，也**不说**自己在数据范围上受限（见模板里的说明）。
+ *
+ * ★ 厂商是**多选 + 可搜索 + 可新建**：候选来自看板接口
+ *   `/api/v1/stats/providers`（库里出现过的名字，已归一化），使用者还能在框里
+ *   手输一个库里没有的名字并回车（`allow-create`）——那个名字只记在**本机浏览器**
+ *   里（`utils/providerCatalog.ts`），绝不写库。服务端对每个值仍是子串匹配，
+ *   与 CLI 的 `--provider` 同义。
  */
 import {
   ElAlert,
@@ -148,6 +156,13 @@ onUnmounted(() => clearTimeout(selectTimer))
           aria-label="人员筛选"
           @change="applySelectsSoon"
           ><el-option
+
+        🚨 **只看自己的身份没有人员下拉**：那个下拉对他来说只有一个选项
+        （而且服务端无论如何都只回他自己的数据，见 `stats-route.ts` 的
+        `applyDataScope()`）。留一个筛不了任何东西的下拉，只会让人以为自己筛到了别人。
+        ★ 这里也**刻意不写那行「不是管理员」的提示**：页面既筛不了别人的数据，
+          也没有资格替服务端解释数据范围 —— 那句话只是占着一个筛不了控件的位置，
+          去讲一件与筛选无关的事。真正的收窄在服务端，与页面画了什么无关。
             v-for="option in dashboard.userOptions"
             :key="option.key"
             :value="option.key"
@@ -157,6 +172,7 @@ onUnmounted(() => clearTimeout(selectTimer))
         ><el-input
           v-model="draft.provider"
           clearable
+        v-if="!session.scopedToSelf"
           placeholder="搜索厂商"
           aria-label="厂商筛选"
       /></el-form-item>
@@ -201,7 +217,7 @@ onUnmounted(() => clearTimeout(selectTimer))
     <el-alert
       v-if="dashboard.rangeError"
       :title="dashboard.rangeError"
-      type="warning"
+
       :closable="false"
       show-icon
     />

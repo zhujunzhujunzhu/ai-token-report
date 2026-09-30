@@ -68,8 +68,13 @@ function payload(member: number, batch: string, count: number): IngestPayload {
 }
 async function overview(member?: number): Promise<OverviewResponse> {
   const selector = member === undefined ? '' : `&member_id=${members[member]!.id}`
-  return http(`/api/v1/stats/overview?period=last7d&identity_view=member${selector}`, members[member ?? 0]!.token)
-}
+  // 🚨 两种读法刻意用两把不同的凭证：
+  //   - 不带 `member_id`（并发期间与收尾的全量核对）→ **管理员**：数据范围从 v7 起
+  //     收窄成「非管理员只看自己」，拿某个 appKey 读全员合计会只读到自己那一份。
+  //   - 带 `member_id` → 那个人**自己的** appKey：顺带钉住「点名自己的 ID 允许」。
+  const token = member === undefined ? adminSecret : members[member]!.token
+  return http(`/api/v1/stats/overview?period=last7d&identity_view=member${selector}`, token)
+
 function verifyOverview(value: OverviewResponse, calls: number): void {
   const expected = {
     calls, inputTokens: calls * usage.input, outputTokens: calls * usage.output,
@@ -177,3 +182,4 @@ try {
   if (!location || location.startsWith('..') || !location.startsWith('atr-ingest-performance-')) throw new Error('临时目录不在本次压测范围，拒绝清理')
   rmSync(tempRoot, { recursive: true, force: true })
 }
+

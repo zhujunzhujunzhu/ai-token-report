@@ -409,7 +409,41 @@ describe('现状契约：GET /api/v1/stats/*', () => {
     expect(r.status).toBe(200)
     expect(r.body).toHaveProperty('members')
   })
-})
+  /**
+   * ★ 数据范围的分发面契约：**非内置管理员只能查自己**。
+   *
+   * 这条与「页面隐藏人员下拉」是两件事 —— 手拼查询串同样拿不到别人的数据，
+   * 否则任何人都能把看板换成「全公司」。
+   */
+  test('★ 非管理员点名别人 → 403；点自己与不带筛选 → 200；管理员不受限', async () => {
+    const roster = (
+      await call(dept, 'GET', '/api/v1/stats/members', { headers: MEMBER })
+    ).body as { members: { member_id: string; name: string }[] }
+    const zhang = roster.members.find((member) => member.name === '张三')!.member_id
+    const manager = roster.members.find((member) => member.name === '李经理')!.member_id
+    const overview = (query: string): Promise<Reply> =>
+      call(dept, 'GET', `/api/v1/stats/overview?period=today&identity_view=member${query}`, { headers: MEMBER })
+
+    // 不带人员筛选 = 「全部人员」：服务端**收窄成本人**，所以仍是 200 而不是 403
+    expect((await overview('')).status).toBe(200)
+    // 点自己允许 —— 人员详情抽屉发的就是它
+    expect((await overview(`&member_id=${zhang}`)).status).toBe(200)
+    // 🚨 点名别人：403，绝不静默替换成「我」（那会给出一个看起来正常的错答案）
+    const denied = await overview(`&member_id=${manager}`)
+    expect(denied.status).toBe(403)
+    expect(reason(denied)).toContain('只能查看本人数据')
+    // 未署名用量不属于任何个人，同样被拒（不是「查出 0 行」）
+    expect((await overview('&unattributed=true')).status).toBe(403)
+    // 管理员不受这条限制
+    const allowed = await call(
+      dept,
+      'GET',
+      `/api/v1/stats/overview?period=today&identity_view=member&member_id=${zhang}`,
+      { headers: ADMIN },
+    )
+    expect(allowed.status).toBe(200)
+  })
+
 
 // ─────────────────────────────────────────────────────────────
 describe('现状契约：看板金额与单价快照（v7 / cost:read）', () => {
@@ -1091,3 +1125,4 @@ describe('S12.3 静态托管：ETag / 304 / Cache-Control / HEAD / 压缩', () =
     },
   )
 })
+

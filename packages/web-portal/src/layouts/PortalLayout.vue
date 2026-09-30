@@ -159,15 +159,19 @@ async function signOut(): Promise<void> {
               <el-avatar :size="34">{{
                 session.identity?.name.slice(0, 1)
               }}</el-avatar
-              ><span class="identity-copy"
+              ><!--
+                ★ 标签跟着**数据范围**走（内置管理员角色），而不是跟着
+                  `members:read`：写着「管理员」却只看得到自己的数字，会让人
+                  以为看板坏了。两者的区别见 `stores/session.ts` 的注释。
+              --><span class="identity-copy"
                 ><strong>{{ session.identity?.name }}</strong
                 ><small>{{
                   session.isAdmin ? '管理员' : '普通成员'
                 }}</small></span
               ><el-icon><ArrowDown /></el-icon>
             </button>
-            <template #dropdown
-              ><el-dropdown-menu
+                  session.scopedToSelf ? '普通成员' : '管理员'
+
                 ><el-dropdown-item command="logout" :icon="SwitchButton"
                   >退出登录</el-dropdown-item
                 ></el-dropdown-menu
@@ -183,3 +187,4 @@ async function signOut(): Promise<void> {
     </div>
   </div>
 </template>
+

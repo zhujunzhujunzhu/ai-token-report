@@ -77,6 +77,14 @@ const MYSQL_PORT = 18902
 const TOKENS = {
   zhang: 'atr-verify-zhang-0001',
   li: 'atr-verify-li-0002',
+  /**
+   * 看板对照用的凭证。
+   *
+   * 🚨 **必须是内置管理员角色**：数据范围从 v7 起收窄成「非管理员只看自己」
+   *   （`stats-route.ts` 的 `applyDataScope()`），拿张三的凭证去断言全部门数字
+   *   只会在第一个接口上就失败。
+   */
+  admin: 'atr-verify-admin-0003',
 }
 
 // ── 断言脚手架 ──────────────────────────────────────────────────────────────
@@ -252,6 +260,8 @@ async function startServer(opts: {
   const handle = await createServer({
     port: opts.port,
     host: '127.0.0.1',
+    // ★ 显式种一个管理员：看板对照读的是**全部门**，而这里必须有一个能看全员的身份。
+    { token: TOKENS.admin, name: '验收管理员', role: 'admin' },
     dshHome: home,
     dataDir,
     dbPath: opts.dbPath,
@@ -299,7 +309,9 @@ async function stats(
 }
 
 let sqlite: RunningServer | null = null
-let mysql: RunningServer | null = null
+    // 🚨 用管理员凭证：本脚本逐位比对的是**全部门**的看板响应，
+    //   而非管理员的凭证只会看到自己（见 `TOKENS.admin` 的注释）。
+    headers: { Authorization: `Bearer ${TOKENS.admin}` },
 let mysqlStore: PortalStore | null = null
 /** 跑之前 MySQL 里 `ingest_run.last_ingest_ms` 的原值（跑完要还回去）。 */
 let previousIngestMoment: number | null = null
@@ -471,7 +483,20 @@ try {
   const membersLite = (await stats(sqlite, 'members'))['members'] as Record<string, unknown>[]
   const membersMy = (await stats(mysql, 'members'))['members'] as Record<string, unknown>[]
   check(
-    '★ members 两个后端的名册一致（人员候选目录）',
+  // ★ 供应商候选目录（`/api/v1/stats/providers`）：这句 SQL 只有两个后端都写对
+  //   才成立（`DISTINCT` + `ORDER BY` 一个列），而它**只在活体 MySQL 上才算证据**。
+  //   候选名字逐个对得上，才说明「页面上能选到的供应商」在两种部署下一致。
+  const providersLite = (await stats(sqlite, 'providers'))['providers'] as string[]
+  const providersMy = (await stats(mysql, 'providers'))['providers'] as string[]
+  same('providers 逐位一致（供应商候选目录）', providersLite, providersMy)
+  check(
+    'providers 非空且已排序去重（不是「两边都空」）',
+    providersMy.length > 0 &&
+      JSON.stringify(providersMy) === JSON.stringify([...new Set(providersMy)].sort()),
+    JSON.stringify(providersMy),
+  )
+
+
     JSON.stringify(rosterOf(membersLite)) === JSON.stringify(rosterOf(membersMy)),
     `\n     SQLite: ${JSON.stringify(rosterOf(membersLite))}\n     MySQL : ${JSON.stringify(rosterOf(membersMy))}`,
   )
@@ -576,3 +601,4 @@ if (failed === 0) {
 }
 console.log('='.repeat(72))
 process.exit(failed > 0 ? 1 : 0)
+

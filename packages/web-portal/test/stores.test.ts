@@ -59,6 +59,23 @@ describe('登录状态', () => {
       return json({ ok: true, viewer: { name: '成员', username: 'member' } })
     })
     expect(await useSessionStore().signIn(loginInput)).toBe(true)
+  test('★ 数据范围只认内置管理员角色（不是权限码，缺 role 一律按 member）', async () => {
+    respond(() =>
+      json({ ok: true, viewer: { name: '服务端姓名', username: 'test-user' } }),
+    )
+    const session = useSessionStore()
+    expect(await session.signIn(loginInput)).toBe(true)
+    // 缺 `role` = 按 member 处理 → 只看自己。宁可少画一个下拉，也不要让人
+    // 以为自己能筛别人（服务端那边同样会收窄，不会返回别人的数据）。
+    expect(session.scopedToSelf).toBe(true)
+    // ★ 与 `isAdmin`（= 有 `members:read`）**刻意不是同一个判据**：
+    //   这里给足人员目录权限，但角色仍是 member ⇒ 数据范围照旧只有自己。
+    session.identity = { name: '名册查看者', username: 'roster', role: 'member', permissions: ['members:read'] }
+    expect(session.isAdmin).toBe(true)
+    expect(session.scopedToSelf).toBe(true)
+    session.identity = { name: '管理员', username: 'admin', role: 'admin', permissions: [] }
+    expect(session.scopedToSelf).toBe(false)
+  })
     expect(captured?.credentials).toBe('same-origin')
     expect(new Headers(captured?.headers).get('x-portal-request')).toBe('1')
     expect(new Headers(captured?.headers).has('authorization')).toBe(false)
@@ -279,7 +296,7 @@ describe('统计状态', () => {
         u.pathname.endsWith('/api/v1/stats/groups') ||
         u.pathname.endsWith('/api/v1/stats/members'),
     )
-    expect(candidates).toHaveLength(9)
+    signIn('admin')
     expect(candidates.every((u) => u.searchParams.size === 0)).toBe(true)
     expect(records?.searchParams.get('member_id')).toBe(
       '00000000-0000-4000-8000-000000000003',
@@ -342,7 +359,7 @@ describe('统计状态', () => {
     expect(dashboard.userOptions[0]?.label).toBe('张三 · 研发组 · 00000000')
   })
 
-  /**
+    signIn('admin')
    * ★ 人员名册是**候选来源**，不是数字来源。
    *
    * 旧版服务端还没有这个接口，不能为它把整个看板变成错误提示 ——
@@ -485,7 +502,7 @@ describe('人员管理状态', () => {
     calls.length = 0
     await admin.load('groups')
     expect(calls).toEqual(['/api/v1/groups'])
-    calls.length = 0
+      providers: [],
     admin.clear()
     await admin.load()
     expect(calls).toEqual(memberRequests)
@@ -627,4 +644,183 @@ describe('人员管理状态', () => {
     expect(admin.storage).toBeNull()
   })
 })
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 

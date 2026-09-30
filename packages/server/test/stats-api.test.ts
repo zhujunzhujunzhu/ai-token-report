@@ -69,6 +69,7 @@ afterEach(() => {
  *   数据范围本身由「★ 数据范围」那一块专门断言，那里会显式用 member 凭证。
  */
 const STORE = CredentialStore.from([
+  { token: 'tok-admin', name: '管理员', role: 'admin' },
   { token: 'tok-zhang', name: '张三', group: '研发一部' },
   { token: 'tok-zhangsf', name: '张三丰', group: '研发一部' },
   { token: 'tok-li', name: '李四', group: '研发二部' },
@@ -173,7 +174,8 @@ async function get(
   sub: string,
   params: Record<string, string> = {},
   auth: string | null = 'Bearer tok-zhang',
-  store: CredentialStore = STORE,
+  // 缺省用**管理员**凭证：这些断言看的是全部门聚合（见 `STORE` 的注释）。
+  auth: string | null = 'Bearer tok-admin',
 ): Promise<StatsRouteResult> {
   return stats(store).handle(sub, new URLSearchParams(params), auth)
 }
@@ -215,6 +217,177 @@ describe('部门看板鉴权', () => {
 
 describe('部门总览口径', () => {
   test('四项 token 分列，total 等于四项之和', async () => {
+/**
+ * ★ 数据范围（S7 之后的收紧）：**非内置管理员只能看到自己**。
+ *
+ * ## 这些断言在守什么
+ *
+ * 1. 🚨 **收窄发生在服务端**，不是页面隐藏一个下拉。手拼 `?member_id=<别人>`
+ *    必须拿不到别人的数字 —— 「前端过滤 = 权限」是明令禁止的那类错误。
+ * 2. ★ **显式点名别人一律 403，绝不静默替换成「我」**：一个看起来正常的数字，
+ *    回答的却是另一个问题（要张三的用量却给了自己的），比明确报错危险得多。
+ * 3. ★ **判据是角色码，不是权限码**：自定义角色即使拿到 `members:read`
+ *    （人员目录），也照样只看自己 —— 「能管名册」与「能看全员用量」是两件事。
+ * 4. 🚨 **兼容凭证表身份没有稳定人员 ID 时直接 403**，绝不按姓名兜底：
+ *    同名会把两个人的用量并成一个人的。
+ */
+describe('★ 数据范围（非内置管理员只看本人）', () => {
+  test('旧凭证表的 member 身份：不能按个人取数 → 403（绝不按姓名兜底）', async () => {
+    for (const sub of ['overview', 'breakdown', 'series', 'records', 'diagnostics']) {
+      const res = await get(sub, { period: 'today' }, 'Bearer tok-zhang')
+      expect(res.status).toBe(403)
+      const reason = String((res.body as { reason: string }).reason)
+      expect(reason).toContain('只能查看本人数据')
+      // 文案要指出下一步动作，而不是一句「没有权限」
+      expect(reason).toContain('appKey')
+    }
+  })
+
+  test('旧凭证表的 admin 身份照旧看到全部门', async () => {
+    await report('tok-zhang', [rec('z1', { input_tokens: 1000, output_tokens: 0, cache_read_tokens: 0 })])
+    await report('tok-li', [rec('l1', { seq: 2, input_tokens: 500, output_tokens: 0, cache_read_tokens: 0 })])
+    const res = await get('breakdown', { period: 'today', by: 'user' }, 'Bearer tok-admin')
+    expect(res.status).toBe(200)
+    // 旧姓名视图的行只有 `key`（没有稳定 ID，也就没有 `label`）
+    expect((res.body as BreakdownResponse).rows.map((row) => row.key)).toEqual(['张三', '李四'])
+  })
+
+  /**
+   * 真身份库 + 真 appKey：只有这条路才走得到稳定 `member_id`，
+   * 而「只看自己」正是按它收窄的（生产身份就是这一种）。
+   */
+  async function twoPeople() {
+    const repository = new IdentityRepository({ sqlitePath: dbPath })
+    await repository.initialize({
+      adminToken: 'tok-admin',
+      adminName: '管理员',
+      adminUsername: 'admin',
+      adminPassword: 'test-password-2026',
+    })
+    const admin = (await repository.resolveBearer('tok-admin'))!
+    const zhang = (await repository.createMember(admin, { name: '张三', role_ids: [MEMBER_ROLE_ID] })).member!
+    const li = (await repository.createMember(admin, { name: '李四', role_ids: [MEMBER_ROLE_ID] })).member!
+    const zhangKey = (await repository.issueAppKey(admin, { member_id: zhang.member_id })).token_secret
+    const liKey = (await repository.issueAppKey(admin, { member_id: li.member_id })).token_secret
+    const ingest = new IngestRoute({ identityStore: repository, dbPath })
+    const send = async (secret: string, records: unknown[], seq = 1): Promise<void> => {
+      const res = await ingest.submit(
+        {
+          schemaVersion: 1,
+          client: { userId: 'ignored', userName: 'ignored' },
+          generatedAt: new Date().toISOString(),
+          records: records.map((record) => ({ ...(record as object), seq })),
+        },
+        `Bearer ${secret}`,
+      )
+      expect(res.status).toBe(200)
+    }
+    return { repository, admin, zhang, li, zhangKey, liKey, send }
+  }
+
+  const route = (repository: IdentityRepository): StatsRoute =>
+    new StatsRoute({ identityStore: repository, dbPath })
+
+  test('★ member 的 appKey 只拿到自己的用量；点名别人 → 403；点自己 → 200（详情抽屉）', async () => {
+    const { repository, zhang, li, zhangKey, liKey, send } = await twoPeople()
+    await send(zhangKey, [rec('z1', { input_tokens: 1000, output_tokens: 0, cache_read_tokens: 0 })])
+    await send(liKey, [rec('l1', { input_tokens: 500, output_tokens: 0, cache_read_tokens: 0 })], 2)
+    const stats = route(repository)
+    const base = { period: 'today', identity_view: 'member' }
+
+    // 不带人员筛选 = 「全部人员」→ 服务端收窄成本人
+    const mine = await stats.handle('overview', new URLSearchParams(base), `Bearer ${zhangKey}`)
+    expect(mine.status).toBe(200)
+    expect((mine.body as Record<string, number>)['totalTokens']).toBe(1000)
+
+    // 手拼别人的 member_id：403，绝不静默换成「我」
+    const other = await stats.handle(
+      'overview',
+      new URLSearchParams({ ...base, member_id: li.member_id }),
+      `Bearer ${zhangKey}`,
+    )
+    expect(other.status).toBe(403)
+    expect((other.body as { code?: string }).code).toBe('stats_self_only')
+
+    // 点自己允许 —— 人员详情抽屉发的就是它
+    const self = await stats.handle(
+      'overview',
+      new URLSearchParams({ ...base, member_id: zhang.member_id }),
+      `Bearer ${zhangKey}`,
+    )
+    expect(self.status).toBe(200)
+    expect((self.body as Record<string, number>)['totalTokens']).toBe(1000)
+
+    // 排行 / 趋势分层 / 明细同样只剩自己
+    const ranking = await stats.handle('breakdown', new URLSearchParams({ ...base, by: 'user' }), `Bearer ${zhangKey}`)
+    expect((ranking.body as BreakdownResponse).rows.map((row) => row.key)).toEqual([zhang.member_id])
+    const series = await stats.handle(
+      'series',
+      new URLSearchParams({ ...base, bucket: 'day', stack: 'user' }),
+      `Bearer ${zhangKey}`,
+    )
+    expect((series.body as SeriesResponse).stack!.items.map((item) => item.key)).toEqual([zhang.member_id])
+    const records = await stats.handle('records', new URLSearchParams(base), `Bearer ${zhangKey}`)
+    expect((records.body as { total: number }).total).toBe(1)
+
+    // 🚨 未署名 / 旧历史子集 / 姓名永远不可能等价于「我」—— 一律 403，
+    //   而不是「查出 0 行」。合法编码的历史键先过参数校验，再被数据范围挡下。
+    const widening = [
+      { unattributed: 'true' },
+      { legacy_user: `legacy:${Buffer.from('张三', 'utf8').toString('base64url')}` },
+      { identity_view: 'legacy', user: '张三' },
+    ]
+    for (const params of widening) {
+      const denied = await stats.handle('overview', new URLSearchParams({ ...base, ...params }), `Bearer ${zhangKey}`)
+      expect(denied.status).toBe(403)
+    }
+    // ★ 旧姓名视图被**强制**成人员视图（它本来表达的是全库范围，而稳定 ID
+    //   才收窄得了）；结果仍然只有自己。
+    const legacyView = await stats.handle(
+      'overview',
+      new URLSearchParams({ period: 'today', identity_view: 'legacy' }),
+      `Bearer ${zhangKey}`,
+    )
+    expect(legacyView.status).toBe(200)
+    expect((legacyView.body as Record<string, number>)['totalTokens']).toBe(1000)
+  })
+
+  test('★ 判据是角色码不是权限码：自定义角色有 members:read 也只看自己', async () => {
+    const { repository, admin, zhangKey, liKey, send } = await twoPeople()
+    const role = (await repository.createRole(admin, {
+      code: 'roster-lite',
+      name: '名册查看者',
+      permission_codes: ['stats:read', 'usage:write', 'members:read'],
+    })).role!
+    const person = (await repository.createMember(admin, { name: '小运营', role_ids: [role.role_id] })).member!
+    const key = (await repository.issueAppKey(admin, { member_id: person.member_id })).token_secret
+    await send(zhangKey, [rec('z1', { input_tokens: 1000, output_tokens: 0, cache_read_tokens: 0 })])
+    await send(liKey, [rec('l1', { input_tokens: 500, output_tokens: 0, cache_read_tokens: 0 })], 2)
+    await send(key, [rec('o1', { input_tokens: 7, output_tokens: 0, cache_read_tokens: 0 })], 3)
+
+    const res = await route(repository).handle(
+      'overview',
+      new URLSearchParams({ period: 'today', identity_view: 'member' }),
+      `Bearer ${key}`,
+    )
+    expect(res.status).toBe(200)
+    expect((res.body as Record<string, number>)['totalTokens']).toBe(7)
+  })
+
+  test('★ 内置 admin 角色的凭证照旧看到全部门', async () => {
+    const { repository, zhangKey, liKey, send } = await twoPeople()
+    await send(zhangKey, [rec('z1', { input_tokens: 1000, output_tokens: 0, cache_read_tokens: 0 })])
+    await send(liKey, [rec('l1', { input_tokens: 500, output_tokens: 0, cache_read_tokens: 0 })], 2)
+    const res = await route(repository).handle(
+      'overview',
+      new URLSearchParams({ period: 'today', identity_view: 'member' }),
+      'Bearer tok-admin',
+    )
+    expect(res.status).toBe(200)
+    expect((res.body as Record<string, number>)['totalTokens']).toBe(1500)
+  })
+})
+
     await report('tok-zhang', [
       rec('e1', { seq: 1, input_tokens: 100, output_tokens: 20, cache_read_tokens: 900 }),
       rec('e2', { seq: 2, input_tokens: 300, output_tokens: 40, cache_read_tokens: 700 }),
@@ -606,7 +779,6 @@ describe('人员候选目录（GET /api/v1/stats/members）', () => {
    *   整个下拉会空掉 —— 那看起来像数据丢了，而不像「这段时间没人用」。
    */
   async function roster() {
-    const repository = new IdentityRepository({ sqlitePath: dbPath })
     await repository.initialize({
       adminToken: 'tok-admin',
       adminName: '管理员',
@@ -722,6 +894,15 @@ describe('★ 趋势分层（按用户 / 按模型）', () => {
     const res = await get('series', { bucket: 'hour', period: 'today', stack: 'model' })
     expect(res.status).toBe(200)
     const body = res.body as SeriesResponse
+  test('未知 stack 回 400（不许静默退回单序列）', async () => {
+    // 静默退回合计会让「按用户展开」的页面画出一条合计线，
+    // 而图上没有任何迹象说明它没展开 —— 与非法 bucket 是同一类陷阱。
+    for (const value of ['', 'provider', 'users']) {
+      const res = await get('series', { bucket: 'day', stack: value })
+      expect(res.status).toBe(400)
+    }
+  })
+
     expect(body.stack?.by).toBe('model')
     // 按窗口总量降序：b-model 200 > a-model 150
     expect(body.stack!.items.map((item) => item.key)).toEqual(['b-model', 'a-model'])
@@ -971,4 +1152,265 @@ describe('★ 趋势分层（按用户 / 按模型）', () => {
   })
 })
 })
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 

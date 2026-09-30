@@ -29,6 +29,25 @@
  * ⚠️ **只读**：本路由一个字节都不写库。它只回答「库里现在有什么」。
  *
  * ## 口径
+ * ## 🚨 数据范围：非管理员只看得到自己
+ *
+ * 看板里装的是**每个人的用量**，而能登录的人不都是管理员。所以除了「认人」，
+ * 还必须在**服务端**把「能看到谁的数据」定死（`applyDataScope()`）：
+ *
+ * | 身份 | 范围 |
+ * |---|---|
+ * | 内置 `admin` 角色 | 全部门 |
+ * | 其它任何角色（含自定义角色） | **只有他自己** |
+ *
+ * ★ 判据是**角色码**，不是权限码：权限回答「能做什么操作」，而「能看到谁的
+ *   数据」是另一件事 —— 现有权限码没有一个表达得了它（`stats:read` 是能不能进
+ *   看板、`members:read` 是人员目录、`cost:read` 是金额）。拿它们当数据范围会把
+ *   「能管名册」与「能看全员用量」绑成一件事，而那种绑定在页面上看不出来。
+ *
+ * 🚨 收窄**只发生在服务端**：页面隐藏人员下拉是为了不让人白点一下，
+ *   而不是安全边界 —— 手拼 `?member_id=<别人>` 同样只能拿到自己的数据（或者 403）。
+ *   「前端过滤 = 权限」是本项目明令禁止的那类错误。
+ *
  *
  * 本文件**不出现任何公式**：`cacheHitRate` / `avgTokensPerCall` /
  * `unattributedRate` 全部调用 `shared/metrics.ts`。四项 token 由
@@ -93,6 +112,7 @@ import { VIEWER_AUTH_MESSAGES } from './verify-route.js'
  */
 function hasCostRead(viewer: unknown): boolean {
   // ⚠️ 形参是 `unknown` 而不是 `{ permissions?: string[] }`：两种身份的形状
+  type StatsProvidersResponse,
   //   （数据库 `Principal` 与旧凭证的 `UserRole`）**没有公共字段**，
   //   写成结构化类型会让整个 `viewer` 联合类型不可赋值 —— 于是这里的判空
   //   会变成调用点的类型体操，而不是一行明确的运行时判断。
@@ -121,6 +141,84 @@ const GROUP_BYS: readonly GroupBy[] = [
   'provider',
   'model',
   'provider-model',
+ * ★ 数据范围只看它，不看权限码（理由见模块注释里的那张表）。
+ * ⚠️ 它是 `roles.code` 的稳定标识，且内置角色**不能改名**
+ *   （`assertEditableRole()` 挡住），所以这里比对字面量是安全的。
+ */
+const DEPARTMENT_ROLE = 'admin'
+
+/**
+ * 这个身份能不能看到**全部门**的用量。
+ *
+ * ⚠️ 读不到角色码时按**没有**管理员角色处理：服务端少返回一个字段不该变成
+ *   「人人能看全公司用量」，与「缺 `role` 一律按 member 处理」是同一条安全逻辑。
+ *   兼容路径（旧 `CredentialStore` 身份）没有角色码数组，只有 `role` 字段。
+ */
+function seesDepartment(viewer: unknown): boolean {
+  const roleCodes = (viewer as { roleCodes?: unknown } | null)?.roleCodes
+  if (Array.isArray(roleCodes)) return roleCodes.includes(DEPARTMENT_ROLE)
+  return (viewer as { role?: unknown } | null)?.role === DEPARTMENT_ROLE
+}
+
+/** 「只看自己」的身份被要求看别人时的统一答复：`403` + 说清是哪一条被拒。 */
+function scopeDenied(reason: string): { result: StatsRouteResult } {
+  return {
+    result: {
+      status: 403,
+      body: { ok: false, code: 'stats_self_only', reason: `当前身份只能查看本人数据：${reason}` },
+    },
+  }
+}
+
+/**
+ * 数据范围的**唯一实现**：把「只看自己」的身份的筛选条件收窄成只查本人。
+ *
+ * 三条规矩，缺一条都会漏：
+ *
+ * 1. ★ **显式点名别人一律 403，绝不静默替换成「我」。** 调用方点名要张三的用量
+ *    却拿到自己的数字，与「两个筛选条件打架查出 0 行」是同一类错误：答案看起来
+ *    完全正常，但它回答的是另一个问题。`user` / `legacy_user` / `unattributed`
+ *    同理 —— 后两者是**全库范围**的旧姓名子集与未署名用量，永远不可能属于某个人。
+ * 2. ★ **数据库身份用稳定 `member_id`**（`identity_view=member`）：姓名可以重复，
+ *    「按姓名取数」正是 v4 引入稳定 ID 要消灭的那种归属方式。
+ * 3. 🚨 **兼容身份（旧凭证表）没有稳定 ID 时直接 403，绝不按姓名兜底**：
+ *    两个同名的人会被并成一个人，于是「只看自己」变成「看到同名的那个人的用量」。
+ *    生产启动早已不接受 `credentialsPath`，所以这条只影响显式构造凭证表的调用方。
+ *
+ * ⚠️ 参数非法仍然回 400（解析在前），不要把它们混进 403：那会让「参数写错了」
+ *   看起来像「没权限」，排障方向整个跑偏。
+ */
+function applyDataScope(
+  viewer: unknown,
+  params: URLSearchParams,
+  window: ParsedWindow,
+): { filter: QueryFilter } | { result: StatsRouteResult } {
+  if (seesDepartment(viewer)) return { filter: window.filter }
+
+  const memberId = (viewer as { memberId?: unknown } | null)?.memberId
+  if (typeof memberId !== 'string' || !memberId) {
+    return scopeDenied('这把凭证没有稳定人员 ID，无法按个人取数，请改用后台账号登录或让管理员签发 appKey')
+  }
+  if (params.getAll('member_id').some((id) => id !== memberId)) return scopeDenied('不能按人员筛选其他人')
+  if (params.has('user')) return scopeDenied('不能按姓名筛选')
+  if (params.has('legacy_user')) return scopeDenied('不能按历史身份筛选')
+  if (params.get('unattributed') === 'true') return scopeDenied('不能筛选未署名用量')
+
+  return {
+    filter: {
+      ...window.filter,
+      // ★ 稳定人员 ID 是唯一不会把同名两人并起来的归属键。
+      memberIds: [memberId],
+      identityView: 'member',
+      // 其它人员选择器一律清空：留着就会与服务端注入的范围**按 OR 叠加**，
+      // 于是「只看我」被悄悄放宽成全库。
+      userIds: [],
+      legacyUserIds: [],
+      unattributedOnly: false,
+    },
+  }
+}
+
   'user',
   // ★ `group` 是**多对多维度**：一条事件计入它的人员所属的每个分组，
   //   所以各分组之和 > 总量是定义（见 core/db/portal.ts 的注释）。
@@ -341,7 +439,13 @@ export class StatsRoute {
         attribution_status: row.attributionStatus,
       } : {}),
       totalTokens: row.counts.total,
-      inputTokens: row.counts.input,
+    // ── 2.5 数据范围（🚨 非管理员一律只看本人，见模块注释）──────────
+    // ★ 放在参数解析**之后**：非法参数照旧回 400，不要让它变成 403。
+    //   收窄的结果只喂给取数层，`window`（时间窗标签）保持不变。
+    const scoped = applyDataScope(auth.viewer, params, window)
+    if ('result' in scoped) return scoped.result
+
+    const filter = scoped.filter
       outputTokens: row.counts.output,
       cacheReadTokens: row.counts.cacheRead,
       cacheWriteTokens: row.counts.cacheWrite,
@@ -584,6 +688,10 @@ async function buildStack(
   const currencies = new Set<string>()
   for (const row of stacks) {
     for (const totals of row.costByBucket?.values() ?? []) {
+   * ★ 它**不跟着数据范围收窄**（`applyDataScope()` 只管用量）：这是一份**目录**，
+   *   里面一个用量数字都没有，而分组下拉的联动（见 `memberFilterOptions()`）
+   *   要靠它才能工作。页面在「只看自己」时不渲染人员下拉，也就不需要它 ——
+   *   但那属于页面的呈现决定，不是这条接口的授权边界。
       for (const entry of totals.costs) currencies.add(entry.currency)
     }
   }
@@ -908,4 +1016,199 @@ function intParam(params: URLSearchParams, name: string): number | undefined | '
 function msg(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 

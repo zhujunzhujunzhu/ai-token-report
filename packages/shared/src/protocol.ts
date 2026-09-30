@@ -845,6 +845,10 @@ export interface AdminMember {
   username?: string | null
   login_enabled?: boolean
   /**
+ *
+ * ★ 它同时是**数据范围**的判据（`server/src/stats-route.ts` 的
+ *   `applyDataScope()`）：只有内置 `admin` 角色能看到全部门的用量，
+ *   其余身份一律只看得到自己。这里比对的是**内置角色码**，不是权限码。
    * 身份 token。
    *
    * ★ 这里**刻意返回明文**：管理页的用途就是「把 token 发给本人」与
@@ -854,7 +858,7 @@ export interface AdminMember {
    */
   token: string
   name: string
-  group: string | null
+/** 普通成员：**只看得到自己的统计**（数据范围由服务端强制），看不到管理页。 */
   role: UserRole
   /** token 发放时刻（epoch ms）。手工写进文件的凭证没有这个字段 → null。 */
   createdAt: number | null
@@ -957,4 +961,30 @@ export interface AdminMemberResponse {
   /** 本次操作涉及的人员（含**新签发的 token**，供管理员复制转发）。 */
   member?: AdminMember
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
