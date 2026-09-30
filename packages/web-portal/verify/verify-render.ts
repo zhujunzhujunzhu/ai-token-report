@@ -319,6 +319,12 @@ try {
     issueHtml.includes('有效期可以留空'))
   check('列表提供改有效期入口，并说明过期可以续期',
     appKeyHtml.includes('aria-label="设置有效期"') && appKeyHtml.includes('过期前可以延长有效期'))
+  // ⚠️ 行内那五个动作（交付信息 / 有效期 / 轮换 / 吊销 / 删除）**断言不到**：
+  //   `el-table` 的表头与单元格在 SSR 下都不渲染（只有空 `<tr>`，见下面角色页那段），
+  //   所以这里只钉页面壳里那句「删除只对从未上报过的凭证开放」——
+  //   它同时也是使用者唯一能在点按钮之前看到的口径说明。
+  check('页面壳写明删除只对从未上报过的凭证开放',
+    appKeyHtml.includes('误发且从未上报过的可以删除'))
   // ★ 完整明文不落在页面上：连「拿到过明文」这一次也不进 DOM。
   const demoSecret = 'atr-' + 'demo'.repeat(12)
   members.issuedSecret = demoSecret

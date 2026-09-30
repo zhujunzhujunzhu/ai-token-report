@@ -34,6 +34,19 @@
  * 「已到期」不是库里的状态，而是 `expires_at_ms` 与当前时间比出来的，
  * 所以过期 key 还能在这里**续期** —— 不必轮换出一把新的（那会换掉明文，
  * 已经发出去的插件配置全部作废）。
+ *
+ * ## 删除：只删「从没被用过」的，其余让它吊销
+ *
+ * 「吊销」与「删除」回答的是两个问题：前者是「让这把 key 立刻失效」（行还在，
+ * 「谁被吊销过」这一屏照旧看得到，历史用量也仍指向它）；后者是「这把 key
+ * 发错了、从没被用过，把它从列表里清掉」。所以删除按钮的存在不是为了让吊销
+ * 更快，而是为了让列表不攒下一堆**从未生效过**的凭证。
+ *
+ * 🚨 已经上报过用量的凭证**在库层面就删不掉**：`usage_event.report_token_id`
+ *   是 RESTRICT 外键，硬删会让那些用量失去归属。服务端因此先查引用，删不掉时
+ *   回 409 并在原因里直说「请改用吊销」，页面把那条原因**原样**呈现出来。
+ * ⚠️ 按钮不做「先禁用」的猜测：appKey 列表里没有「这把 key 用过没有」这个事实，
+ *   猜错不是「按钮能点却必然失败」，就是更糟的「明明能删却点不动」。
  */
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { Refresh, Search, Ticket } from '@element-plus/icons-vue'
@@ -156,6 +169,32 @@ async function action(entry: PortalAppKeyEntry, kind: 'rotate' | 'revoke'): Prom
   if (!ok) return
   if (kind === 'rotate') ElMessage.success(`已为 ${entry.member.name} 轮换 appKey，请立即复制`)
 }
+/**
+ * 删除一把凭证（列表行的「删除」）。
+ *
+ * ★ 与 `action(entry, 'revoke')` 分开写而不是合成一个带 kind 的分支：两者的**后果
+ *   不同**，确认文案要各说各的 —— 吊销只讲「立即失效」，删除还要讲清「这一行会
+ *   消失」以及「已经上报过的凭证删不掉」。混在一个分支里只会让文案堆满条件。
+ * ⚠️ 服务端拒绝（有上报记录 / 审计引用 / 最后管理入口）时**不重试、也不降级成吊销**：
+ *   `mutate` 把 `reason` 放进 `admin.error`，页面顶部那条红条就是使用者要看的答案。
+ * ⚠️ 无论成败都重载列表：失败里有一类是版本冲突（别人刚动过这一行），不刷新的话
+ *   重试会拿着同一个过期版本号再失败一次。
+ */
+async function remove(entry: PortalAppKeyEntry): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      '删除后这一行不再出现在列表里。已经上报过的用量不受影响，但已经产生上报记录的凭证在库层面无法删除，只能吊销。',
+      `删除 appKey（${entry.member.name}）`,
+      { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch { return /* 用户取消。 */ }
+  const removed = await admin.mutate(
+    () => api.deleteToken({ member_id: entry.member.member_id, token_id: entry.token.token_id, expected_version: entry.token.version }),
+    entry.token.token_id,
+  )
+  await admin.loadAppKeys()
+  if (removed) ElMessage.success(`已删除 ${entry.member.name} 的 appKey`)
+}
 /** 打开改有效期弹框。★ 已有的到期时间摆到「自定义」档上，别让人对着档位重猜原值。 */
 function openExpiry(entry: PortalAppKeyEntry): void {
   admin.error = null
@@ -199,7 +238,7 @@ onUnmounted(() => { admin.clear() })
     <el-card shadow="never">
       <template #header>
         <div class="panel-heading">
-          <div><h2>已发放 appKey</h2><p>完整 appKey 只在签发或轮换成功时出现一次，之后只能轮换一把新的；过期前可以延长有效期。</p></div>
+          <div><h2>已发放 appKey</h2><p>完整 appKey 只在签发或轮换成功时出现一次，之后只能轮换一把新的；过期前可以延长有效期，误发且从未上报过的可以删除。</p></div>
         </div>
       </template>
       <div class="member-filters">
@@ -218,14 +257,17 @@ onUnmounted(() => { admin.clear() })
         <el-table-column label="凭证提示" min-width="140"><template #default="{ row }"><code>{{ tokenHint(row.token.token_prefix) }}</code></template></el-table-column>
         <el-table-column label="状态 / 到期" min-width="150"><template #default="{ row }">{{ STATE_TEXT[keyState(row.token)] }}<br /><small>{{ row.token.expires_at_ms ? formatFullDateTime(row.token.expires_at_ms) : '长期有效' }}</small></template></el-table-column>
         <el-table-column label="签发时间" min-width="150"><template #default="{ row }">{{ formatFullDateTime(row.token.created_at_ms) }}</template></el-table-column>
-        <el-table-column label="操作" min-width="260"><template #default="{ row }"><div class="row-actions">
+        <el-table-column label="操作" min-width="320"><template #default="{ row }"><div class="row-actions">
           <!-- 轮换要求凭证仍然可用（服务端拒已到期的轮换：换不出明文就等于白换）；
                而「有效期」与「吊销」对已到期的凭证仍要能点 —— 续期是过期的补救，
-               吊销是「别再让它活过来」的唯一手段。 -->
+               吊销是「别再让它活过来」的唯一手段。
+               ★ 「删除」对已吊销 / 已到期的凭证同样可点：发错之后先吊销、再把这一行
+                 清掉，是最常见的顺序。能不能删由服务端说了算（见文件头「删除」一节）。 -->
           <el-button link :disabled="!!admin.busyId" @click="listedTarget = { owner: memberLabel(rowEntry(row).member), secret: null, prefix: row.token.token_prefix }">交付信息</el-button>
           <el-button link :disabled="!!admin.busyId || row.token.status === 'revoked'" @click="openExpiry(rowEntry(row))">有效期</el-button>
           <el-button link :disabled="!!admin.busyId || keyState(row.token) !== 'active'" @click="action(rowEntry(row), 'rotate')">轮换</el-button>
           <el-button link type="danger" :disabled="!!admin.busyId || row.token.status === 'revoked'" @click="action(rowEntry(row), 'revoke')">吊销</el-button>
+          <el-button link type="danger" :disabled="!!admin.busyId" @click="remove(rowEntry(row))">删除</el-button>
         </div></template></el-table-column>
       </el-table>
     </el-card>

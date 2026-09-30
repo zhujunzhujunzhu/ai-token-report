@@ -96,6 +96,16 @@ export const updateTokenScopes = (input: PortalTokenScopesRequest) => post<Porta
  *   改有效期是两件事，合成一个「更新凭证」请求会让只想续期的调用顺手带上 scopes。
  */
 export const setTokenExpiry = (input: PortalTokenExpiryRequest) => post<PortalTokenResult>(members + '/tokens/expiry', input)
+/**
+ * ★ 物理删除一把凭证（appKey 管理页的「删除」）。
+ *
+ * ⚠️ 与 `revokeToken` 是两件事：吊销保留整行与历史归属，删除让这一行彻底消失。
+ *   服务端只允许删**从未上报过、也没被审计引用**的凭证（`usage_event.report_token_id`
+ *   是 RESTRICT 外键），其余情况返回 409 并说明原因 —— 所以它**不能**被做成
+ *   「失败就当吊销处理」：那会把一句「这把 key 已经产生过用量」变成一个静默的降级。
+ * ⚠️ 响应里没有 `token` 字段：行已经不存在了。
+ */
+export const deleteToken = (input: PortalTokenVersionRequest) => post<PortalMutationResult>(members + '/tokens/delete', input)
 export const createGroup = (name: string) => post<PortalGroupResult>(root + '/groups', { name })
 export const updateGroup = (input: PortalGroupVersionRequest & { name: string }) => post<PortalGroupResult>(root + '/groups/update', input)
 export const updateGroupStatus = (input: PortalGroupVersionRequest & { status: 'active' | 'disabled' }) => post<PortalGroupResult>(root + '/groups/status', input)

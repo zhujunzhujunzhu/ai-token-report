@@ -59,10 +59,21 @@ export const useMembersStore = defineStore('portal-members', () => {
     busyId.value = null; error.value = null; forbidden.value = null; dismissSecret()
     activeSection = 'members'
   }
-  function failure(result: { status: number; error: string }): void {
+  /**
+   * `409` 有两种含义，只有带 `version_conflict` 的才是「本地这一行过期了」。
+   *
+   * ⚠️ 另一类是**状态不允许这个动作**：最后管理员护栏、已上报过的凭证不能删除。
+   *   把它们一起渲染成「资料已被其他操作更新，请刷新后重新确认」，等于让使用者
+   *   照着一句永远不成立的提示反复刷新 —— 而真正的原因（该改用吊销）就在
+   *   服务端的 `reason` 里，白白丢掉。
+   */
+  function isVersionConflict(result: { status: number; code?: string }): boolean {
+    return result.status === 409 && result.code === 'version_conflict'
+  }
+  function failure(result: { status: number; error: string; code?: string }): void {
     if (result.status === 401) session.expire('登录已失效，请重新登录')
     else {
-      error.value = result.status === 409 ? '资料已被其他操作更新，请刷新后重新确认。' : result.error
+      error.value = isVersionConflict(result) ? '资料已被其他操作更新，请刷新后重新确认。' : result.error
       if (result.status === 403) forbidden.value = result.error
     }
   }
@@ -123,7 +134,9 @@ export const useMembersStore = defineStore('portal-members', () => {
     if (!result.ok) {
       failure(result)
       // 版本冲突意味着本地这一行已经过期，重载列表后才能再试。
-      if (result.status === 409) await load()
+      // ⚠️ 只对 `version_conflict` 重载：另一类 409（护栏、被引用的凭证）
+      //    重载也改变不了结果，只会白读一次。
+      if (isVersionConflict(result)) await load()
       return null
     }
     if (!result.data.ok) { error.value = result.data.reason ?? '操作失败'; return null }

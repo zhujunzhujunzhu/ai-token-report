@@ -2,9 +2,17 @@
  * 部门后台 HTTP 边界。GET 与 POST 共用解析、超时及鉴权头逻辑，
  * HTTP 错误和 200 + ok:false 的业务结果保持分开，由各业务 Store 处理。
  */
+/**
+ * HTTP 失败也带上服务端的**错误码**（`code`），因为状态码本身不够分派。
+ *
+ * ★ 典型是 `409`：它既表示「这一行在你手上过期了」（`version_conflict`），
+ *   也表示「当前状态不允许这个动作」（最后管理员护栏、已上报过的凭证不能删除）。
+ *   只按状态码渲染，会把后者的原因替换成一句「资料已被其他操作更新」——
+ *   使用者照着那句提示刷十次页面也不会成功。
+ */
 export type ApiResult<T> =
   | { ok: true; data: T }
-  | { ok: false; error: string; status: number }
+  | { ok: false; error: string; status: number; code?: string }
 
 /**
  * 把接口路径接到部署前缀上。
@@ -56,6 +64,9 @@ async function send<T>(
       }
     }
     if (!response.ok) {
+      // ⚠️ 只认字符串型 `code`：`{ code: undefined }` 被 `String()` 一过就成了
+      //    字面量 `"undefined"`，分派逻辑会以为服务端真给了个错误码。
+      const serverCode = parsed && typeof parsed === 'object' ? (parsed as { code?: unknown }).code : undefined
       return {
         ok: false,
         status: response.status,
@@ -63,6 +74,7 @@ async function send<T>(
           parsed && typeof parsed === 'object' && 'reason' in parsed
             ? String(parsed.reason)
             : `请求失败（HTTP ${response.status}）`,
+        ...(typeof serverCode === 'string' && serverCode ? { code: serverCode } : {}),
       }
     }
     // 本站接口均返回对象；空响应不能当成功，否则页面会在读取字段时白屏。
