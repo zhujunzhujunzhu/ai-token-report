@@ -133,6 +133,13 @@ function which(names) {
 /**
  * 从 ~/.ssh/known_hosts 取主机指纹，供 plink/pscp 的 -hostkey 使用。
  * ⚠️ 少了它 plink 会停下来问 yes/no；`-batch` 下则直接拒绝连接，表现为「密码对但连不上」。
+ *
+ * 🚨 指纹形式必须用 **MD5 冒号**（`ab:cd:…`），不能用 `SHA256:…`。
+ *   实测本机 PuTTY 0.72：`-hostkey SHA256:…`（含 `ssh-ed25519 255 SHA256:…` 变体）一律
+ *   `not a valid format for a manual host key specification`，pscp 在**上传阶段**就失败，
+ *   连密码那步都走不到；同一把钥匙换成裸 MD5 冒号形式即正常连上。
+ *   而 `ssh-keygen -lf` 输出的是 SHA256，所以这里显式 `-E md5` 再剥掉 `MD5:` 前缀。
+ *   MD5 形式新旧 PuTTY 都接受（新版本只是把 MD5 视为弱指纹），故它对两端都安全。
  */
 function knownHostFingerprint(host, sshKeygen) {
   const knownHosts = join(homedir(), '.ssh', 'known_hosts')
@@ -141,9 +148,13 @@ function knownHostFingerprint(host, sshKeygen) {
   if (!line) return ''
   const scratch = join(tmpdir(), `atr-known-host-${process.pid}`)
   writeFileSync(scratch, `${line}\n`)
-  const result = spawnSync(sshKeygen, ['-lf', scratch], { encoding: 'utf8' })
+  const md5 = spawnSync(sshKeygen, ['-l', '-E', 'md5', '-f', scratch], { encoding: 'utf8' })
+  const md5Fingerprint = md5.stdout.match(/MD5:([0-9a-f]{2}(?::[0-9a-f]{2}){15})/i)?.[1]
+  // 兜底：极老的 OpenSSH 没有 -E md5 时退回 SHA256（新版 PuTTY 认这种形式）
+  const sha256 = md5Fingerprint ? null : spawnSync(sshKeygen, ['-lf', scratch], { encoding: 'utf8' })
   rmSync(scratch, { force: true })
-  return result.stdout.match(/SHA256:[A-Za-z0-9+/=]+/)?.[0] ?? ''
+  if (md5Fingerprint) return md5Fingerprint
+  return sha256?.stdout.match(/SHA256:[A-Za-z0-9+/=]+/)?.[0] ?? ''
 }
 
 /**

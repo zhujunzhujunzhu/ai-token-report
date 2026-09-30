@@ -1,2 +1,7 @@
 # 运行时模板字符串使用 LF，DDL 对账文件在 Windows 上也保留相同字节。
+# ⚠️ 每一代的 DDL 对账文件都要在列：v5 漏了这一行时，`core.autocrlf=true`
+#   的工作副本会把它签出成 CRLF，而 `portal-v5.test.ts` 断言的是**逐字节相等**
+#   与运行时模板（LF）—— 于是「v5 运行时 SQL 与设计契约逐字一致」在 Windows 上
+#   必然失败，且失败信息只有一行 `Expected - 0 / Received + 0`，看不出是行尾。
 docs/database-v4/*.sql text eol=lf
+docs/database-v5/*.sql text eol=lf
