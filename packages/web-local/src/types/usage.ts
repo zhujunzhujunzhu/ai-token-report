@@ -8,7 +8,7 @@
  *   | 旧字段 | 现在 | 问题 |
  *   |---|---|---|
  *   | `apiKey` | `provider` + `model` | 概念不同 |
- *   | `cost`（CNY） | 无 | **不展示金额**（已确认决策），且无单价来源 |
+ *   | `cost`（CNY，mock 时代的假数） | `cost`（服务端按单价现算） | 同名字段**语义完全不同**：现在是整数微元、多币种、显式未计价 |
  *   | `requests` | `calls` | 同义不同名 |
  *   | （无） | `cacheReadTokens` | **漏掉 94.3% 的用量** |
  *
@@ -111,6 +111,14 @@ export interface UsageSummary {
    */
   sources: LocalStatsSources
   metrics: MetricCard[]
+  /**
+   * 费用口径说明：未计价比例 + 单价来源 + 还没配单价的目标；没有金额时为 null。
+   *
+   * ★ 与 `sources` 同类：这是**服务端的事实**（价从哪来、多少用量没算钱），
+   *   不是展示口径。本地页读 `pricing.json` 快照、看板读库里的 `model_price`，
+   *   两者会给出不同的金额 —— 少了这一行，使用者没法判断该信哪个数。
+   */
+  costNote: string | null
   metricGroups: MetricGroup[]
   /** 明细表的分组行。 */
   rows: LocalBreakdownRow[]

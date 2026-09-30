@@ -45,6 +45,14 @@ function totalOfRows(): number {
 const sourceText = computed(() => describeSources(summary.value.sources))
 const sourcePaths = computed(() => describeSourcePaths(summary.value.sources))
 const missingRoots = computed(() => describeMissingRoots(summary.value.sources))
+/**
+ * 费用口径那一行（未计价比例 + 单价来源 + 缺哪个价）。
+ *
+ * ★ 与「数据来源」同类：它回答的是「这个数是怎么来的」。
+ *   本地页读的是数据目录下的 `pricing.json` 快照，看板读的是库里的单价表 ——
+ *   两者会给出不同的金额，而都「看起来正常」，所以这一行必须与金额同时在场。
+ */
+const costNote = computed(() => summary.value.costNote)
 </script>
 
 <template>
@@ -71,6 +79,12 @@ const missingRoots = computed(() => describeMissingRoots(summary.value.sources))
     <UsageMetricGrid :metrics="summary.metrics" :loading="loading" />
 
     <p class="usage-page__sources" :title="sourcePaths">{{ sourceText }}</p>
+    <!--
+      费用口径：与「数据来源」同一类信息 —— 它回答「这个金额是按哪份价、有多少没算钱」。
+      本地页读数据目录下的 pricing.json 快照，看板读库里的 model_price，
+      两者会给不同的金额而都「看起来正常」，所以这一行必须与金额同时在场。
+    -->
+    <p v-if="costNote" class="usage-page__sources is-cost">{{ costNote }}</p>
     <p v-if="missingRoots" class="usage-page__sources is-missing" role="status">
       ⚠ 以下会话日志根不存在，已跳过：{{ missingRoots }}
     </p>
@@ -149,6 +163,15 @@ const missingRoots = computed(() => describeMissingRoots(summary.value.sources))
 
 .usage-page__sources.is-missing {
   color: #b42318;
+}
+
+/*
+  费用口径那一行的左边框是个提示：金额是**估算**，且这一行里可能写着
+  「多少 Token 没算钱」。它不该像报错那样红，但也不该和「数据来源」完全一样。
+*/
+.usage-page__sources.is-cost {
+  padding-left: 8px;
+  border-left: 2px solid var(--c-divider, #e4e7ec);
 }
 
 .usage-page__tabs {

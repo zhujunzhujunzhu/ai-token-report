@@ -1,14 +1,22 @@
 <script setup lang="ts">
 /**
- * 明细表格：按选中的维度分组，展示四项 token 与命中率。
+ * 明细表格：按选中的维度分组，展示四项 token、命中率与**费用（估算）**。
  *
- * ★ **没有金额列** —— 无单价来源，只展示 token 数（已确认决策）。
- *   四项 token 分列而不是只给一个「输入」，是因为 `cacheRead` 实测占
+ * ★ 费用列**只在服务端下发了 `cost` 时才出现**（判字段不判数值）：
+ *   一列恒为 `¥0.00` 会让「拿不到金额」看起来像「这段没花钱」。
+ *   本地页的价来自数据目录下的 `pricing.json` 快照（没有就退回内置种子价），
+ *   与部门看板读库里的 `model_price` 不是同一份价 —— 口径那一行在页面顶部。
+ * ★ 四项 token 分列而不是只给一个「输入」，是因为 `cacheRead` 实测占
  *   总用量的 94.3%，把它并进 input 或干脆不显示，都会让这张表彻底失真。
  */
 import { computed } from 'vue'
 
-import { detailCell, DETAIL_COLUMNS } from '@/composables/usage-view-model'
+import {
+  COST_COLUMN,
+  DETAIL_COLUMNS,
+  detailCell,
+  showCostColumn,
+} from '@/composables/usage-view-model'
 import type { LocalBreakdownRow } from '@ai-token-report/shared'
 
 const props = defineProps<{
@@ -34,6 +42,11 @@ const dimLabel = computed(() => DIM_LABELS[props.groupBy] ?? props.groupBy)
 
 /** 第一列标题随维度变化 */
 const firstColumnTitle = computed(() => dimLabel.value)
+
+/** 实际渲染的列：费用列按「服务端有没有下发 `cost`」加上去。 */
+const columns = computed(() =>
+  showCostColumn(props.rows) ? [...DETAIL_COLUMNS, COST_COLUMN] : DETAIL_COLUMNS,
+)
 </script>
 
 <template>
@@ -52,7 +65,7 @@ const firstColumnTitle = computed(() => dimLabel.value)
         <thead>
           <tr>
             <th
-              v-for="col in DETAIL_COLUMNS"
+              v-for="col in columns"
               :key="col.key"
               :class="{ 'is-text': !col.numeric }"
             >
@@ -62,18 +75,18 @@ const firstColumnTitle = computed(() => dimLabel.value)
         </thead>
         <tbody>
           <tr v-if="loading">
-            <td class="usage-table__empty" :colspan="DETAIL_COLUMNS.length">
+            <td class="usage-table__empty" :colspan="columns.length">
               正在扫描本机日志…
             </td>
           </tr>
           <tr v-else-if="rows.length === 0">
-            <td class="usage-table__empty" :colspan="DETAIL_COLUMNS.length">
+            <td class="usage-table__empty" :colspan="columns.length">
               当前筛选条件下暂无用量数据
             </td>
           </tr>
           <tr v-for="row in rows" v-else :key="row.key">
             <td
-              v-for="col in DETAIL_COLUMNS"
+              v-for="col in columns"
               :key="col.key"
               :class="{ 'is-text': !col.numeric, tabular: col.numeric }"
             >

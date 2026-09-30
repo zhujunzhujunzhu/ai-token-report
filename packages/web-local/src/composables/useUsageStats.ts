@@ -28,8 +28,10 @@ import {
   bucketFor,
   buildUsageSummary,
   GROUP_TABS,
+  showCostColumn,
   TIME_RANGES,
 } from '@/composables/usage-view-model'
+import { UNPRICED_TEXT, costText } from '@/utils/cost'
 import type {
   LocalBreakdownRow,
   LocalGroupBy,
@@ -123,6 +125,7 @@ export function useUsageStats() {
 
   /** 导出当前明细为 CSV。 */
   function exportCsv(): void {
+    const withCost = showCostColumn(rows.value)
     const columns = [
       '分组',
       '调用次数',
@@ -132,6 +135,9 @@ export function useUsageStats() {
       '缓存写',
       '计费总量',
       '命中率',
+      // ★ 费用列只在服务端下发了 `cost` 时才加（与页面上的列同一个开关）：
+      //   导出一份恒为空的费用列，会让人以为「这段时间没花钱」。
+      ...(withCost ? ['费用（估算）', '未计价Token'] : []),
     ]
     const body = rows.value.map((row) =>
       [
@@ -144,6 +150,11 @@ export function useUsageStats() {
         row.cacheWriteTokens,
         row.totalTokens,
         (row.cacheHitRate * 100).toFixed(1) + '%',
+        // ⚠️ 未配价的写「未计价」，绝不写 0 —— 导出的表格里 `0` 会被当成
+        //   「免费」，而这个数是「还没配上单价」。多币种用 ` + ` 连接（见 costText）。
+        ...(withCost
+          ? [`"${row.cost ? (costText(row.cost) ?? UNPRICED_TEXT) : ''}"`, row.cost?.unpricedTokens ?? '']
+          : []),
       ].join(','),
     )
 

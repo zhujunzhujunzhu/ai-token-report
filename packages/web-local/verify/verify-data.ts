@@ -4,7 +4,8 @@
  * 运行： bun run verify/verify-data.ts
  *
  * ★ 这些断言守的是「口径不许漂移」：
- *   缓存命中率必须原样来自服务端，四项 token 必须各自独立，不许出现金额。
+ *   缓存命中率必须原样来自服务端，四项 token 必须各自独立；
+ *   金额**只在服务端下发了 `cost` 时才出现**，且未计价绝不显示成 ¥0。
  */
 
 import {
@@ -13,6 +14,8 @@ import {
   describeMissingRoots,
   describeSourcePaths,
   describeSources,
+  detailCell,
+  showCostColumn,
 } from '../src/composables/usage-view-model'
 import { formatCompact, formatCount, formatPercent } from '../src/utils/format'
 import type { LocalOverviewResponse, LocalSeriesResponse } from '@ai-token-report/shared'
@@ -100,7 +103,7 @@ console.log(`--- freshness: ${summary.freshness}`)
 console.log(`--- metricGroups: ${summary.metricGroups.length}`)
 console.log(`--- rows: ${summary.rows.length}`)
 
-check('指标卡片有 4 项', summary.metrics.length === 4)
+check('服务端没下发 cost 时指标卡片仍是 4 项', summary.metrics.length === 4)
 check('计费总量格式正确', summary.metrics[0]?.value === '521,262,657')
 check('缓存命中率为 95.0%', summary.metrics[1]?.value === '95.0%', summary.metrics[1]?.value)
 check('调用次数正确', summary.metrics[2]?.value === '3,026')
@@ -120,12 +123,84 @@ check(
 check('缺失的根逐项列出', describeMissingRoots(summary.sources) === '/home/u/.dsh-vscode/sessions')
 check('悬停能看全部根路径', describeSourcePaths(summary.sources).split('\n').length === 2)
 
-// ★ 铁律：不展示金额
+// ★ 金额三态之一：**字段缺席**（旧服务端 / 没有金额来源）
+//   —— 此时页面必须一位金额都不显示，绝不能用 ¥0.00 顶替（那会让
+//   「拿不到金额」与「这段时间没花钱」长得一模一样）。
+//   ⚠️ 这三条断言**保留原样**（v7 之前它们守的是「本地页不展示金额」这个决策；
+//   现在守的是同一件事的另一半：**没有这个字段时**不展示）。
 const allText = JSON.stringify(summary)
-check('视图模型不含 CNY', !allText.includes('CNY'))
-check('视图模型不含「消费金额」', !allText.includes('消费金额'))
-check('视图模型不含 ¥', !allText.includes('¥'))
-check('视图模型不含 cost 字段', !allText.includes('"cost"'))
+check('无 cost 字段时不含 CNY', !allText.includes('CNY'))
+check('无 cost 字段时不含「消费金额」', !allText.includes('消费金额'))
+check('无 cost 字段时不含 ¥', !allText.includes('¥'))
+check('无 cost 字段时不含 cost 字段', !allText.includes('"cost"'))
+check('无 cost 字段时没有费用口径那一行', summary.costNote === null)
+
+// ★ 金额三态之二 / 之三：字段在场时的「未计价」与「有金额」。
+//   金额全部由 `shared/price.ts` 的 `formatCostSummary()` 拼出来：
+//   ≥1 的币种两位小数、<1 的四位小数，多币种用 ` + ` 连接（**绝不相加**）。
+const withCost = buildUsageSummary(
+  {
+    ...overview,
+    cost: {
+      costs: [
+        { currency: 'CNY', amountMicro: 12_345_678, tokens: 500_000_000 },
+        { currency: 'USD', amountMicro: 500_000, tokens: 21_262_657 },
+      ],
+      pricedTokens: 521_262_657,
+      unpricedTokens: 0,
+      totalTokens: 521_262_657,
+      pricedRate: 1,
+      unpricedRate: 0,
+      pricing: { pricingSource: 'snapshot', pricingSyncedAt: 1_700_000_000_000 },
+    },
+  },
+  series,
+  [
+    {
+      ...rows[0]!,
+      cost: {
+        costs: [{ currency: 'CNY', amountMicro: 12_345_678, tokens: 521_262_657 }],
+        pricedTokens: 521_262_657,
+        unpricedTokens: 0,
+        totalTokens: 521_262_657,
+        pricedRate: 1,
+        unpricedRate: 0,
+        pricing: { pricingSource: 'snapshot', pricingSyncedAt: 1_700_000_000_000 },
+      },
+    },
+  ],
+  'today',
+)
+check('有 cost 时多出一张费用卡片', withCost.metrics.length === 5)
+check('费用卡片在最后且标题是「费用（估算）」', withCost.metrics[4]?.label === '费用（估算）')
+check(
+  '多币种用 + 连接、绝不跨币种相加',
+  withCost.metrics[4]?.value === '¥12.35 + $0.5000',
+  withCost.metrics[4]?.value,
+)
+check('费用口径那一行给出单价来源', (withCost.costNote ?? '').includes('快照'), withCost.costNote ?? '')
+check('有费用列时明细单元格显示金额', detailCell(withCost.rows[0]!, 'cost') === '¥12.35')
+check('有金额时明细表显示费用列', showCostColumn(withCost.rows))
+
+// ★ 未计价绝不能显示成 ¥0.00 —— 它看起来像「省了钱」，而实际是「没配上价」。
+const unpricedText = detailCell(
+  {
+    ...rows[0]!,
+    cost: {
+      costs: [],
+      pricedTokens: 0,
+      unpricedTokens: 1000,
+      totalTokens: 1000,
+      pricedRate: 0,
+      unpricedRate: 1,
+      pricing: { pricingSource: 'builtin', pricingSyncedAt: null },
+    },
+  },
+  'cost',
+)
+check('未计价的单元格写「未计价」而不是 ¥0', unpricedText === '未计价', unpricedText)
+check('字段缺席的行写「—」（与未计价区分开）', detailCell(rows[0]!, 'cost') === '—')
+check('没有一行带 cost 时不显示费用列', !showCostColumn(rows))
 
 // ★ 铁律：cacheRead 是独立的一项，不能被并进 input
 check(

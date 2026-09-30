@@ -16,9 +16,14 @@
  * 前端只做格式化（`0.9503` → `'95.0%'`），**绝不在这里重算**。
  * 前端一旦自己算一遍，就是第二个口径来源，两端迟早会不一致。
  *
- * ## 不展示金额
+ * ## 金额（v7 起）
  *
- * 全程不出现任何人民币字段 —— 无单价来源，只展示 token 数（已确认决策）。
+ * 页面上会显示**费用（估算）**，但所有金额都来自服务端下发的 `cost`：
+ * 四类分价相乘、按币种分桶、未计价比例一律在 `packages/shared/src/price.ts`
+ * 算好后透传，这里只做格式化（`14200` 微元 → `¥0.01`）。
+ * 本地页的价来自数据目录下的 `pricing.json` 快照（没有就退回内置种子价），
+ * 与部门看板读库里的 `model_price` **不是同一份价** —— 所以那行
+ * 「按哪份单价算的」必须跟着金额一起显示。
  */
 
 import type {
@@ -37,6 +42,7 @@ import type {
   UsageSummary,
 } from '@/types/usage'
 import { formatCompact, formatCount, formatPercent } from '@/utils/format'
+import { UNPRICED_TEXT, costText, describeCost } from '@/utils/cost'
 
 /**
  * 可选的具名周期。
@@ -72,9 +78,25 @@ export const METRIC_HINTS: Record<string, string> = {
     '注意分母不是「输入」—— 未缓存输入只是没命中那部分。',
   calls: '计费事件条数，即带 usage 的 assistant/message 条数。',
   sessions: '这段时间内有实际调用的会话数。',
+  // ★ 金额这条提示必须点明「估算」与「按哪份价」：本地页读数据目录下的
+  //   pricing.json 快照（没有就退回内置种子价），而部门看板读的是库里的单价表 ——
+  //   同一个时间窗在两边会给出不同的金额，而两个数都「看起来正常」。
+  cost:
+    '费用（估算）＝ 四类 token 各自乘单价后求和，按币种分别累加。' +
+    '单价来自本机单价快照，不是财务账单（折扣、预付、赠送额度都不在其中）；' +
+    '没配上单价的用量会显式标为「未计价」，绝不算成 0 元。',
 }
 
-/** 图表卡片的提示文案。 */
+/**
+ * 图表卡片的提示文案。
+ *
+ * ⚠️ **趋势里刻意没有金额曲线**（本地页的金额出现在概览卡、明细列与口径那一行）。
+ *   理由不是「懒得画」：金额曲线在多币种时**必须禁用而不是画线**
+ *   （跨币种相加是个口径错误），而那条判定规则只允许有一份实现 ——
+ *   它在部门看板的 `web-portal/src/utils/cost.ts`（`costSeriesOf`）。
+ *   在这里照抄一遍，等于把「什么时候可以把钱加起来」变成两个地方各自决定，
+ *   而它们分叉时不会报错，只会给出一个看起来正常的错误总额。
+ */
 export const CHART_HINTS: Record<string, string> = {
   tokens: '四项相加的计费总量，按时间分桶。',
   calls: '按时间分桶的调用次数。',
@@ -98,6 +120,19 @@ export const DETAIL_COLUMNS: DetailColumn[] = [
   { key: 'cacheHitRate', title: '命中率', numeric: true },
 ]
 
+/**
+ * 费用列（**只在真的有金额可展示时**加到表里）。
+ *
+ * ★ 与指标卡同一条规矩：判「字段在不在」，不判数值大不大 ——
+ *   一列恒为 `¥0.00` 会让「拿不到金额」看起来像「这段没花钱」。
+ */
+export const COST_COLUMN: DetailColumn = { key: 'cost', title: '费用（估算）', numeric: true }
+
+/** 这张表要不要显示费用列（任一行带 `cost` 就显示）。 */
+export function showCostColumn(rows: readonly LocalBreakdownRow[]): boolean {
+  return rows.some((row) => row.cost)
+}
+
 /** 把一行的字段渲染成单元格文本。 */
 export function detailCell(row: LocalBreakdownRow, key: string): string {
   switch (key) {
@@ -115,14 +150,19 @@ export function detailCell(row: LocalBreakdownRow, key: string): string {
       return formatCount(row.totalTokens)
     case 'cacheHitRate':
       return formatPercent(row.cacheHitRate)
+    case 'cost':
+      // ⚠️ 三种「没有数」措辞不同：字段缺席（旧服务端）→ `—`；
+      //   字段在但没配价 → 「未计价」；有金额 → 货币金额。
+      //   把中间那种显示成 `¥0.00`，就等于把「漏配了价」说成「省了钱」。
+      return row.cost ? (costText(row.cost) ?? UNPRICED_TEXT) : '—'
     default:
       return ''
   }
 }
 
-/** 顶部四个指标卡片。 */
+/** 顶部指标卡片（金额卡只在服务端下发了 `cost` 时才出现）。 */
 function buildMetrics(overview: LocalOverviewResponse): MetricCard[] {
-  return [
+  const metrics: MetricCard[] = [
     {
       key: 'total',
       label: '计费总量',
@@ -144,6 +184,16 @@ function buildMetrics(overview: LocalOverviewResponse): MetricCard[] {
       value: formatCount(overview.sessions),
     },
   ]
+  // ★ 判的是**字段在不在**，不是数值大不大：没有这个字段（旧版服务端）时
+  //   一张 `¥0.00` 的卡片会让「拿不到金额」与「这段时间没花钱」长得一模一样。
+  if (overview.cost) {
+    metrics.push({
+      key: 'cost',
+      label: '费用（估算）',
+      value: costText(overview.cost) ?? UNPRICED_TEXT,
+    })
+  }
+  return metrics
 }
 
 /**
@@ -267,6 +317,9 @@ export function buildUsageSummary(
     // ★ 来源原样透传：**不在前端加工**（「读了哪几处」是服务端的事实，不是展示口径）
     sources: overview.sources,
     metrics: buildMetrics(overview),
+    // ★ 费用口径那一行（单价来源 + 未计价比例 + 缺哪个价）；没有金额时为 null。
+    //   与 `sources` 同理：这是**服务端的事实**，前端只排版。
+    costNote: describeCost(overview.cost),
     metricGroups,
     rows,
   }
