@@ -12,7 +12,9 @@
  *   README.md
  * ```
  *
- * 发布：仓库根目录 `bun run publish:plugin`（强制完整验证）
+ * 发布：仓库根目录 `bun run publish:plugin`（强制完整验证）；
+ * 迭代期可用 `bun run publish:plugin:quick`（只验本包产物 + tarball 真启动）——
+ * 两条通道的边界见 `docs/发布检查与事故恢复.md`。
  *
  * ## 为什么是「打包 + 独立清单」而不是直接发布 workspace 包
  *
@@ -200,13 +202,21 @@ const manifest = {
   // ⚠️ 一律不写 `dependencies`：`@ai-token-report/*` 已内联，
   //   写进去只会让同事装到指向未发布包的 404。
   peerDependencies: {
-    // DSH 的 session 格式与 telemetry API 必须和宿主严格同代。
-    // 0.1.5 的 telemetry 会嵌套一套旧 dsh-session，读取 0.1.7 日志时
-    // 会把合法的 system-prompt source 误判成缺少 plugin source。
+    // DSH 的 session 格式与 telemetry API 必须与宿主同代，**但不必同版本**。
+    // 实测 0.1.7-rc.2 → 0.2.0-rc.2：telemetry 只是**纯增量**（新增可选
+    // `sourceEvent`，`body` 与 coordinator 签名逐字未变），`dsh-session-format*`
+    // 全树 89 个实现文件逐字节相同，`dsh-llm` 的 usage 类型文件也逐字节相同
+    // —— 即落盘日志格式没变，插件读日志的口径不受影响。
+    // 而 0.1.5 那代**不能**放进来：它的 telemetry 会嵌套一套旧 dsh-session，
+    // 读取 0.1.7 日志时会把合法的 system-prompt source 误判成缺少 plugin source。
+    // 所以下界钉在 0.1.7-rc.2，上界 `<0.3.0-0` 排除下一代的全部预发布
+    // （0.3.0-rc.1 之类必须重新验证后再放开）。
+    // ⚠️ 这两处（本文件与 packages/dsh-plugin/package.json）必须一致，
+    //   由 verify/verify-npm-package.ts 的「发布清单 peer == 源码清单 peer」兜住。
     '@deepseek-ai/cordis': '~4.0.4',
-    '@deepseek-ai/dsh-session-telemetry': '0.1.7-rc.2',
-    '@deepseek-ai/dsh-agent': '0.1.7-rc.2',
-    '@deepseek-ai/dsh-session': '0.1.7-rc.2',
+    '@deepseek-ai/dsh-session-telemetry': '>=0.1.7-rc.2 <0.3.0-0',
+    '@deepseek-ai/dsh-agent': '>=0.1.7-rc.2 <0.3.0-0',
+    '@deepseek-ai/dsh-session': '>=0.1.7-rc.2 <0.3.0-0',
   },
   peerDependenciesMeta: {
     '@deepseek-ai/dsh-agent': { optional: true },
@@ -245,5 +255,6 @@ process.stdout.write(
     `   宿主半  index.js（${(hostSize / 1024).toFixed(1)} KB，零运行时依赖）\n` +
     `   浏览器半 client.js（${(clientSize / 1024).toFixed(1)} KB，id 已改为发布名）\n` +
     `   文件数  ${files.length}\n` +
-    `   发布    bun run publish:plugin（完整验证后发布）\n`,
+    `   发布    bun run publish:plugin（完整验证后发布）\n` +
+    `   快速发布 bun run publish:plugin:quick（只验本包产物 + tarball 真启动，跳过全仓验证）\n`,
 )

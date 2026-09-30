@@ -68,6 +68,7 @@ bun run verify:npm:plugin     # ★ 发布前必跑
 bun run publish:plugin:dry    # 只打包断言 tarball，不发布
 bun run publish:plugin:next   # 发 --tag next（首版就走这个）
 bun run publish:plugin        # 正式发 latest
+bun run publish:plugin:quick  # 快速通道：只验本包产物 + tarball 真启动，跳过的步骤会逐条打印
 ```
 
 ⚠️ 根脚本用的是 `bun publish`，与上面的 `npm publish packages/dsh-plugin/dist`

@@ -22,7 +22,7 @@
 | 页面资源 | `packages/web-local/dist` 内嵌进产物，装完即用 |
 | 构建 | `bun run build:npm:cli`（= `--filter '@ai-token-report/cli' build:npm`） |
 | 验证 | `bun run verify:npm:cli`（= `--filter '@ai-token-report/cli' verify:npm`） |
-| 发布 | `bun run publish:cli:dry` → `publish:cli:next` → `publish:cli` |
+| 发布 | `bun run publish:cli:dry` → `publish:cli:next` → `publish:cli`；迭代期可用 `publish:cli:quick`（只验本包产物 + tarball 真启动） |
 
 **为什么"零依赖"是关键**：`shared`/`core`/`server` 在 workspace 里都是
 `private: true`、依赖写成 `workspace:*`，**发不出去**。
@@ -122,6 +122,7 @@ bun run verify:npm:cli     # ★ 发布前必跑（零依赖 + 双运行时）
 bun run publish:cli:dry    # 只打包断言 tarball，不发布
 bun run publish:cli:next   # 发 --tag next（首版就走这个）
 bun run publish:cli        # 正式发 latest
+bun run publish:cli:quick  # 快速通道：只验本包产物 + tarball 真启动，跳过的步骤会逐条打印
 ```
 
 展开就是下面这套（`bun` 与 `npm` 二选一都能发，见下方说明）：
