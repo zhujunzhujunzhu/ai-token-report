@@ -6,5 +6,6 @@
 
 export * from './identity.js'
 export * from './metrics.js'
+export * from './price.js'
 export * from './protocol.js'
 export * from './portal-identity.js'
