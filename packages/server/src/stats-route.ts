@@ -35,6 +35,7 @@
  */
 
 import {
+  loadProviderAliases,
   openPortalStats,
   openPortalStore,
   resolvePortalTarget,
@@ -174,7 +175,15 @@ export class StatsRoute {
     //   所以 finally 里的形状与 `ingest-route.ts` 完全一致。
     let session: PortalStatsSession
     try {
-      session = await openPortalStats(this.#target, filter)
+      // ★ 供应商归一化按**查看者**解析（全局规则 + 他个人的规则逐条覆盖）。
+      //   传加载函数而不是现成映射：规则要用同一个已过版本闸门的连接去读。
+      //   ⚠️ 人员 ID 只来自**服务端解析出的身份**（`auth.viewer.memberId`），
+      //   绝不从查询参数里取「以谁的身份归一化」—— 那等于让任何有
+      //   `stats:read` 的人套用别人的口径，而页面上看不出任何差别。
+      //   旧的 `CredentialStore` 身份（兼容路径）没有稳定人员 ID，
+      //   此时退化成「只有全局规则」，这是刻意的。
+      const viewerId = 'memberId' in auth.viewer ? auth.viewer.memberId : undefined
+      session = await openPortalStats(this.#target, filter, (store) => loadProviderAliases(store, viewerId))
     } catch (err) {
       if (isIdentityViewRequired(err)) return { status: 409, body: { ok: false, code: 'identity_view_required', reason: err.message } }
       if (this.#identityStore) return { status: 503, body: { ok: false, reason: '统计数据库暂时不可用，请稍后重试' } }
@@ -444,6 +453,10 @@ function toRecordRow(row: PortalRecordRow): RecordRow {
       attribution_status: row.attributionStatus,
     } : {}),
     provider: row.provider,
+    // ★ 原值只在**与展示名不同**时才发：它存在的意义是核对规则，
+    //   而绝大多数行（没配规则的 provider）两者逐字相同，
+    //   多发一个字段只是让每页 JSON 白胖一圈。
+    ...(row.providerRaw && row.providerRaw !== row.provider ? { providerRaw: row.providerRaw } : {}),
     model: row.model,
     // 口径只经 shared 计算；四项原始用量完整透传。
     totalTokens: computeTotal({ input: row.input, output: row.output, cacheRead: row.cacheRead, cacheWrite: row.cacheWrite, reasoning: 0 }),

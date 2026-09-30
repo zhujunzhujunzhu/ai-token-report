@@ -513,6 +513,61 @@ describe('现状契约：/api/v1/groups 与 /api/v1/admin/groups*', () => {
 })
 
 // ─────────────────────────────────────────────────────────────
+describe('现状契约：/api/v1/admin/provider-aliases*（供应商归一化规则）', () => {
+  test('缺 Authorization → 401（读目录与写规则都要身份）', async () => {
+    expect((await call(dept, 'GET', '/api/v1/admin/provider-aliases')).status).toBe(401)
+    expect((await call(dept, 'POST', '/api/v1/admin/provider-aliases', { headers: JSON_HEADERS, body: '{}' })).status).toBe(401)
+  })
+
+  test('admin 建规则 → 200，列表能读回；重复设置是 upsert 而不是新增', async () => {
+    const body = JSON.stringify({ scope: 'global', provider: 'dashscope', alias: 'bailian-tpp' })
+    const created = await call(dept, 'POST', '/api/v1/admin/provider-aliases', { headers: { ...JSON_HEADERS, ...ADMIN }, body })
+    expect(created.status).toBe(200)
+    expect((created.body as { alias: { provider: string; alias: string } }).alias).toMatchObject({ provider: 'dashscope', alias: 'bailian-tpp' })
+
+    const again = await call(dept, 'POST', '/api/v1/admin/provider-aliases', { headers: { ...JSON_HEADERS, ...ADMIN }, body: JSON.stringify({ scope: 'global', provider: 'dashscope', alias: 'bailian' }) })
+    expect(again.status).toBe(200)
+    const list = await call(dept, 'GET', '/api/v1/admin/provider-aliases', { headers: ADMIN })
+    expect(list.status).toBe(200)
+    const aliases = (list.body as { aliases: { provider: string; alias: string }[] }).aliases
+    expect(aliases.length).toBe(1)
+    expect(aliases[0]!.alias).toBe('bailian')
+  })
+
+  test('非法形状 400：首尾空格的原始名、带 / 的归一化名、未知作用域', async () => {
+    for (const payload of [
+      { scope: 'global', provider: ' dashscope', alias: 'ok' },
+      { scope: 'global', provider: 'dashscope', alias: 'a/b' },
+      { scope: 'team', provider: 'dashscope', alias: 'ok' },
+      { scope: 'global', provider: 'dashscope' },
+    ]) {
+      const r = await call(dept, 'POST', '/api/v1/admin/provider-aliases', { headers: { ...JSON_HEADERS, ...ADMIN }, body: JSON.stringify(payload) })
+      expect(r.status).toBe(400)
+    }
+  })
+
+  test('★ 归一化名允许中文（展示名是给人看的）', async () => {
+    const r = await call(dept, 'POST', '/api/v1/admin/provider-aliases', { headers: { ...JSON_HEADERS, ...ADMIN }, body: JSON.stringify({ scope: 'global', provider: 'openai', alias: '开放人工智能' }) })
+    expect(r.status).toBe(200)
+    expect((r.body as { alias: { alias: string } }).alias.alias).toBe('开放人工智能')
+  })
+
+  test('普通成员（无 providers:read）读规则目录 → 403', async () => {
+    // ★ 看板查询**不经过这个接口**：它用 stats:read 自己读规则表。
+    //   所以「能看数据」的人不会因为缺这个权限就看到未归一化的名字，
+    //   而「能改口径」这件事仍然只管在管理员手里。
+    const r = await call(dept, 'GET', '/api/v1/admin/provider-aliases', { headers: MEMBER })
+    expect(r.status).toBe(403)
+  })
+
+  test('GET /admin/provider-aliases/delete → 405 且 Allow 恰好是 POST', async () => {
+    const r = await call(dept, 'GET', '/api/v1/admin/provider-aliases/delete')
+    expect(r.status).toBe(405)
+    expect(r.allow).toBe('POST')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────
 describe('现状契约：/api/local/*（本地形态启用时）', () => {
   test('GET /api/local/identity → 200 + signed:false', async () => {
     const r = await call(local, 'GET', '/api/local/identity')

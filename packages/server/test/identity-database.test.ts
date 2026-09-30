@@ -436,4 +436,96 @@ describe('数据库权威身份', () => {
     expect(owners).toEqual([{ event_id: 'legacy:1', member_id: actor.memberId }, { event_id: 'legacy:2', member_id: null }, { event_id: 'new:3', member_id: null }])
     expect((await r.listAudit(actor, { target_type: 'legacy_mapping', target_id: mapping.mapping_id })).total).toBe(1)
   })
+  /**
+   * v6：供应商归一化规则的仓储层。
+   *
+   * 这一组覆盖的是**规则怎么存**（唯一性、归属、启停、审计、权限），
+   * 「规则怎么用」由 `packages/core/test/provider-alias.test.ts` 覆盖 ——
+   * 两边刻意分开：一处错了不会被另一处的通过掩盖。
+   */
+  describe('供应商归一化规则', () => {
+    test('新建 / 覆盖 / 列表：同一 (作用域, 人员, provider) 只留一条', async () => {
+      const { repository: r, admin } = await fixture()
+      const first = await r.setProviderAlias(admin, { scope: 'global', provider: 'dashscope', alias: 'bailian-tpp' })
+      expect(first.alias.alias).toBe('bailian-tpp')
+      expect(first.alias.scope).toBe('global')
+      expect(first.alias.member_id).toBeNull()
+
+      // ★ upsert：同一个人把同一个 provider 再设一次，是**改**不是新增。
+      const again = await r.setProviderAlias(admin, { scope: 'global', provider: 'dashscope', alias: 'bailian' })
+      expect(again.alias.alias_id).toBe(first.alias.alias_id)
+      expect(again.alias.alias).toBe('bailian')
+      expect((await r.listProviderAliases(admin)).aliases.length).toBe(1)
+    })
+
+    test('★ 人员规则与全局规则可同名共存，且列表带出归属人姓名', async () => {
+      const { repository: r, admin } = await fixture()
+      const someone = await member(r, admin, '张三')
+      await r.setProviderAlias(admin, { scope: 'global', provider: 'dashscope', alias: 'bailian-tpp' })
+      await r.setProviderAlias(admin, { scope: 'member', member_id: someone.member_id, provider: 'dashscope', alias: '我的百炼' })
+
+      const list = (await r.listProviderAliases(admin)).aliases
+      expect(list.length).toBe(2)
+      const mine = list.find((a) => a.scope === 'member')!
+      expect(mine.member_id).toBe(someone.member_id)
+      // 列表页要显示归属人；为此单独调一次人员接口是白费的往返。
+      expect(mine.member_name).toBe('张三')
+      expect(list.find((a) => a.scope === 'global')!.member_name).toBeNull()
+    })
+
+    test('同一人员的同一 provider 不能有两条规则（挡住「同样输入、不同结果」）', async () => {
+      const { repository: r, admin } = await fixture()
+      const someone = await member(r, admin)
+      await r.setProviderAlias(admin, { scope: 'member', member_id: someone.member_id, provider: 'dashscope', alias: '第一个' })
+      // 第二次是 upsert，所以这里**不会**报错 —— 但库里必须还是一条。
+      await r.setProviderAlias(admin, { scope: 'member', member_id: someone.member_id, provider: 'dashscope', alias: '第二个' })
+      const list = (await r.listProviderAliases(admin)).aliases
+      expect(list.length).toBe(1)
+      expect(list[0]!.alias).toBe('第二个')
+    })
+
+    test('校验：非法名字 / 非法作用域 / 不存在的人员都是 400 或 404', async () => {
+      const { repository: r, admin } = await fixture()
+      await expect(r.setProviderAlias(admin, { scope: 'global', provider: ' dashscope', alias: 'x' })).rejects.toMatchObject({ status: 400 })
+      await expect(r.setProviderAlias(admin, { scope: 'global', provider: 'dashscope', alias: 'x ' })).rejects.toMatchObject({ status: 400 })
+      await expect(r.setProviderAlias(admin, { scope: 'team', provider: 'dashscope', alias: 'x' })).rejects.toMatchObject({ status: 400 })
+      await expect(r.setProviderAlias(admin, { scope: 'member', member_id: randomUUID(), provider: 'dashscope', alias: 'x' })).rejects.toMatchObject({ status: 404 })
+      // 一条都没写进去
+      expect((await r.listProviderAliases(admin)).aliases.length).toBe(0)
+    })
+
+    test('停用 / 启用 / 删除：停用后规则行还在（可逆），删除后彻底消失', async () => {
+      const { repository: r, admin } = await fixture()
+      const created = (await r.setProviderAlias(admin, { scope: 'global', provider: 'dashscope', alias: 'bailian-tpp' })).alias
+      const off = await r.setProviderAliasStatus(admin, { alias_id: created.alias_id, enabled: false })
+      expect(off.alias.enabled).toBe(false)
+      expect((await r.listProviderAliases(admin)).aliases.length).toBe(1)
+      const on = await r.setProviderAliasStatus(admin, { alias_id: created.alias_id, enabled: true })
+      expect(on.alias.enabled).toBe(true)
+      await r.deleteProviderAlias(admin, { alias_id: created.alias_id })
+      expect((await r.listProviderAliases(admin)).aliases.length).toBe(0)
+      await expect(r.deleteProviderAlias(admin, { alias_id: created.alias_id })).rejects.toMatchObject({ status: 404 })
+    })
+
+    test('★ 规则变更全部进审计（改一条配置也必须能查出是谁改的）', async () => {
+      const { repository: r, admin } = await fixture()
+      const created = (await r.setProviderAlias(admin, { scope: 'global', provider: 'dashscope', alias: 'bailian-tpp' })).alias
+      await r.setProviderAliasStatus(admin, { alias_id: created.alias_id, enabled: false })
+      await r.deleteProviderAlias(admin, { alias_id: created.alias_id })
+      const actions = (await r.listAudit(admin, { target_type: 'provider_alias' })).rows.map((e) => e.action).sort()
+      expect(actions).toEqual(['provider_alias.delete', 'provider_alias.set', 'provider_alias.status'])
+    })
+
+    test('🚨 权限：只有 providers:read / providers:manage 能读能写', async () => {
+      const { repository: r, admin } = await fixture()
+      await r.setProviderAlias(admin, { scope: 'global', provider: 'dashscope', alias: 'bailian-tpp' })
+      // 普通成员（MEMBER_ROLE_ID 没有 providers:*）两条都该被拒。
+      const someone = await member(r, admin)
+      const token = await r.issueToken(admin, { member_id: someone.member_id, label: '普通成员' })
+      const actor = (await r.resolveBearer(token.token_secret))!
+      await expect(r.listProviderAliases(actor)).rejects.toMatchObject({ status: 403 })
+      await expect(r.setProviderAlias(actor, { scope: 'global', provider: 'openai', alias: 'x' })).rejects.toMatchObject({ status: 403 })
+      expect(actor.permissions).not.toContain('providers:manage')
+    })
+  })
 })

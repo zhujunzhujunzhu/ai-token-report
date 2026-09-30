@@ -55,6 +55,7 @@ import {
   portalTokenScopesSchema, portalIssueAppKeySchema, portalCreateGroupSchema, portalUpdateGroupSchema, portalGroupStatusSchema,
   portalCreateRoleSchema, portalUpdateRoleSchema, portalRoleStatusSchema,
   portalTokenExpirySchema,
+  portalSetProviderAliasSchema, portalProviderAliasIdSchema, portalProviderAliasStatusSchema,
 } from '@ai-token-report/shared/schemas'
 
 import type { CredentialStore } from './credentials.js'
@@ -230,22 +231,33 @@ export class DatabaseAdminRoute {
       // ★ 改有效期与改范围同一权限：都是「动一把已有凭证」，而能改有效期的
       //   人本来就敢让这把 key 立刻失效。
       'POST members/tokens/expiry': 'tokens:manage',
+      // ★ 删除与吊销共用权限：都是「处置一把已有凭证」，而删除比吊销更狠
+      //   （吊销留痕，删除让整行消失）。能吊销的人本来就能让它立刻失效。
       // ★ appKey 的权限范围由服务端固定（见 `issueAppKey`），但它们仍然是
       //   「签凭证」这件事，所以与其它签发动作共用同一个权限。
       'POST members/appkey': 'tokens:manage',
       'GET roles': 'roles:read', 'GET groups': 'groups:read',
       // ★ 角色定义（新建 / 改名 / 改权限 / 启停）复用 `roles:assign` 而不是新造一个
-      //   `roles:manage` 权限码。理由是一条硬约束：权限目录来自 `portal-schema-v5.ts`
-      //   的 seed，而 `portalSchemaChecksum` 是对**整份 SQL（含 seed）**求哈希 ——
-      //   加一行 `permissions` 就会让现有部署的 checksum 不匹配、`current` 判定失败，
-      //   服务端直接拒绝启动。新增权限码必须配套显式迁移，代价远大于收益；
-      //   而 `roles:assign` 的语义本就是「授予 / 调整权限关系」，且已在
-      //   `RECOVERY_PERMISSIONS` 里。
+      //   `roles:manage` 权限码。
+      //   ⚠️ 这里曾经的理由是「权限目录在 seed 里，改它会动 checksum」——
+      //     那个理由在 v6 已经不成立：v6 **新增了** `providers:read` /
+      //     `providers:manage` 两个权限码，并配套了显式迁移
+      //     （`portalV6Statements()` 的幂等权限行 + v5→v6 迁移步骤）。
+      //     也就是说「新增权限码」现在有正规路径了 —— 但要**走完整的版本升级**，
+      //     而不是往 seed 里插一行就完事（那会让已部署的库 checksum 不符、
+      //     `current` 判定失败、服务端直接拒绝启动）。
       'POST roles': 'roles:assign', 'POST roles/update': 'roles:assign',
       'POST roles/status': 'roles:assign',
       'POST groups': 'groups:manage', 'POST groups/update': 'groups:manage',
       'POST groups/status': 'groups:manage', 'GET audit': 'audit:read', 'GET storage': 'members:read',
       'GET legacy-attributions': 'members:read', 'POST legacy-attributions/confirm': 'members:manage',
+      // ★ 供应商归一化规则：读 / 写分开。看板查询**不经过这里** ——
+      //   它用 `stats:read` 自己读规则表（见 `stats-route.ts`），
+      //   所以「能看数据」的人不会因为缺 `providers:read` 就看到未归一化的名字。
+      'GET provider-aliases': 'providers:read',
+      'POST provider-aliases': 'providers:manage',
+      'POST provider-aliases/delete': 'providers:manage',
+      'POST provider-aliases/status': 'providers:manage',
     }
     const permission = permissions[key]
     if (!permission) return { status: 404, body: { ok: false, reason: '未找到管理接口' } }
@@ -305,6 +317,10 @@ export class DatabaseAdminRoute {
         case 'POST groups': return mutate(parsePortalBody(portalCreateGroupSchema, body), input => r.createGroup(actor, input))
         case 'POST groups/update': return mutate(parsePortalBody(portalUpdateGroupSchema, body), input => r.updateGroup(actor, input))
         case 'POST groups/status': return mutate(parsePortalBody(portalGroupStatusSchema, body), input => r.setGroupStatus(actor, input))
+        case 'GET provider-aliases': return ok(await r.listProviderAliases(actor))
+        case 'POST provider-aliases': return mutate(parsePortalBody(portalSetProviderAliasSchema, body), input => r.setProviderAlias(actor, input))
+        case 'POST provider-aliases/delete': return mutate(parsePortalBody(portalProviderAliasIdSchema, body), input => r.deleteProviderAlias(actor, input))
+        case 'POST provider-aliases/status': return mutate(parsePortalBody(portalProviderAliasStatusSchema, body), input => r.setProviderAliasStatus(actor, input))
         default: return { status: 404, body: { ok: false, reason: '未找到管理接口' } }
       }
     } catch (err) {

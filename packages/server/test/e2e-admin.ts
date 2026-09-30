@@ -1,4 +1,4 @@
-/** 数据库 v5 管理 → 上报 → SQL 对账，真 HTTP、隔离目录、动态端口。 */
+/** 数据库 v6 管理 → 上报 → SQL 对账，真 HTTP、隔离目录、动态端口。 */
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -238,6 +238,79 @@ try {
   const selfLongLived = selfTokens.find((token: any) => token.expires_at_ms === null)
   assert(selfLongLived); checks++
   equal((await request(a, 'admin/members/tokens/expiry', adminToken, { member_id: self.member_id, token_id: selfLongLived.token_id, expected_version: selfLongLived.version, expires_at_ms: season })).status, 409, '唯一长期管理凭证不能被改成会过期')
+
+  // ── ★ v6 供应商归一化规则：配一次，全库的「供应商视角」立刻跟着变 ──
+  // 这一段的重点是**归一化作用在查询期**：库里 `usage_event.provider` 始终是原值，
+  // 规则只影响分组与筛选的**表达式**，所以改规则是即时且可逆的，历史数据不用回填。
+  const aliasSecret = (await request(a, 'admin/members/tokens', adminToken, { member_id: first.member_id, label: '归一化验收' })).data.token_secret
+  equal((await request(b, 'token-usage', aliasSecret, { schemaVersion: 1, client: {}, generatedAt: new Date().toISOString(), records: [event('v6:alias:1'), { ...event('v6:alias:2'), provider: 'dashscope' }, { ...event('v6:alias:3'), provider: 'unconfigured-provider' }] })).data.accepted, 3, '同一批里可以有三个不同 provider')
+  // 全局规则：管理员配的，所有人可见。
+  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: 'dashscope', alias: 'bailian-tpp' })).status, 200, '管理员可以配置全局归一化规则')
+  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: 'fixture', alias: '验收供应商' })).status, 200, '归一化名允许中文')
+  // 🚨 读规则要 providers:read、写规则要 providers:manage —— 普通上报凭证两样都没有。
+  equal((await request(a, 'admin/provider-aliases', null)).status, 401, '未认证不能读归一化规则')
+  equal((await request(a, 'admin/provider-aliases', aliasSecret)).status, 403, '普通上报凭证读不到规则目录')
+  equal((await request(a, 'admin/provider-aliases', aliasSecret, { scope: 'global', provider: 'openai', alias: 'x' })).status, 403, '普通上报凭证改不了归一化规则')
+  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: ' dashscope', alias: 'ok' })).status, 400, '首尾空格的原始名是 400（它会静默不命中）')
+  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: 'dashscope', alias: 'a/b' })).status, 400, '归一化名带 / 是 400（它会让 provider/model 拼接歧义）')
+
+  const collapsed = await request(a, 'stats/breakdown?identity_view=member&by=provider')
+  const collapsedKeys = collapsed.data.rows.map((entry: any) => entry.key)
+  // ★ 这就是使用者要的效果：`dashscope` 与 `fixture` 都折进各自配好的名字里。
+  assert(collapsedKeys.includes('bailian-tpp') && collapsedKeys.includes('验收供应商')); checks++
+  equal(collapsedKeys.includes('dashscope') || collapsedKeys.includes('fixture'), false, '配过规则的原始名不再作为分组出现')
+  // `provider-model` 组合维度只换 provider 那一段 —— 模型名必须原样保留。
+  const modelKeys = (await request(a, 'stats/breakdown?identity_view=member&by=provider-model')).data.rows.map((entry: any) => entry.key)
+  assert(modelKeys.includes('验收供应商/fixture')); checks++
+  assert(modelKeys.includes('bailian-tpp/fixture')); checks++
+  // ★ 明细仍然给出原值：这是人用来核对「规则配得对不对」的唯一地方。
+  const aliasRows = (await request(a, 'stats/records?identity_view=member')).data.rows
+  equal(aliasRows.find((row: any) => row.eventId === 'v6:alias:2').provider, 'bailian-tpp', '明细里 provider 是归一化名')
+  equal(aliasRows.find((row: any) => row.eventId === 'v6:alias:2').providerRaw, 'dashscope', '明细同时给出原值，规则配错时看得出来')
+  // 没配规则的 provider 两个字段同值 → 不发冗余的 providerRaw，前端也不必判断。
+  equal(aliasRows.find((row: any) => row.eventId === 'v6:alias:3').provider, 'unconfigured-provider', '未配规则的 provider 保持原值')
+  equal(aliasRows.find((row: any) => row.eventId === 'v6:alias:3').providerRaw, undefined, '两者相同时不发冗余的 providerRaw')
+  // 🚨 反过来：配了规则的行必须**同时**发两个值 —— 前端「有没有原值可看」只由这一个字段决定。
+  assert(collapsedKeys.includes('unconfigured-provider')); checks++
+
+  // ── 按人覆盖：同一个库、同一批数据，不同的人看到不同的供应商视角 ──
+  // 🚨 归一化按**查看者**解析（`auth.viewer.memberId`），绝不从查询参数取
+  //   「以谁的身份归一化」：否则任何有 `stats:read` 的人都能套用别人的口径。
+  //   要验证这一点，就必须真的拿那个人的凭证去请求 —— 用管理员的 token 查
+  //   `member_id=` 得到的是**管理员自己的**口径。
+  const viewerA = first.member_id
+  const viewerB = (await request(a, 'admin/members', adminToken, { name: '看全局的人', role_ids: [memberRole] })).data.member.member_id
+  const keyA = (await request(a, 'admin/members/appkey', adminToken, { member_id: viewerA, label: '归一化A' })).data.token_secret
+  const keyB = (await request(a, 'admin/members/appkey', adminToken, { member_id: viewerB, label: '归一化B' })).data.token_secret
+  equal((await request(b, 'token-usage', keyB, payload('v6:alias:B'))).data.accepted, 1, '另一把 appKey 上报的数据归属另一个人')
+  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'member', member_id: viewerA, provider: 'dashscope', alias: '我的百炼' })).status, 200, '可以给某个人单独配规则')
+  const keysA = (await request(a, 'stats/breakdown?identity_view=member&by=provider', keyA)).data.rows.map((entry: any) => entry.key)
+  const keysB = (await request(a, 'stats/breakdown?identity_view=member&by=provider', keyB)).data.rows.map((entry: any) => entry.key)
+  assert(keysA.includes('我的百炼') && !keysA.includes('bailian-tpp')); checks++
+  equal(keysA.includes('验收供应商'), true, '人员规则没提的 provider 仍回落全局（逐条覆盖）')
+  assert(keysB.includes('bailian-tpp') && !keysB.includes('我的百炼')); checks++
+  // 个人规则只对该人员生效：他自己那把 appKey 上报的数据也按他来归一化。
+  equal((await request(a, 'stats/records?identity_view=member', keyA)).data.rows.find((row: any) => row.eventId === 'v6:alias:2').provider, '我的百炼', '按人覆盖对这个人自己的明细也生效')
+
+  // ── 改规则立即生效（不需要回填历史） ──
+  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: 'fixture', alias: 'fixture-tpp' })).status, 200, '同一 provider 再配一次是覆盖')
+  const coveredKeys = (await request(a, 'stats/breakdown?identity_view=member&by=provider')).data.rows.map((entry: any) => entry.key)
+  assert(coveredKeys.includes('fixture-tpp') && !coveredKeys.includes('验收供应商')); checks++
+  equal((await request(a, 'admin/provider-aliases')).data.aliases.length, 3, '列表里是全局两条 + 人员一条（upsert 没有多出行）')
+
+  // ── 停用与删除：两种「不想再归一化」的强度 ──
+  const aliasId = (await request(a, 'admin/provider-aliases')).data.aliases.find((entry: any) => entry.scope === 'global' && entry.provider === 'fixture').alias_id
+  equal((await request(a, 'admin/provider-aliases/status', adminToken, { alias_id: aliasId, enabled: false })).status, 200, '停用规则')
+  assert((await request(a, 'stats/breakdown?identity_view=member&by=provider')).data.rows.map((entry: any) => entry.key).includes('fixture')); checks++
+  equal((await request(a, 'admin/provider-aliases/status', adminToken, { alias_id: aliasId, enabled: true })).status, 200, '重新启用规则')
+  equal((await request(a, 'admin/provider-aliases/delete', adminToken, { alias_id: aliasId })).status, 200, '删除规则')
+  assert((await request(a, 'stats/breakdown?identity_view=member&by=provider')).data.rows.map((entry: any) => entry.key).includes('fixture')); checks++
+  equal((await request(a, 'admin/provider-aliases/delete', adminToken, { alias_id: aliasId })).status, 404, '再删一次是 404，不静默成功')
+  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'member', member_id: '00000000-0000-4000-8000-00000000dead', provider: 'openai', alias: 'x' })).status, 404, '给不存在的人配规则是 404')
+  // 🚨 事实表一个字节都没被改写：归一化只是查询侧的表达式。
+  const rawProviders = (await request(a, 'stats/records?identity_view=member')).data.rows.map((row: any) => row.providerRaw ?? row.provider)
+  assert(rawProviders.includes('fixture') && rawProviders.includes('dashscope')); checks++
+
   await a.stop()
   a = await start()
   equal((await request(a, 'identity/verify', secondIssue.data.token_secret, {})).data.member_id, second.member_id, '重启后凭证仍有效')
@@ -247,7 +320,7 @@ try {
   servers.push(empty)
   equal((await request(empty, 'token-usage', firstSecret, payload('v5:5'))).status, 503, '未初始化上报非2xx')
   equal((await request(empty, 'admin/members')).status, 503, '未初始化管理503')
-  console.log(`${typeof Bun === 'undefined' ? 'Node' : 'Bun'} + ${isolation ? 'MySQL' : 'SQLite'} 数据库 v5 真 HTTP 管理与上报通过：${checks} 项`)
+  console.log(`${typeof Bun === 'undefined' ? 'Node' : 'Bun'} + ${isolation ? 'MySQL' : 'SQLite'} 数据库 v6 真 HTTP 管理与上报通过：${checks} 项`)
 } finally {
   await Promise.all(servers.map(server => server.stop().catch(() => {})))
   await isolation?.dispose()

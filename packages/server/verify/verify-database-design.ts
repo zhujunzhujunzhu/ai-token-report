@@ -1,5 +1,5 @@
 /**
- * Portal v5 数据库设计原型：执行两份 DDL 并验证真实约束、事务和历史引用。
+ * Portal v6 数据库设计原型：执行两份 DDL 并验证真实约束、事务和历史引用。
  * 这不是应用 E2E，也不是生产迁移。只建随机隔离 SQLite / MySQL schema。
  * MySQL 不可连接或无建库权限时明确失败；不进入配置 URL 原来指定的业务库。
  * 用法：bun run packages/server/verify/verify-database-design.ts
@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createSqliteDatabase } from '../../core/src/db/driver.js'
 import { openMysqlBackend, type MysqlBackend } from '../../core/src/db/mysql.js'
+import { PORTAL_SCHEMA_VERSION, portalV6Statements } from '../../core/src/db/portal-schema-v5.js'
 
 type Params = Record<string, string | number | null>
 interface Db {
@@ -110,17 +111,23 @@ async function verify(db: Db, kind: 'sqlite' | 'mysql', second: () => Promise<Db
     ddlHashes[kind] = sha(ddl)
     assert.ok(!/^\s*(ALTER|DROP)\s/im.test(ddl), 'DDL 只允许创建新库结构')
     await db.exec(ddl)
-    check('18 张表可真实创建', (await Promise.all(tableNames.map(t=>scalar(`SELECT COUNT(*) AS n FROM ${t}`)))).every(Number.isFinite))
-    check('12 个权限与两个内置角色', await scalar('SELECT COUNT(*) AS n FROM permissions')===12 && await scalar('SELECT COUNT(*) AS n FROM roles')===2)
-    check('admin 有 12 项、member 有 4 项权限', await scalar('SELECT COUNT(*) AS n FROM role_permissions WHERE role_id=$id', {$id:seedAdmin})===12 && await scalar('SELECT COUNT(*) AS n FROM role_permissions WHERE role_id=$id', {$id:seedMember})===4)
+    // ⚠️ v5 的 DDL 文件是**冻结基线**（与 `PORTAL_*_V5_SQL` 逐字一致，由 core 的
+    //   契约测试钉住），所以它必然是 18 张表 / 12 个权限。v6 的追加在**代码里**
+    //   （`PORTAL_*_V6_ADDITIONS` + `PORTAL_V6_PERMISSION_SQL`），这里照执行一遍，
+    //   于是下面所有断言看到的是**当前终态**。
+    for (const sql of portalV6Statements(kind)) await db.exec(sql)
+    tableNames.push('provider_alias')
+    check('19 张表可真实创建', (await Promise.all(tableNames.map(t=>scalar(`SELECT COUNT(*) AS n FROM ${t}`)))).every(Number.isFinite))
+    check('14 个权限与两个内置角色', await scalar('SELECT COUNT(*) AS n FROM permissions')===14 && await scalar('SELECT COUNT(*) AS n FROM roles')===2)
+    check('admin 有 14 项、member 有 4 项权限', await scalar('SELECT COUNT(*) AS n FROM role_permissions WHERE role_id=$id', {$id:seedAdmin})===14 && await scalar('SELECT COUNT(*) AS n FROM role_permissions WHERE role_id=$id', {$id:seedMember})===4)
     check('DDL 没伪造迁移完成或初始化管理员', await scalar('SELECT COUNT(*) AS n FROM portal_schema_migrations')===0 && await scalar('SELECT COUNT(*) AS n FROM login_accounts')===0)
     const migrationId = randomUUID()
-    await insert('portal_schema_migrations', {migration_id:migrationId,version:5,checksum:sha(ddl),status:'started',last_completed_step:1,checkpoint_json:JSON.stringify({verified_tables:tableNames}),started_at_ms:1})
-    // ⚠️ 这里只验「迁移步骤自身的状态机」：v5 的 DDL 不伪造完成证据，
-    //   真实迁移由 core 的 v4→v5 步骤按 checksum 核实后写入。
-    check('独立 v5 迁移步骤可记录为未完成', Number((await db.get('SELECT version FROM portal_schema_migrations'))?.version)===5 && (await db.get('SELECT completed_at_ms FROM portal_schema_migrations'))?.completed_at_ms===null)
+    await insert('portal_schema_migrations', {migration_id:migrationId,version:PORTAL_SCHEMA_VERSION,checksum:sha(ddl),status:'started',last_completed_step:1,checkpoint_json:JSON.stringify({verified_tables:tableNames}),started_at_ms:1})
+    // ⚠️ 这里只验「迁移步骤自身的状态机」：受控 DDL 不伪造完成证据，
+    //   真实迁移由 core 的 v4→v5 / v5→v6 步骤按 checksum 核实后写入。
+    check('独立迁移步骤可记录为未完成', Number((await db.get('SELECT version FROM portal_schema_migrations'))?.version)===PORTAL_SCHEMA_VERSION && (await db.get('SELECT completed_at_ms FROM portal_schema_migrations'))?.completed_at_ms===null)
     await rejected('迁移未填完成时间不能标成功', ()=>db.run("UPDATE portal_schema_migrations SET status='completed'"))
-    if(kind==='sqlite') check('本地 user_version 未被提升为 v5', Number((await db.get('PRAGMA user_version'))?.user_version)===0)
+    if(kind==='sqlite') check('本地 user_version 未被提升', Number((await db.get('PRAGMA user_version'))?.user_version)===0)
     const groupId=randomUUID(), memberId=randomUUID(), otherId=randomUUID(), accountId=randomUUID(), tokenId=randomUUID()
     // ⚠️ v5 的 `members` 上**没有**分组列：归属只存在关联表里（多对多）。
     const member = (id:string,name:string):Params => ({member_id:id,display_name:name,created_at_ms:10,updated_at_ms:10})
@@ -189,6 +196,34 @@ async function verify(db: Db, kind: 'sqlite' | 'mysql', second: () => Promise<Db
     const subjectHash=sha('qa-account-subject')
     await insert('auth_rate_limit_buckets',{bucket_id:randomUUID(),scope:'login:account',subject_hash:subjectHash,window_started_at_ms:10,expires_at_ms:100})
     await rejected('同 scope/subject 只有一个限流桶',()=>insert('auth_rate_limit_buckets',{bucket_id:randomUUID(),scope:'login:account',subject_hash:subjectHash,window_started_at_ms:10,expires_at_ms:100}))
+    // ── v6：供应商归一化规则表（provider_alias）──────────────────────
+    // 规则只在**查询时**生效，事实表一个字节都不动，所以这里只验这份配置表自己的约束。
+    const alias=(over:Params={}):Params=>({alias_id:randomUUID(),scope:'global',member_id:null,provider:'dashscope',alias:'bailian-tpp',enabled:1,created_at_ms:10,updated_at_ms:10,...over})
+    await insert('provider_alias',alias())
+    check('全局规则可写入且默认启用',await scalar("SELECT COUNT(*) AS n FROM provider_alias WHERE scope='global' AND alias='bailian-tpp'")===1)
+    // ★ 「同一原始名的全局规则只能有一条」在两个后端上**都不由数据库保证** ——
+    //   实测（本脚本的 MySQL 分支）：`(NULL, 'dashscope')` 在 SQLite 与 MySQL 上
+    //   都能插进两行。两个后端的唯一索引都只对**整行非 NULL** 的组合去重，
+    //   所以全局那一档只能靠 repository 的 findProviderAlias() 显式查重
+    //   （它本身不在写事务里，并发下仍可能留下重复，见 provider-alias.ts 的排序注释）。
+    //   ⚠️ 这里绝不能断言「数据库会拒」—— 那是假承诺，会让真正的缺口看起来已被堵上。
+    await insert('provider_alias',alias({alias:'别的名字'}))
+    check('两个后端的唯一索引都不管含 NULL 的全局重复（靠应用层查重）',await scalar("SELECT COUNT(*) AS n FROM provider_alias WHERE scope='global' AND provider='dashscope'")===2)
+    await db.run("DELETE FROM provider_alias WHERE alias='别的名字'")
+    await insert('provider_alias',alias({scope:'member',member_id:memberId,provider:'dashscope',alias:'我自己的名字'}))
+    check('人员规则可与全局规则同名共存（逐条覆盖）',await scalar("SELECT COUNT(*) AS n FROM provider_alias WHERE provider='dashscope'")===2)
+    await rejected('同一人员的同一 provider 只能有一条',()=>insert('provider_alias',alias({scope:'member',member_id:memberId,provider:'dashscope',alias:'第三条'})))
+    await insert('provider_alias',alias({scope:'member',member_id:otherId,provider:'bailian',alias:'bailian-tpp'}))
+    check('★ 不同人员可各自设置同一个 provider 的规则',await scalar("SELECT COUNT(*) AS n FROM provider_alias WHERE member_id=$id",{$id:otherId})===1)
+    await rejected('scope=member 时 member_id 必须非空',()=>insert('provider_alias',alias({scope:'member',member_id:null})))
+    await rejected('scope=global 时 member_id 必须为空',()=>insert('provider_alias',alias({scope:'global',member_id:memberId,provider:'openai'})))
+    await rejected('规则指向不存在的人员被外键挡住',()=>insert('provider_alias',alias({scope:'member',member_id:randomUUID(),provider:'openai'})))
+    // 先把 id 取出来：`rejected()` 的回调是同步签名，await 写进回调里会直接是语法错误。
+    const bailianAliasId=(await db.get<{alias_id:string}>("SELECT alias_id FROM provider_alias WHERE provider='bailian'"))!.alias_id
+    await rejected('enabled 只接受 0/1',()=>db.run('UPDATE provider_alias SET enabled=2 WHERE alias_id=$id',{$id:bailianAliasId}))
+    // ★ 「停用」不是「映射到原名」：行还在，但不再参与归一化（查询层只取 enabled=1）。
+    await db.run("UPDATE provider_alias SET enabled=0 WHERE provider='bailian'")
+    check('停用后规则行仍保留（可逆）',await scalar("SELECT COUNT(*) AS n FROM provider_alias WHERE provider='bailian'")===1)
     const event=(id:string):Params=>({event_id:id,session_id:'qa-session',seq:1,ts:10,provider:'provider',model:'model',user_id:'旧姓名',user_name:'旧姓名',group_name:'旧分组',input_tokens:11,output_tokens:22,cache_read_tokens:333,cache_write_tokens:44,reasoning_tokens:7,member_id:memberId,report_token_id:tokenId,received_at_ms:20})
     await insert('usage_event',event('qa-session:1'))
     const before=await db.get('SELECT * FROM usage_event WHERE event_id=$id',{$id:'qa-session:1'})
@@ -258,7 +293,7 @@ async function verify(db: Db, kind: 'sqlite' | 'mysql', second: () => Promise<Db
   }
 }
 
-console.log('Portal v5 真实数据库设计验证（多对多分组）；不是应用 E2E，不修改业务库。')
+console.log('Portal v6 真实数据库设计验证（多对多分组 + 供应商归一化）；不是应用 E2E，不修改业务库。')
 let controller: MysqlBackend|undefined, mysql: MysqlBackend|undefined, created=false
 let failure: string|undefined
 const sqlitePath=join(artifactDir,'portal-v5.sqlite')

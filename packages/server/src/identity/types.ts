@@ -40,8 +40,14 @@ export const RECOVERY_PERMISSIONS = ['members:read', 'members:manage', 'tokens:m
  * ⚠️ 权限码**不做兼容别名**：v5 迁移原地改写了 `permissions.code`，
  *   库里只有 `groups:*`。同时保留两套写法会让「这个人到底有没有分组管理权」
  *   取决于哪一处代码在读，而两处都不会报错。
+ *
+ * ★ v6 新增 `providers:read` / `providers:manage`（供应商归一化规则）。
+ *   它们**不是**只改这个数组就生效的：`portal-schema-v5.ts` 的
+ *   `PORTAL_V6_PERMISSION_SQL` 负责往库里补行（幂等），v5→v6 的迁移步骤
+ *   负责让已部署的库也拿到它们。漏了任何一半，表现都是
+ *   「管理员登录进去了，但配置页显示没有权限」。
  */
-export const PERMISSIONS = ['identity:read', 'usage:write', 'stats:read', 'members:read', 'members:manage', 'tokens:manage', 'accounts:manage', 'roles:read', 'roles:assign', 'audit:read', 'groups:read', 'groups:manage']
+export const PERMISSIONS = ['identity:read', 'usage:write', 'stats:read', 'members:read', 'members:manage', 'tokens:manage', 'accounts:manage', 'roles:read', 'roles:assign', 'audit:read', 'groups:read', 'groups:manage', 'providers:read', 'providers:manage']
 export const str = (r: Row, k: string): string => String(r[k] ?? '')
 export const num = (r: Row, k: string): number => Number(r[k] ?? 0)
 export function requirePermission(p: Principal, permission: string): void {

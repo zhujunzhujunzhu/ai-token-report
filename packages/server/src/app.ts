@@ -330,7 +330,7 @@ export function createApp(deps: AppDeps): Hono {
       if ('error' in parsed) return fail(parsed.error, 400)
       return respond(await route.handle(c.req.method, action, await portalAuthorization(c), parsed.value, new URL(c.req.url).searchParams))
     }
-    for (const path of ['members', 'members/tokens', 'appkeys', 'roles', 'audit', 'storage', 'legacy-attributions']) {
+    for (const path of ['members', 'members/tokens', 'appkeys', 'roles', 'audit', 'storage', 'legacy-attributions', 'provider-aliases']) {
       app.get(`/api/v1/admin/${path}`, c => dispatch(c, path))
     }
     app.get('/api/v1/groups', c => dispatch(c, 'groups'))
@@ -340,6 +340,10 @@ export function createApp(deps: AppDeps): Hono {
       'members/tokens/scopes', 'members/tokens/expiry', 'members/appkey', 'groups', 'groups/update', 'groups/status',
       'roles', 'roles/update', 'roles/status',
       'legacy-attributions/confirm',
+      // v6 供应商归一化规则：写规则也是 POST 子路径（与上面几条同一形状），
+      // ★ 必须逐条列出 —— 注册是**枚举**的，漏一条的表现是 404，
+      //   而 `http-contract.test.ts` 里那条 405 + Allow 断言正是为了钉住这一点。
+      'provider-aliases', 'provider-aliases/delete', 'provider-aliases/status',
     ]) app.post(`/api/v1/admin/${path}`, c => dispatch(c, path))
   } else if (deps.adminRoute) {
   const legacyAdmin = deps.adminRoute

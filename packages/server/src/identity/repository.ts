@@ -1,6 +1,6 @@
 /** 人员 / 分组身份的数据库真值；与用量写入共用连接、锁顺序和提交边界。 */
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { openPortalStore, PORTAL_SCHEMA_VERSION, type PortalStore, type PortalTarget } from '@ai-token-report/core/db'
+import { openPortalStore, PORTAL_SCHEMA_VERSION, aliasNameError, providerNameError, type PortalProviderAlias, type PortalStore, type PortalTarget } from '@ai-token-report/core/db'
 import { hashPassword, normalizeUsername, passwordError, usernameError } from '../auth/password.js'
 import type { CredentialInput } from '../credentials.js'
 import { APP_KEY_LABEL, APP_KEY_SCOPES, type PortalAppKeyEntry, type PortalAppKeyOwner, type PortalMember, type PortalMemberGroupRef, type PortalRole, type PortalGroup, type PortalReportToken, type PortalAuditResponse, type PortalStorageResponse, type PortalLegacyAttribution } from '@ai-token-report/shared'
@@ -797,6 +797,145 @@ export class IdentityRepository {
       return { ok: true as const, group: await this.group(tx, id) }
     })
   }
+  /**
+   * 供应商归一化规则（`provider_alias`）—— 列表。
+   *
+   * ★ 权限是 `providers:read`：看板本身不读管理接口（它走 `stats:read` 的
+   *   `loadProviderAliases()`），所以「能看数据」与「能看规则目录」是两件事。
+   *   `member_name` 顺带 JOIN 出来，免得页面为了显示一个归属人再调一次人员接口。
+   */
+  async listProviderAliases(actor: Principal) {
+    return this.securedRead(actor, 'providers:read', async (tx) => ({
+      aliases: (await tx.all<Row>(
+        `SELECT a.*, m.display_name AS member_name
+           FROM provider_alias a LEFT JOIN members m ON m.member_id = a.member_id
+          ORDER BY a.scope, m.display_name, a.provider`,
+      )).map((row) => this.providerAlias(row)),
+    }))
+  }
+
+  private providerAlias(row: Row): PortalProviderAlias {
+    const scope = str(row, 'scope') === 'member' ? 'member' as const : 'global' as const
+    return {
+      alias_id: str(row, 'alias_id'),
+      scope,
+      member_id: row.member_id == null ? null : str(row, 'member_id'),
+      member_name: row.member_name == null ? null : str(row, 'member_name'),
+      provider: str(row, 'provider'),
+      alias: str(row, 'alias'),
+      enabled: num(row, 'enabled') === 1,
+      created_at_ms: num(row, 'created_at_ms'),
+      updated_at_ms: num(row, 'updated_at_ms'),
+    }
+  }
+
+  /**
+   * 新建或修改一条归一化规则。
+   *
+   * ★ **upsert 语义**：`(scope, member_id, provider)` 就是这条规则的业务主键，
+   *   页面上「把 dashscope 改成 bailian-tpp」是一次设置，不是一次「查了再改」。
+   *   让调用方自己拿 alias_id 来更新，会把「我看到的规则已经被别人删了」
+   *   这种事变成一次报错，而对一个展示口径的配置来说，
+   *   重新设置一遍就是使用者本来想做的事。
+   *
+   * 🚨 **同一原始名 + 同一作用域只能有一条规则**：两个目标会让
+   *   `CASE` 的命中结果取决于分支顺序 —— 一个「同样输入、不同结果」的配置。
+   *   MySQL 的 `(member_id, provider)` 唯一索引会挡住它，
+   *   SQLite 允许多条 NULL，所以两种后端都在这里显式查重
+   *   （见 `assertAliasFree()`），不能只靠索引。
+   */
+  async setProviderAlias(actor: Principal, input: MutationInput) {
+    const scope = textField(input, 'scope')
+    if (scope !== 'global' && scope !== 'member') throw new IdentityError(400, '作用域只支持 global 或 member')
+    const provider = textField(input, 'provider')
+    const providerReason = providerNameError(provider)
+    if (providerReason) throw new IdentityError(400, `原始供应商名无效：${providerReason}`)
+    const alias = textField(input, 'alias')
+    // ★ 展示名与原始名用**两套**校验：展示名允许中文（`dashscope` → `阿里百炼`
+    //   显然比 `bailian-tpp` 更好读），原始名必须与上报值逐字一致，所以只收 ASCII。
+    const aliasReason = aliasNameError(alias)
+    if (aliasReason) throw new IdentityError(400, `归一化名无效：${aliasReason}`)
+    const memberId = scope === 'member' ? idField(input, 'member_id') : null
+    const inputEnabled = input.enabled === undefined ? true : input.enabled
+    if (typeof inputEnabled !== 'boolean') throw new IdentityError(400, 'enabled 需要是布尔值')
+
+    return this.mutate(actor, 'providers:manage', 'provider_alias.set', 'provider_alias', null, async (tx) => {
+      if (memberId) {
+        // 人员必须真实存在：外键在两种后端上都会拦，但拦下来的报错是驱动原文，
+        // 使用者看到的应该是「人员不存在」。
+        const exists = await tx.get<Row>('SELECT member_id FROM members WHERE member_id = $id', { $id: memberId })
+        if (!exists) throw new IdentityError(404, '人员不存在')
+      }
+      const existing = await this.findProviderAlias(tx, memberId, provider)
+      if (existing) {
+        await tx.run('UPDATE provider_alias SET alias = $alias,enabled = $enabled,updated_at_ms = $now WHERE alias_id = $id', {
+          $alias: alias, $enabled: inputEnabled ? 1 : 0, $now: this.now(), $id: str(existing, 'alias_id'),
+        })
+        return { ok: true as const, alias: await this.providerAliasById(tx, str(existing, 'alias_id')) }
+      }
+      const id = randomUUID()
+      await tx.run('INSERT INTO provider_alias (alias_id,scope,member_id,provider,alias,enabled,created_at_ms,updated_at_ms) VALUES ($id,$scope,$member,$provider,$alias,$enabled,$now,$now)', {
+        $id: id, $scope: scope, $member: memberId, $provider: provider, $alias: alias, $enabled: inputEnabled ? 1 : 0, $now: this.now(),
+      })
+      return { ok: true as const, alias: await this.providerAliasById(tx, id) }
+    })
+  }
+
+  /** 删除一条规则（按 `alias_id`）。删除后该 provider 立刻回到原值。 */
+  async deleteProviderAlias(actor: Principal, input: MutationInput) {
+    const id = idField(input, 'alias_id')
+    return this.mutate(actor, 'providers:manage', 'provider_alias.delete', 'provider_alias', id, async (tx) => {
+      const row = await tx.get<Row>('SELECT alias_id FROM provider_alias WHERE alias_id = $id', { $id: id })
+      if (!row) throw new IdentityError(404, '规则不存在')
+      await tx.run('DELETE FROM provider_alias WHERE alias_id = $id', { $id: id })
+      return { ok: true as const, deleted: id }
+    })
+  }
+
+  /**
+   * 启用 / 停用一条规则。
+   *
+   * ⚠️ 停用**不等于**「映射到原名」：停用后这条 provider 回到**未配置**状态，
+   *   也就是显示上报原值。与 `setGroupStatus` 里「停用不解除人员关联」
+   *   是同一类取舍 —— 停用是「不再应用这条口径」，不是改写数据。
+   */
+  async setProviderAliasStatus(actor: Principal, input: MutationInput) {
+    const id = idField(input, 'alias_id'), enabled = input.enabled
+    if (typeof enabled !== 'boolean') throw new IdentityError(400, 'enabled 需要是布尔值')
+    return this.mutate(actor, 'providers:manage', 'provider_alias.status', 'provider_alias', id, async (tx) => {
+      const row = await tx.get<Row>('SELECT alias_id FROM provider_alias WHERE alias_id = $id', { $id: id })
+      if (!row) throw new IdentityError(404, '规则不存在')
+      await tx.run('UPDATE provider_alias SET enabled = $enabled,updated_at_ms = $now WHERE alias_id = $id', { $enabled: enabled ? 1 : 0, $now: this.now(), $id: id })
+      return { ok: true as const, alias: await this.providerAliasById(tx, id) }
+    })
+  }
+
+  /**
+   * 按 `(member_id, provider)` 查一条规则；全局限定 `member_id IS NULL`。
+   *
+   * ⚠️ 必须带 `ORDER BY`：唯一索引只对**整行非 NULL** 的组合去重，
+   *   `(NULL, provider)` 在 SQLite 与 MySQL 上都能插进两行（实测见
+   *   `verify-database-design.ts`），所以「同一原始名只有一条全局规则」
+   *   是**这道应用层查重**在保证，而不是数据库。真出现重复行时，
+   *   不带排序的 `get()` 会让每一次「改这条规则」随机命中其中一行 ——
+   *   取最早的一条，至少让结果是确定的（`provider-alias.ts` 读取侧同款）。
+   */
+  private async findProviderAlias(tx: PortalStore, memberId: string | null, provider: string): Promise<Row | null> {
+    return memberId
+      ? await tx.get<Row>('SELECT alias_id FROM provider_alias WHERE member_id = $member AND provider = $provider ORDER BY created_at_ms, alias_id LIMIT 1', { $member: memberId, $provider: provider })
+      : await tx.get<Row>('SELECT alias_id FROM provider_alias WHERE member_id IS NULL AND provider = $provider ORDER BY created_at_ms, alias_id LIMIT 1', { $provider: provider })
+  }
+
+  private async providerAliasById(tx: PortalStore, id: string): Promise<PortalProviderAlias> {
+    const row = await tx.get<Row>(
+      `SELECT a.*, m.display_name AS member_name
+         FROM provider_alias a LEFT JOIN members m ON m.member_id = a.member_id
+        WHERE a.alias_id = $id`, { $id: id },
+    )
+    if (!row) throw new IdentityError(404, '规则不存在')
+    return this.providerAlias(row)
+  }
+
   async listAudit(actor: Principal, input: MutationInput = {}): Promise<PortalAuditResponse> {
     const limit = input.limit === undefined ? 50 : Number(input.limit), offset = input.offset === undefined ? 0 : Number(input.offset)
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200 || !Number.isSafeInteger(offset) || offset < 0) throw new IdentityError(400, '分页参数无效')
