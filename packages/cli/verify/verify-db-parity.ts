@@ -35,15 +35,15 @@ function counts(c: { input: number; output: number; cacheRead: number; cacheWrit
 console.log('='.repeat(70))
 console.log('SQL 路径 vs 直扫路径 双轨对照（真实日志）')
 console.log('='.repeat(70))
-console.log(`会话日志: ${paths.sessionsRoot}`)
+console.log(`会话日志: ${paths.sessionsRoots.join(' + ')}（${paths.sessionsRoots.length} 个根）`)
 console.log(`本地库  : ${paths.dbPath}\n`)
 
 for (const period of periods) {
   const label = period ?? '(全部)'
   console.log(`── period = ${label} ──`)
 
-  const sql = await openStats({ sessionsRoot: paths.sessionsRoot, dbPath: paths.dbPath, ...(period ? { period } : {}) })
-  const scan = await openStats({ sessionsRoot: paths.sessionsRoot, dbPath: paths.dbPath, ...(period ? { period } : {}), forceScan: true })
+  const sql = await openStats({ sessionsRoot: paths.sessionsRoots, dbPath: paths.dbPath, ...(period ? { period } : {}) })
+  const scan = await openStats({ sessionsRoot: paths.sessionsRoots, dbPath: paths.dbPath, ...(period ? { period } : {}), forceScan: true })
 
   try {
     if (sql.source !== 'sql') {

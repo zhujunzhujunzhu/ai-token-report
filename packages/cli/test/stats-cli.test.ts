@@ -7,9 +7,19 @@ import { zstdCompressSync } from 'node:zlib'
 
 test('CLI 索引聚合与直扫的分组、趋势、交叉表及空窗口一致', async () => {
   const home = mkdtempSync(join(tmpdir(), 'atr-cli-stats-'))
+  /**
+   * 数据目录：**必须显式传给子进程**。
+   *
+   * ⚠️ 缺省值在家目录下（`~/.ai-token-report`），而且 `bun test` 的 preload
+   *   （`scripts/test-preload.ts`）**管不到子进程** —— 实测 Bun 1.4.2 下
+   *   preload 里改的 `process.env` 不会被 `Bun.spawn` 继承（父进程能读到，
+   *   子进程读到 `undefined`）。少了这一项，这条用例会把本地库写进使用者
+   *   真实的 `~/.ai-token-report/usage.sqlite`。
+   */
+  const dataDir = join(home, 'token-report')
   const run = async (args: string[]) => {
     const child = Bun.spawn([process.execPath, resolve(import.meta.dir, '../src/cli.ts'),
-      '--dsh-home', home, '--quiet', ...args], { stdout: 'pipe', stderr: 'pipe' })
+      '--dsh-home', home, '--data-dir', dataDir, '--quiet', ...args], { stdout: 'pipe', stderr: 'pipe' })
     const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited])
     expect(stderr).toBe('')
     expect(code).toBe(0)

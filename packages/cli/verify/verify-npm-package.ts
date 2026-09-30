@@ -116,7 +116,10 @@ if (!existsSync(realSessions)) {
 // 而不是复用到上一次的库。
 const fixture = mkdtempSync(join(tmpdir(), 'atr-npm-verify-'))
 cpSync(realSessions, join(fixture, 'sessions'), { recursive: true })
-const dbPath = join(fixture, 'token-report', 'usage.sqlite')
+// ★ 数据目录：显式指到 fixture。缺省值是家目录下的 ~/.ai-token-report，
+//   而它**不跟随 --dsh-home** —— 不显式给的话这里会读写使用者的真实本地库。
+const DATA_DIR = join(fixture, 'token-report')
+const dbPath = join(DATA_DIR, 'usage.sqlite')
 process.stdout.write(`  fixture: ${fixture}\n`)
 
 /** 跑一次 CLI，返回退出码与合并输出。 */
@@ -157,12 +160,12 @@ const totalsKey = (t: Totals): string => JSON.stringify(t)
 // ══ 4. 统计口径：Node 建库 → Bun 读；Bun 建库 → Node 读 ═══════════════════
 process.stdout.write('\n=== 4. 统计口径跨运行时一致 ===\n')
 // 验收不能依赖执行当天恰有会话；午夜后真实历史仍须被纳入四列对账。
-const STATS_ARGS = ['--dsh-home', fixture]
+const STATS_ARGS = ['--dsh-home', fixture, '--data-dir', DATA_DIR]
 
 // 4a. Node 冷建库
 const nodeCold = runCliJson(nodeBin, STATS_ARGS)
 check('Node 冷建库并出数', nodeCold !== null)
-// 库必须落在 fixture 里，不能碰到用户真实的 $DSH_HOME/token-report
+// 库必须落在 fixture 里，不能碰到用户真实的 ~/.ai-token-report
 check(
   '建库落在隔离 fixture 内（未污染真实 DSH home）',
   existsSync(dbPath) && dbPath.startsWith(fixture),
@@ -180,7 +183,7 @@ check(
 )
 
 // 4c. 重置后用 Bun 冷建库、Node 读（反方向）
-const reset1 = runCli(bunBin, ['--dsh-home', fixture, '--reset-db'])
+const reset1 = runCli(bunBin, ['--dsh-home', fixture, '--data-dir', DATA_DIR, '--reset-db'])
 check('Bun --reset-db 成功', reset1.code === 0 && !existsSync(dbPath), reset1.out.trim().split('\n')[0])
 
 const bunCold = runCliJson(bunBin, STATS_ARGS)
@@ -218,7 +221,7 @@ async function probeWeb(
   port: number,
 ): Promise<{ ok: boolean; apiTotals: { calls: number; total: number } | null }> {
   const proc = Bun.spawn(
-    [bin, cliPath, 'web', '--dsh-home', fixture, '--no-open', '--port', String(port)],
+    [bin, cliPath, 'web', '--dsh-home', fixture, '--data-dir', DATA_DIR, '--no-open', '--port', String(port)],
     { stdout: 'pipe', stderr: 'pipe', env: cleanChildEnv() },
   )
   const base = `http://127.0.0.1:${port}`
@@ -312,7 +315,7 @@ if (nodeWeb.apiTotals && bunWeb.apiTotals) {
 // ══ 6. Node 侧 --reset-db ═════════════════════════════════════════════════
 process.stdout.write('\n=== 6. Node --reset-db（EBUSY 陷阱）===\n')
 runCli(nodeBin, [...STATS_ARGS, '--quiet'])
-const reset2 = runCli(nodeBin, ['--dsh-home', fixture, '--reset-db'])
+const reset2 = runCli(nodeBin, ['--dsh-home', fixture, '--data-dir', DATA_DIR, '--reset-db'])
 check(
   'Node --reset-db 成功且不留 wal/shm',
   reset2.code === 0 &&

@@ -25,7 +25,7 @@
  * 投递失败时数据就永久消失了。所以顺序是「先存后发」。
  */
 
-import type { IncrementalScanResult } from '@ai-token-report/core'
+import type { IncrementalScanResult, SessionsRootInput } from '@ai-token-report/core'
 import { scanIncremental, type WatermarkLookup } from '@ai-token-report/core'
 import {
   ackRecords,
@@ -53,9 +53,25 @@ export interface DeliverOutcome {
 }
 
 export interface RunReportOptions {
-  sessionsRoot: string
+  /**
+   * 会话日志根。**一组**（同一台机器上并存多套 DSH）或单个（兼容老调用点）。
+   *
+   * 多根共用**同一份** `state.json`：水位按**绝对路径**索引，跨根不冲突；
+   * L3 的 `lastSeqBySession` 按 sessionId 共享，镜像会话因此天然去重
+   * （与本地库的 `event_id` 主键同一套语义）。
+   */
+  sessionsRoot: SessionsRootInput
+  /**
+   * 已**不参与**路径解析（状态文件只由 `dataDir` 决定），仅为兼容旧调用点保留。
+   * 新代码请用 `sessionsRoot` 传一组根。
+   */
   dshHome?: string
-  /** 状态文件路径；默认 `$DSH_HOME/token-report/state.json`。 */
+  /**
+   * 数据目录：状态文件的默认位置由它决定（缺省 `~/.ai-token-report`）。
+   * 与 `dshHome`（日志从哪读）是两件事，见 `core/src/home.ts`。
+   */
+  dataDir?: string
+  /** 状态文件路径；默认 `<dataDir>/state.json`。 */
   statePath?: string
   /** 真实投递器。`dry-run` 时不需要提供。 */
   deliver?: Deliverer
@@ -112,7 +128,7 @@ export function totalOfRecords(records: UsageRecord[]): TokenCounts {
  * `state.ts` 与传入的 `deliver` 上，因此可用 `dryRun` 完整演练。
  */
 export async function runReport(options: RunReportOptions): Promise<RunReportResult> {
-  const statePath = options.statePath ?? resolveStatePath(options.dshHome)
+  const statePath = options.statePath ?? resolveStatePath(options.dshHome, options.dataDir)
   const loaded = loadState(statePath)
   const state = loaded.state
   const before = statsOf(state)

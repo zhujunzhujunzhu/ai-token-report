@@ -43,8 +43,11 @@ const HOME = mkdtempSync(join(tmpdir(), 'atr-verify-report-'))
 const PORT = 0
 const TOKEN = 'atr-zhangsan-9f3c'
 
-mkdirSync(join(HOME, 'token-report'), { recursive: true })
-const dbPath = join(HOME, 'token-report', 'portal.sqlite')
+// ★ 数据目录**不跟随 `DSH_HOME`**：缺省是家目录下的 `~/.ai-token-report`，
+//   不显式指到 fixture，状态文件与库就会落到使用者真实的目录里。
+const DATA_DIR = join(HOME, 'token-report')
+mkdirSync(DATA_DIR, { recursive: true })
+const dbPath = join(DATA_DIR, 'portal.sqlite')
 const target = { sqlitePath: dbPath }
 await preparePortalDatabase(target)
 await new IdentityRepository(target).importCredentials([
@@ -152,7 +155,7 @@ function allRows(): {
   }
 }
 
-const statePath = resolveStatePath(HOME)
+const statePath = resolveStatePath(HOME, DATA_DIR)
 const pendingCount = (): number => loadState(statePath).state.pending.length
 
 // ── 1. 起真实服务端 ─────────────────────────────────────────────────────────
@@ -161,6 +164,7 @@ const portal = await createServer({
   port: PORT,
   host: '127.0.0.1',
   dshHome: HOME,
+  dataDir: DATA_DIR,
   dbPath,
   mysqlUrl: '',
   enableLocalApi: false,

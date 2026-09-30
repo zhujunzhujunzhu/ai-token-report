@@ -36,7 +36,14 @@ import {
   renderTable,
   seriesToCsv,
 } from '@ai-token-report/core'
-import { resolvePaths, type ResolvedPaths } from '@ai-token-report/core'
+import {
+  discoverDshHomesDetailed,
+  inspectSessionRoots,
+  resolvePaths,
+  resolveSessionsRoots,
+  splitHomeList,
+  type ResolvedPaths,
+} from '@ai-token-report/core'
 import {
   RangeError as RangeParseError,
   PERIOD_NAMES,
@@ -89,7 +96,8 @@ dsh-token-report —— DSH token 用量统计
   --quiet          不输出扫描进度
 
 数据源:
-  默认读本地 SQLite 增量库（$DSH_HOME/token-report/usage.sqlite），
+  默认读本地 SQLite 增量库（缺省 ~/.ai-token-report/usage.sqlite，
+  可用 --data-dir 或 DSH_TOKEN_REPORT_DATA_DIR 覆盖），
   每次请求先做增量入库再查库 —— 热态约 10ms，冷态首次约 15 秒
   （需全量解析历史日志以建库）。
   --no-db          强制直扫日志，不走库（用于与库结果对照验证）
@@ -97,7 +105,8 @@ dsh-token-report —— DSH token 用量统计
 
 ── 本地页面 web ────────────────────────────────────────
   起一个只监听 127.0.0.1 的本地服务并打开浏览器。数据来自**本地 SQLite
-  增量库**（$DSH_HOME/token-report/usage.sqlite），每次请求先增量入库再查，
+  增量库**（缺省 ~/.ai-token-report/usage.sqlite，
+  可用 --data-dir 或 DSH_TOKEN_REPORT_DATA_DIR 覆盖），每次请求先增量入库再查，
   热态约 50ms；**不出网、不上报、断网可用**。
 
   首次启动会全量建库（约 15 秒，需解析历史日志），之后都是毫秒级。
@@ -118,7 +127,7 @@ dsh-token-report —— DSH token 用量统计
   --token <t>      鉴权 token；默认读取 DSH_REPORT_TOKEN 或共享 identity.json
   --out-file <f>   不联网, 把记录追加到本地 JSONL (端到端演练)
   --no-save        只看不改: 不写状态文件 (纯观察增量)
-  --state <p>      状态文件路径 (默认 $DSH_HOME/token-report/state.json)
+  --state <p>      状态文件路径 (默认 <data-dir>/state.json)
   --reset          清空水位线后退出, 下次全量重扫
   --timeout <ms>   单次请求超时 (默认 15000)
   --user-id <id>   客户端标识（归属由服务端按 token 决定）
@@ -129,9 +138,16 @@ dsh-token-report —— DSH token 用量统计
   --dry-run / --no-save / --out-file 是主动的本地演练，无需署名。
 
 其他:
-  --dsh-home <p>   指定 DSH home (默认 $DSH_HOME 或 ~/.dsh)
+  --dsh-home <p>   指定 DSH home（会话日志从哪读）;**可重复**以统计多套 DSH
+  --dsh-homes <p>  一次给多个 home，用系统路径分隔符分隔 (Windows ';' / POSIX ':')
+  --discover       只打印发现了哪些 home（含会话数 / 最新写入）后退出
+  --data-dir <p>   指定数据目录: 身份 / 本地库 / 上报水位 (默认 ~/.ai-token-report)
   --list-providers 只列出发现的所有 provider/model 后退出
   -h, --help       显示帮助
+
+  不给 --dsh-home 时**自动发现**本机所有 DSH：$DSH_HOME + ~/.dsh + ~/.dsh*
+  + 各平台应用数据目录下的客户端目录（例如第三方 dsh-desktop 的 harness），
+  只收有 sessions 的那个。关闭发现: DSH_TOKEN_REPORT_DISCOVER=0
 
 示例:
   dsh-token-report --period today                # 今天
@@ -139,6 +155,8 @@ dsh-token-report —— DSH token 用量统计
   dsh-token-report --provider dashscope --period month   # 数字集团本月
   dsh-token-report --by provider --cross         # 全量按厂商
   dsh-token-report --list-providers              # 先摸清有哪些厂商
+  dsh-token-report --discover                    # 看本机有哪些 DSH home
+  dsh-token-report --dsh-home ~/.dsh --dsh-home "$env:APPDATA/dsh-desktop/harness"
   dsh-token-report --format csv --out report.csv
   dsh-token-report --period today --no-db        # 直扫日志（与库结果对照）
 
@@ -176,7 +194,25 @@ interface CliOptions {
   noDb: boolean
   /** 清空本地库后退出；下次运行会全量重建。 */
   resetDb: boolean
-  dshHome?: string
+  /**
+   * ★ DSH home 列表（会话日志从哪读）。
+   *
+   * `--dsh-home` 可重复，`--dsh-homes` 一次给多个（用系统路径分隔符）。
+   * 都不给则**自动发现**：`$DSH_HOME` + `~/.dsh` + 家目录下 `.dsh*`
+   * + 各平台应用数据目录里形如 DSH home 的客户端目录（筛掉没有 `sessions` 的）。
+   * 关掉发现用 `DSH_TOKEN_REPORT_DISCOVER=0`。
+   */
+  dshHomes?: string[]
+  /** `--discover`：只打印发现了哪些 home（含会话数与最新写入）后退出。 */
+  discover?: boolean
+  /**
+   * 数据目录：身份 / 本地库 / 上报水位都放这里。
+   *
+   * 缺省 `~/.ai-token-report`（**与 home 列表无关**）—— 所以同一台机器上的
+   * DSH Desktop 与命令行版自动共用同一份身份与本地库，见 `core/src/home.ts`。
+   * ⚠️ 多根统计共用**一份**库：库只有一份，统计才可能是一份并集。
+   */
+  dataDir?: string
   listProviders: boolean
   /** 子命令：`report` 时走增量上报流程而非统计。 */
   command?: 'report' | 'web'
@@ -443,8 +479,26 @@ function parseArgs(argv: string[]): CliOptions | null {
         opts.out = takeValue(i, arg)
         i++
         break
-      case '--dsh-home':
-        opts.dshHome = takeValue(i, arg)
+      case '--dsh-home': {
+        // ★ 可重复：多套 DSH 并存时逐个累加（`--dsh-home A --dsh-home B`）。
+        //   刻意不做「最后一次覆盖」——那会让多根统计在命令行上无法表达。
+        const value = takeValue(i, arg)
+        opts.dshHomes = [...(opts.dshHomes ?? []), value]
+        i++
+        break
+      }
+      case '--dsh-homes': {
+        const parts = splitHomeList(takeValue(i, arg))
+        if (parts.length === 0) throw new UsageError('--dsh-homes 没有给出任何有效路径')
+        opts.dshHomes = [...(opts.dshHomes ?? []), ...parts]
+        i++
+        break
+      }
+      case '--discover':
+        opts.discover = true
+        break
+      case '--data-dir':
+        opts.dataDir = takeValue(i, arg)
         i++
         break
       case '--no-diag':
@@ -498,19 +552,77 @@ function dimLabel(dim: GroupDimension): string {
 }
 
 /**
+ * `--discover`：打印本机发现了哪些 DSH home。
+ *
+ * 给两组信息，回答的是两个不同的问题：
+ *
+ * - **自动发现的结果**（含会话数 / 最新写入）——「本机有哪些 DSH」，
+ *   用来把候选写进 `DSH_TOKEN_REPORT_DSH_HOMES` 固定下来；
+ * - **本次配置实际生效的根** —— 「这次统计究竟读了哪几处」。
+ *
+ * 两者在多根场景下**可能不同**（例如显式配了单根、或关掉了发现），
+ * 打在一起才不会让人把「配了什么」与「读了什么」混为一谈。
+ */
+async function printDiscover(paths: ResolvedPaths): Promise<number> {
+  const report = discoverDshHomesDetailed()
+  const inspections = await inspectSessionRoots(resolveSessionsRoots(report.homes))
+
+  const lines: string[] = ['', '=== 自动发现的 DSH home ===']
+  if (inspections.length === 0) lines.push('  (没有发现含 sessions 目录的 home)')
+  for (const info of inspections) {
+    lines.push(
+      `  [${info.exists ? '✓' : '✗'}] ${info.root}`,
+      `        会话 ${fmtInt(info.sessions)} / 日志 ${fmtInt(info.files)} / 最新写入 ${
+        info.latestMs === null ? '-' : fmtTime(info.latestMs)}`,
+    )
+    if (info.error) lines.push(`        ⚠ ${info.error}`)
+  }
+  lines.push(`  共考察 ${fmtInt(report.considered)} 个候选目录`)
+
+  if (report.suspicious.length > 0) {
+    lines.push('', '  名字不像 DSH 客户端、但结构像 home 的目录（**未自动采用**）:')
+    for (const item of report.suspicious) lines.push(`    ${item}`)
+  }
+
+  lines.push('', '=== 本次配置实际生效 ===')
+  for (const info of paths.sessionRoots) lines.push(`  [${info.exists ? '✓' : '✗'}] ${info.root}`)
+  lines.push(
+    `  数据目录（多根共用一份）  ${paths.dataDir}`,
+    '',
+    '  固定统计范围: --dsh-home <p>（可重复）或 DSH_TOKEN_REPORT_DSH_HOMES',
+    '  关闭自动发现: DSH_TOKEN_REPORT_DISCOVER=0',
+    '',
+  )
+  process.stdout.write(lines.join('\n'))
+  return 0
+}
+
+/**
  * 描述本次取数用的数据源，用于终端头部与诊断。
  *
  * 把「走了哪个源、库里有多少条」显式打出来，是为了让「SQL 化到底有没有生效」
  * 一眼可见 —— 否则降级发生时用户只会觉得「这次慢」，而不知道原因。
  */
+/**
+ * 描述一组会话日志根。
+ *
+ * 多套 DSH 并存时「读了哪几处」必须打印出来 —— 否则「我加了一个 home 数字没变」
+ * 无法区分是**镜像去重**（正确）还是**那个根根本没读到**（错误）。
+ */
+function describeRoots(roots: readonly string[]): string {
+  if (roots.length === 0) return '(未配置)'
+  if (roots.length === 1) return roots[0]!
+  return `${roots.length} 个 DSH home: ${roots.join(' + ')}`
+}
+
 function describeSource(
   source: 'sql' | 'scan',
   paths: ResolvedPaths,
   dbStats: { events: number; earliest: number | null; latest: number | null } | null,
 ): string {
-  if (source === 'scan') return `直扫日志 ${paths.sessionsRoot}`
+  if (source === 'scan') return `直扫日志 ${describeRoots(paths.sessionsRoots)}`
   const count = dbStats?.events ?? 0
-  return `本地库 ${paths.dbPath}（${fmtInt(count)} 条记录）`
+  return `本地库 ${paths.dbPath}（${fmtInt(count)} 条记录；来源 ${describeRoots(paths.sessionsRoots)}）`
 }
 
 /**
@@ -627,13 +739,28 @@ async function main(): Promise<number> {
     return 0
   }
 
-  const paths = resolvePaths(opts.dshHome)
+  const paths = resolvePaths({ dshHomes: opts.dshHomes, dataDir: opts.dataDir })
+
+  // `--discover`：只回答「本机有哪些 DSH home」，不统计、不碰库。
+  if (opts.discover) return printDiscover(paths)
+
+  // ★ 多根：缺失的根**逐项报出但不失败**，全部缺失才算失败 ——
+  //   多写了一个暂时不存在的 home（外接盘没插、客户端刚卸载）不该让整个命令挂掉，
+  //   但也不能静默：`⚠` 那行是使用者分辨「镜像去重」与「根本没读到」的唯一线索。
+  const missingRoots = paths.sessionRoots.filter((info) => !info.exists)
   if (!paths.sessionsRootExists) {
     process.stderr.write(
-      `错误: 找不到会话目录 ${paths.sessionsRoot}\n` +
-        `请用 --dsh-home 指定，或设置 DSH_HOME 环境变量。\n`,
+      `错误: 没有可用的会话目录。\n` +
+        missingRoots.map((info) => `  ${info.root}`).join('\n') +
+        `\n请用 --dsh-home 指定（可重复），或设置 DSH_HOME / DSH_TOKEN_REPORT_DSH_HOMES。\n` +
+        `想看本机有哪些 DSH home: --discover\n`,
     )
     return 1
+  }
+  if (missingRoots.length > 0) {
+    process.stderr.write(
+      `⚠ 以下会话日志根不存在，已跳过: ${missingRoots.map((info) => info.root).join(' / ')}\n`,
+    )
   }
 
   // --reset-db：清空本地库后立即退出。
@@ -659,7 +786,7 @@ async function main(): Promise<number> {
 
   // 子命令分派：report 走增量上报，web 起本地服务，都不进入统计流程
   if (opts.command === 'report') {
-    return runReportCommand(opts, paths.sessionsRoot)
+    return runReportCommand(opts, paths.sessionsRoots)
   }
   if (opts.command === 'web') {
     return runWebCommand(opts, paths)
@@ -686,7 +813,8 @@ async function main(): Promise<number> {
   // ★ 默认走本地 SQLite 增量库（`core/db`）：先 ingest 再查，量级从秒降到毫秒。
   //   `--no-db` 强制走直扫日志，用于与库结果做对照验证（两条路径必须给出同一个数）。
   const session = await openStats({
-    sessionsRoot: paths.sessionsRoot,
+    // ★ 一组根：库路径与直扫路径吃的是同一个入参，两者必然给出同一个并集。
+    sessionsRoot: paths.sessionsRoots,
     dbPath: paths.dbPath,
     rollup: true,
     ...(opts.period ? { period: opts.period } : {}),
@@ -776,8 +904,16 @@ async function main(): Promise<number> {
 
     const payload = {
       generatedAt: new Date().toISOString(),
+      // ★ 多根：`dshHomes` 是全部生效的 home；`dshHome` 保留为兼容字段（= 第一个）。
+      dshHomes: paths.dshHomes,
       dshHome: paths.dshHome,
+      // 数据目录一并给出：身份 / 本地库都在那里，排查「读的是哪一份」时
+      // 只看 home 会得到错误答案（两者现在是独立的）。
+      dataDir: paths.dataDir,
+      sessionsRoots: paths.sessionsRoots,
       sessionsRoot: paths.sessionsRoot,
+      // 给了但不存在、因而被跳过的根（「加了 home 数字没变」要能分辨原因）
+      ...(missingRoots.length > 0 ? { missingRoots: missingRoots.map((info) => info.root) } : {}),
       // 数据源与是否降级：脚本消费方据此判断这次数字的可信度与新鲜度
       source,
       dbPath: source === 'sql' ? paths.dbPath : null,
@@ -951,7 +1087,8 @@ async function runWebCommand(opts: CliOptions, paths: ResolvedPaths): Promise<nu
   try {
     handle = await createServer({
       ...(opts.web.port !== undefined ? { port: opts.web.port } : {}),
-      dshHome: paths.dshHome,
+      dshHomes: paths.dshHomes,
+      dataDir: paths.dataDir,
       staticDir,
       enableLocalApi: true,
       ...(opts.web.portal ? { portalUrl: opts.web.portal } : {}),
@@ -968,7 +1105,7 @@ async function runWebCommand(opts: CliOptions, paths: ResolvedPaths): Promise<nu
   if (handle.portShifted) {
     out.push(`  ⚠ 端口 ${opts.web.port ?? DEFAULT_PORT} 被占用，已改用 ${handle.port}`)
   }
-  out.push(`  会话日志  ${paths.sessionsRoot}`)
+  out.push(`  会话日志  ${describeRoots(paths.sessionsRoots)}`)
   out.push(`  本地库    ${paths.dbPath}`)
   out.push(`  页面资源  ${staticDir}`)
   out.push(
@@ -1077,9 +1214,11 @@ function topSlice<T>(rows: T[], top: number): T[] {
  * - `2` 参数错误
  * - `3` 投递失败（pending 已保留，下一轮会重试）
  */
-async function runReportCommand(opts: CliOptions, sessionsRoot: string): Promise<number> {
+async function runReportCommand(opts: CliOptions, sessionsRoots: string[]): Promise<number> {
   const r = opts.report
-  const statePath = r.statePath ?? resolveStatePath(opts.dshHome)
+  // ⚠️ 状态文件只由 dataDir 决定（多根共用同一份水位文件）：
+  //   水位按**绝对路径**索引，多根并存天然不冲突，推进顺序也保持一致。
+  const statePath = r.statePath ?? resolveStatePath(undefined, opts.dataDir)
 
   // --reset：清空水位线后立即退出
   if (r.reset) {
@@ -1093,7 +1232,7 @@ async function runReportCommand(opts: CliOptions, sessionsRoot: string): Promise
 
   // ★ 与本地页 / DSH 插件共用身份；显式提供 token 也表示主动授权上报。
   // 没有身份时必须在扫描及写 pending 之前退出，不能先收集再等服务端 401。
-  const identity = readIdentity(resolvePaths(opts.dshHome).identityPath)
+  const identity = readIdentity(resolvePaths({ dshHomes: opts.dshHomes, dataDir: opts.dataDir }).identityPath)
   const token = (r.token ?? process.env['DSH_REPORT_TOKEN'] ?? identity.identity?.token)?.trim()
   const localRehearsal = r.dryRun || r.noSave || !!r.outFile
   if (!localRehearsal && (!token || !token.replace(/^Bearer\s*/i, '').trim())) {
@@ -1143,8 +1282,8 @@ async function runReportCommand(opts: CliOptions, sessionsRoot: string): Promise
   let result: RunReportResult
   try {
     result = await runReport({
-      sessionsRoot,
-      dshHome: opts.dshHome,
+      sessionsRoot: sessionsRoots,
+      dataDir: opts.dataDir,
       statePath,
       deliver,
       dryRun: r.dryRun,
@@ -1177,6 +1316,7 @@ async function runReportCommand(opts: CliOptions, sessionsRoot: string): Promise
   }
 
   out.push(`状态文件  ${result.statePath}`)
+  out.push(`会话日志  ${describeRoots(sessionsRoots)}`)
   out.push(
     `会话文件  ${result.scan.files.length} 个（未变化跳过 ${result.scan.skippedUnchanged} 个，实际解压 ${result.scan.diagnostics.filesScanned} 个）`,
   )

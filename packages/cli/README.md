@@ -121,7 +121,7 @@ dsh-token-report report --endpoint https://portal.example.com/api/v1/token-usage
 
 ## 与本地库的关系
 
-`$DSH_HOME/token-report/usage.sqlite` 是**日志的派生物，不是真值**：
+`~/.ai-token-report/usage.sqlite` 是**日志的派生物，不是真值**：
 它只是把「每次查询都重新解压 19 MB 日志」的 CPU 开销省掉。
 库损坏、磁盘满、权限不足时**自动回退直扫日志**并在输出里说明原因 ——
 不会因为库坏了就让你看不到数。

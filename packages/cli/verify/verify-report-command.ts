@@ -54,11 +54,18 @@ function makeHome(name: string, signed = false): string {
   return home
 }
 
-function statePath(home: string): string { return join(home, 'token-report', 'state.json') }
+/**
+ * 数据目录：显式指定，**不再跟随 DSH_HOME**。
+ *
+ * 缺省值是家目录下的 ~/.ai-token-report，不显式给的话 CLI 会把 pending /
+ * 状态文件写进使用者真实的目录（而本脚本的断言全在 fixture 里看结果）。
+ */
+function dataDir(home: string): string { return join(home, 'token-report') }
+function statePath(home: string): string { return join(dataDir(home), 'state.json') }
 function pending(home: string): number { return loadState(statePath(home)).state.pending.length }
 
 async function run(bin: string, home: string, args: string[]): Promise<{ code: number; out: string }> {
-  const proc = Bun.spawn([bin, cli, 'report', '--dsh-home', home, '--quiet', ...args], {
+  const proc = Bun.spawn([bin, cli, 'report', '--dsh-home', home, '--data-dir', dataDir(home), '--quiet', ...args], {
     stdout: 'pipe', stderr: 'pipe', env,
   })
   // 响应头已到但 body 永不结束时也要能失败；上限只用于回归脚本防挂死。
@@ -78,7 +85,7 @@ await new IdentityRepository(target).importCredentials([
   { token, name: '服务端身份', group: '验证分组' },
 ], 'verify-report-command')
 const portalOptions = {
-  port: 18804, host: '127.0.0.1', dshHome: portalHome,
+  port: 18804, host: '127.0.0.1', dshHome: portalHome, dataDir: dataDir(portalHome),
   dbPath: target.sqlitePath, mysqlUrl: '', enableLocalApi: false,
 }
 let portal: ServerHandle | undefined
