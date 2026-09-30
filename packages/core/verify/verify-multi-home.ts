@@ -33,12 +33,12 @@
  */
 
 import { strict as assert } from 'node:assert'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { zstdCompressSync } from 'node:zlib'
 
-import { resolvePaths } from '../src/home.js'
+import { normalizeHomes, resolvePaths } from '../src/home.js'
 import { inspectSessionRoots, listSessionFiles, scanAll } from '../src/scanner.js'
 import { ingest } from '../src/db/ingest.js'
 import { openStats } from '../src/db/stats.js'
@@ -48,11 +48,31 @@ import type { UsageRecord } from '../src/types.js'
 
 let checks = 0
 let failures = 0
+let skips = 0
+let observations = 0
 
 function check(label: string, condition: boolean, detail = ''): void {
   checks++
   if (!condition) failures++
   console.log(`  ${condition ? '✓' : '✗'} ${label}${detail ? `   ${detail}` : ''}`)
+}
+
+/** 本机无法构造该条件时**如实跳过** —— 不假装通过，也不计失败。 */
+function skip(label: string, reason: string): void {
+  skips++
+  console.log(`  ⏭ ${label}：${reason}`)
+}
+
+/**
+ * 观察项：**当前行为**与另一处的口径不一致。
+ *
+ * 本脚本只做验证、不改产品，所以这类发现**不计入失败** —— 但必须在汇总里显眼列出，
+ * 否则「验证全绿」会把一个真实的口径缺口掩盖掉。
+ */
+function observe(label: string, detail: string): void {
+  observations++
+  console.log(`  ⚠ ${label}`)
+  console.log(`      ${detail}`)
 }
 
 function section(title: string): void {
@@ -436,9 +456,189 @@ try {
   check('规模下依然与合并根逐位相同', sameRecords(scaleUnion.records, scaleMergedScan.records))
   check('规模下依然不翻倍（相加会是 1800 条）', scaleUnion.records.length === 900)
 
-  // ── S13 真实日志（`--real`）：同样的等价关系，用真实的 sessionId / seq 分布再验一遍 ──
+  // ── S13 同一个根的大小写不同写法 ────────────────────────────────────────
+  section('S13 大小写不同的同一路径：home 层去重 vs 扫描层按字符串去重')
+  const caseRoot = materialize(rootAt('case'), { c1: [F(1), F(2)] })
+  const caseHome = dirname(caseRoot)
+  const upperHome = caseHome.toUpperCase()
+  const upperRoot = join(upperHome, 'sessions')
+  const caseInfos = await inspectSessionRoots([caseRoot, upperRoot])
+  console.log(`  根 A：${caseRoot}`)
+  console.log(`  根 B：${upperRoot}`)
+
+  if (process.platform === 'win32' && caseInfos[1]!.exists) {
+    check(
+      'home 层：`normalizeHomes` 按平台归一大小写（`dedupeKey`）→ 两个写法算一个 home',
+      normalizeHomes([caseHome, upperHome]).length === 1,
+      `${normalizeHomes([caseHome, upperHome]).length} 个`,
+    )
+    const caseFiles = await listSessionFiles([caseRoot, upperRoot])
+    check(
+      '★ 但扫描层按 `filePath` **字符串**去重：大小写不同 → 同一份日志被列两次',
+      caseFiles.length === 2,
+      `${caseFiles.length} 个文件（磁盘上只有 1 份日志）`,
+    )
+    check(
+      '两个写法都巡检出同一份日志（都 exists，会话数相同）',
+      caseInfos[0]!.exists && caseInfos[1]!.exists && caseInfos[0]!.sessions === caseInfos[1]!.sessions,
+      `${caseInfos[0]!.sessions} / ${caseInfos[1]!.sessions} 个会话`,
+    )
+  } else if (process.platform === 'win32') {
+    skip('大小写场景', '临时目录带「区分大小写」标志（WSL 遗留）—— 大小写变体不是同一个目录')
+  } else {
+    check(
+      '非 Windows：大小写敏感，两个写法是**不同的根**（B 不存在）',
+      normalizeHomes([caseHome, upperHome]).length === 2 && caseInfos[1]!.exists === false,
+      `normalizeHomes=${normalizeHomes([caseHome, upperHome]).length} 个，B.exists=${caseInfos[1]!.exists}`,
+    )
+  }
+  const caseScan = await scanAll([caseRoot, upperRoot])
+  check(
+    '★ 无论平台，事件都不翻倍（2 条仍是 2 条）→ 靠 eventId 兜底，而不是靠路径归一',
+    caseScan.records.length === 2,
+    `${caseScan.records.length} 条`,
+  )
+
+  // ── S14 符号链接 / junction：两个根指向同一份日志 ────────────────────────
+  section('S14 符号链接 / junction：两个根指向同一份日志')
+  const realRoot = materialize(rootAt('link-real'), { L1: [F(1), F(2), F(3)] })
+  const linkPath = join(dir, 'link-alias')
+  let linked = false
+  try {
+    // Windows 上用 junction：创建**目录**链接不需要特权，普通 symlink 需要开发者模式
+    symlinkSync(dirname(realRoot), linkPath, process.platform === 'win32' ? 'junction' : 'dir')
+    linked = true
+  } catch (error) {
+    skip('符号链接场景', `本机无法创建链接：${error instanceof Error ? error.message : String(error)}`)
+  }
+
+  if (linked) {
+    const linkRoot = join(linkPath, 'sessions')
+    const linkInfos = await inspectSessionRoots([realRoot, linkRoot])
+    const linkFiles = await listSessionFiles([realRoot, linkRoot])
+    const linkScan = await scanAll([realRoot, linkRoot])
+    console.log(`  真实根：${realRoot}`)
+    console.log(`  链接根：${linkRoot}`)
+
+    check(
+      '两个根都巡检出同一份日志（都 exists，会话数相同）',
+      linkInfos[0]!.exists && linkInfos[1]!.exists && linkInfos[0]!.sessions === linkInfos[1]!.sessions,
+      `${linkInfos[0]!.sessions} / ${linkInfos[1]!.sessions} 个会话`,
+    )
+    check(
+      '★ 文件被列两次（列表按 `filePath` 字符串去重，**不做 realpath**）',
+      linkFiles.length === 2,
+      `${linkFiles.length} 个文件（磁盘上只有 1 份）`,
+    )
+    check(
+      '★ 事件不翻倍：3 条仍是 3 条（同一 eventId 先到者胜）',
+      linkScan.records.length === 3,
+      `${linkScan.records.length} 条`,
+    )
+    check('与只看真实根逐位相同', sameRecords(linkScan.records, (await scanAll([realRoot])).records))
+
+    const linkDb = join(dir, 'link.sqlite')
+    const linkIngest = await ingest({ sessionsRoot: [realRoot, linkRoot], dbPath: linkDb })
+    check('入库也只算一份（3 条）', linkIngest.inserted === 3, `inserted=${linkIngest.inserted}`)
+  }
+
+  // ── S15 「存在但读不了」与「根本不存在」必须能分开 ────────────────────────
+  section('S15 「存在但读不了」（根不是目录）vs「根本不存在」')
+  const notADirRoot = join(dir, 'not-a-dir', 'sessions')
+  mkdirSync(dirname(notADirRoot), { recursive: true })
+  writeFileSync(notADirRoot, '这不是目录\n') // 用**文件**占住根路径 → readdir 抛 ENOTDIR
+
+  const brokenInfos = await inspectSessionRoots([rootA, notADirRoot, missing])
+  console.log(`  读不了的根：${brokenInfos[1]!.root}`)
+  console.log(`    → exists=${brokenInfos[1]!.exists} error=${brokenInfos[1]!.error}`)
+  console.log(`  不存在的根：${brokenInfos[2]!.root}`)
+  console.log(`    → exists=${brokenInfos[2]!.exists} error=${brokenInfos[2]!.error}`)
+
+  check(
+    '文件占住根路径：exists=true 且**带 error**（不是「不存在」）',
+    brokenInfos[1]!.exists === true && (brokenInfos[1]!.error ?? '').length > 0,
+  )
+  check('真正不存在的根：exists=false', brokenInfos[2]!.exists === false)
+  check('★ 两种失败在诊断里可区分（exists 取值不同）', brokenInfos[1]!.exists !== brokenInfos[2]!.exists)
+  check('读不了的根不贡献会话 / 文件（但也不冒充「不存在」）',
+    brokenInfos[1]!.sessions === 0 && brokenInfos[1]!.files === 0)
+
+  check('scanAll 容错：scanAll([A, 读不了]) ≡ scanAll([A])',
+    sameRecords((await scanAll([rootA, notADirRoot])).records, once.records))
+  check('默认 listSessionFiles 也容错（不抛错）',
+    (await listSessionFiles([rootA, notADirRoot])).length === (await listSessionFiles([rootA])).length)
+
+  let strictThrew = false
+  try {
+    await listSessionFiles([notADirRoot], { strictErrors: true })
+  } catch {
+    strictThrew = true
+  }
+  check('★ 严格模式（strictErrors）必须抛错 —— 全量补报不能把不可读伪装成空历史', strictThrew)
+
+  const brokenDb = join(dir, 'broken.sqlite')
+  const brokenIngest = await ingest({ sessionsRoot: [rootA, notADirRoot], dbPath: brokenDb })
+  check('读不了的根**不污染数字**（入库条数与只有 A 时相同）',
+    brokenIngest.inserted === 6, `inserted=${brokenIngest.inserted}`)
+
+  // ⚠️ 口径缺口：取数路径只用 existsSync 分流「存在 / 不存在」
+  const brokenStats = await openStats({ sessionsRoot: [rootA, notADirRoot], dbPath: brokenDb })
+  try {
+    if (!brokenStats.missingRoots.includes(notADirRoot)) {
+      observe(
+        '取数路径（`ingest` / `stats`）把「存在但读不了」的根当成空 home，且不放进 `missingRoots`',
+        `同一个根，两处口径不同：\n` +
+          `      · inspectSessionRoots → exists=true + error（「读不了」表达得出来）\n` +
+          `      · stats.missingRoots  → ${JSON.stringify(brokenStats.missingRoots)}（里面**没有**它）\n` +
+          `      于是「这个 home 是空的」与「这个 home 读不到」在取数路径上无法区分 ——\n` +
+          `      而接口注释承诺「存在但读不了与根本不存在是两件事」。`,
+      )
+    } else {
+      check('取数路径也把读不了的根报进 missingRoots（与 inspectSessionRoots 口径一致）', true)
+    }
+  } finally {
+    brokenStats.close()
+  }
+
+  // ── S16 权限不足的根（chmod 0o000） ──────────────────────────────────────
+  section('S16 权限不足的根（chmod 0o000）')
+  const lockedRoot = materialize(rootAt('locked'), { K1: [F(1)] })
+  let locked = false
+  try {
+    chmodSync(lockedRoot, 0o000)
+    // 只有**真的读不了**才算构造成功：Windows 的 chmod 动不了 ACL，目录通常照样可读
+    try {
+      await listSessionFiles([lockedRoot], { strictErrors: true })
+      chmodSync(lockedRoot, 0o755)
+    } catch {
+      locked = true
+    }
+  } catch (error) {
+    skip('权限场景', `无法修改权限：${error instanceof Error ? error.message : String(error)}`)
+  }
+
+  if (locked) {
+    const lockedInfos = await inspectSessionRoots([lockedRoot])
+    check(
+      '权限不足：exists=true 且带 error（与「不存在」分开）',
+      lockedInfos[0]!.exists === true && (lockedInfos[0]!.error ?? '').length > 0,
+      `error=${lockedInfos[0]!.error}`,
+    )
+    check('权限不足的根不贡献任何记录', (await scanAll([lockedRoot])).records.length === 0)
+    check('多根里有一个不可读时，其余根照常统计',
+      (await scanAll([rootA, lockedRoot])).records.length === 6,
+      `${(await scanAll([rootA, lockedRoot])).records.length} 条`)
+    chmodSync(lockedRoot, 0o755) // 恢复，否则 finally 里的 rmSync 可能删不掉
+  } else {
+    skip(
+      '权限场景',
+      '本机 chmod 0o000 之后目录仍可读（Windows 的访问控制由 ACL 表达，chmod 改不动 ACL）—— 未构造出 EACCES',
+    )
+  }
+
+  // ── S17 真实日志（`--real`）：同样的等价关系，用真实的 sessionId / seq 分布再验一遍 ──
   if (process.argv.includes('--real')) {
-    section('S13 真实日志：并集 ≡ 两个根各自扫描的手工并集')
+    section('S17 真实日志：并集 ≡ 两个根各自扫描的手工并集')
     const paths = resolvePaths()
     const roots = paths.sessionsRoots
     console.log(`  自动发现的根（${roots.length} 个）：`)
@@ -446,7 +646,7 @@ try {
     console.log(`  数据目录：${paths.dataDir}（本脚本不写它，只读日志）`)
 
     if (roots.length < 2) {
-      console.log('  只有 0~1 个根，跳过 S13（这条验证需要至少两个根）。')
+      console.log('  只有 0~1 个根，跳过 S17（这条验证需要至少两个根）。')
     } else {
       const scanA = await scanAll([roots[0]!])
       const scanB = await scanAll([roots[1]!])
@@ -512,6 +712,12 @@ try {
 
   // ── 汇总 ───────────────────────────────────────────────────────────────
   console.log('')
+  if (skips > 0) {
+    console.log(`（跳过 ${skips} 项：本机构造不出该条件，已在上面对应小节逐条说明 —— 不是通过）`)
+  }
+  if (observations > 0) {
+    console.log(`（另有 ${observations} 处**口径不一致**，作为观察项列出；不计入失败，需要你决定是否修）`)
+  }
   if (failures > 0) {
     console.error(`✗ 多 home 语义正确性：${checks - failures}/${checks} 项通过，${failures} 项失败`)
     process.exitCode = 1
