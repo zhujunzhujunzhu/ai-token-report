@@ -369,12 +369,6 @@ code {
   align-items: center;
   gap: 25px;
 }
-.workspace-label {
-  color: #8a98ac;
-  font-size: 12px;
-  padding-right: 24px;
-  border-right: 1px solid #e9eef5;
-}
 .identity-menu {
   background: none;
   border: none;
@@ -1225,7 +1219,6 @@ code {
     margin-right: auto;
     font-size: 12px;
   }
-  .workspace-label,
   .identity-copy {
     display: none;
   }

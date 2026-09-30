@@ -36,9 +36,6 @@ const route = useRoute()
 const router = useRouter()
 const mobileOpen = ref(false)
 const collapsed = ref(false)
-// ★ 顶部工作空间标签优先显示「当前登录者所属分组」（多对多用「、」拼）。
-//   一个分组都没有时保留「部门工作空间」这一**部署形态**的说法 ——
-//   它说的是「这个平台部署给一个部门用」，不是人员归属实体（见改造规范 §0）。
 const navigation = computed(() => [
   { path: '/overview', label: '用量总览', icon: DataAnalysis },
   { path: '/analysis', label: '用量分析', icon: DataLine },
@@ -148,11 +145,6 @@ async function signOut(): Promise<void> {
           }}</el-breadcrumb-item></el-breadcrumb
         >
         <div class="header-right">
-          <span class="workspace-label">{{
-            session.identity?.group_names?.join('、') ||
-            session.identity?.group ||
-            '部门工作空间'
-          }}</span>
           <el-dropdown trigger="click" @command="signOut"
             ><button class="identity-menu" aria-label="账号菜单">
               <el-avatar :size="34">{{
