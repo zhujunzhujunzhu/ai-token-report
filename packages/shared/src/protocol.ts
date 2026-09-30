@@ -349,7 +349,7 @@ export interface DiagnosticsResponse {
 //   | `unattributedRate` | 有（覆盖率监控） | **不存在**（本机不存在归属问题） |
 //
 //   ⚠️ 两个库是**不同文件**：部门端用 `dbPath`（含全员上报数据），
-//      本地端用 `$DSH_HOME/token-report/usage.sqlite`（只含本机数据）。
+//      本地端用 `~/.ai-token-report/usage.sqlite`（只含本机数据）。
 //      本地端因此仍然「断网可用、服务端挂掉不影响看自己的数据」。
 //
 //   早期图省事让本地页复用部门契约，结果是把「本机根本没有的概念」
@@ -375,6 +375,27 @@ export interface LocalStatsQuery {
 }
 
 /**
+ * ★ 统计的**数据来源** —— 回答「这个数是从哪几处日志算出来的」。
+ *
+ * 同一台机器上并存多套 DSH 时（命令行版 / Desktop / 第三方客户端），会话日志根是
+ * **一组**，统计是它们的**并集**（互为镜像的会话按 `event_id` 去重，只算一次）。
+ * 没有这组字段就分不清两件**看起来完全一样**的事：
+ *
+ * - 「并按集去重」—— 加了一个 home，数字只涨了一点，**这是对的**；
+ * - 「那个根根本没读到」—— 数字同样没怎么涨，**这是 bug**。
+ *
+ * 所以 `missingRoots` 必须逐项报出、绝不静默。
+ */
+export interface LocalStatsSources {
+  /** 本次统计读的**会话日志根**（绝对路径）。多个 = 多套 DSH 的并集去重。 */
+  sessionsRoots: string[]
+  /** 配了但**不存在**的根：逐项列出，不静默跳过。 */
+  missingRoots: string[]
+  /** token-report 自己的**数据目录**（身份 / 本地库 / outbox / 补报水位）；与会话日志根无关。 */
+  dataDir: string | null
+}
+
+/**
  * 本地指标卡片（`GET /api/local/stats/overview`）。
  *
  * ★ 四项 token **分列**，与铁律 3 一致：采集端一旦合并，后续拆分无法还原。
@@ -384,6 +405,8 @@ export interface LocalStatsQuery {
 export interface LocalOverviewResponse {
   /** 实际统计窗口（服务端解析后的绝对时间，便于页面显示口径）。 */
   range: { from: number | null; to: number | null; label: string }
+  /** ★ 数据来源：读了哪几个会话日志根（多套 DSH 并存时是并集）。 */
+  sources: LocalStatsSources
   /** 计费总量 = input + output + cacheRead + cacheWrite */
   totalTokens: number
   /** ★ 未命中缓存的输入，**不是**总输入。 */
@@ -481,6 +504,8 @@ export interface LocalDiagnosticsResponse {
   eventTypes: Record<string, number>
   /** 出现过的 provider，已排序。 */
   providersSeen: string[]
+  /** ★ 数据来源：与 `overview` 同一组根，便于诊断页对照「数字来自哪几处」。 */
+  sources: LocalStatsSources
   scannedAt: number
   cached: boolean
 }
