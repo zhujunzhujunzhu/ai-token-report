@@ -17,5 +17,11 @@
       "@ai-token-report/core/db": ["../core/src/db/index.ts"]
     }
   },
-  "include": ["src/**/*.ts"]
+  // ★ `scripts/**` 也纳入：`reconcile-bill.ts`（月度对账）与 `migrate-db.ts` 都在这里，
+  //   而它们此前**完全不在** `bun run typecheck` 的覆盖内 —— 脚本里的类型错误
+  //   只会在真跑那一刻以运行时错误出现。
+  // ⚠️ `test/**` 仍然**不**纳入：那批端到端脚本有一批既有的 `unknown` 类型错误
+  //   （`e2e-identity.ts` 等，响应体解析处），顺手加进来会让 `bun run typecheck`
+  //   从「7 包全绿」变成一片红，而修它们与本次改动无关。
+  "include": ["src/**/*.ts", "scripts/**/*.ts"]
 }
