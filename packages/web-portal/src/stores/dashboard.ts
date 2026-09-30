@@ -10,17 +10,25 @@ import type {
   RecordRow,
   SeriesResponse,
   StatsGroupOption,
+  StatsMemberOption,
 } from '@ai-token-report/shared'
 import {
   fetchBreakdown,
   fetchDiagnostics,
   fetchGroupOptions,
+  fetchMemberOptions,
   fetchOverview,
   fetchRecords,
   fetchSeries,
   type PortalFilter,
 } from '../api/portal.js'
-import { bucketFor, CUSTOM_PERIOD, identityLabel, userLabel } from '../types/portal.js'
+import {
+  bucketFor,
+  CUSTOM_PERIOD,
+  memberFilterOptions,
+  userLabel,
+  type MemberFilterOption,
+} from '../types/portal.js'
 import { useSessionStore } from './session.js'
 
 export type StatsSection = 'overview' | 'analysis' | 'records' | 'diagnostics'
@@ -100,7 +108,23 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
    *   所以「各分组之和 > 总量」是定义；两个榜回答的是不同问题。
    */
   const groupRanking = ref<BreakdownRow[]>([])
-  const userOptions = ref<BreakdownRow[]>([])
+  /**
+   * 人员**名册**（`GET /api/v1/stats/members`，`stats:read`）。
+   *
+   * ★ 它是「窗口内没有用量的人」唯一的来源：只从用量行里取候选时，
+   *   选中分组之后人员下拉会整个空掉（见协议里的注释）。
+   * ⚠️ 刻意**不带任何筛选**：候选必须是完整名册，否则选中一项后
+   *   下拉会塌缩（自锁定）。按分组收窄是页面用 `group_ids` 自己做的展示过滤，
+   *   与查询无关 —— 它不参与任何数值计算。
+   */
+  const memberDirectory = ref<StatsMemberOption[]>([])
+  /**
+   * 用量派生的人员候选（`breakdown?by=user`，**不含人员筛选**）。
+   *
+   * ⚠️ 它仍然是「未署名 / 待确认历史」唯一的来源：那两种归属状态在人员
+   *   目录里根本表达不出来（见 `docs/数据库重设计-接口与验收.md`）。
+   */
+  const usageUsers = ref<BreakdownRow[]>([])
   /**
    * 分组候选项，来自看板接口 `GET /api/v1/stats/groups`（`stats:read`）。
    *
@@ -109,6 +133,20 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
    *   否则选中一个分组后下拉会塌缩成一项（自锁定）。
    */
   const groupOptions = ref<StatsGroupOption[]>([])
+  /**
+   * 人员下拉的选项 = 名册 ∪ 用量派生键，再按所选分组收窄。
+   *
+   * ★ 联动规则只有这一处实现（`memberFilterOptions`）：未选分组 = 全部人员；
+   *   选中分组 = 只列该分组的成员。页面只负责渲染，不自己再筛一遍。
+   */
+  const userOptions = computed<MemberFilterOption[]>(() =>
+    memberFilterOptions(
+      memberDirectory.value,
+      usageUsers.value,
+      filters.value.groups,
+      groupOptions.value,
+    ),
+  )
   const breakdown = ref<BreakdownResponse | null>(null)
   const diagnostics = ref<DiagnosticsResponse | null>(null)
   const records = ref<RecordRow[]>([])
@@ -201,33 +239,38 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     // ★ 分组候选同样不能带筛选（含分组筛选本身）：从已筛选结果里取候选，
     //   选中一个分组之后下拉会塌缩成一个选项，使用者再也加不回别的分组。
     const groupCandidates = fetchGroupOptions()
-    const [ov, opts, gopts, se, rank, groupRank, bd, rec, diag] = await Promise.all([
-      fetchOverview(filter),
-      // ★ 候选不能带人员筛选，否则选择一个人后再也选不到其他人。
-      candidates,
-      groupCandidates,
-      active === 'overview' || active === 'analysis'
-        ? fetchSeries(filter, granularity.value)
-        : null,
-      active === 'overview'
-        ? filter.users.length ? fetchBreakdown(filter, 'user') : candidates
-        : null,
-      // ★ 分组排行按**当前筛选**取（含分组筛选本身）：「只看这两个分组时各占多少」
-      //   正是使用者下一步要问的问题。数值全部来自服务端，前端不做任何换算。
-      active === 'overview' ? fetchBreakdown(filter, 'group') : null,
-      active === 'analysis'
-        ? breakdownBy.value === 'user' && !filter.users.length
-          ? candidates
-          : fetchBreakdown(filter, breakdownBy.value)
-        : null,
-      active === 'records'
-        ? fetchRecords(filter, {
-            limit: PAGE_SIZE,
-            offset: (page.value - 1) * PAGE_SIZE,
-          })
-        : null,
-      active === 'diagnostics' ? fetchDiagnostics(filter) : null,
-    ])
+    // ★ 人员名册：下拉里「窗口内没有用量的人」唯一的来源，同样不带筛选。
+    //   它只喂候选，不参与任何数字；失败也不能拖垮整页（见下面的处理）。
+    const memberCandidates = fetchMemberOptions()
+    const [ov, opts, gopts, mo, se, rank, groupRank, bd, rec, diag] =
+      await Promise.all([
+        fetchOverview(filter),
+        // ★ 候选不能带人员筛选，否则选择一个人后再也选不到其他人。
+        candidates,
+        groupCandidates,
+        memberCandidates,
+        active === 'overview' || active === 'analysis'
+          ? fetchSeries(filter, granularity.value)
+          : null,
+        active === 'overview'
+          ? filter.users.length ? fetchBreakdown(filter, 'user') : candidates
+          : null,
+        // ★ 分组排行按**当前筛选**取（含分组筛选本身）：「只看这两个分组时各占多少」
+        //   正是使用者下一步要问的问题。数值全部来自服务端，前端不做任何换算。
+        active === 'overview' ? fetchBreakdown(filter, 'group') : null,
+        active === 'analysis'
+          ? breakdownBy.value === 'user' && !filter.users.length
+            ? candidates
+            : fetchBreakdown(filter, breakdownBy.value)
+          : null,
+        active === 'records'
+          ? fetchRecords(filter, {
+              limit: PAGE_SIZE,
+              offset: (page.value - 1) * PAGE_SIZE,
+            })
+          : null,
+        active === 'diagnostics' ? fetchDiagnostics(filter) : null,
+      ])
     if (seq !== requestSeq || generation !== session.generation) return
     pending = false
     loading.value = false
@@ -240,9 +283,21 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
       handleFailure(failure)
       return
     }
+    // ★ 人员名册刻意**不并进 failures**：它是候选来源，不是数字来源。
+    //   旧版服务端还没有这个接口（404），却要为它把整个看板变成一片错误提示，
+    //   那是拿一个下拉的可用性去换所有数字的可读性。回落行为就是以前的样子：
+    //   下拉只列用量里出现过的人（`canNarrow` 为假时不做任何收窄）。
+    //   ⚠️ 但 401 与数据无关，仍然必须让会话过期 —— 否则页面会一直转圈。
+    if (!mo.ok && mo.status === 401) {
+      handleFailure(mo)
+      return
+    }
     if (ov.ok) overview.value = ov.data
-    if (opts.ok) userOptions.value = opts.data.rows
+    if (opts.ok) usageUsers.value = opts.data.rows
+    // ★ 先分组目录后人员名册：人员选项的展示名要用分组 ID 翻名字，
+    //   反过来的话首帧会闪一次「未知分组」。
     if (gopts.ok) groupOptions.value = gopts.data.groups ?? []
+    if (mo.ok) memberDirectory.value = mo.data.members ?? []
     if (se?.ok) series.value = se.data
     if (rank?.ok) ranking.value = rank.data.rows
     if (groupRank?.ok) groupRanking.value = groupRank.data.rows
@@ -261,10 +316,41 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     const built = buildFilter(next)
     rangeError.value = built.error
     if (built.error) return false
-    filters.value = { ...next, users: [...next.users], groups: [...next.groups] }
+    const groups = [...new Set(next.groups)]
+    filters.value = {
+      ...next,
+      groups,
+      // ★ 选了分组之后，把**分组外**的人员从筛选里去掉。
+      //   服务端按 AND 叠加：留下一个不在所选分组里的人，查询必然是 0，
+      //   而页面上只看到一片空数字 —— 看不出是筛选条件在打架。
+      //   ⚠️ 只在名册可用时收窄。名册取不到（旧服务端 / 请求失败）时我们
+      //   并不知道谁属于哪个分组，此时按原样保留 —— 不能凭一份空名册
+      //   删掉使用者的选择。
+      users: memberDirectory.value.length > 0
+        ? pruneUsers(next.users, groups)
+        : [...next.users],
+    }
     page.value = 1
     await load()
     return true
+  }
+  /**
+   * 去掉在当前分组下选不到的归属键（分组外的成员、以及不属于任何分组的
+   * 未署名 / 待确认历史）。
+   *
+   * ⚠️ 判据必须与下拉**共用** `memberFilterOptions`：各写一份过滤逻辑，
+   *   早晚会出现「下拉里看不到、筛选里还留着」的幽灵条件。
+   */
+  function pruneUsers(users: readonly string[], groups: readonly string[]): string[] {
+    const visible = new Set(
+      memberFilterOptions(
+        memberDirectory.value,
+        usageUsers.value,
+        groups,
+        groupOptions.value,
+      ).map((option) => option.key),
+    )
+    return users.filter((key) => visible.has(key))
   }
   async function setPage(value: number): Promise<void> {
     page.value = Math.min(
@@ -296,7 +382,9 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     const seq = ++detailSeq
     const generation = session.generation
     const candidate = userOptions.value.find((row) => row.key === userId)
-    const label = candidate ? identityLabel(candidate) : userLabel(userId)
+    // 下拉里翻不到（例如名册接口失败、或这个键已不在当前分组下）时保留原始
+    // 归属键：宁可让人看见一个 UUID，也不要把抽屉标题显示成空白。
+    const label = candidate?.label ?? userLabel(userId)
     // 后台刷新保留已展示的数据，避免每五秒闪回骨架屏。
     if (!background) {
       detail.value = { userId, label, overview: null, series: null, models: [] }
@@ -338,7 +426,8 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
       pending = false
       loading.value = false
       clearData()
-      userOptions.value = []
+      usageUsers.value = []
+      memberDirectory.value = []
       groupOptions.value = []
       filters.value = initialFilters()
       page.value = 1

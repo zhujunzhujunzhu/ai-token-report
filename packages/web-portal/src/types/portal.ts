@@ -13,6 +13,7 @@ import {
   type GroupBy,
   type RecordRow,
   type StatsGroupOption,
+  type StatsMemberOption,
 } from '@ai-token-report/shared'
 
 /** 时间窗选项（value 是服务端认识的具名周期）。 */
@@ -148,9 +149,122 @@ export function userLabel(key: string): string {
 
 /** 同名人员用分组与短 ID 辅助区分；旧响应仍可显示旧人名。 */
 export function identityLabel(row: BreakdownRow): string {
-  const name = row.label ?? userLabel(row.key)
-  const groups = groupNamesLabel(row.group_names)
-  return row.member_id ? `${name} · ${groups ? groups + ' · ' : ''}${row.member_id.slice(0, 8)}` : name
+  return memberFilterLabel(
+    row.label ?? userLabel(row.key),
+    row.member_id,
+    row.group_names ?? [],
+  )
+}
+
+/**
+ * 人员下拉里的一项。
+ *
+ * ★ 把两种来源归一成同一种形状：**人员目录**（`/api/v1/stats/members`）与
+ *   **用量派生的归属键**（未署名 / 待确认历史）。下拉只需要「键、显示名、当前分组」，
+ *   不必知道它来自哪一边。
+ */
+export interface MemberFilterOption {
+  /** 服务端认识的不透明归属键：人员 UUID / `legacy:…` / `unknown`。 */
+  key: string
+  /** 已经拼好的展示名（同名消歧也在里面）。 */
+  label: string
+  /** 该人员的**当前**所属分组 ID；未分组与用量派生键都是空数组。 */
+  groupIds: string[]
+}
+
+/**
+ * 人员的显示文案：`姓名 · 分组、分组 · 短ID`。
+ *
+ * ★ 与 `identityLabel()` 共用同一份拼法：排行、明细与下拉里的同一个人
+ *   必须长得一模一样，否则使用者会以为是两个人。
+ * ⚠️ 两个人同名时，短 ID 是唯一能区分它们的可见线索 —— 别去掉它。
+ */
+export function memberFilterLabel(
+  name: string,
+  memberId: string | null | undefined,
+  groupNames: readonly string[],
+): string {
+  const groups = groupNamesLabel(groupNames)
+  return memberId
+    ? `${name} · ${groups ? groups + ' · ' : ''}${memberId.slice(0, 8)}`
+    : name
+}
+
+/**
+ * 人员下拉的候选集合：**人员目录 ∪ 用量派生键**，并按所选分组收窄。
+ *
+ * ## 为什么候选不能只从用量里取
+ *
+ * 用量的分组聚合只回答「谁在这个窗口里用过量」。刚入职、休假、只在别的窗口
+ * 用过的人一概不出现；一旦选中某个分组，下拉会**整个空掉** ——
+ * 看起来像数据丢了，而不像「这段时间没人用」。所以名册以目录为准。
+ *
+ * ## 联动规则（分组在前、人员在后）
+ *
+ * - 未选分组 → **全部人员**（含窗口内零用量的人）
+ * - 选中分组 → 只列**当前属于所选分组**的人（多对多：属于任一所选分组即列出）
+ *
+ * ⚠️ 「未署名 / 待确认历史」是**真实存在的归属状态**（见
+ *   `docs/数据库重设计-接口与验收.md`），目录里表达不出来，必须保留；
+ *   但它们不属于任何分组，所以选了分组时不再列出 —— 与分组 AND 之后必然是 0，
+ *   留在下拉里只会让人选出一个「什么都没筛出来」的条件。
+ * ⚠️ 目录**取不到**时（旧服务端没有这个接口 / 请求失败）不做任何收窄，
+ *   回落到「只列用量里出现过的人」——不能凭一份空目录删掉使用者的选项。
+ *
+ * @param selectedGroups 当前筛选的分组 ID；空数组 = 不按分组收窄
+ * @param groups         分组候选目录，仅用于把分组 ID 翻成展示名
+ */
+export function memberFilterOptions(
+  directory: readonly StatsMemberOption[],
+  usageRows: readonly BreakdownRow[],
+  selectedGroups: readonly string[],
+  groups: readonly StatsGroupOption[],
+): MemberFilterOption[] {
+  const nameOf = (groupId: string): string =>
+    groups.find((group) => group.group_id === groupId)?.name ?? '未知分组'
+  const listed = (member: StatsMemberOption): boolean =>
+    selectedGroups.length === 0 ||
+    member.group_ids.some((id) => selectedGroups.includes(id))
+  // ★ 「目录能不能用来收窄」取决于目录里有没有人，而不是请求成功与否：
+  //   凭证表形态的部署（还没有人员库）返回的就是一份空名册。
+  const canNarrow = directory.length > 0
+
+  const options: MemberFilterOption[] = []
+  // ★ 去重按**整份名册**判定，而不是「已经列出来的那些」：一个人不在所选
+  //   分组里时会从上面那段被跳过，若只记「已列出的人」，紧接着用量那段
+  //   又会用他的用量行把他加回来 —— 分组筛选当场失效。
+  const known = new Set(directory.map((member) => member.member_id))
+  for (const member of directory) {
+    if (!listed(member)) continue
+    options.push({
+      key: member.member_id,
+      label: memberFilterLabel(
+        // 与人员管理页同一种说法（那里也把归档与停用分开），
+        // 否则同一个人在两页上显示成两种状态。
+        member.status === 'active'
+          ? member.name
+          : `${member.name}（${member.status === 'archived' ? '已归档' : '停用'}）`,
+        member.member_id,
+        member.group_ids.map(nameOf),
+      ),
+      groupIds: [...member.group_ids],
+    })
+  }
+
+  for (const row of usageRows) {
+    // 目录里已经列过的人不再重复；剩下的分两类：
+    //   · 有用量但**目录里翻不到**（目录拿不到 / 人员行已不在册）→ 照原样列出。
+    //     让有用量的人从下拉里消失，看起来就是数据丢了。
+    //   · 未署名 / 待确认历史 → 不属于任何分组，只有不筛分组时才列出。
+    if (row.member_id && known.has(row.member_id)) continue
+    if (!row.member_id && canNarrow && selectedGroups.length > 0) continue
+    options.push({
+      key: row.key,
+      label: identityLabel(row),
+      groupIds: [],
+    })
+  }
+  return options
 }
 
 /**

@@ -149,23 +149,31 @@ describe('统计状态', () => {
       urls.push(url)
       if (url.pathname.endsWith('overview')) return json(overview)
       if (url.pathname.endsWith('series')) return json({ points: [] })
+      if (url.pathname.endsWith('/api/v1/stats/members')) return json({ members: [] })
       return json({ rows: url.searchParams.has('member_id')
         ? [{ key: 'selected' }]
         : [{ key: 'selected' }, { key: 'other' }] })
     })
     const dashboard = useDashboardStore()
     await dashboard.activate('overview')
-    // 总览一轮 5 个请求：指标、人员候选、分组候选、趋势、分组排行。
+    // 总览一轮 6 个请求：指标、人员候选（用量）、分组候选、**人员名册**、趋势、分组排行。
     // ★ 分组候选走看板接口 `/api/v1/stats/groups`（`stats:read`），
     //   不是管理接口 `/api/v1/admin/groups`（那是 `groups:read`）。
-    expect(urls).toHaveLength(5)
+    // ★ 人员名册同理走 `/api/v1/stats/members`：它是「窗口内没有用量的人」
+    //   唯一的来源（只从用量行里取候选时，选了分组下拉会整个空掉）。
+    expect(urls).toHaveLength(6)
     expect(urls.filter((url) => url.pathname.endsWith('/api/v1/stats/groups'))).toHaveLength(1)
+    expect(urls.filter((url) => url.pathname.endsWith('/api/v1/stats/members'))).toHaveLength(1)
     const by = (url: URL, value: string) =>
       url.pathname.endsWith('breakdown') && url.searchParams.get('by') === value
     // ★ 全员排行复用候选请求：`by=user` 只发一次；另一次是分组排行 `by=group`。
     expect(urls.filter((url) => by(url, 'user'))).toHaveLength(1)
     expect(urls.filter((url) => by(url, 'group'))).toHaveLength(1)
-    expect(dashboard.ranking).toEqual(dashboard.userOptions)
+    // ★ 全员排行与候选取自**同一个**不带人员筛选的请求（少一轮聚合）；
+    //   候选多了一层排版（键 / 展示名 / 分组），所以只比归属键。
+    expect(dashboard.ranking.map((row) => row.key)).toEqual(
+      dashboard.userOptions.map((option) => option.key),
+    )
     urls.length = 0
     await dashboard.applyFilters({ ...dashboard.filters, users: ['selected'] })
     // 筛人后 `by=user` 变成两次（不带筛选的候选 + 带筛选的排行），
@@ -248,40 +256,44 @@ describe('统计状态', () => {
       urls.push(url)
       if (url.pathname.endsWith('overview')) return json(overview)
       if (url.pathname.endsWith('records')) return json({ rows: [], total: 45 })
+      if (url.pathname.endsWith('/api/v1/stats/members')) return json({ members: [] })
       return json({ rows: [{ key: '00000000-0000-4000-8000-000000000003', label: '张三' }, { key: '00000000-0000-4000-8000-000000000004', label: '李四' }] })
     })
     const dashboard = useDashboardStore()
     await dashboard.activate('records')
     await dashboard.applyFilters({ ...dashboard.filters, users: ['00000000-0000-4000-8000-000000000003'] })
     await dashboard.setPage(2)
-    // 一轮请求的实际发出顺序是「候选 → 分组候选 → 指标 → 本页数据」，
-    // 所以取末尾 4 条来覆盖这一轮（多了分组候选这一条）。
-    const last = urls.slice(-4)
+    // 按「最后一条匹配的请求」取，而不是按下标切片：请求条数会随接口增减变化，
+    // 下标切片的断言会在无关改动里悄悄指向另一个请求。
+    const lastOf = (match: (url: URL) => boolean): URL | undefined =>
+      urls.filter(match).at(-1)
+    const breakdown = lastOf((u) => u.pathname.endsWith('breakdown'))
+    const records = lastOf((u) => u.pathname.endsWith('records'))
+    expect(breakdown?.searchParams.has('member_id')).toBe(false)
+    // ★ 分组 / 人员候选必须始终是完整集合：带上筛选就会让下拉在选中后塌缩成一项。
+    const candidates = urls.filter(
+      (u) =>
+        u.pathname.endsWith('/api/v1/stats/groups') ||
+        u.pathname.endsWith('/api/v1/stats/members'),
+    )
+    expect(candidates).toHaveLength(6)
+    expect(candidates.every((u) => u.searchParams.size === 0)).toBe(true)
+    expect(records?.searchParams.get('member_id')).toBe(
+      '00000000-0000-4000-8000-000000000003',
+    )
     expect(
-      last
-        .find((u) => u.pathname.endsWith('breakdown'))
-        ?.searchParams.has('member_id'),
-    ).toBe(false)
-    // ★ 分组候选必须始终是完整集合：带上筛选就会让下拉在选中后塌缩成一项。
-    expect(urls.find((u) => u.pathname.endsWith('/api/v1/stats/groups'))?.searchParams.size).toBe(0)
-    expect(
-      last
-        .find((u) => u.pathname.endsWith('records'))
-        ?.searchParams.get('member_id'),
-    ).toBe('00000000-0000-4000-8000-000000000003')
-    expect(
-      // 分组候选是唯一**完全不带查询参数**的请求：它只回答「有哪些分组」，
-      // 一旦带上筛选就会自锁定，所以把它排除在「都带 identity_view」之外。
+      // 候选目录是唯一**完全不带查询参数**的请求：它们只回答「有哪些分组、
+      // 名册上有谁」，一旦带上筛选就会自锁定，所以排除在「都带 identity_view」之外。
       urls
-        .filter((u) => !u.pathname.endsWith('/api/v1/stats/groups'))
+        .filter(
+          (u) =>
+            !u.pathname.endsWith('/api/v1/stats/groups') &&
+            !u.pathname.endsWith('/api/v1/stats/members'),
+        )
         .every((u) => u.searchParams.get('identity_view') === 'member'),
     ).toBe(true)
     expect(urls.every((u) => !u.searchParams.has('user'))).toBe(true)
-    expect(
-      last
-        .find((u) => u.pathname.endsWith('records'))
-        ?.searchParams.get('offset'),
-    ).toBe('20')
+    expect(records?.searchParams.get('offset')).toBe('20')
     expect(urls.some((u) => /series|diagnostics|admin/.test(u.pathname))).toBe(
       false,
     )
@@ -290,6 +302,79 @@ describe('统计状态', () => {
       '00000000-0000-4000-8000-000000000004',
     ])
   })
+  /**
+   * ★ 分组 → 人员的联动：选中分组后只列该分组的成员，并**同时**清掉分组外的人选。
+   *
+   * 服务端按 AND 叠加两个维度，留下一个不在所选分组里的人，查询必然是 0，
+   * 而页面上只看到一片空数字 —— 看不出是筛选条件在打架。
+   */
+  test('人员下拉随分组收窄，分组外的人选一并清掉', async () => {
+    signIn()
+    const inGroup = '00000000-0000-4000-8000-00000000000a'
+    const outGroup = '00000000-0000-4000-8000-00000000000b'
+    respond((raw) => {
+      const url = new URL(raw, 'http://test')
+      if (url.pathname.endsWith('overview')) return json(overview)
+      if (url.pathname.endsWith('/api/v1/stats/groups'))
+        return json({ groups: [{ group_id: 'g-dev', name: '研发组', status: 'active', member_count: 1 }] })
+      if (url.pathname.endsWith('/api/v1/stats/members'))
+        return json({ members: [
+          { member_id: inGroup, name: '张三', status: 'active', group_ids: ['g-dev'] },
+          { member_id: outGroup, name: '李四', status: 'active', group_ids: ['g-ops'] },
+        ] })
+      return json({ rows: [], points: [] })
+    })
+    const dashboard = useDashboardStore()
+    await dashboard.activate('overview')
+    // 未选分组 = 全部人员（李四这个窗口里一条用量都没有，照样在名册里）。
+    expect(dashboard.userOptions.map((option) => option.key)).toEqual([inGroup, outGroup])
+    await dashboard.applyFilters({
+      ...dashboard.filters,
+      groups: ['g-dev'],
+      users: [inGroup, outGroup],
+    })
+    expect(dashboard.userOptions.map((option) => option.key)).toEqual([inGroup])
+    expect(dashboard.filters.users).toEqual([inGroup])
+    // 展示名用分组 ID 翻名字（服务端只回 ID），与排行里的拼法一致。
+    expect(dashboard.userOptions[0]?.label).toBe('张三 · 研发组 · 00000000')
+  })
+
+  /**
+   * ★ 人员名册是**候选来源**，不是数字来源。
+   *
+   * 旧版服务端还没有这个接口，不能为它把整个看板变成错误提示 ——
+   * 回落行为就是以前的样子（下拉只列用量里出现过的人）。
+   */
+  test('人员名册失败不拖垮看板，回落成用量候选', async () => {
+    signIn()
+    respond((raw) => {
+      const url = new URL(raw, 'http://test')
+      if (url.pathname.endsWith('/api/v1/stats/members')) return json({ reason: '未找到' }, 404)
+      if (url.pathname.endsWith('overview')) return json(overview)
+      if (url.pathname.endsWith('/api/v1/stats/groups')) return json({ groups: [] })
+      return json({ rows: [{ key: 'selected' }], points: [] })
+    })
+    const dashboard = useDashboardStore()
+    await dashboard.activate('overview')
+    expect(dashboard.overview?.totalTokens).toBe(101)
+    expect(dashboard.error).toBeNull()
+    expect(dashboard.userOptions.map((option) => option.key)).toEqual(['selected'])
+  })
+
+  /** ★ 401 与数据无关，必须让会话过期 —— 否则页面会一直转圈。 */
+  test('人员名册 401 仍然让会话过期', async () => {
+    signIn()
+    respond((raw) => {
+      const url = new URL(raw, 'http://test')
+      if (url.pathname.endsWith('/api/v1/stats/members')) return json({ reason: '失效' }, 401)
+      if (url.pathname.endsWith('overview')) return json(overview)
+      if (url.pathname.endsWith('/api/v1/stats/groups')) return json({ groups: [] })
+      return json({ rows: [], points: [] })
+    })
+    await useDashboardStore().activate('overview')
+    expect(useSessionStore().signedIn).toBe(false)
+  })
+
   test('旧查询晚到不会覆盖新时间范围', async () => {
     signIn()
     const old = deferred<Response>()

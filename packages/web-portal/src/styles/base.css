@@ -472,9 +472,12 @@ code {
 .filter-card .el-card__body {
   padding: 18px 22px 20px;
 }
+/* 列宽按**字段**给，不按位置给：DOM 顺序是「时间范围 / 分组 / 人员 / 厂商 / 模型」，
+   分组在前但人员仍是最宽的一列（人名比分组名长得多）。
+   改了筛选栏顺序就要回头对一遍这里，否则会悄悄地让人员下拉变窄。 */
 .filter-form {
   display: grid;
-  grid-template-columns: 1fr 1.2fr 1fr 1.2fr auto;
+  grid-template-columns: 1fr 1fr 1.2fr 1.2fr auto;
   gap: 16px;
   align-items: end;
 }

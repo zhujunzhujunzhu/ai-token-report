@@ -1,8 +1,10 @@
 <script setup lang="ts">
 /**
  * 筛选草稿与已应用条件分开，填写期间不会触发无效查询。
- * 三个下拉（时间范围 / 人员 / 分组）是离散选择，选中即应用到列表，不必再点「查询」；
+ * 三个下拉（时间范围 / 分组 / 人员）是离散选择，选中即应用到列表，不必再点「查询」；
  * 厂商 / 模型是子串输入，逐字符查询没有意义，仍由按钮或回车提交。
+ *
+ * ★ 分组在人员**之前**：它是人员的上一位筛选（见模板里的说明）。
  */
 import {
   ElAlert,
@@ -21,7 +23,6 @@ import { useDashboardStore } from '../stores/dashboard.js'
 import {
   TIME_RANGES,
   CUSTOM_PERIOD,
-  identityLabel,
   periodReadyForQuery,
 } from '../types/portal.js'
 const dashboard = useDashboardStore()
@@ -94,23 +95,13 @@ onUnmounted(() => clearTimeout(selectTimer))
             :value="option.value"
             :label="option.label" /></el-select
       ></el-form-item>
-      <el-form-item label="人员"
-        ><el-select
-          v-model="draft.users"
-          multiple
-          filterable
-          clearable
-          collapse-tags
-          collapse-tags-tooltip
-          placeholder="全部人员"
-          aria-label="人员筛选"
-          @change="applySelectsSoon"
-          ><el-option
-            v-for="row in dashboard.userOptions"
-            :key="row.key"
-            :value="row.key"
-            :label="identityLabel(row)" /></el-select
-      ></el-form-item>
+      <!--
+        分组 / 人员的顺序是**有语义的**：先选分组，再选人。
+        分组是人员的上一位筛选 —— 未选分组时人员下拉列出全部人员（含当前
+        时间窗内零用量的人，名册来自 `GET /api/v1/stats/members`）；
+        选中分组后只列该分组的成员。反过来放会让人以为「先挑人再挑分组」
+        也能筛出东西，而服务端是按 AND 叠加的。
+      -->
       <!--
         分组筛选的候选项来自看板接口 `/api/v1/stats/groups`（`stats:read`），
         不是管理接口 `/api/v1/admin/groups`（那是 `groups:read`）。
@@ -118,7 +109,8 @@ onUnmounted(() => clearTimeout(selectTimer))
         ⚠️ 已停用的分组**照样列出**并标注：停用只影响「以后还能不能选它」，
           历史用量仍在，排行里也仍有它那一行 —— 藏起来会让人以为用量丢了。
       -->
-      <el-form-item label="分组"
+      <el-form-item
+        label="分组"
         ><el-select
           v-model="draft.groups"
           multiple
@@ -136,6 +128,30 @@ onUnmounted(() => clearTimeout(selectTimer))
             :label="
               group.status === 'active' ? group.name : `${group.name}（已停用）`
             " /></el-select
+      ></el-form-item>
+      <!--
+        人员候选项 = 人员名册 ∪ 未署名 / 待确认历史，再按所选分组收窄
+        （见 `types/portal.ts` 的 `memberFilterOptions`）。
+        ⚠️ 标签随分组变化，是为了让「怎么只剩这几个人」有现成的答案 ——
+          下拉变短本身不该需要使用者去猜原因。
+      -->
+      <el-form-item
+        :label="draft.groups.length ? '人员（仅所选分组）' : '人员'"
+        ><el-select
+          v-model="draft.users"
+          multiple
+          filterable
+          clearable
+          collapse-tags
+          collapse-tags-tooltip
+          placeholder="全部人员"
+          aria-label="人员筛选"
+          @change="applySelectsSoon"
+          ><el-option
+            v-for="option in dashboard.userOptions"
+            :key="option.key"
+            :value="option.key"
+            :label="option.label" /></el-select
       ></el-form-item>
       <el-form-item label="厂商"
         ><el-input

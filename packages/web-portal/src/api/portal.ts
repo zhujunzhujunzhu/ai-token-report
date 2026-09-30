@@ -20,6 +20,7 @@ import type {
   RecordsResponse,
   SeriesResponse,
   StatsGroupsResponse,
+  StatsMembersResponse,
 } from '@ai-token-report/shared'
 
 import { request, type ApiResult } from './request.js'
@@ -89,6 +90,20 @@ function toQuery(filter: PortalFilter): string {
  */
 export function fetchGroupOptions(): Promise<ApiResult<StatsGroupsResponse>> {
   return request<StatsGroupsResponse>('/api/v1/stats/groups')
+}
+
+/**
+ * 人员候选项（`GET /api/v1/stats/members`）。
+ *
+ * ★ 同样走**看板接口**而不是管理接口 `/api/v1/admin/members`：那是 `members:read`，
+ *   而看板使用者不一定有读人员目录的权限。
+ * ★ 它带回每个人的**当前分组 ID**，页面据此把人员下拉与分组下拉联动起来
+ *   （未选分组 = 全部人员；选中分组 = 只列该分组成员）。
+ * ⚠️ 与分组候选同理，**不带任何筛选参数**：候选必须是完整名册。
+ *   从已筛选结果里取候选，选中一项之后下拉会塌缩（自锁定）。
+ */
+export function fetchMemberOptions(): Promise<ApiResult<StatsMembersResponse>> {
+  return request<StatsMembersResponse>('/api/v1/stats/members')
 }
 
 /** 顶部指标卡片。 */
