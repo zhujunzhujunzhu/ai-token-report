@@ -75,14 +75,28 @@ export function cleanChildEnv(): Record<string, string> {
 
 /** 判断一个候选可执行文件是不是**真的 Node**（而不是 Bun 冒充的）。 */
 export function isRealNode(bin: string): boolean {
-  const probe = Bun.spawnSync([bin, '-p', '[process.version, typeof Bun].join("|")'], {
+  // 🚨 先直接排除 `.cmd` / `.bat`：它们是包管理器装的 **shell shim**，不是 node 可执行文件
+  //   本身。Windows 上 `Bun.which('node')` 常常先命中 shim —— 实测本机第一个候选就是
+  //   `%APPDATA%\dsh-desktop\harness\.desktop-bin\node.cmd` —— 而 shim 一旦被**直接 spawn**
+  //   就会拿到 `EINVAL`（Node 出于命令注入防护拒绝无 shell 地启动 .cmd/.bat；这条对
+  //   「参数里有没有特殊字符」都成立）。症状是「挑中的 node 明明能跑却报 spawn 失败」，
+  //   而被测脚本往往在更晚的地方才炸，很难看出根因是候选挑错了。跳过 shim 之后候选列表
+  //   会继续落到真正的 `node.exe`（本机在 `D:\Program Files\DSH Desktop\…\node.exe`）。
+  if (/\.(cmd|bat)$/i.test(bin)) return false
+  // 探测表达式里**不能出现 `|`**：Bun 对「要传给 .bat/.cmd 的参数含 cmd.exe 特殊字符」
+  //   是抛错（`ERR_INVALID_ARG_VALUE`）而不是返回非 0，一次探测炸掉就会中断整个候选扫描。
+  //   分开两次探测既避开特殊字符，也照样保留原本的两条证据。
+  const probe = (expr: string) => Bun.spawnSync([bin, '-p', expr], {
     stdout: 'pipe',
     stderr: 'pipe',
     env: cleanChildEnv(),
   })
-  if (probe.exitCode !== 0) return false
-  const line = new TextDecoder().decode(probe.stdout).trim().split('\n').pop() ?? ''
-  return /^v\d+\.\d+/.test(line) && line.endsWith('|undefined')
+  const version = probe('process.version')
+  if (version.exitCode !== 0) return false
+  const runtime = probe('typeof Bun')
+  if (runtime.exitCode !== 0) return false
+  const line = new TextDecoder().decode(version.stdout).trim().split('\n').pop() ?? ''
+  return /^v\d+\.\d+/.test(line) && new TextDecoder().decode(runtime.stdout).trim() === 'undefined'
 }
 
 /**
