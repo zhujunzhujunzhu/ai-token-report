@@ -5,7 +5,7 @@ import { join, dirname, resolve, relative } from 'node:path'
 import { tmpdir } from 'node:os'
 import { zstdCompressSync } from 'node:zlib'
 import { hostRequire } from '../scripts/repair-profile.js'
-import { cleanChildEnv, resolveNodeBin } from '../../core/verify/lib/runtime.js'
+import { cleanChildEnv, resolveNodeBin, scratchDataDir, scratchDshHomes } from '../../core/verify/lib/runtime.js'
 
 const args = process.argv.slice(2)
 const option = (name: string) => { const i = args.indexOf(name); return i < 0 ? undefined : args[i + 1] }
@@ -42,6 +42,13 @@ try {
   const env = cleanChildEnv()
   for (const key of Object.keys(env)) if (key.startsWith('DSH_TOKEN_REPORT_') || key.startsWith('DSH_REPORT_')) delete env[key]
   env.DSH_HOME = home
+  // ★ 数据目录**不跟随 `DSH_HOME`**（缺省是家目录下的 `~/.ai-token-report`）：
+  //   不显式给这一项，插件的本地库 / outbox / 身份就会落到使用者真实的目录里。
+  env.DSH_TOKEN_REPORT_DATA_DIR = scratchDataDir(home)
+  // ★ 同理钉住日志根：默认自动发现会连带扫使用者真实的 home，
+  //   于是下面「5000 条 / 475000」的固定期望值会与真实用量混在一起 ——
+  //   在装了 DSH 的机器上必失败、在干净 CI 上反而通过。
+  env.DSH_TOKEN_REPORT_DSH_HOMES = scratchDshHomes(home)
   const start = performance.now()
   // 直接运行 dsh 的 CLI 入口，绕开 Windows 包管理器 shim，确保 finally 只终止本次宿主。
   child = Bun.spawn([node, dsh, '--profile', 'web', '--no-open', '--port', '0'], { cwd: home, env, stdout: 'pipe', stderr: 'pipe' })

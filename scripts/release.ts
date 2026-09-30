@@ -57,6 +57,9 @@ async function run(step: Step) {
 const script = (path: string): Step => ({ label: path, args: ['run', path] })
 const command = (name: string): Step => ({ label: name, args: ['run', name] })
 const scratch = mkdtempSync(join(tmpdir(), 'atr-release-parity-'))
+// ★ 数据目录**不跟随 `DSH_HOME`**（缺省是家目录下的 `~/.ai-token-report`）。
+//   发布验证里的子进程一律继承这一项，免得把使用者的真实身份 / 本地库 / 补报水位写乱。
+env['DSH_TOKEN_REPORT_DATA_DIR'] = join(scratch, 'token-report')
 try {
   // 固定输入快照：运行中的 DSH 仍会追加日志，两个查询不能读不同时间点的数据。
   const dshHome = resolve(process.env['DSH_HOME'] ?? join(homedir(), '.dsh'))
@@ -68,7 +71,7 @@ try {
     script('packages/server/test/e2e-admin.ts'),
     script('packages/cli/verify/verify-report-ingest.ts'),
     script('packages/cli/verify/verify-report-command.ts'),
-    { ...script('packages/cli/verify/verify-db-parity.ts'), env: { DSH_HOME: scratch } },
+    { ...script('packages/cli/verify/verify-db-parity.ts'), env: { DSH_HOME: scratch, DSH_TOKEN_REPORT_DATA_DIR: join(scratch, 'token-report'), DSH_TOKEN_REPORT_DSH_HOMES: scratch } },
     script('packages/core/verify/run-driver-parity.ts'),
     script('packages/core/verify/verify-mysql-dialect.ts'),
     script('packages/server/verify/verify-mysql-portal.ts'),

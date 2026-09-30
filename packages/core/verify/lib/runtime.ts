@@ -14,6 +14,43 @@ export function isBunRuntime(): boolean {
 }
 
 /**
+ * 一次性 DSH home 对应的**一次性数据目录**（`<home>/token-report`）。
+ *
+ * 🚨 为什么每个起子进程的脚本都必须调用它：数据目录的缺省值是家目录下的
+ *   `~/.ai-token-report`，**刻意不跟随 `DSH_HOME`**（见 `core/src/home.ts`）。
+ *   于是「把子进程的 `DSH_HOME` 指到临时目录」这个用了几年的隔离办法
+ *   **不再隔离任何东西** —— 身份文件、本地库、outbox、补报水位会落到使用者
+ *   真实的目录里，而脚本的输出一切正常。
+ *
+ * 用法：`env.DSH_TOKEN_REPORT_DATA_DIR = scratchDataDir(home)`。
+ * 注意 `~` 形式的数据目录只影响**本进程**，子进程要显式传这个环境变量
+ * （或命令行上的 `--data-dir`）。
+ */
+export function scratchDataDir(home: string): string {
+  return join(home, 'token-report')
+}
+
+/**
+ * 一次性 DSH home 对应的**会话日志根列表**（`DSH_TOKEN_REPORT_DSH_HOMES` 的值）。
+ *
+ * 🚨 为什么每个起子进程的脚本也必须调用它：会话日志根现在**默认自动发现**
+ *   （`$DSH_HOME` + `~/.dsh` + `~/.dsh*` + 各平台应用数据目录下的客户端目录）。
+ *   于是「把子进程的 `DSH_HOME` 指到临时目录」这个老办法**不再是隔离** ——
+ *   `$DSH_HOME` 只是候选之一，子进程会连带扫到使用者**真实的** home：
+ *   断言随机器漂移（本机真实用量 vs 固定期望值），更糟的是插件的历史补报
+ *   会把真实用量以验收身份**上报出去**。
+ *
+ * 用法：`env.DSH_TOKEN_REPORT_DSH_HOMES = scratchDshHomes(home)`。
+ * 只想关掉发现、保留 `$DSH_HOME` 语义时用 `DSH_TOKEN_REPORT_DISCOVER='0'`。
+ *
+ * ⚠️ 传**多个**参数时用系统路径分隔符拼（Windows `;` / POSIX `:`）——
+ *   硬编码 `:` 会在 Windows 上把盘符 `C:` 切成两半。
+ */
+export function scratchDshHomes(...homes: string[]): string {
+  return homes.join(delimiter)
+}
+
+/**
  * 子进程环境：剔除会让 Node **直接崩掉**的代理变量。
  *
  * 🚨 本机实测（Node 22.21.1 / Windows）：只要 `NODE_USE_ENV_PROXY=1`，

@@ -127,7 +127,7 @@ async function burst(stage: string, batch: string, replay: boolean, completedRou
 try {
   // 空 mysqlUrl 显式覆盖部署环境；凭证和监听地址也不继承生产配置。
   server = await createServer({
-    host: '127.0.0.1', port: 0, dshHome: tempRoot, dbPath: join(tempRoot, 'portal.sqlite'),
+    host: '127.0.0.1', port: 0, dshHome: tempRoot, dataDir: join(tempRoot, 'token-report'), dbPath: join(tempRoot, 'portal.sqlite'),
     mysqlUrl: '', adminToken: adminSecret, adminName: '性能夹具管理员',
     adminUsername: '', adminPassword: '', captchaHmacKey: '', portalOrigin: '', requestLog: false,
     ingestQueue: { maxRequests: 64, maxWaitMs: 30_000 },

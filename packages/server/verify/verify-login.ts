@@ -47,7 +47,8 @@ const app = createApp({
   identityStore: repository,
   portalAuth: auth,
   databaseAdminRoute: new DatabaseAdminRoute(repository),
-  identityRoute: new IdentityRoute({ dshHome: dir }),
+  // ★ 数据目录**不跟随 `DSH_HOME`**：显式指到临时目录，免得署名落到使用者的真实目录。
+  identityRoute: new IdentityRoute({ dshHome: dir, dataDir: join(dir, 'token-report') }),
   ingestRoute: new IngestRoute({
     identityStore: repository,
     dbPath: join(dir, 'portal.sqlite'),

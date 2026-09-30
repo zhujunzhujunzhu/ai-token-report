@@ -33,7 +33,7 @@ try {
   } finally { db.close() }
   const old = run('migrate-db', ['inspect', '--db', target.sqlitePath])
   check(old.code === 0 && old.output.includes('"status": "legacy"'), 'inspect 识别真实 v3 库')
-  const gate = run('main', ['--db', target.sqlitePath, '--dsh-home', dir])
+  const gate = run('main', ['--db', target.sqlitePath, '--dsh-home', dir, '--data-dir', join(dir, 'token-report')])
   check(gate.code !== 0 && gate.output.includes('显式'), 'Node 服务启动拒绝旧库隐式升级')
   check((await inspectPortalDatabase(target)).version === 3, '失败启动未修改旧版本')
   const encoded = await hashPassword('node-entrypoints-test-password-2026')

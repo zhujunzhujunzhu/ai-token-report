@@ -10,6 +10,9 @@ import { createIsolatedMysql } from '../verify/mysql-isolation.js'
 
 const home = mkdtempSync(join(tmpdir(), 'atr-admin-v5-'))
 const dbPath = join(home, 'portal.sqlite')
+// ★ 数据目录**不跟随 DSH_HOME**：缺省在家目录下（~/.ai-token-report）。
+//   显式指到 fixture，免得管理接口去读写使用者真实的身份 / 本地状态。
+const DATA_DIR = join(home, 'token-report')
 const isolation = process.argv.includes('--mysql') ? await createIsolatedMysql() : null
 const target = { sqlitePath: dbPath, ...(isolation ? { mysqlUrl: isolation.url } : {}) }
 const adminToken = 'isolated-admin-secret'
@@ -17,7 +20,7 @@ const servers: ServerHandle[] = []
 let checks = 0
 function equal(actual: unknown, expected: unknown, message: string) { assert.deepEqual(actual, expected, message); checks++ }
 async function start(extra: Record<string, unknown> = {}) {
-  const server = await createServer({ port: 0, dshHome: home, dbPath, mysqlUrl: isolation?.url ?? '', adminToken, adminName: '验收管理员', requestLog: false, ...extra })
+  const server = await createServer({ port: 0, dshHome: home, dataDir: DATA_DIR, dbPath, mysqlUrl: isolation?.url ?? '', adminToken, adminName: '验收管理员', requestLog: false, ...extra })
   servers.push(server)
   return server
 }
@@ -331,7 +334,7 @@ try {
   equal((await request(a, 'identity/verify', secondIssue.data.token_secret, {})).data.member_id, second.member_id, '重启后凭证仍有效')
   writeFileSync(join(home, 'credentials.json'), 'broken obsolete file')
   equal((await request(a, 'admin/members')).status, 200, '旧文件不能改变已初始化数据库')
-  const empty = await createServer({ port: 0, dshHome: home, dbPath: join(home, 'empty.sqlite'), mysqlUrl: '', adminToken: '', adminUsername: '', adminPassword: '', requestLog: false })
+  const empty = await createServer({ port: 0, dshHome: home, dataDir: DATA_DIR, dbPath: join(home, 'empty.sqlite'), mysqlUrl: '', adminToken: '', adminUsername: '', adminPassword: '', requestLog: false })
   servers.push(empty)
   equal((await request(empty, 'token-usage', firstSecret, payload('v5:5'))).status, 503, '未初始化上报非2xx')
   equal((await request(empty, 'admin/members')).status, 503, '未初始化管理503')

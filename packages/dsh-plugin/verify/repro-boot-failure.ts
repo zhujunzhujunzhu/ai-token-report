@@ -52,6 +52,9 @@ console.log(`\n插件  ${libPath}`)
 console.log(`名称  ${mod.default.name}`)
 
 // 按 profile 里配的那份 config 走一遍（与 cordis.patch.yml 保持一致）
+// ★ 复现脚本同样不能碰使用者的真实目录：会话日志根默认自动发现，数据目录缺省也不跟随
+//   `DSH_HOME` —— 不钉住就会扫真实 home，并把身份 / 本地库指向真实 `~/.ai-token-report`。
+const reproHome = join(process.env['TEMP'] ?? process.env['TMPDIR'] ?? '.', 'atr-repro-home')
 const config = {
   name: 'dsh-token-report',
   appKey: '',
@@ -60,6 +63,8 @@ const config = {
   outbox: { enabled: true, maxBytes: 33554432 },
   features: { reporting: true, tools: true, service: true },
   localDb: false,
+  dshHome: reproHome,
+  dataDir: join(reproHome, 'token-report'),
 }
 
 console.log('\n── 直接调用 apply()（不经过 loader）──')

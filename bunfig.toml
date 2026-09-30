@@ -9,3 +9,9 @@ dir = ".bun-cache"
 [run]
 # 允许 bun run 直接执行 package.json 里的脚本（默认已开启）
 bun = true
+
+[test]
+# ★ 数据目录缺省是家目录下的 `~/.ai-token-report`（不跟随 DSH_HOME），
+#   所以测试必须把它钉在一次性临时目录里，否则会用使用者的真实身份与本地库跑测试。
+#   见 `scripts/test-preload.ts`。
+preload = ["./scripts/test-preload.ts"]

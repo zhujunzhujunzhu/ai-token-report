@@ -40,7 +40,8 @@ async function worker(): Promise<void> {
       const captcha = createCaptchaImage(); emit({ event: 'answer', answer: captcha.answer }); return captcha
     } }),
     databaseAdminRoute: new DatabaseAdminRoute(repository),
-    identityRoute: new IdentityRoute({ dshHome: config.dir }),
+    // ★ 数据目录**不跟随 `DSH_HOME`**：显式指到临时目录。
+    identityRoute: new IdentityRoute({ dshHome: config.dir, dataDir: join(config.dir, 'token-report') }),
     ingestRoute: new IngestRoute({ identityStore: repository, dbPath: config.target.sqlitePath, mysqlUrl: config.target.mysqlUrl }),
     statsRoute: new StatsRoute({ identityStore: repository, dbPath: config.target.sqlitePath, mysqlUrl: config.target.mysqlUrl }),
     localStats: null, enableLocalApi: false, requestLog: false,

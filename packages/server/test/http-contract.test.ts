@@ -121,12 +121,23 @@ function makeHome(tag: string): { home: string; staticDir: string } {
 }
 
 const deptHome = makeHome('dept')
+/** 本地形态的临时 home。两种形态必须各有自己的 home / 数据目录，不能共用。 */
 const localHome = makeHome('local')
-await seedDatabaseIdentity({ sqlitePath: join(deptHome.home, 'token-report', 'portal.sqlite') }, JSON.parse(CREDENTIALS))
+/**
+ * 数据目录：显式指定，**不再跟随 `dshHome`**。
+ *
+ * ⚠️ 缺省值在家目录下（`~/.ai-token-report`），不给的话这个文件会去开
+ *   **真实的上报库**（`openPortalStore` 对空路径会初始化一个空库 ——
+ *   而它正是历史用量的唯一副本）。夹具里的凭证 / 上报库都在这一层。
+ */
+const deptData = join(deptHome.home, 'token-report')
+const localData = join(localHome.home, 'token-report')
+await seedDatabaseIdentity({ sqlitePath: join(deptData, 'portal.sqlite') }, JSON.parse(CREDENTIALS))
 
 /** 部门形态：开静态托管，**关** `/api/local/*`。 */
 const dept: HandlerBundle = await createHandlerFor({
   dshHome: deptHome.home,
+  dataDir: deptData,
   staticDir: deptHome.staticDir,
   enableLocalApi: false,
   // ⚠️ 关掉访问日志：本文件有 60+ 个用例，日志会把断言输出淹掉
@@ -137,6 +148,7 @@ const dept: HandlerBundle = await createHandlerFor({
 /** 本地形态：开 `/api/local/*`，不托管静态。 */
 const local: HandlerBundle = await createHandlerFor({
   dshHome: localHome.home,
+  dataDir: localData,
   enableLocalApi: true,
   requestLog: false,
 })

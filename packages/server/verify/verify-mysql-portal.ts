@@ -36,7 +36,7 @@
  * 管理连接取 ATR_V4_TEST_MYSQL_URL 或本机开发容器，不打开现有业务库。
  */
 
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -104,20 +104,17 @@ function same(label: string, a: unknown, b: unknown): void {
 // ── 临时环境 ────────────────────────────────────────────────────────────────
 
 const home = mkdtempSync(join(tmpdir(), 'atr-verify-mysql-'))
-const credPath = join(home, 'token-report', 'credentials.json')
-mkdirSync(join(home, 'token-report'), { recursive: true })
-writeFileSync(
-  credPath,
-  JSON.stringify(
-    [
-      { token: TOKENS.zhang, name: '张三', group: '研发一部' },
-      { token: TOKENS.li, name: '李四', group: '研发二部' },
-    ],
-    null,
-    2,
-  ),
-  'utf8',
-)
+/**
+ * 数据目录：显式指定，**不再跟随 `dshHome`**。
+ *
+ * ⚠️ 缺省值是家目录下的 `~/.ai-token-report`，不给的话本脚本会去读使用者真实的
+ *   身份文件（只读，但仍然不该跨出 fixture 边界）。
+ *
+ * 旧版本这里还写了一份 `credentials.json` 当身份源 —— 生产启动早已拒绝该旗标
+ * （身份的唯一真值是 portal 数据库），所以那份夹具已经删掉。
+ */
+const dataDir = join(home, 'token-report')
+mkdirSync(dataDir, { recursive: true })
 
 /** SQLite 服务端的库文件（MySQL 侧刻意也传一个路径，用来验证它**没被创建**）。 */
 const sqliteDbPath = join(home, 'sqlite-side', 'portal.sqlite')
@@ -249,13 +246,14 @@ async function startServer(opts: {
     { token: TOKENS.li, name: '李四', group: '研发二部' },
   ])
   // ★ 生产入口：凭证表、三条路由、应用装配、端口重试全在里面。
-  //   `credentialsPath` 由 `dshHome` 推导（`<home>/token-report/credentials.json`），
-  //   与 fixture 写下的位置一致。
+  //   身份的唯一真值是 portal 数据库（`seedDatabaseIdentity` 已经种好）；
+  //   `dataDir` 只决定本次进程读哪一份本地身份文件 / 本地状态。
   //   ⚠️ `requestLog: false`：脚本会打几十个请求，访问日志会把断言淹掉。
   const handle = await createServer({
     port: opts.port,
     host: '127.0.0.1',
     dshHome: home,
+    dataDir,
     dbPath: opts.dbPath,
     // SQLite 对照组必须显式屏蔽环境变量，否则 ATR_MYSQL_URL 会让两端写进同一个库。
     mysqlUrl: opts.mysqlUrl ?? '',

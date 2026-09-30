@@ -12,7 +12,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { scanAll } from '@ai-token-report/core'
 import type { RecordsResponse } from '@ai-token-report/shared'
-import { cleanChildEnv, resolveNodeBin } from '../../core/verify/lib/runtime.js'
+import { cleanChildEnv, resolveNodeBin, scratchDataDir, scratchDshHomes } from '../../core/verify/lib/runtime.js'
 
 const portalUrl = process.env['ATR_VERIFY_PORTAL_URL']
 const token = process.env['ATR_VERIFY_TOKEN']
@@ -37,6 +37,14 @@ const env: Record<string, string> = { ...cleanChildEnv(), DSH_HOME: home }
 for (const key of Object.keys(env)) {
   if (key.startsWith('DSH_TOKEN_REPORT_') || key.startsWith('ATR_VERIFY_')) delete env[key]
 }
+// ★ 数据目录**不跟随 `DSH_HOME`**：不显式给这一项，下面写进临时 home 的身份文件
+//   就不会被插件读到，而上报会用到使用者真实的身份与本地库。
+env.DSH_TOKEN_REPORT_DATA_DIR = scratchDataDir(home)
+// ★ 会话日志根**默认自动发现**：只给 `DSH_HOME` 不足以隔离 —— 它会连带扫到
+//   使用者真实的 home，而本脚本的 patch 里 `reporting: true` 且已配 appKey，
+//   历史补报线程会把**真实用量以验收身份上报到验收服务端**。
+//   必须把范围钉死在这个临时 home 上。
+env.DSH_TOKEN_REPORT_DSH_HOMES = scratchDshHomes(home)
 
 let child: ReturnType<typeof Bun.spawn> | undefined
 try {

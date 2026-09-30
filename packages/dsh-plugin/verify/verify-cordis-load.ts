@@ -16,7 +16,8 @@
  * 3. `ctx.on(...)` / `ctx.effect(...)` / `ctx.logger` 在真上下文里是否可调用，
  *    以及 **fiber 卸载时监听器与定时器是否被清干净**（泄漏在这里最容易暴露）。
  *
- * 全程使用临时 `DSH_HOME`，不碰真实数据；也**不会**发任何网络请求
+ * 全程使用临时 `DSH_HOME` + 临时 `dataDir`，不碰真实数据（缺省数据目录在
+ * 家目录下且**不跟随 `DSH_HOME`**）；也**不会**发任何网络请求
  * （用一个不可达的地址，让上报必然失败并留在 outbox）。
  */
 
@@ -78,6 +79,7 @@ try {
     appKey: 'atr-cordis-key',
     endpoint: 'http://127.0.0.1:1/unreachable',
     dshHome: home,
+    dataDir: join(home, 'token-report'),
     outbox: { dir: join(home, 'outbox') },
   } as never)
 

@@ -14,7 +14,9 @@
  * 4. **未署名时确实一个字节都不发**（合规底线，用真实 socket 验证）。
  * 5. **崩溃恢复** —— 手工造出 inflight 文件，看新进程是否补发。
  *
- * ⚠️ 全程用临时 `DSH_HOME` 与临时 outbox，**不碰**真实的 `~/.dsh`。
+ * ⚠️ 全程用临时 `DSH_HOME` + 临时数据目录（`dataDir` 配置）与临时 outbox，
+ *   **不碰**真实的 `~/.dsh`，也不碰真实的 `~/.ai-token-report` —— 后者是缺省
+ *   数据目录，而它**刻意不跟随 `DSH_HOME`**（见 `core/src/home.ts`）。
  */
 
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
@@ -39,7 +41,12 @@ function check(label: string, ok: boolean, detail = ''): void {
   }
 }
 
-/** 造一个临时 DSH home，并按需写入身份文件。 */
+/**
+ * 造一个临时 DSH home，并按需写入身份文件。
+ *
+ * 身份文件写在 <home>/token-report，与这里显式传下去的 dataDir 必须一致：
+ * 缺省数据目录在家目录下，不给就会读写使用者真实的身份文件。
+ */
 function makeHome(signed: boolean): string {
   const home = mkdtempSync(join(tmpdir(), 'atr-smoke-'))
   if (signed) {
@@ -190,6 +197,7 @@ console.log('\n── 1. 未署名 = 不采集也不上报 ──')
       appKey: 'atr-smoke-key',
       endpoint: receiver.url,
       dshHome: home,
+      dataDir: join(home, 'token-report'),
       outbox: { dir: join(home, 'outbox') },
     })
     host.collectEffects()
@@ -219,6 +227,7 @@ console.log('\n── 2. 已署名：会话事件 → 上报 → 服务端收下
       appKey: 'atr-smoke-key',
       endpoint: receiver.url,
       dshHome: home,
+      dataDir: join(home, 'token-report'),
       batch: { maxRecords: 50, flushIntervalMillis: 60_000 },
       outbox: { dir: join(home, 'outbox') },
     }
@@ -283,7 +292,12 @@ console.log('\n── 3. 脱敏：DSH 记录在到达后端前就被裁剪 ─�
   const home = makeHome(true)
   try {
     const host = makeCtx()
-    apply(host.ctx, { appKey: 'k', dshHome: home, outbox: { dir: join(home, 'outbox') } })
+    apply(host.ctx, {
+      appKey: 'k',
+      dshHome: home,
+      dataDir: join(home, 'token-report'),
+      outbox: { dir: join(home, 'outbox') },
+    })
     host.collectEffects()
 
     const cleaned = host.runWaterfall(usageEvent(9))
@@ -311,6 +325,7 @@ console.log('\n── 4. 崩溃不丢：inflight 文件在新进程里被补发 
       appKey: 'atr-smoke-key',
       endpoint: 'http://127.0.0.1:1/unreachable',
       dshHome: home,
+      dataDir: join(home, 'token-report'),
       outbox: { dir: outboxDir },
     })
     first.collectEffects()
@@ -329,6 +344,7 @@ console.log('\n── 4. 崩溃不丢：inflight 文件在新进程里被补发 
       appKey: 'atr-smoke-key',
       endpoint: receiver.url,
       dshHome: home,
+      dataDir: join(home, 'token-report'),
       outbox: { dir: outboxDir },
     })
     second.collectEffects()
@@ -357,7 +373,12 @@ console.log('\n── 5. 统计工具与服务（真扫本机会话日志）─�
       ...host.ctx,
       reflect: { provide: (name, value) => void (provided[name] = value) },
     }
-    apply(ctxWithReflect, { appKey: 'k', dshHome: home, outbox: { dir: join(home, 'outbox') } })
+    apply(ctxWithReflect, {
+      appKey: 'k',
+      dshHome: home,
+      dataDir: join(home, 'token-report'),
+      outbox: { dir: join(home, 'outbox') },
+    })
     host.collectEffects()
 
     check('注册了 tokenReportTools', provided['tokenReportTools'] !== undefined)
