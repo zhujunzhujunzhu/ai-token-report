@@ -12,6 +12,8 @@ import type {
   PortalLegacyAttribution, PortalConfirmLegacyRequest, PortalLegacyResult,
   PortalProviderAliasListResponse, PortalProviderAliasResult,
   PortalSetProviderAliasRequest, PortalProviderAliasIdRequest, PortalProviderAliasStatusRequest,
+  PortalModelPriceListResponse, PortalModelPriceResult,
+  PortalSetModelPriceRequest, PortalModelPriceIdRequest, PortalSeedModelPricesRequest,
 } from '@ai-token-report/shared'
 import { post, request } from './request.js'
 
@@ -121,3 +123,20 @@ export const fetchProviderAliases = () => request<PortalProviderAliasListRespons
 export const setProviderAlias = (input: PortalSetProviderAliasRequest) => post<PortalProviderAliasResult>(root + '/provider-aliases', input)
 export const setProviderAliasStatus = (input: PortalProviderAliasStatusRequest) => post<PortalProviderAliasResult>(root + '/provider-aliases/status', input)
 export const deleteProviderAlias = (input: PortalProviderAliasIdRequest) => post<PortalMutationResult>(root + '/provider-aliases/delete', input)
+/**
+ * 模型单价（v7）—— 费用统计的**唯一**计价来源。
+ *
+ * ★ 粒度是 `(provider, model)` 精确匹配，不是一个供应商一个价：
+ *   同一个供应商下不同模型的价差常常在 10 倍以上，汇成一个价会让一半模型算错，
+ *   而页面上只看得出「金额不对」，看不出是哪一半。
+ * 🚨 金额一律是**整数微元 / 千 token**（1 微 = 1e-6 货币单位）。页面只负责
+ *   把「货币单位 / 百万 token」换算成库里的这个整数（两者差 1000），**不参与任何计费算术**
+ *   （口径与格式化都在 `shared/price.ts`）。
+ * ⚠️ 四类单价必须分开填：`cacheRead` 通常比 `input` 便宜一个数量级，
+ *   而它占总量的 94% 以上（铁律 2）—— 合成一个价等于让绝大部分用量算错。
+ */
+export const fetchModelPrices = () => request<PortalModelPriceListResponse>(root + '/pricing')
+export const setModelPrice = (input: PortalSetModelPriceRequest) => post<PortalModelPriceResult>(root + '/pricing', input)
+export const deleteModelPrice = (input: PortalModelPriceIdRequest) => post<PortalMutationResult>(root + '/pricing/delete', input)
+/** 只在单价表**为空**时能成功；非空时服务端回 409 并说明已有多少条。 */
+export const seedModelPrices = (input: PortalSeedModelPricesRequest) => post<PortalModelPriceListResponse>(root + '/pricing/seed', input)

@@ -25,6 +25,9 @@ import {
   Ticket,
   OfficeBuilding,
   Connection,
+  // ★ 单价的图标刻意用 `Money`：这一页改的是**钱怎么算**，
+  //   而它旁边的「供应商归一化」改的是名字怎么显示 —— 两者不该看起来同族。
+  Money,
   Fold,
   Expand,
   ArrowDown,
@@ -59,6 +62,12 @@ const navigation = computed(() => [
   //   所以不共用权限：能管分组的人不一定该改全平台的供应商口径。
   ...(session.can('providers:read')
     ? [{ path: '/providers', label: '供应商归一化', icon: Connection }]
+    : []),
+  // ★ 单价决定**每一笔费用怎么算**，是配置而不是「看一眼的数字」，
+  //   所以读也要求 `pricing:manage`：能看金额的人（`cost:read`）不必能改计价，
+  //   两者的误操作代价完全不同（「看错一个数」vs「把全平台计价改掉」）。
+  ...(session.can('pricing:manage')
+    ? [{ path: '/pricing', label: '模型单价', icon: Money }]
     : []),
 ])
 watch(

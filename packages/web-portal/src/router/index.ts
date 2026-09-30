@@ -90,6 +90,15 @@ export function createPortalRouter(
             //   对全平台的统计口径都有影响，所以读要 providers:read、写要 providers:manage。
             meta: { title: '供应商归一化', requiredPermission: 'providers:read' },
           },
+          {
+            path: 'pricing',
+            name: 'pricing',
+            component: () => import('../views/PricingView.vue'),
+            // ★ 读也归 `pricing:manage`：单价是**配置**，不是「看一眼的数字」。
+            //   能看金额的人（`cost:read`）不必能看/改计价表 —— 那两件事的
+            //   误操作代价不同：「看错一个数」与「把全平台的计价改掉」。
+            meta: { title: '模型单价', requiredPermission: 'pricing:manage' },
+          },
         ],
       },
       { path: '/:pathMatch(.*)*', redirect: '/overview' },
@@ -114,7 +123,7 @@ export function createPortalRouter(
 /** 回跳只接受本站已知页面，避免把登录参数当作外部跳转地址。 */
 export function loginDestination(value: unknown): string {
   return typeof value === 'string' &&
-    /^\/(overview|analysis|records|diagnostics|members|appkeys|roles|groups|providers)(\?.*)?$/.test(value)
+    /^\/(overview|analysis|records|diagnostics|members|appkeys|roles|groups|providers|pricing)(\?.*)?$/.test(value)
     ? value
     : '/overview'
 }

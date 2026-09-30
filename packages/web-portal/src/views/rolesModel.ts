@@ -29,6 +29,14 @@ export const ROLE_PERMISSION_LABELS: Record<string, string> = {
   'groups:read': '查看分组',
   'groups:manage': '管理分组',
   'audit:read': '查看管理记录',
+  // ⚠️ `providers:*`（v6）与 `cost:read` / `pricing:manage`（v7）**必须各有一行**。
+  //   缺了它不会报错：服务端 seed 的 `description` 就是权限码本身，
+  //   于是角色管理页把 `providers:read` 原样显示出来，
+  //   而使用者会以为「这个权限是给机器看的」，不知道该不该勾。
+  'providers:read': '查看供应商归一化规则',
+  'providers:manage': '管理供应商归一化规则',
+  'cost:read': '查看用量费用',
+  'pricing:manage': '管理模型单价',
 }
 
 /** 权限码 → 展示标签：中文说明 → 服务端描述 → 码本身（逐级回退，不吞掉信息）。 */
