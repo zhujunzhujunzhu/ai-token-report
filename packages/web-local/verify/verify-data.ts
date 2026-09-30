@@ -7,7 +7,13 @@
  *   缓存命中率必须原样来自服务端，四项 token 必须各自独立，不许出现金额。
  */
 
-import { buildUsageSummary, bucketFor } from '../src/composables/usage-view-model'
+import {
+  buildUsageSummary,
+  bucketFor,
+  describeMissingRoots,
+  describeSourcePaths,
+  describeSources,
+} from '../src/composables/usage-view-model'
 import { formatCompact, formatCount, formatPercent } from '../src/utils/format'
 import type { LocalOverviewResponse, LocalSeriesResponse } from '@ai-token-report/shared'
 
@@ -20,6 +26,13 @@ function check(label: string, condition: boolean, detail = ''): void {
 // ── 构造一份与真实扫描结果同形的样本 ──────────────────────────────────────
 const overview: LocalOverviewResponse = {
   range: { from: null, to: null, label: '今天' },
+  // ★ 来源样本刻意给**两个根 + 一个缺失根**：页面必须能自证「读了哪几处」，
+  //   并对「配了但没读到」的那个显式告警 —— 那种情况与「镜像去重」的数字看起来一样
+  sources: {
+    sessionsRoots: ['/home/u/.dsh/sessions', '/home/u/AppData/Roaming/dsh-desktop/harness/sessions'],
+    missingRoots: ['/home/u/.dsh-vscode/sessions'],
+    dataDir: '/home/u/.ai-token-report',
+  },
   totalTokens: 521_262_657,
   inputTokens: 25_866_328,
   outputTokens: 985_321,
@@ -92,6 +105,20 @@ check('计费总量格式正确', summary.metrics[0]?.value === '521,262,657')
 check('缓存命中率为 95.0%', summary.metrics[1]?.value === '95.0%', summary.metrics[1]?.value)
 check('调用次数正确', summary.metrics[2]?.value === '3,026')
 check('会话数正确', summary.metrics[3]?.value === '22')
+
+// ★ 来源可见性：多套 DSH 并存时页面上的数是并集，必须能自证「读了哪几处」
+check('来源原样透传（前端不加工）', summary.sources.sessionsRoots.length === 2)
+check('多根文案点明按并集统计', describeSources(summary.sources).includes('并集'), describeSources(summary.sources))
+check(
+  '单根文案不吹并集',
+  !describeSources({ ...summary.sources, sessionsRoots: ['/one'] }).includes('并集'),
+)
+check(
+  '空来源有明确文案而不是空白',
+  describeSources({ ...summary.sources, sessionsRoots: [] }) === '数据来源：未读到任何会话日志根',
+)
+check('缺失的根逐项列出', describeMissingRoots(summary.sources) === '/home/u/.dsh-vscode/sessions')
+check('悬停能看全部根路径', describeSourcePaths(summary.sources).split('\n').length === 2)
 
 // ★ 铁律：不展示金额
 const allText = JSON.stringify(summary)

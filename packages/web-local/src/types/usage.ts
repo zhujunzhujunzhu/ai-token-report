@@ -16,9 +16,9 @@
  *   看到空图表才发现。
  */
 
-import type { LocalBreakdownRow, LocalGroupBy } from '@ai-token-report/shared'
+import type { LocalBreakdownRow, LocalGroupBy, LocalStatsSources } from '@ai-token-report/shared'
 
-export type { LocalBreakdownRow, LocalGroupBy }
+export type { LocalBreakdownRow, LocalGroupBy, LocalStatsSources }
 
 /** 时间维度选项（value 是服务端认识的具名周期）。 */
 export interface TimeRangeOption {
@@ -102,6 +102,14 @@ export interface UsageSummary {
   activeTimeRange: string
   /** 数据新鲜度提示（缓存 / 重扫、扫描时刻）。 */
   freshness: string
+  /**
+   * ★ 数据来源：本次统计读了哪几个会话日志根。
+   *
+   * 同一台机器上并存多套 DSH 时，页面上的数是它们的**并集**
+   * （镜像会话按 `event_id` 去重）。少了这一行，「加了一个 home 数字没怎么涨」
+   * 就分不清是「并按集去重」（正常）还是「那个根根本没读到」（bug）。
+   */
+  sources: LocalStatsSources
   metrics: MetricCard[]
   metricGroups: MetricGroup[]
   /** 明细表的分组行。 */

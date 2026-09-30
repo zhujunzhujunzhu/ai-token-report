@@ -199,6 +199,8 @@ export function useUsageStats() {
  */
 const EMPTY_OVERVIEW = {
   range: { from: null, to: null, label: '全部时间' },
+  // 首屏还不知道读了哪几处：给**空来源**而不是编几条假路径，加载完由真实响应覆盖
+  sources: { sessionsRoots: [], missingRoots: [], dataDir: null },
   totalTokens: 0,
   inputTokens: 0,
   outputTokens: 0,

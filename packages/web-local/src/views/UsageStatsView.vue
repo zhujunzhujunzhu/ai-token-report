@@ -10,7 +10,13 @@ import UsageDetailTable from '@/components/usage/UsageDetailTable.vue'
 import UsageFilterBar from '@/components/usage/UsageFilterBar.vue'
 import UsageMetricGrid from '@/components/usage/UsageMetricGrid.vue'
 import { useUsageStats } from '@/composables/useUsageStats'
+import {
+  describeMissingRoots,
+  describeSourcePaths,
+  describeSources,
+} from '@/composables/usage-view-model'
 import UiButton from '@/components/ui/UiButton.vue'
+import { computed } from 'vue'
 
 defineEmits<{ (e: 'configure'): void }>()
 
@@ -33,6 +39,12 @@ const {
 function totalOfRows(): number {
   return rows.value.reduce((sum, row) => sum + row.totalTokens, 0)
 }
+
+// ★ 数据来源：多套 DSH 并存时页面上的数是**并集**，必须能自证「读了哪几处」。
+//   文案在视图模型里生成，组件只负责排版（与「前端不重算口径」同一条约束）。
+const sourceText = computed(() => describeSources(summary.value.sources))
+const sourcePaths = computed(() => describeSourcePaths(summary.value.sources))
+const missingRoots = computed(() => describeMissingRoots(summary.value.sources))
 </script>
 
 <template>
@@ -57,6 +69,11 @@ function totalOfRows(): number {
     </p>
 
     <UsageMetricGrid :metrics="summary.metrics" :loading="loading" />
+
+    <p class="usage-page__sources" :title="sourcePaths">{{ sourceText }}</p>
+    <p v-if="missingRoots" class="usage-page__sources is-missing" role="status">
+      ⚠ 以下会话日志根不存在，已跳过：{{ missingRoots }}
+    </p>
 
     <MetricGroupSection
       v-for="(group, index) in summary.metricGroups"
@@ -120,6 +137,18 @@ function totalOfRows(): number {
   color: #b42318;
   background-color: #fef3f2;
   border-radius: var(--radius-md);
+}
+
+.usage-page__sources {
+  margin: -8px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--c-text-muted, #667085);
+  word-break: break-all;
+}
+
+.usage-page__sources.is-missing {
+  color: #b42318;
 }
 
 .usage-page__tabs {

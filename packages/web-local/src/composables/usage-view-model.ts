@@ -25,6 +25,7 @@ import type {
   LocalBreakdownRow,
   LocalOverviewResponse,
   LocalSeriesResponse,
+  LocalStatsSources,
 } from '@ai-token-report/shared'
 
 import type {
@@ -263,10 +264,40 @@ export function buildUsageSummary(
     timeRanges: TIME_RANGES,
     activeTimeRange,
     freshness: freshnessOf(overview),
+    // ★ 来源原样透传：**不在前端加工**（「读了哪几处」是服务端的事实，不是展示口径）
+    sources: overview.sources,
     metrics: buildMetrics(overview),
     metricGroups,
     rows,
   }
+}
+
+/**
+ * ★ 数据来源的一行文案。
+ *
+ * 多套 DSH 并存时页面上的数是**并集**（镜像会话按 `event_id` 去重），
+ * 所以必须能自证「读了哪几处」：「加了一个 home 数字几乎没变」只有两种解释 ——
+ * 镜像去重（正常）或那个根根本没读到（bug），而它们的数字看起来一样。
+ */
+export function describeSources(sources: LocalStatsSources): string {
+  const roots = sources.sessionsRoots
+  if (roots.length === 0) return '数据来源：未读到任何会话日志根'
+  if (roots.length === 1) return '数据来源：1 个 DSH 的会话日志'
+  return `数据来源：${roots.length} 个 DSH 的会话日志，按并集统计（镜像会话自动去重）`
+}
+
+/**
+ * 逐项列出读到的根（鼠标悬停时展示完整路径）。
+ *
+ * 用换行分隔而不是逗号：路径本身可能含逗号，用逗号会读不出到底是几个根。
+ */
+export function describeSourcePaths(sources: LocalStatsSources): string {
+  return sources.sessionsRoots.join('\n')
+}
+
+/** 缺失的根 —— 有值时页面必须显式告警（绝不静默跳过）。 */
+export function describeMissingRoots(sources: LocalStatsSources): string {
+  return sources.missingRoots.join('、')
 }
 
 /** 趋势用哪个分桶：当天/昨天看小时，更长窗口看天。 */

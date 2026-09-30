@@ -4,7 +4,7 @@
 
 由 `dsh-token --web`（或 `bun run web`）启动：CLI 内嵌一个只监听
 `127.0.0.1` 的服务，页面由它托管。数据来自**本地 SQLite 增量库**
-（`$DSH_HOME/token-report/usage.sqlite`，由会话日志增量派生），
+（`~/.ai-token-report/usage.sqlite`，由会话日志增量派生），
 **不上报、不出网、断网可用**。首次启动需全量建库（约 15 秒），之后每次请求约 50ms。
 
 > 📖 数据通路与职责划分见根目录 [`ARCHITECTURE.md`](../../ARCHITECTURE.md) §3.1 与 §6。
