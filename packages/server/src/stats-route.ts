@@ -50,6 +50,7 @@ import { derive, resolveRange } from '@ai-token-report/core'
 import {
   cacheHitRate,
   computeTotal,
+  summarizeCosts,
   unattributedRate,
   UNATTRIBUTED_USER,
   type BreakdownResponse,
@@ -60,16 +61,49 @@ import {
   type RecordRow,
   type RecordsResponse,
   type SeriesResponse,
+  type StatsCostTotals,
   type StatsGroupOption,
   type StatsGroupsResponse,
   type StatsMemberOption,
   type StatsMembersResponse,
+  type StatsPricingResponse,
 } from '@ai-token-report/shared'
 
 import type { CredentialStore } from './credentials.js'
 import { authorize, authorizeDatabase, type Authentication } from './http/auth.js'
 import type { IdentityRepository } from './identity/index.js'
+import { modelPriceFromRow } from './identity/model-price-row.js'
 import { VIEWER_AUTH_MESSAGES } from './verify-route.js'
+
+/**
+ * 这个身份能不能看金额。
+ *
+ * ★ **全仓唯一一处把 `cost:read` 翻译成布尔的地方**：core 的取数层不认权限概念，
+ *   它能收到的只是一个「要不要算金额」的开关。
+ *
+ * ⚠️ 兼容路径（旧的 `CredentialStore` 身份）没有 `permissions` 字段 ——
+ *   此时按**没有**处理。默认给权限意味着「服务端少返回一个字段」直接变成
+ *   「人人能看到全公司的钱」，与「缺 role 必须按 member 处理」是同一条安全逻辑。
+ */
+function hasCostRead(viewer: unknown): boolean {
+  // ⚠️ 形参是 `unknown` 而不是 `{ permissions?: string[] }`：两种身份的形状
+  //   （数据库 `Principal` 与旧凭证的 `UserRole`）**没有公共字段**，
+  //   写成结构化类型会让整个 `viewer` 联合类型不可赋值 —— 于是这里的判空
+  //   会变成调用点的类型体操，而不是一行明确的运行时判断。
+  const permissions = (viewer as { permissions?: unknown } | null)?.permissions
+  return Array.isArray(permissions) && permissions.includes('cost:read')
+}
+
+/**
+ * 某一行没查到金额时的兜底：一份**零用量**的金额。
+ *
+ * 正常情况不会走到（分组键与金额键由同一份实现产出），留着是为了让
+ * 「有这一行就一定有 `cost` 字段」成立 —— 字段时有时无会让页面在
+ * 「有金额」和「没金额」之间闪，而截图时它恰好是哪种完全看运气。
+ */
+function emptyCost(session: PortalStatsSession): StatsCostTotals {
+  return { ...summarizeCosts([]), pricing: session.pricingProvenance }
+}
 
 /**
  * 可用的分组维度（协议里的 `GroupBy`）。
@@ -167,6 +201,16 @@ export class StatsRoute {
     //   鉴权已经在上面做完了，401/503 的语义与其它子路径完全一致。
     if (sub === 'groups') return await this.#groups()
     if (sub === 'members') return await this.#members()
+    // ★ 单价只读快照：门是 `cost:read`（不是管理接口那道 `pricing:manage`）。
+    //   能看金额的人必须能看到这份金额是按哪份单价算出来的 —— 看不到单价，
+    //   他就只能相信这一屏上的数字，而「自建计价 ≠ 财务账单」正是要提醒的。
+    //   它不需要时间窗与筛选（单价是全局配置），所以放在解析窗口之前。
+    if (sub === 'pricing') {
+      if (!hasCostRead(auth.viewer)) {
+        return { status: 403, body: { ok: false, reason: '当前身份没有查看计价的权限' } }
+      }
+      return await this.#pricing()
+    }
 
     // ── 2. 参数（时间窗在服务端解析，前端不做日期换算）──────────────
     const window = parseWindow(params)
@@ -188,7 +232,9 @@ export class StatsRoute {
       //   旧的 `CredentialStore` 身份（兼容路径）没有稳定人员 ID，
       //   此时退化成「只有全局规则」，这是刻意的。
       const viewerId = 'memberId' in auth.viewer ? auth.viewer.memberId : undefined
-      session = await openPortalStats(this.#target, filter, (store) => loadProviderAliases(store, viewerId))
+      // 🚨 权限在这里转成**一个布尔**，core 不认权限概念。
+      //   没有 `cost:read` 时金额**根本没被计算过** —— 不是「算完再丢掉」。
+      session = await openPortalStats(this.#target, filter, (store) => loadProviderAliases(store, viewerId), hasCostRead(auth.viewer))
     } catch (err) {
       if (isIdentityViewRequired(err)) return { status: 409, body: { ok: false, code: 'identity_view_required', reason: err.message } }
       if (this.#identityStore) return { status: 503, body: { ok: false, reason: '统计数据库暂时不可用，请稍后重试' } }
@@ -241,6 +287,9 @@ export class StatsRoute {
       cacheReadTokens: p.counts.cacheRead,
       calls: p.counts.calls,
       cacheHitRate: cacheHitRate({ input: p.counts.input, cacheRead: p.counts.cacheRead }),
+      // ★ 每个点各自带金额：横跨换价的一段窗口里，不同点的同一模型单价是不同的，
+      //   所以趋势上的金额**不能**用「总量 × 当前价」重算一遍。
+      ...(p.cost ? { cost: p.cost } : {}),
     }))
 
     const body: SeriesResponse = { bucket, points }
@@ -256,6 +305,12 @@ export class StatsRoute {
         body: { ok: false, reason: `未知维度 "${by}"。可选: ${GROUP_BYS.join(' | ')}` },
       }
     }
+
+    // ★ 金额按**同一套分组键**另取一趟，然后在这里合并。
+    //   键的口径（归一化后的 provider、稳定人员 ID、按项目名合并、按本地时区分桶）
+    //   只有 `core/db/portal.ts` 一份实现 —— 让本文件自己去对键，就会多出
+    //   第二份「什么算同一组」的判断，而它与分组的判断一定会分叉。
+    const costs = await session.costByGroup(by)
 
     const rows = (await session.groups(by)).map((row) => ({
       key: row.key,
@@ -274,6 +329,8 @@ export class StatsRoute {
       cacheWriteTokens: row.counts.cacheWrite,
       calls: row.counts.calls,
       cacheHitRate: cacheHitRate({ input: row.counts.input, cacheRead: row.counts.cacheRead }),
+      // 无 `cost:read` 时 `costs` 是空表 → 字段不下发（不是 0）。
+      ...(costs.size === 0 ? {} : { cost: costs.get(row.key) ?? emptyCost(session) }),
     }))
 
     const body: BreakdownResponse = { by, rows }
@@ -423,6 +480,53 @@ export class StatsRoute {
       await store.close()
     }
   }
+
+  /**
+   * `GET /api/v1/stats/pricing` —— 单价只读快照。
+   *
+   * ★ 与 `/api/v1/admin/pricing` 是**两条接口、两道门**：
+   *
+   * | | `/api/v1/admin/pricing` | 本条 |
+   * |---|---|---|
+   * | 性质 | **配置**（可改的那份目录） | 看数据时的**解释材料** |
+   * | 权限 | `pricing:manage` | `cost:read` |
+   *
+   * 分开的理由是它们回答两个不同的问题：「这台服务器上的价是怎么配的」
+   * 与「我刚看到的那个金额是按哪份价算的」。后者是任何能看到金额的人
+   * **必须**能回答的 —— 看不到单价，他只能选择相信屏幕上的数字，
+   * 而「自建计价 ≠ 财务账单」这件事就没法自查了。
+   *
+   * 🚨 **只读**，而且只读 `model_price` 一张表：这里绝不出现任何用量数据，
+   *   也绝不写一个字节（与 `/api/v1/stats/*` 的其它子路径同一约束）。
+   */
+  async #pricing(): Promise<StatsRouteResult> {
+    let store: PortalStore
+    try {
+      store = await openPortalStore(this.#target)
+    } catch (err) {
+      if (this.#identityStore) return { status: 503, body: { ok: false, reason: '统计数据库暂时不可用，请稍后重试' } }
+      return { status: 500, body: { ok: false, reason: `上报库不可用: ${msg(err)}` } }
+    }
+
+    try {
+      // ★ 排序与管理员目录**逐字相同**（`provider, model, effective_from_ms, price_id`）：
+      //   两处的「同一模型的历史价」顺序一旦不同，使用者会以为自己在看两份不同的配置。
+      const rows = await store.all<Record<string, unknown>>(
+        'SELECT * FROM model_price ORDER BY provider, model, effective_from_ms, price_id',
+      )
+      const body: StatsPricingResponse = {
+        prices: rows.map(modelPriceFromRow),
+        // 服务端读的是数据库表，所以没有「快照同步时刻」这回事。
+        pricing: { pricingSource: 'db', pricingSyncedAt: null },
+      }
+      return { status: 200, body }
+    } catch (err) {
+      if (this.#identityStore) return { status: 503, body: { ok: false, reason: '统计数据库暂时不可用，请稍后重试' } }
+      return { status: 500, body: { ok: false, reason: `查询失败: ${msg(err)}` } }
+    } finally {
+      await store.close()
+    }
+  }
 }
 
 /** 已实现的子路径。写成常量而不是散落的 if，便于一处看清「有哪些接口」。 */
@@ -434,6 +538,10 @@ const KNOWN_SUBS: readonly string[] = [
   'groups',
   'members',
   'diagnostics',
+  // ★ 单价只读快照（`cost:read`）。与管理的 `/api/v1/admin/pricing` 是两件事：
+  //   那条是**配置**（读也要求 `pricing:manage`），这条是**看数据时的解释材料** ——
+  //   能看金额的人必须能看到这份金额是按哪份单价算出来的，否则他无法核对。
+  'pricing',
 ] as const
 
 /**
@@ -449,6 +557,9 @@ async function buildOverview(
   const total = await session.totals()
   // 口径来自 core 的 derive() + shared/metrics.ts，本文件不写公式
   const metrics = derive(total)
+  // 没有 `cost:read` 时 `costTotals()` 直接返回 null —— **整个字段不下发**。
+  // 回 0 会让「你没权限」与「这个月没花钱」长得一模一样。
+  const cost = await session.costTotals()
 
   return {
     range: {
@@ -466,6 +577,7 @@ async function buildOverview(
     cacheHitRate: cacheHitRate({ input: total.input, cacheRead: total.cacheRead }),
     avgTokensPerCall: metrics.avgTokensPerCall,
     unattributedRate: unattributedRate(await session.unattributedCalls(), total.calls),
+    ...(cost === null ? {} : { cost }),
   }
 }
 
@@ -530,6 +642,10 @@ function toRecordRow(row: PortalRecordRow): RecordRow {
     cacheReadTokens: row.cacheRead,
     cacheWriteTokens: row.cacheWrite,
     cwd: row.cwd,
+    // 逐条的金额：`currency: null` = 这一条没配上价（**不是 0 元**）。
+    // 有权限时字段恒在（哪怕未计价），所以页面可以「按这个字段是否存在」决定
+    // 要不要显示金额列 —— 不需要自己也去判一次权限。
+    ...(row.cost ? { cost: row.cost } : {}),
   }
 }
 

@@ -412,6 +412,90 @@ describe('现状契约：GET /api/v1/stats/*', () => {
 })
 
 // ─────────────────────────────────────────────────────────────
+describe('现状契约：看板金额与单价快照（v7 / cost:read）', () => {
+  /**
+   * 🚨 这一组断言的核心只有一句话：**「没有权限」与「金额是 0」必须长得不一样**。
+   *
+   * 所以两边的判据都不是数值，而是**字段在不在**：
+   *   - 无 `cost:read` → 响应体里**一个 `cost` 都不许出现**（连 `0` 都不许有）；
+   *   - 有 `cost:read` → 字段恒在，哪怕这段时间一条用量都没有。
+   *
+   * ⚠️ 用的是共享的一个服务端与一个库（本文件的其它用例也在往里写数据），
+   *   所以断言一律不依赖「有几行数据」。
+   */
+  test('★ 无 cost:read（member）：整个 cost 字段不下发，不是 0', async () => {
+    const r = await call(dept, 'GET', '/api/v1/stats/overview?period=today', { headers: MEMBER })
+    expect(r.status).toBe(200)
+    expect(r.body).not.toHaveProperty('cost')
+    expect(r.text).not.toContain('"cost"')
+  })
+
+  test('★ 有 cost:read（admin）：字段恒在，并带上单价来源', async () => {
+    const r = await call(dept, 'GET', '/api/v1/stats/overview?period=today', { headers: ADMIN })
+    expect(r.status).toBe(200)
+    expect(r.body).toHaveProperty('cost')
+    const cost = r.body.cost as Record<string, unknown>
+    // 未计价比例必须显式给出 —— 只给金额会让「没配价」看起来像「省了钱」。
+    expect(cost).toHaveProperty('unpricedRate')
+    expect(cost).toHaveProperty('unpricedTokens')
+    expect(cost).toHaveProperty('costs')
+    expect(cost).toHaveProperty('unpricedTargets')
+    // 缺了来源就没法回答「这一屏是按哪份单价算的」，因此它与金额同进同出。
+    expect(cost.pricing).toEqual({ pricingSource: 'db', pricingSyncedAt: null })
+  })
+
+  test('排行 / 趋势 / 明细：金额字段的存在性跟着权限走', async () => {
+    for (const path of [
+      '/api/v1/stats/breakdown?by=model&period=today',
+      '/api/v1/stats/series?bucket=day&period=today',
+      '/api/v1/stats/records?limit=5',
+    ]) {
+      const denied = await call(dept, 'GET', path, { headers: MEMBER })
+      expect(denied.status).toBe(200)
+      expect(denied.text).not.toContain('"cost"')
+
+      const allowed = await call(dept, 'GET', path, { headers: ADMIN })
+      expect(allowed.status).toBe(200)
+      const rows = (allowed.body.rows ?? allowed.body.points ?? []) as Record<string, unknown>[]
+      for (const row of rows) expect('cost' in row).toBe(true)
+    }
+  })
+
+  test('★ 单价只读快照：member → 403（能看 token 不等于能看钱）', async () => {
+    const r = await call(dept, 'GET', '/api/v1/stats/pricing', { headers: MEMBER })
+    expect(r.status).toBe(403)
+    expect(r.text).not.toContain('micro')
+  })
+
+  test('★ 单价只读快照：缺 Authorization → 401', async () => {
+    expect((await call(dept, 'GET', '/api/v1/stats/pricing')).status).toBe(401)
+  })
+
+  test('★ 单价只读快照：admin → 200，且只含单价、不含任何用量', async () => {
+    const r = await call(dept, 'GET', '/api/v1/stats/pricing', { headers: ADMIN })
+    expect(r.status).toBe(200)
+    expect(r.body).toHaveProperty('prices')
+    expect(r.body.pricing).toEqual({ pricingSource: 'db', pricingSyncedAt: null })
+    const prices = r.body.prices as Record<string, unknown>[]
+    for (const price of prices) {
+      // 快照是**解释材料**：它必须能说清一条价的全部定义。
+      for (const field of ['price_id', 'provider', 'model', 'currency', 'effective_from_ms', 'effective_to_ms']) {
+        expect(price).toHaveProperty(field)
+      }
+    }
+    // 它绝不该顺带把用量发出来 —— 这是它与其它 stats 子路径的边界。
+    expect(r.text).not.toContain('totalTokens')
+    expect(r.text).not.toContain('calls')
+  })
+
+  test('单价快照是 GET，POST → 405 且 Allow 恰好是 GET', async () => {
+    const r = await call(dept, 'POST', '/api/v1/stats/pricing')
+    expect(r.status).toBe(405)
+    expect(r.allow).toBe('GET')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────
 describe('现状契约：/api/v1/admin/members*', () => {
   test('缺 Authorization → 401', async () => {
     expect((await call(dept, 'GET', '/api/v1/admin/members')).status).toBe(401)
@@ -593,6 +677,116 @@ describe('现状契约：/api/v1/admin/provider-aliases*（供应商归一化规
     const r = await call(dept, 'GET', '/api/v1/admin/provider-aliases/delete')
     expect(r.status).toBe(405)
     expect(r.allow).toBe('POST')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────
+describe('现状契约：/api/v1/admin/pricing*（模型单价 / v7）', () => {
+  /**
+   * 一条合法的单价请求体；传 `over` 只改其中一两个字段。
+   *
+   * ⚠️ 这个文件里的用例**共用同一个服务端与同一个库**，所以每个用例都要用**自己的模型名**
+   *（`priceBody({ model: '...' })`）并把断言限定在自己的那些行上 ——
+   * 断言「列表长度是 1」会在别的用例先写过价时变成一个假失败。
+   */
+  const priceBody = (over: Record<string, unknown> = {}) => JSON.stringify({
+    provider: 'deepseek-official', model: 'deepseek-v4.1-flash', currency: 'CNY',
+    input_micro_per_ktok: 2_000, output_micro_per_ktok: 8_000,
+    cache_read_micro_per_ktok: 200, cache_write_micro_per_ktok: 2_000,
+    effective_from_ms: 0, ...over,
+  })
+  const write = (body: string, headers = ADMIN) => call(dept, 'POST', '/api/v1/admin/pricing', { headers: { ...JSON_HEADERS, ...headers }, body })
+  /** 读回单价目录，按模型过滤成「本用例自己的行」。 */
+  const rowsOf = async (model: string) => {
+    const r = await call(dept, 'GET', '/api/v1/admin/pricing', { headers: ADMIN })
+    expect(r.status).toBe(200)
+    return (r.body as { prices: { model: string; input_micro_per_ktok: number }[] }).prices.filter((p) => p.model === model)
+  }
+
+  test('缺 Authorization → 401（读目录与写单价都要身份）', async () => {
+    expect((await call(dept, 'GET', '/api/v1/admin/pricing')).status).toBe(401)
+    expect((await call(dept, 'POST', '/api/v1/admin/pricing', { headers: JSON_HEADERS, body: '{}' })).status).toBe(401)
+  })
+
+  test('admin 写单价 → 200，列表能读回；同一 (provider, model, 起点) 是 upsert 而不是新增', async () => {
+    const created = await write(priceBody({ model: 'contract-upsert' }))
+    expect(created.status).toBe(200)
+    const price = (created.body as { price: { model: string; input_micro_per_ktok: number } }).price
+    expect(price).toMatchObject({ model: 'contract-upsert', input_micro_per_ktok: 2_000 })
+
+    expect((await write(priceBody({ model: 'contract-upsert', input_micro_per_ktok: 2_500 }))).status).toBe(200)
+    const rows = await rowsOf('contract-upsert')
+    // upsert 没有多出行 —— 页面上「改一条价」与「加一条价」必须是两个不同的动作。
+    expect(rows.length).toBe(1)
+    expect(rows[0]!.input_micro_per_ktok).toBe(2_500)
+  })
+
+  test('★ 同一供应商下另一个模型各配各的价（粒度是 provider+model，不是一个供应商一个价）', async () => {
+    expect((await write(priceBody({ model: 'contract-flash' }))).status).toBe(200)
+    expect((await write(priceBody({ model: 'contract-pro', input_micro_per_ktok: 40_000 }))).status).toBe(200)
+    expect((await rowsOf('contract-flash')).map((p) => p.input_micro_per_ktok)).toEqual([2_000])
+    expect((await rowsOf('contract-pro')).map((p) => p.input_micro_per_ktok)).toEqual([40_000])
+  })
+
+  test('🚨 生效区间重叠 → 409（重叠会让金额取决于读取顺序，不能只靠数据库的 UNIQUE 索引）', async () => {
+    expect((await write(priceBody({ model: 'contract-overlap', effective_from_ms: 1_000, effective_to_ms: 5_000 }))).status).toBe(200)
+    // 右端交叉、完全被包含：数据库的 UNIQUE 只拦「起点完全相同」，这两种它拦不住。
+    expect((await write(priceBody({ model: 'contract-overlap', effective_from_ms: 4_000, effective_to_ms: 9_000 }))).status).toBe(409)
+    expect((await write(priceBody({ model: 'contract-overlap', effective_from_ms: 2_000, effective_to_ms: 3_000 }))).status).toBe(409)
+    // 端点相接是合法的（区间两端都含），所以必须从已有终点的下一毫秒起。
+    expect((await write(priceBody({ model: 'contract-overlap', effective_from_ms: 5_001, effective_to_ms: null }))).status).toBe(200)
+    expect((await rowsOf('contract-overlap')).length).toBe(2)
+  })
+
+  test('非法形状 400：负单价、超过上限、非三位币种、终点早于起点、模型名带空格', async () => {
+    for (const payload of [
+      { input_micro_per_ktok: -1 },
+      { input_micro_per_ktok: 10_000_001 },
+      { input_micro_per_ktok: 1.5 },
+      { currency: '人民币' },
+      { effective_from_ms: 5_000, effective_to_ms: 1_000 },
+      { model: ' contract-bad' },
+    ]) {
+      expect((await write(priceBody(payload))).status).toBe(400)
+    }
+    // 一条都没落库。
+    expect((await rowsOf('deepseek-v4.1-flash')).length).toBe(0)
+    expect((await rowsOf('contract-bad')).length).toBe(0)
+  })
+
+  test('种子初始化：缺 confirm → 400；单价表非空 → 409', async () => {
+    await write(priceBody({ model: 'contract-seed' }))
+    const noConfirm = await call(dept, 'POST', '/api/v1/admin/pricing/seed', { headers: { ...JSON_HEADERS, ...ADMIN }, body: '{}' })
+    expect(noConfirm.status).toBe(400)
+    const nonEmpty = await call(dept, 'POST', '/api/v1/admin/pricing/seed', { headers: { ...JSON_HEADERS, ...ADMIN }, body: JSON.stringify({ confirm: true }) })
+    expect(nonEmpty.status).toBe(409)
+  })
+
+  test('删除：200 后这一条就没了，再删一次 404（不静默成功）', async () => {
+    const priceId = ((await write(priceBody({ model: 'contract-delete' }))).body as { price: { price_id: string } }).price.price_id
+    expect((await rowsOf('contract-delete')).length).toBe(1)
+    const del = await call(dept, 'POST', '/api/v1/admin/pricing/delete', { headers: { ...JSON_HEADERS, ...ADMIN }, body: JSON.stringify({ price_id: priceId }) })
+    expect(del.status).toBe(200)
+    expect((await rowsOf('contract-delete')).length).toBe(0)
+    const again = await call(dept, 'POST', '/api/v1/admin/pricing/delete', { headers: { ...JSON_HEADERS, ...ADMIN }, body: JSON.stringify({ price_id: priceId }) })
+    expect(again.status).toBe(404)
+  })
+
+  test('🚨 普通成员读单价目录也是 403（单价是配置，不是「看一眼的数字」）', async () => {
+    // ★ 与供应商归一化**刻意不同**：那边 `providers:read` 就能读，
+    //   因为规则只影响名字怎么显示；单价决定每一笔费用怎么算，读也归 `pricing:manage`。
+    await write(priceBody({ model: 'contract-member' }))
+    expect((await call(dept, 'GET', '/api/v1/admin/pricing', { headers: MEMBER })).status).toBe(403)
+    expect((await write(priceBody({ model: 'contract-member-2' }), MEMBER)).status).toBe(403)
+    expect((await call(dept, 'POST', '/api/v1/admin/pricing/seed', { headers: { ...JSON_HEADERS, ...MEMBER }, body: JSON.stringify({ confirm: true }) })).status).toBe(403)
+  })
+
+  test('GET /admin/pricing/delete 与 /seed → 405 且 Allow 恰好是 POST', async () => {
+    for (const path of ['/api/v1/admin/pricing/delete', '/api/v1/admin/pricing/seed']) {
+      const r = await call(dept, 'GET', path)
+      expect(r.status).toBe(405)
+      expect(r.allow).toBe('POST')
+    }
   })
 })
 

@@ -57,6 +57,7 @@ import {
   portalCreateRoleSchema, portalUpdateRoleSchema, portalRoleStatusSchema,
   portalTokenExpirySchema,
   portalSetProviderAliasSchema, portalProviderAliasIdSchema, portalProviderAliasStatusSchema,
+  portalSetModelPriceSchema, portalModelPriceIdSchema, portalSeedModelPricesSchema,
 } from '@ai-token-report/shared/schemas'
 
 import type { CredentialStore } from './credentials.js'
@@ -260,6 +261,13 @@ export class DatabaseAdminRoute {
       'POST provider-aliases': 'providers:manage',
       'POST provider-aliases/delete': 'providers:manage',
       'POST provider-aliases/status': 'providers:manage',
+      // ★ 模型单价（v7）：读也归 `pricing:manage` —— 单价是**配置**，
+      //   不是「看一眼的数字」。能看金额的人（`cost:read`）不必能看/改计价表；
+      //   看板要展示金额时走的是 `stats` 侧的只读快照，不经过这里。
+      'GET pricing': 'pricing:manage',
+      'POST pricing': 'pricing:manage',
+      'POST pricing/delete': 'pricing:manage',
+      'POST pricing/seed': 'pricing:manage',
     }
     const permission = permissions[key]
     if (!permission) return { status: 404, body: { ok: false, reason: '未找到管理接口' } }
@@ -324,6 +332,10 @@ export class DatabaseAdminRoute {
         case 'POST provider-aliases': return mutate(parsePortalBody(portalSetProviderAliasSchema, body), input => r.setProviderAlias(actor, input))
         case 'POST provider-aliases/delete': return mutate(parsePortalBody(portalProviderAliasIdSchema, body), input => r.deleteProviderAlias(actor, input))
         case 'POST provider-aliases/status': return mutate(parsePortalBody(portalProviderAliasStatusSchema, body), input => r.setProviderAliasStatus(actor, input))
+        case 'GET pricing': return ok(await r.listModelPrices(actor))
+        case 'POST pricing': return mutate(parsePortalBody(portalSetModelPriceSchema, body), input => r.setModelPrice(actor, input))
+        case 'POST pricing/delete': return mutate(parsePortalBody(portalModelPriceIdSchema, body), input => r.deleteModelPrice(actor, input))
+        case 'POST pricing/seed': return mutate(parsePortalBody(portalSeedModelPricesSchema, body), input => r.seedModelPrices(actor, input))
         default: return { status: 404, body: { ok: false, reason: '未找到管理接口' } }
       }
     } catch (err) {

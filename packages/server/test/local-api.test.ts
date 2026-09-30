@@ -28,6 +28,7 @@ import { zstdCompressSync } from 'node:zlib'
 
 import { cacheHitRate } from '@ai-token-report/shared'
 import type { StatsSession } from '@ai-token-report/core/db'
+import { writePricingSnapshot } from '@ai-token-report/core/db'
 
 import { CoreStatsProvider, LocalStatsRouter, type StatsProvider } from '../src/local-api.js'
 
@@ -545,5 +546,177 @@ describe('本地统计空目录', () => {
     expect(b['sessions']).toBe(0)
     // 无调用时命中率应为 0 而不是 NaN
     expect(b['cacheHitRate']).toBe(0)
+  })
+})
+
+/**
+ * 本地金额（v7 起本地页也显示费用）。
+ *
+ * ## 这些断言在守什么
+ *
+ * 1. **价从哪来必须说清楚**：本地路径没有 `model_price` 表，价只能来自数据目录下的
+ *    `pricing.json` 快照 —— 没有就退回内置种子价，并在 `pricing.pricingSource` 里
+ *    如实标成 `builtin`。两个来源给出的金额**不一样**，而都「看起来正常」。
+ * 2. **未计价绝不算成 0**：没配上单价的用量必须落进 `unpricedTokens`，
+ *    而不是让 `costs` 里出现一条 0 元。
+ * 3. **分组键与用量分组逐字相同**：分布表的某个键、趋势的某个桶，
+ *    两者相加必须等于概览 —— 键各拼一套的话，它们在「项目 / 按天」两维会悄悄错开。
+ * 4. **两条取数路径金额一致**：SQL 路径与直扫路径必须给出同一个整数微元。
+ */
+describe('本地金额（估算）', () => {
+  /** 一段用量：input 400 / output 60 / cacheRead 1600。 */
+  function writeCostSession(): void {
+    writeSession('proj-a', 'sess-1', [
+      { seq: 1, ts: todayAt(10), provider: 'dashscope', model: 'm-1', input: 100, output: 20, cacheRead: 900 },
+      { seq: 2, ts: todayAt(11), provider: 'dashscope', model: 'm-1', input: 300, output: 40, cacheRead: 700 },
+    ])
+  }
+
+  /** 把一份单价写进 `<home>/token-report/pricing.json`（`pricing sync` 的落点）。 */
+  function writeLocalPrices(): void {
+    writePricingSnapshot(join(home, 'token-report', 'pricing.json'), {
+      syncedAtMs: 1_700_000_000_000,
+      endpoint: 'http://portal.example/api/v1/stats/pricing',
+      prices: [
+        {
+          provider: 'dashscope',
+          model: 'm-1',
+          currency: 'CNY',
+          // 输入 1000 / 输出 2000 / 缓存读 100（微元每千 token）
+          inputMicroPerKtok: 1000,
+          outputMicroPerKtok: 2000,
+          cacheReadMicroPerKtok: 100,
+          cacheWriteMicroPerKtok: 0,
+          effectiveFromMs: 0,
+          effectiveToMs: null,
+        },
+      ],
+    })
+  }
+
+  function costRouter(): LocalStatsRouter {
+    return new LocalStatsRouter(new CoreStatsProvider(sessionsRoot, dbPath), {
+      dataDir: join(home, 'token-report'),
+    })
+  }
+
+  type CostBody = {
+    cost: {
+      costs: { currency: string; amountMicro: number; tokens: number }[]
+      pricedTokens: number
+      unpricedTokens: number
+      totalTokens: number
+      pricedRate: number
+      unpricedRate: number
+      pricing: { pricingSource: string; pricingSyncedAt: number | null }
+    }
+  }
+
+  test('没有单价快照时退回内置种子价，并如实标注来源（绝不假装是按快照算的）', async () => {
+    writeCostSession()
+    const res = await costRouter().overview(params({ period: 'today' }))
+    expect(res.status).toBe(200)
+    const cost = (res.body as unknown as CostBody).cost
+
+    expect(cost.pricing).toEqual({ pricingSource: 'builtin', pricingSyncedAt: null })
+    // 内置价只覆盖 deepseek-official 的几个模型，dashscope/m-1 一条都不在表里
+    // → 全部用量都是「未计价」，而不是 0 元。
+    expect(cost.costs).toEqual([])
+    expect(cost.unpricedTokens).toBe(2060)
+    expect(cost.pricedTokens).toBe(0)
+    expect(cost.unpricedRate).toBe(1)
+    expect(cost.totalTokens).toBe(2060)
+  })
+
+  test('★ 四类分价各自相乘：input 400×1000 + output 60×2000 + cacheRead 1600×100（微元/千）', async () => {
+    writeCostSession()
+    writeLocalPrices()
+    const res = await costRouter().overview(params({ period: 'today' }))
+    const cost = (res.body as unknown as CostBody).cost
+
+    expect(cost.pricing).toEqual({
+      pricingSource: 'snapshot',
+      pricingSyncedAt: 1_700_000_000_000,
+    })
+    // 400 + 120 + 160 = 680 微元（整数，逐位可对）
+    expect(cost.costs).toEqual([{ currency: 'CNY', amountMicro: 680, tokens: 2060 }])
+    expect(cost.unpricedTokens).toBe(0)
+    expect(cost.pricedRate).toBe(1)
+  })
+
+  test('分布表每一行的金额与该行的用量对得上（键复用同一份 groupKey）', async () => {
+    writeCostSession()
+    writeLocalPrices()
+    const res = await costRouter().breakdown(params({ by: 'provider-model' }))
+    const rows = (
+      res.body as unknown as { rows: ({ key: string; totalTokens: number } & CostBody)[] }
+    ).rows
+
+    expect(rows.length).toBe(1)
+    expect(rows[0]!.key).toBe('dashscope/m-1')
+    expect(rows[0]!.totalTokens).toBe(2060)
+    expect(rows[0]!.cost.costs).toEqual([{ currency: 'CNY', amountMicro: 680, tokens: 2060 }])
+  })
+
+  test('趋势各桶金额之和等于概览金额（补零出来的桶给空金额，不是 0 元的一条）', async () => {
+    writeCostSession()
+    writeLocalPrices()
+    const r = costRouter()
+
+    const overview = (await r.overview(params({ period: 'today' }))).body as unknown as CostBody
+    const series = (await r.series(params({ bucket: 'hour' }))).body as unknown as {
+      points: ({ bucket: string } & CostBody)[]
+    }
+
+    const sum = series.points.reduce((acc, p) => acc + (p.cost.costs[0]?.amountMicro ?? 0), 0)
+    expect(sum).toBe(overview.cost.costs[0]!.amountMicro)
+    // 今天的补零桶：有金额的只有 10 点与 11 点两个桶
+    const priced = series.points.filter((p) => p.cost.costs.length > 0)
+    expect(priced.map((p) => p.bucket.slice(-2))).toEqual(['10', '11'])
+    // 每个点都带 cost 字段（缺字段会让页面在某个窗口突然没有金额列）
+    expect(series.points.every((p) => p.cost.pricing !== undefined)).toBe(true)
+  })
+
+  test('未配单价的模型落在 unpricedTokens，且金额数组为空（不是 0 元）', async () => {
+    writeSession('proj-a', 'sess-2', [
+      { seq: 1, ts: todayAt(12), provider: 'dashscope', model: 'm-未知', input: 500, output: 0, cacheRead: 0 },
+    ])
+    writeLocalPrices()
+
+    const breakdown = (await costRouter().breakdown(params({ by: 'model' }))).body as unknown as {
+      rows: ({ key: string } & CostBody)[]
+    }
+    const row = breakdown.rows.find((r) => r.key === 'm-未知')!
+    expect(row.cost.costs).toEqual([])
+    expect(row.cost.unpricedTokens).toBe(500)
+    expect(row.cost.unpricedRate).toBe(1)
+  })
+
+  test('SQL 路径与直扫路径给出同一笔金额（接口级口径一致）', async () => {
+    writeCostSession()
+    writeLocalPrices()
+
+    const sql = (await costRouter().overview(params({ period: 'today' }))).body as unknown as CostBody
+    const provider: StatsProvider = {
+      open: async (opts) => {
+        const { openStats } = await import('@ai-token-report/core/db')
+        return openStats({
+          sessionsRoot,
+          dbPath,
+          ...(opts.period ? { period: opts.period } : {}),
+          providers: opts.providers,
+          models: opts.models,
+          forceScan: true,
+        })
+      },
+    }
+    const scan = (
+      await new LocalStatsRouter(provider, { dataDir: join(home, 'token-report') }).overview(
+        params({ period: 'today' }),
+      )
+    ).body as unknown as CostBody
+
+    expect(scan.cost).toEqual(sql.cost)
+    expect(scan.cost.costs[0]!.amountMicro).toBe(680)
   })
 })

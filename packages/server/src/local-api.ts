@@ -45,6 +45,18 @@ import {
   type SessionsRootInput,
 } from '@ai-token-report/core'
 import { openStats, type StatsSession } from '@ai-token-report/core/db'
+// ★ 费用聚合与离线单价快照：本地路径的价只能来自 `pricing.json`（或内置种子价），
+//   因为员工机器上没有 `model_price` 表，而且必须断网可用。
+//   折叠与格式化全部复用这些函数，本文件**不写任何金额算术**。
+import {
+  costByGroupOf,
+  costTotalsOf,
+  emptyCostTotals,
+  loadLocalPricing,
+  priceResolver,
+  type CostTotals,
+  type LocalPricing,
+} from '@ai-token-report/core/db'
 import { cacheHitRate, cacheLeverage } from '@ai-token-report/shared'
 import type {
   LocalBreakdownResponse,
@@ -149,8 +161,10 @@ export class LocalStatsRouter {
   /**
    * token-report 自己的**数据目录**（身份 / 本地库 / outbox / 补报水位）。
    *
-   * 只用于**展示来源**（页面上的「数据目录」那一行），不参与任何取数路径 ——
-   * 取数只认 provider 手里的会话日志根与本地库路径。`null` = 调用方没给（测试注入常见）。
+   * 只用于**展示来源**（页面上的「数据目录」那一行）与**离线单价快照**
+   * （`pricing.json`：它是配置，必须和身份 / 本地库放在一起，不跟着会话日志根走），
+   * 不参与「用量从哪来」—— 取数只认 provider 手里的会话日志根与本地库路径。
+   * `null` = 调用方没给（测试注入常见）：此时计价退回内置种子价，并在响应里说明。
    */
   readonly #dataDir: string | null
   /** 上次强制失效的时刻（`refresh` 用；现在只是给页面一个回执）。 */
@@ -159,6 +173,40 @@ export class LocalStatsRouter {
   constructor(provider: StatsProvider, options: { dataDir?: string | null } = {}) {
     this.#provider = provider
     this.#dataDir = options.dataDir ?? null
+  }
+
+  /**
+   * 本次请求的计价上下文：**价 + 逐条事件的取价函数 + 全量记录**。
+   *
+   * ## ★ 为什么这里的价来自数据目录，而 `#dataDir` 的注释说它「不参与取数」
+   *
+   * `pricing.json` 是**配置**，它必须和身份 / 本地库放在一起（数据目录），
+   * 而不是跟着会话日志根走 —— 换个 home 不该换掉计价口径。
+   * 所以本文件是数据目录的**第二个**用途（第一个是页面上那行「数据目录」）。
+   * 除此之外它仍然不参与「用量从哪来」。
+   *
+   * ## ★ 为什么逐条事件取价，而不是按分组汇总后再乘
+   *
+   * 单价带生效区间，**换价那一刻**两侧的事件适用不同的价。按「分组 token 总量 ×
+   * 一个价」算，会把换价前后的用量全按其中一个价算 —— 而它看起来完全正常。
+   * 代价是每次请求物化全量记录：**本机实测 2.37 万条记录 56ms**（分组查询 31ms），
+   * 也就是热态请求从 ~50ms 变成 ~110ms。这是**刻意付的代价**：
+   * 唯一能省掉它的办法是「按 (provider, model) 汇总后再乘一个价」，
+   * 而那正是上面这条错误。单机量级下 110ms 仍然是「点一下就出来」。
+   */
+  #costContext(session: StatsSession): {
+    pricing: LocalPricing
+    totals: CostTotals
+    byGroup: (dim: GroupDimension) => Map<string, CostTotals>
+  } {
+    const pricing = loadLocalPricing({ dataDir: this.#dataDir })
+    const resolve = priceResolver(pricing.prices)
+    const records = session.records()
+    return {
+      pricing,
+      totals: costTotalsOf(records, resolve, pricing.provenance),
+      byGroup: (dim) => costByGroupOf(records, dim, resolve, pricing.provenance),
+    }
   }
 
   /**
@@ -213,6 +261,10 @@ export class LocalStatsRouter {
         // 每次请求都会先做增量 ingest 保证新鲜，因此恒为 false ——
         // 保留字段是为了不改动前端契约（页面靠它显示"刚刚更新"）。
         cached: false,
+        // ★ 金额总在下发（本地页没有权限模型，它只读本机数据），
+        //   但「按哪份单价算的」跟着一起来 —— 离线端读快照、看板读库，
+        //   两者会给出不同的金额，而都「看起来正常」。
+        cost: this.#costContext(session).totals,
       }
 
       return { status: 200, body }
@@ -237,6 +289,8 @@ export class LocalStatsRouter {
     try {
       // 补零让趋势连续；core 的 series() 内部复用 timeSeries 的补零逻辑，
       // 因此 SQL 路径与直扫路径的桶集合必然一致。
+      const cost = this.#costContext(session)
+      const costByBucket = cost.byGroup(bucket)
       const points = session.series(bucket, true).map((p) => ({
         bucket: p.bucket,
         totalTokens: p.counts.total,
@@ -246,6 +300,10 @@ export class LocalStatsRouter {
         cacheWriteTokens: p.counts.cacheWrite,
         calls: p.counts.calls,
         cacheHitRate: cacheHitRate({ input: p.counts.input, cacheRead: p.counts.cacheRead }),
+        // ⚠️ 键与 `session.series()` 的桶**逐字相同**（两边都用 `toDayKey()` /
+        //   `toHourKey()`），所以这里必然对得上；补零出来的桶没有事件，
+        //   给一份 `costs: []` 的空金额（不是 0 元的一条记录）。
+        cost: costByBucket.get(p.bucket) ?? emptyCostTotals(cost.pricing.provenance),
       }))
 
       const body: LocalSeriesResponse = {
@@ -274,6 +332,8 @@ export class LocalStatsRouter {
     if (error) return error
 
     try {
+      const cost = this.#costContext(session)
+      const costByKey = cost.byGroup(toCoreDim(by))
       const rows = session.groups(toCoreDim(by)).map((row) => ({
         key: row.key,
         totalTokens: row.counts.total,
@@ -283,6 +343,8 @@ export class LocalStatsRouter {
         cacheWriteTokens: row.counts.cacheWrite,
         calls: row.counts.calls,
         cacheHitRate: cacheHitRate({ input: row.counts.input, cacheRead: row.counts.cacheRead }),
+        // 键复用 `groupKey()`，与排行里那一行逐字相同（金额与用量必然对得上）。
+        cost: costByKey.get(row.key) ?? emptyCostTotals(cost.pricing.provenance),
       }))
 
       const body: LocalBreakdownResponse = {

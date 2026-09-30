@@ -329,6 +329,35 @@ try {
   const rawProviders = (await request(a, 'stats/records?identity_view=member')).data.rows.map((row: any) => row.providerRaw ?? row.provider)
   assert(rawProviders.includes('fixture') && rawProviders.includes('dashscope')); checks++
 
+  // ── ★ v7 模型单价：费用统计的计价来源（真 HTTP，含权限与 409） ──
+  // 这一段的重点是**单价是配置、不是数据**：写它不会动 `usage_event` 一根毫毛，
+  // 而它决定「每一笔历史用量折算成多少钱」—— 所以增删改全都进审计。
+  // 粒度是 `(provider, model)`：同一供应商下不同模型必须能各配各的价。
+  const overviewBefore = JSON.stringify((await request(a, 'stats/overview?identity_view=member')).data)
+  equal((await request(a, 'admin/pricing', null)).status, 401, '未认证读不到单价目录')
+  equal((await request(a, 'admin/pricing', aliasSecret)).status, 403, '普通上报凭证读不到单价（读也要求 pricing:manage）')
+  const firstPrice = { provider: 'deepseek-official', model: 'deepseek-v4.1-flash', currency: 'CNY', input_micro_per_ktok: 2_000, output_micro_per_ktok: 8_000, cache_read_micro_per_ktok: 200, cache_write_micro_per_ktok: 2_000, effective_from_ms: 0 }
+  equal((await request(a, 'admin/pricing', aliasSecret, firstPrice)).status, 403, '普通上报凭证改不了单价')
+  equal((await request(a, 'admin/pricing', adminToken, firstPrice)).status, 200, '管理员可以写第一条单价')
+  equal((await request(a, 'admin/pricing')).data.prices.length, 1, '列表里只有这一条')
+  equal((await request(a, 'admin/pricing')).data.prices[0].input_micro_per_ktok, 2_000, '整数微元原样存取，没有被浮点截断')
+  // 🚨 区间重叠必须回 409：重叠会让「某一时刻该用哪个价」变成读取顺序问题。
+  equal((await request(a, 'admin/pricing', adminToken, { ...firstPrice, effective_from_ms: 1 })).status, 409, '同一模型的重叠生效区间回 409')
+  equal((await request(a, 'admin/pricing', adminToken, { ...firstPrice, model: 'deepseek-v4.1-pro', input_micro_per_ktok: 40_000 })).status, 200, '同一供应商下另一个模型可以各配各的价')
+  equal((await request(a, 'admin/pricing', adminToken, { ...firstPrice, model: 'x', input_micro_per_ktok: -1 })).status, 400, '负单价是 400')
+  equal((await request(a, 'admin/pricing', adminToken, { ...firstPrice, model: 'x', currency: '人民币' })).status, 400, '非 ISO 4217 三位码是 400')
+  equal((await request(a, 'admin/pricing', adminToken, { ...firstPrice, model: 'x', effective_from_ms: 5_000, effective_to_ms: 1_000 })).status, 400, '终点早于起点是 400')
+  // 种子价只在空表时能写 —— 非空时必须挡住「一键覆盖我调好的价」。
+  equal((await request(a, 'admin/pricing/seed', adminToken, { confirm: true })).status, 409, '单价表非空时种子初始化回 409')
+  equal((await request(a, 'admin/pricing/seed', adminToken, {})).status, 400, '种子初始化必须显式确认')
+  // ★ 改动计价**不得**改写任何用量数字：这正是「只存单价、绝不存金额」的收益。
+  equal(JSON.stringify((await request(a, 'stats/overview?identity_view=member')).data), overviewBefore, '写单价前后，看板用量数字逐字不变')
+  const priceId = (await request(a, 'admin/pricing')).data.prices.find((p: any) => p.model === 'deepseek-v4.1-flash').price_id
+  equal((await request(a, 'admin/pricing/delete', adminToken, { price_id: priceId })).status, 200, '删除单价')
+  equal((await request(a, 'admin/pricing/delete', adminToken, { price_id: priceId })).status, 404, '再删一次是 404，不静默成功')
+  const priceActions = (await request(a, 'admin/audit?limit=200')).data.rows.map((entry: any) => entry.action)
+  assert(priceActions.includes('model_price.set') && priceActions.includes('model_price.delete')); checks++
+
   await a.stop()
   a = await start()
   equal((await request(a, 'identity/verify', secondIssue.data.token_secret, {})).data.member_id, second.member_id, '重启后凭证仍有效')
@@ -338,7 +367,7 @@ try {
   servers.push(empty)
   equal((await request(empty, 'token-usage', firstSecret, payload('v5:5'))).status, 503, '未初始化上报非2xx')
   equal((await request(empty, 'admin/members')).status, 503, '未初始化管理503')
-  console.log(`${typeof Bun === 'undefined' ? 'Node' : 'Bun'} + ${isolation ? 'MySQL' : 'SQLite'} 数据库 v6 真 HTTP 管理与上报通过：${checks} 项`)
+  console.log(`${typeof Bun === 'undefined' ? 'Node' : 'Bun'} + ${isolation ? 'MySQL' : 'SQLite'} 数据库 v7 真 HTTP 管理与上报通过：${checks} 项`)
 } finally {
   await Promise.all(servers.map(server => server.stop().catch(() => {})))
   await isolation?.dispose()

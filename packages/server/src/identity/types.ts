@@ -42,12 +42,13 @@ export const RECOVERY_PERMISSIONS = ['members:read', 'members:manage', 'tokens:m
  *   取决于哪一处代码在读，而两处都不会报错。
  *
  * ★ v6 新增 `providers:read` / `providers:manage`（供应商归一化规则）。
- *   它们**不是**只改这个数组就生效的：`portal-schema-v5.ts` 的
- *   `PORTAL_V6_PERMISSION_SQL` 负责往库里补行（幂等），v5→v6 的迁移步骤
- *   负责让已部署的库也拿到它们。漏了任何一半，表现都是
- *   「管理员登录进去了，但配置页显示没有权限」。
+ * ★ v7 新增 `cost:read` / `pricing:manage`（费用统计与模型单价）。
+ *   两批权限码都**不是**只改这个数组就生效的：`portal-schema-v5.ts` 的
+ *   `PORTAL_V6_PERMISSION_SQL` / `PORTAL_V7_PERMISSION_SQL` 负责往库里补行（幂等），
+ *   对应的迁移步骤（v5→v6、v6→v7）负责让已部署的库也拿到它们。漏了任何一半，
+ *   表现都是「管理员登录进去了，但配置页显示没有权限」。
  */
-export const PERMISSIONS = ['identity:read', 'usage:write', 'stats:read', 'members:read', 'members:manage', 'tokens:manage', 'accounts:manage', 'roles:read', 'roles:assign', 'audit:read', 'groups:read', 'groups:manage', 'providers:read', 'providers:manage']
+export const PERMISSIONS = ['identity:read', 'usage:write', 'stats:read', 'members:read', 'members:manage', 'tokens:manage', 'accounts:manage', 'roles:read', 'roles:assign', 'audit:read', 'groups:read', 'groups:manage', 'providers:read', 'providers:manage', 'cost:read', 'pricing:manage']
 export const str = (r: Row, k: string): string => String(r[k] ?? '')
 export const num = (r: Row, k: string): number => Number(r[k] ?? 0)
 export function requirePermission(p: Principal, permission: string): void {
@@ -69,6 +70,25 @@ export function listField(input: MutationInput, key: string): string[] {
   const value = input[key]
   if (!Array.isArray(value) || value.some((v) => typeof v !== 'string')) throw new IdentityError(400, `${key} 需要是字符串数组`)
   return [...new Set(value as string[])]
+}
+/**
+ * 非负安全整数。
+ *
+ * ★ epoch 毫秒与微元单价共用它：两者都必须落在安全整数范围内 ——
+ *   一个是 `BIGINT` 列，一个是 `INT` 列，超出范围的浮点数写进去会被截断，
+ *   而**截断不会报错**，只会让「生效起点」变成一个谁都没设过的时刻。
+ */
+export function intField(input: MutationInput, key: string): number {
+  const value = input[key]
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new IdentityError(400, `${key} 需要是非负整数`)
+  return value
+}
+/** 可空的非负安全整数（`effective_to_ms` 用）；`undefined` / `null` 都归成 `null`。 */
+export function nullableIntField(input: MutationInput, key: string): number | null {
+  const value = input[key]
+  if (value === undefined || value === null) return null
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new IdentityError(400, `${key} 需要是非负整数或留空`)
+  return value
 }
 export function displayName(raw: string, limit = 32): string {
   const value = raw.trim()

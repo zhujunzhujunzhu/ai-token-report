@@ -330,7 +330,7 @@ export function createApp(deps: AppDeps): Hono {
       if ('error' in parsed) return fail(parsed.error, 400)
       return respond(await route.handle(c.req.method, action, await portalAuthorization(c), parsed.value, new URL(c.req.url).searchParams))
     }
-    for (const path of ['members', 'members/tokens', 'appkeys', 'roles', 'audit', 'storage', 'legacy-attributions', 'provider-aliases']) {
+    for (const path of ['members', 'members/tokens', 'appkeys', 'roles', 'audit', 'storage', 'legacy-attributions', 'provider-aliases', 'pricing']) {
       app.get(`/api/v1/admin/${path}`, c => dispatch(c, path))
     }
     app.get('/api/v1/groups', c => dispatch(c, 'groups'))
@@ -344,6 +344,10 @@ export function createApp(deps: AppDeps): Hono {
       // ★ 必须逐条列出 —— 注册是**枚举**的，漏一条的表现是 404，
       //   而 `http-contract.test.ts` 里那条 405 + Allow 断言正是为了钉住这一点。
       'provider-aliases', 'provider-aliases/delete', 'provider-aliases/status',
+      // v7 模型单价：三条写路径（设置 / 删除 / 种子初始化）。
+      // ★ 同样必须逐条列出 —— 注册是**枚举**的，漏一条的表现是 404，
+      //   而 `http-contract.test.ts` 里那条 405 + Allow 断言正是为了钉住这一点。
+      'pricing', 'pricing/delete', 'pricing/seed',
     ]) app.post(`/api/v1/admin/${path}`, c => dispatch(c, path))
   } else if (deps.adminRoute) {
   const legacyAdmin = deps.adminRoute

@@ -586,4 +586,115 @@ describe('数据库权威身份', () => {
       expect(actor.permissions).not.toContain('providers:manage')
     })
   })
+
+  describe('模型单价（v7）', () => {
+    /** 一条合法的单价请求；`over` 用来只改其中一两个字段。 */
+    const price = (over: Record<string, unknown> = {}) => ({
+      provider: 'deepseek-official', model: 'deepseek-v4.1-flash', currency: 'CNY',
+      input_micro_per_ktok: 2_000, output_micro_per_ktok: 8_000,
+      cache_read_micro_per_ktok: 200, cache_write_micro_per_ktok: 2_000,
+      effective_from_ms: 1_000, ...over,
+    })
+
+    test('upsert：(provider, model, effective_from_ms) 是业务主键，重复提交是改不是新增', async () => {
+      const { repository: r, admin } = await fixture()
+      const first = (await r.setModelPrice(admin, price())).price
+      expect(first.input_micro_per_ktok).toBe(2_000)
+      const again = (await r.setModelPrice(admin, price({ input_micro_per_ktok: 2_500 }))).price
+      // 同一行被改（`price_id` 不变、没有多出第二行），这正是页面「改一条价」的语义。
+      expect(again.price_id).toBe(first.price_id)
+      expect(again.input_micro_per_ktok).toBe(2_500)
+      expect((await r.listModelPrices(admin)).prices.length).toBe(1)
+    })
+
+    test('🚨 生效区间重叠回 409 并指出撞上哪一条（重叠会让金额取决于读取顺序）', async () => {
+      const { repository: r, admin } = await fixture()
+      await r.setModelPrice(admin, price({ effective_from_ms: 1_000, effective_to_ms: 5_000 }))
+      // 右端交叉、左端交叉、完全包含、完全被包含 —— 四种重叠都必须是冲突。
+      // ⚠️ 刻意**不用** `effective_from_ms: 1_000`：那与已有行是同一个业务主键，
+      //   按 upsert 语义属于「改这一条」，不是「新增一条重叠的价」。
+      for (const span of [
+        { effective_from_ms: 4_000, effective_to_ms: 9_000 },
+        { effective_from_ms: 500, effective_to_ms: 2_000 },
+        { effective_from_ms: 2_000, effective_to_ms: 3_000 },
+        { effective_from_ms: 0, effective_to_ms: 10_000 },
+      ]) {
+        await expect(r.setModelPrice(admin, price(span))).rejects.toMatchObject({ status: 409 })
+      }
+      // 端点相接是合法的：区间两端都**含**，所以新的那条必须从已有终点的**下 1 毫秒**起。
+      const adjacent = (await r.setModelPrice(admin, price({ effective_from_ms: 5_001, effective_to_ms: null }))).price
+      expect(adjacent.effective_from_ms).toBe(5_001)
+      expect((await r.listModelPrices(admin)).prices.length).toBe(2)
+    })
+
+    test('★ 同一供应商下不同模型互不冲突（这正是「按模型分别定价」的意义）', async () => {
+      const { repository: r, admin } = await fixture()
+      await r.setModelPrice(admin, price({ model: 'deepseek-v4.1-flash' }))
+      await r.setModelPrice(admin, price({ model: 'deepseek-v4.1-pro', input_micro_per_ktok: 40_000 }))
+      const list = (await r.listModelPrices(admin)).prices
+      expect(list.map((p) => p.model)).toEqual(['deepseek-v4.1-flash', 'deepseek-v4.1-pro'])
+      expect(list.map((p) => p.input_micro_per_ktok)).toEqual([2_000, 40_000])
+    })
+
+    test('校验：币种 / 单价越界 / 终点早于起点 / 备注类型都是 400，且一条都不写库', async () => {
+      const { repository: r, admin } = await fixture()
+      await expect(r.setModelPrice(admin, price({ currency: 'rm' }))).rejects.toMatchObject({ status: 400 })
+      await expect(r.setModelPrice(admin, price({ currency: '人民币' }))).rejects.toMatchObject({ status: 400 })
+      await expect(r.setModelPrice(admin, price({ input_micro_per_ktok: -1 }))).rejects.toMatchObject({ status: 400 })
+      await expect(r.setModelPrice(admin, price({ input_micro_per_ktok: 10_000_001 }))).rejects.toMatchObject({ status: 400 })
+      await expect(r.setModelPrice(admin, price({ input_micro_per_ktok: 1.5 }))).rejects.toMatchObject({ status: 400 })
+      await expect(r.setModelPrice(admin, price({ effective_from_ms: 5_000, effective_to_ms: 1_000 }))).rejects.toMatchObject({ status: 400 })
+      await expect(r.setModelPrice(admin, price({ note: 123 }))).rejects.toMatchObject({ status: 400 })
+      await expect(r.setModelPrice(admin, price({ model: ' x ' }))).rejects.toMatchObject({ status: 400 })
+      expect((await r.listModelPrices(admin)).prices.length).toBe(0)
+    })
+
+    test('删除：409 提示之外就是普通删除，删完再删是 404', async () => {
+      const { repository: r, admin } = await fixture()
+      const created = (await r.setModelPrice(admin, price())).price
+      await r.deleteModelPrice(admin, { price_id: created.price_id })
+      expect((await r.listModelPrices(admin)).prices.length).toBe(0)
+      await expect(r.deleteModelPrice(admin, { price_id: created.price_id })).rejects.toMatchObject({ status: 404 })
+    })
+
+    test('★ 种子价只在空表时能写入：非空时回 409（否则它就是一个「覆盖我调好的价」的按钮）', async () => {
+      const { repository: r, admin } = await fixture()
+      const seeded = await r.seedModelPrices(admin, { confirm: true })
+      expect(seeded.prices.length).toBeGreaterThan(0)
+      // 内置种子价必须带来源标记，页面才分得出「没核对过的参考值」。
+      expect(seeded.prices.every((p) => (p.note ?? '').includes('种子价'))).toBe(true)
+      await expect(r.seedModelPrices(admin, { confirm: true })).rejects.toMatchObject({ status: 409 })
+      expect((await r.listModelPrices(admin)).prices.length).toBe(seeded.prices.length)
+    })
+
+    test('种子价必须显式确认（缺 confirm 就是 400，不能靠一个空 body 改数据）', async () => {
+      const { repository: r, admin } = await fixture()
+      await expect(r.seedModelPrices(admin, {})).rejects.toMatchObject({ status: 400 })
+      expect((await r.listModelPrices(admin)).prices.length).toBe(0)
+    })
+
+    test('★ 单价的增删改全部进审计（改计价必须能查出是谁改的）', async () => {
+      const { repository: r, admin } = await fixture()
+      const created = (await r.setModelPrice(admin, price())).price
+      await r.deleteModelPrice(admin, { price_id: created.price_id })
+      await r.seedModelPrices(admin, { confirm: true })
+      const actions = (await r.listAudit(admin, { target_type: 'model_price' })).rows.map((e) => e.action).sort()
+      expect(actions).toEqual(['model_price.delete', 'model_price.seed', 'model_price.set'])
+    })
+
+    test('🚨 权限：`pricing:manage` 与普通成员无关，连读单价都要被拒（403）', async () => {
+      const { repository: r, admin } = await fixture()
+      await r.setModelPrice(admin, price())
+      const someone = await member(r, admin)
+      const token = await r.issueToken(admin, { member_id: someone.member_id, label: '普通成员' })
+      const actor = (await r.resolveBearer(token.token_secret))!
+      await expect(r.listModelPrices(actor)).rejects.toMatchObject({ status: 403 })
+      await expect(r.setModelPrice(actor, price())).rejects.toMatchObject({ status: 403 })
+      await expect(r.seedModelPrices(actor, { confirm: true })).rejects.toMatchObject({ status: 403 })
+      expect(actor.permissions).not.toContain('pricing:manage')
+      // `cost:read`（能看金额）与 `pricing:manage`（能改计价）是**两件事**：
+      // 普通成员两个都没有，而它们不会因为「能看数」就自动带上「能改价」。
+      expect(actor.permissions).not.toContain('cost:read')
+    })
+  })
 })

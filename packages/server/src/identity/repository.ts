@@ -3,13 +3,26 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { openPortalStore, PORTAL_SCHEMA_VERSION, aliasNameError, providerNameError, type PortalProviderAlias, type PortalStore, type PortalTarget } from '@ai-token-report/core/db'
 import { hashPassword, normalizeUsername, passwordError, usernameError } from '../auth/password.js'
 import type { CredentialInput } from '../credentials.js'
-import { APP_KEY_LABEL, APP_KEY_SCOPES, type PortalAppKeyEntry, type PortalAppKeyOwner, type PortalMember, type PortalMemberGroupRef, type PortalRole, type PortalGroup, type PortalReportToken, type PortalAuditResponse, type PortalStorageResponse, type PortalLegacyAttribution } from '@ai-token-report/shared'
-import { ADMIN_ROLE_ID, MEMBER_ROLE_ID, DEFAULT_SCOPES, RECOVERY_PERMISSIONS, PERMISSIONS, IdentityError, requirePermission, subset, str, num, textField, idField, listField, displayName, roleCode, type Principal, type Row, type MutationInput } from './types.js'
+import { APP_KEY_LABEL, APP_KEY_SCOPES, BUILTIN_PRICES, findPriceConflicts, isValidPriceRates, normalizeCurrency, MAX_MICRO_PER_KTOK, type ModelPrice, type PortalAppKeyEntry, type PortalAppKeyOwner, type PortalMember, type PortalMemberGroupRef, type PortalRole, type PortalGroup, type PortalReportToken, type PortalAuditResponse, type PortalStorageResponse, type PortalLegacyAttribution, type PortalModelPrice } from '@ai-token-report/shared'
+import { ADMIN_ROLE_ID, MEMBER_ROLE_ID, DEFAULT_SCOPES, RECOVERY_PERMISSIONS, PERMISSIONS, IdentityError, requirePermission, subset, str, num, textField, idField, intField, nullableIntField, listField, displayName, roleCode, type Principal, type Row, type MutationInput } from './types.js'
+// ★ 单价的两种行映射都在这个模块里（`repository.ts` 与 `stats-route.ts` 共用一份）。
+import { modelPriceFromRow, priceShapeFromRow } from './model-price-row.js'
 
 export const digest = (value: string): string => createHash('sha256').update(value).digest('hex')
 export const randomSecret = (): string => randomBytes(32).toString('base64url')
 export interface BootstrapOptions { adminToken?: string; adminName?: string; adminUsername?: string; adminPassword?: string }
 export type LegacyCredentialInput = CredentialInput & { loginEnabled?: boolean }
+
+/**
+ * 把一个生效区间说成人话。
+ *
+ * ★ 只用于 **409 的提示文案**，不参与任何计算 —— 重叠判定完全由
+ *   `shared/price.ts` 的 `findPriceConflicts()` 做。
+ * ⚠️ 用 UTC 日期截断而不是本地时间：这里只是让人认出「是哪一条」，
+ *   而本地时区在这里会引入第二个时间口径，提示里差一天反而更难找。
+ */
+const describePriceSpan = (price: ModelPrice): string =>
+  `${price.currency} ${new Date(price.effectiveFromMs).toISOString().slice(0, 10)} ~ ${price.effectiveToMs === null ? '至今' : new Date(price.effectiveToMs).toISOString().slice(0, 10)}`
 
 export class IdentityRepository {
   readonly now: () => number
@@ -975,6 +988,138 @@ export class IdentityRepository {
     )
     if (!row) throw new IdentityError(404, '规则不存在')
     return this.providerAlias(row)
+  }
+
+  /**
+   * 模型单价（`model_price`）—— 列表。
+   *
+   * ★ 权限是 `pricing:manage`：单价直接决定每一笔费用怎么算，它是**配置**，
+   *   不是「看一眼的数字」。所以「费用可见」（`cost:read`）与「单价可看可改」
+   *   是两件事 —— 能看金额的人不必能改计价，而改计价的人本来就看得见金额。
+   * ⚠️ 排序按 `(provider, model, effective_from_ms)`：页面正是按这个顺序
+   *   分组渲染（供应商 → 模型 → 历任价格）。乱序会让「同一模型的历史价」
+   *   在表格里跳来跳去，而使用者只会以为自己在看不同的模型。
+   */
+  async listModelPrices(actor: Principal) {
+    return this.securedRead(actor, 'pricing:manage', async (tx) => ({
+      prices: (await tx.all<Row>('SELECT * FROM model_price ORDER BY provider, model, effective_from_ms, price_id')).map(modelPriceFromRow),
+    }))
+  }
+
+  private async modelPriceById(tx: PortalStore, id: string): Promise<PortalModelPrice> {
+    const row = await tx.get<Row>('SELECT * FROM model_price WHERE price_id = $id', { $id: id })
+    if (!row) throw new IdentityError(404, '单价不存在')
+    return modelPriceFromRow(row)
+  }
+
+  /**
+   * 新建或修改一条单价。
+   *
+   * ★ **upsert 语义**：`(provider, model, effective_from_ms)` 就是业务主键 ——
+   *   页面上「把这个模型从今天起的价改成 X」是一次设置，不是「查了再改」。
+   *   要求调用方先拿到 `price_id` 再更新，会把「我看到的价已经被别人改了」
+   *   变成一次报错，而对一份计价配置来说，重新设置一遍正是使用者想做的事
+   *   （与 `setProviderAlias` 同一取舍）。
+   * 🚨 **区间重叠必须在这里拒掉**：库里那条 UNIQUE 索引只认**完全相同**的
+   *   `effective_from_ms`，拦不住 `[1, 100]` 与 `[50, 200]` 这种重叠。
+   *   重叠的后果不是报错，而是**结果取决于读取顺序** ——
+   *   同一段时间的用量有时按这个价、有时按那个价，且两次查询都能自圆其说。
+   *   所以这里显式查重并回 `409`，并把撞上的区间一并说清楚（使用者才知道去改哪条）。
+   */
+  async setModelPrice(actor: Principal, input: MutationInput) {
+    const provider = textField(input, 'provider')
+    const providerReason = providerNameError(provider)
+    if (providerReason) throw new IdentityError(400, `供应商名无效：${providerReason}`)
+    // ⚠️ 模型名**不复用** `providerNameError`：模型 ID 里带 `/` 是常态
+    //   （网关前缀），而那条规则恰好禁止 `/`。形状校验在 zod 层，这里只兜长度与首尾空格。
+    const model = textField(input, 'model')
+    if (!model.trim() || model !== model.trim() || model.length > 255) throw new IdentityError(400, '模型名需要为 1～255 个字符且首尾不能是空格')
+    const currency = normalizeCurrency(input.currency)
+    if (!currency) throw new IdentityError(400, '币种需要是三位大写字母的 ISO 4217 代码（如 USD、CNY）')
+    const rates = {
+      inputMicroPerKtok: intField(input, 'input_micro_per_ktok'),
+      outputMicroPerKtok: intField(input, 'output_micro_per_ktok'),
+      cacheReadMicroPerKtok: intField(input, 'cache_read_micro_per_ktok'),
+      cacheWriteMicroPerKtok: intField(input, 'cache_write_micro_per_ktok'),
+    }
+    if (!isValidPriceRates(rates)) throw new IdentityError(400, `四类单价都必须是 0 到 ${MAX_MICRO_PER_KTOK} 之间的整数微元/千 token`)
+    const effectiveFromMs = intField(input, 'effective_from_ms')
+    const effectiveToMs = nullableIntField(input, 'effective_to_ms')
+    if (effectiveToMs !== null && effectiveToMs < effectiveFromMs) throw new IdentityError(400, '生效终点不能早于生效起点')
+    const note = input.note == null ? null : (typeof input.note === 'string' ? input.note.trim().slice(0, 255) || null : (() => { throw new IdentityError(400, '备注需要是字符串') })())
+
+    return this.mutate(actor, 'pricing:manage', 'model_price.set', 'model_price', null, async (tx) => {
+      const rows = await tx.all<Row>('SELECT * FROM model_price WHERE provider = $provider AND model = $model ORDER BY effective_from_ms, price_id', { $provider: provider, $model: model })
+      // ⚠️ 自身那条要先摘掉 —— 它是这次要改的行，不是「冲突」。
+      //   业务主键里就含 `effective_from_ms`，所以按它排除恰好等价于按 id 排除。
+      const candidate: ModelPrice = { provider, model, currency, ...rates, effectiveFromMs, effectiveToMs }
+      const clashes = findPriceConflicts(rows.filter((row) => num(row, 'effective_from_ms') !== effectiveFromMs).map((row) => priceShapeFromRow(row)), candidate)
+      if (clashes.length > 0) {
+        throw new IdentityError(409, `这个生效区间与已有的 ${clashes.length} 条单价重叠：${clashes.map(describePriceSpan).join('、')}。请先改掉那条的生效终点，或把这次的起点挪到它之后`)
+      }
+      const existing = rows.find((row) => num(row, 'effective_from_ms') === effectiveFromMs)
+      const values = { $currency: currency, $input: rates.inputMicroPerKtok, $output: rates.outputMicroPerKtok, $cacheRead: rates.cacheReadMicroPerKtok, $cacheWrite: rates.cacheWriteMicroPerKtok, $to: effectiveToMs, $note: note, $now: this.now() }
+      if (existing) {
+        await tx.run('UPDATE model_price SET currency = $currency,input_micro_per_ktok = $input,output_micro_per_ktok = $output,cache_read_micro_per_ktok = $cacheRead,cache_write_micro_per_ktok = $cacheWrite,effective_to_ms = $to,note = $note,updated_at_ms = $now WHERE price_id = $id', { ...values, $id: str(existing, 'price_id') })
+        return { ok: true as const, price: await this.modelPriceById(tx, str(existing, 'price_id')) }
+      }
+      const id = randomUUID()
+      await tx.run('INSERT INTO model_price (price_id,provider,model,currency,input_micro_per_ktok,output_micro_per_ktok,cache_read_micro_per_ktok,cache_write_micro_per_ktok,effective_from_ms,effective_to_ms,note,created_at_ms,updated_at_ms) VALUES ($id,$provider,$model,$currency,$input,$output,$cacheRead,$cacheWrite,$from,$to,$note,$now,$now)', {
+        ...values, $id: id, $provider: provider, $model: model, $from: effectiveFromMs,
+      })
+      return { ok: true as const, price: await this.modelPriceById(tx, id) }
+    })
+  }
+
+  /**
+   * 删除一条单价（按 `price_id`）。
+   *
+   * ⚠️ 删除**不改写任何历史用量**，但会改变历史费用的算法：那条区间里的用量
+   *   从此变成「无价」而不是「不要钱」（见 `shared/price.ts` 的 `unpricedRate`）。
+   *   页面必须把这件事说清楚 —— 「删掉一条价」看起来像省事，
+   *   实际效果是那段区间的金额从「有数」变成「未计价」。
+   */
+  async deleteModelPrice(actor: Principal, input: MutationInput) {
+    const id = idField(input, 'price_id')
+    return this.mutate(actor, 'pricing:manage', 'model_price.delete', 'model_price', id, async (tx) => {
+      const row = await tx.get<Row>('SELECT price_id FROM model_price WHERE price_id = $id', { $id: id })
+      if (!row) throw new IdentityError(404, '单价不存在')
+      await tx.run('DELETE FROM model_price WHERE price_id = $id', { $id: id })
+      return { ok: true as const, deleted: id }
+    })
+  }
+
+  /**
+   * 用内置种子价初始化单价表。
+   *
+   * ★ **只在表为空时放行**：它存在的意义是「刚部署完、一条价都没有」那一步。
+   *   允许它对非空表执行，等于把「覆盖我调好的价」做成一个按钮 ——
+   *   而使用者点它的时候，多半以为自己在做别的事。
+   * 🚨 种子价是**内置常量**（`BUILTIN_PRICES`），不是抓来的现价：
+   *   它只是让人不必从零开始填，**必须逐条核对后再用**。
+   *   这也是「自建计价永远不等于财务账单」那条的第一道提醒。
+   */
+  async seedModelPrices(actor: Principal, input: MutationInput) {
+    if (input.confirm !== true) throw new IdentityError(400, '需要显式确认（confirm: true）才能写入种子价')
+    return this.mutate(actor, 'pricing:manage', 'model_price.seed', 'model_price', null, async (tx) => {
+      const existing = num((await tx.get<Row>('SELECT COUNT(*) AS c FROM model_price')) ?? {}, 'c')
+      if (existing > 0) throw new IdentityError(409, `单价表里已经有 ${existing} 条，不能再用种子价初始化；请逐条修改或删除后再试`)
+      const now = this.now()
+      for (const price of BUILTIN_PRICES) {
+        await tx.run('INSERT INTO model_price (price_id,provider,model,currency,input_micro_per_ktok,output_micro_per_ktok,cache_read_micro_per_ktok,cache_write_micro_per_ktok,effective_from_ms,effective_to_ms,note,created_at_ms,updated_at_ms) VALUES ($id,$provider,$model,$currency,$input,$output,$cacheRead,$cacheWrite,$from,$to,$note,$now,$now)', {
+          $id: randomUUID(), $provider: price.provider, $model: price.model, $currency: price.currency,
+          $input: price.inputMicroPerKtok, $output: price.outputMicroPerKtok,
+          $cacheRead: price.cacheReadMicroPerKtok, $cacheWrite: price.cacheWriteMicroPerKtok,
+          $from: price.effectiveFromMs, $to: price.effectiveToMs,
+          // ⚠️ 给种子行打上来源标记：页面要能一眼分出「内置种子价」与「人工调过的价」，
+          //   否则使用者会把一屏没核对过的数字当成已经确认过的计价。
+          //   `ModelPrice` 本身没有 `note` 字段（那是库里的列，不是计价形状的一部分），
+          //   所以这里写死一句固定说明。
+          $note: '内置种子价，请核对后再用', $now: now,
+        })
+      }
+      return { ok: true as const, prices: (await tx.all<Row>('SELECT * FROM model_price ORDER BY provider, model, effective_from_ms')).map(modelPriceFromRow) }
+    })
   }
 
   async listAudit(actor: Principal, input: MutationInput = {}): Promise<PortalAuditResponse> {
