@@ -11,7 +11,7 @@
     "./package.json": "./package.json"
   },
   "scripts": {
-    "start": "bun run src/main.ts",
+    "start": "bun run scripts/start.ts",
     "build:node": "bun run scripts/build-node.ts",
     "start:node": "node dist/main.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",

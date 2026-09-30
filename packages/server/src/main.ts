@@ -130,6 +130,9 @@ ai-token-report 部门服务端
   ATR_ADMIN_NAME 可选。使用用户名 + 密码 + 图形验证码进入管理页。
   这些值只在空数据库初始化一次；以后以数据库为准，停用身份不会因重启复活。
   ATR_CAPTCHA_HMAC_KEY 必须在所有实例保持一致；未配置时后台登录返回 503。
+  本机自用（默认 SQLite + 监听 127.0.0.1）不必手配：启动时若缺失，会连同随机生成的
+  管理员初始化值一起写进 <数据目录>/server.env 并在下次启动复用（见 local/dev-env.ts）。
+  配了 --mysql / ATR_MYSQL_URL（共享库）或 --host 非回环地址时不自动生成，必须显式配置。
   旧 v3 库和 credentials.json 必须显式迁移，服务不会自动改写旧业务库。
   HTTPS 反向代理请配置 ATR_PORTAL_ORIGIN=https://你的域名。
   详见 docs/数据库部署与迁移.md。
