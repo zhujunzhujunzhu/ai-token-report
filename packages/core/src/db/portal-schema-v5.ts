@@ -1,7 +1,25 @@
 /**
- * 上报库 v5 的可打包 SQL 真源（**全新库直接按它建**）。
+ * 上报库受控 DDL 的真源（**全新库直接按它建**）。
  *
- * v5 相对 v4 的三处结构变化：
+ * ## 版本关系（读之前先看这一节）
+ *
+ * | 版本 | 状态 | 说明 |
+ * |---|---|---|
+ * | v4 | ★ **冻结基线**（`portal-schema-v4.ts`） | v3 库先迁到它，再往上走 |
+ * | v5 | 结构改造步骤 | 「分组（多对多）」+ 权限码 `groups:*` |
+ * | v6 | 结构追加步骤 | 追加 `provider_alias` 表与权限码 `providers:*` |
+ * | v7 | ★ **当前终态** | 追加 `model_price` 表（模型单价）与权限码 `cost:read` / `pricing:manage` |
+ *
+ * ⚠️ **本文件的 SQL 常量代表 v7 终态**，v5 / v6 的结构变化都是它的一部分：
+ *   `PORTAL_SCHEMA_VERSION = 7` + 末尾的 {@link PORTAL_SQLITE_V6_ADDITIONS}
+ *   + {@link PORTAL_SQLITE_V7_ADDITIONS}
+ *   （追加 `provider_alias`、`model_price` 与权限行）共同构成受控定义。
+ *   已经迁到 v6 的库不会被误判为 `current` ——
+ *   受控定义的文本摘要变了，旧库会落入 `legacy` 并**必须显式迁移**，
+ *   这正是「schema 变更绝不自愈」这条铁律要的行为。
+ *
+ * ## v5 相对 v4 的三处结构变化
+ *
  * 1. `departments` → `member_groups`、`department_id` → `group_id`（术语统一为「分组」）；
  * 2. ★ **人员与分组改为多对多**：`members.department_id` 单值列被删除，
  *    改由 `member_group_assignments` 承载。因此 `usage_event` 也不再持有分组 ID ——
@@ -9,13 +27,30 @@
  *    `usage_event.dept`（上报当时的文本快照）改名为 `group_name`。
  * 3. 权限码 `departments:read` / `departments:manage` → `groups:read` / `groups:manage`。
  *
- * ⚠️ v4 的 SQL 仍是**冻结基线**，留在 `portal-schema-v4.ts`：v3 库要先经它迁到 v4，
- *   再走本文件的 v4→v5 步骤。两份 SQL 都不允许再改 —— 迁移账本按文本摘要识别版本，
- *   改了文本等于让已完成的迁移变成「checksum 不符」。
+ * ## v6 相对 v5 只有**追加**，不改任何既有列
+ *
+ * `provider_alias`（供应商归一化规则）+ `providers:read` / `providers:manage`。
+ * 🚨 `usage_event` 一个字节都不动 —— 规则是**查询时**应用的，
+ *   事件里的 provider 永远是上报当时的原值（见 `provider-alias.ts` 的文件头）。
+ *
+ * ## v7 相对 v6 同样只有**追加**
+ *
+ * `model_price`（模型单价，按 `provider` + `model` 精确匹配）+ 权限码
+ * `cost:read` / `pricing:manage`。
+ *
+ * 🚨 **不存任何金额列**：费用永远在查询期用「事件的 4 个 token 数 × 生效单价」
+ *   现算（口径在 `@ai-token-report/shared/price.ts`）。把算好的金额落库，
+ *   一旦单价被修正（补录历史价、改错价），库里就已经是一份算错的旧账，
+ *   而它看起来完全正常。同理，单价带生效区间，所以**改价不改历史**。
+ *
+ * ⚠️ v4 的 SQL 仍是**冻结基线**，留在 `portal-schema-v4.ts` ——
+ *   那份文本一个字都不许再改：迁移账本按文本摘要识别版本，
+ *   改了它等于让已完成的 v3→v4 迁移变成「checksum 不符」。
+ *   本文件同理：v5 与 v6 的 DDL 一旦随版本发布，就只能靠**新增**版本号演进。
  */
 import { createHash } from 'node:crypto'
 import type { PortalBackendKind } from './dialect.js'
-export const PORTAL_SCHEMA_VERSION = 5
+export const PORTAL_SCHEMA_VERSION = 7
 export const PORTAL_SQLITE_V5_SQL = `-- 数据库 v5：分组（多对多）+ 权限码 groups:*。
 -- 不执行 ALTER/DROP，不修改本地 usage.sqlite 的 schema v3。
 -- 部署前必须另行实现带备份、版本闸门与恢复点的生产迁移。
@@ -618,6 +653,242 @@ INSERT INTO portal_identity_state (state_id,singleton_key,revision,updated_at_ms
 -- 迁移记录由执行器在核实 DDL 后写入真实 checksum；本文件不伪造迁移完成证据。
 -- 此设计不创建本地扫描的 file_watermark/session_state，也不重定义 ingest_run。
 `
+/**
+ * ★ **v6 追加**：供应商归一化规则表 + 两条权限码。
+ *
+ * ## 为什么是独立常量而不是直接写进上面那条 SQL
+ *
+ * 它要被**两处**用到，而这两处对「哪一份文本算受控定义」的要求不同：
+ *
+ * 1. 全新库初始化与受控校验 —— 拼进 `portalSchemaStatements()`；
+ * 2. v5→v6 的迁移器 —— 只执行这一段，且**每一步都自检目标状态**，
+ *    所以重复执行（resume）是安全的。
+ *
+ * 放在这里而不是另开一个 `portal-schema-v6.ts`：`provider_alias` 只引用
+ * `members`，与 v5 的其余结构同属一份受控定义；分成两个文件会让
+ * 「哪些表属于当前版本」变成两个地方各自维护，而它们必然漂移。
+ *
+ * ## 规则表怎么用（不是 JOIN）
+ *
+ * 服务端在每次看板查询前把它读成「原始名 → 展示名」的映射，
+ * 再把映射内联成 `CASE` 表达式交给 SQL（见 `provider-alias.ts` 的 🚨 注释）。
+ * **绝不在聚合 SQL 里 JOIN 这张表** —— 一个 provider 命中多条规则时
+ * JOIN 会让事件行复制、`SUM()` 放大，而页面上只是数字变大。
+ */
+export const PORTAL_SQLITE_V6_ADDITIONS = `
+-- ★ v6：供应商（provider）归一化规则。
+-- 规则只在**查询时**生效，usage_event.provider 永远是上报当时的原值。
+-- scope='global' 时 member_id 必须为 NULL；scope='member' 时必须指向一个人员。
+-- 未配规则 = 原样显示（CASE 没有 ELSE 分支，见 provider-alias.ts）。
+CREATE TABLE provider_alias (
+  alias_id TEXT NOT NULL PRIMARY KEY CHECK ((length(alias_id) = 36 AND substr(alias_id,9,1) = '-' AND substr(alias_id,14,1) = '-' AND substr(alias_id,19,1) = '-' AND substr(alias_id,24,1) = '-' AND length(replace(alias_id,'-','')) = 32 AND replace(alias_id,'-','') NOT GLOB '*[^0-9a-f]*')),
+  scope TEXT NOT NULL DEFAULT 'global' CHECK (scope IN ('global','member')),
+  member_id TEXT NULL CHECK (member_id IS NULL OR (length(member_id) = 36 AND substr(member_id,9,1) = '-' AND substr(member_id,14,1) = '-' AND substr(member_id,19,1) = '-' AND substr(member_id,24,1) = '-' AND length(replace(member_id,'-','')) = 32 AND replace(member_id,'-','') NOT GLOB '*[^0-9a-f]*')),
+  provider TEXT NOT NULL CHECK (length(provider) BETWEEN 1 AND 255),
+  alias TEXT NOT NULL CHECK (length(alias) BETWEEN 1 AND 255),
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+  created_at_ms INTEGER NOT NULL CHECK ((typeof(created_at_ms) = 'integer' AND created_at_ms BETWEEN 0 AND 9007199254740991)),
+  updated_at_ms INTEGER NOT NULL CHECK ((typeof(updated_at_ms) = 'integer' AND updated_at_ms BETWEEN 0 AND 9007199254740991)),
+  CHECK ((scope = 'global' AND member_id IS NULL) OR (scope = 'member' AND member_id IS NOT NULL)),
+  CHECK (updated_at_ms >= created_at_ms),
+  FOREIGN KEY (member_id) REFERENCES members(member_id) ON DELETE RESTRICT ON UPDATE RESTRICT
+);
+-- ⚠️ 唯一索引**两个后端逐字相同**（不用 SQLite 的部分索引）：
+--   MySQL 没有「CREATE UNIQUE INDEX ... WHERE」，若这里用部分索引，
+--   「受控定义逐列核对」在两种后端上就会看到两套唯一约束 ——
+--   而校验器（verifyUniqueConstraints）只认 DDL 文本里的键，
+--   差异会表现成「MySQL 上迁移做完了却不算成功」。
+--   MySQL 的普通唯一索引把 NULL 视为相等，所以 (member_id, provider)
+--   在两种后端上都同时管住「同一人员的同一 provider 只能有一条」与
+--   「同一原始名只能有一条全局规则」（SQLite 侧由应用层显式查重补齐，
+--   见 repository.ts 的 findProviderAlias()）。
+CREATE UNIQUE INDEX idx_provider_alias_member ON provider_alias (member_id, provider);
+CREATE INDEX idx_provider_alias_alias ON provider_alias (alias);
+CREATE INDEX idx_provider_alias_scope ON provider_alias (scope, enabled);
+`
+
+/** MySQL 形态的 v6 追加（与 SQLite 侧**逐列同名同类型**，只差方言）。 */
+export const PORTAL_MYSQL_V6_ADDITIONS = `
+-- ★ v6：供应商（provider）归一化规则。
+-- 规则只在**查询时**生效，usage_event.provider 永远是上报当时的原值。
+-- scope='global' 时 member_id 必须为 NULL；scope='member' 时必须指向一个人员。
+-- 未配规则 = 原样显示（CASE 没有 ELSE 分支，见 provider-alias.ts）。
+CREATE TABLE provider_alias (
+  alias_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY CHECK (alias_id REGEXP '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'),
+  scope VARCHAR(16) NOT NULL DEFAULT 'global' CHECK (scope IN ('global','member')),
+  member_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL CHECK (member_id IS NULL OR member_id REGEXP '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'),
+  provider VARCHAR(255) NOT NULL CHECK (CHAR_LENGTH(provider) BETWEEN 1 AND 255),
+  alias VARCHAR(255) NOT NULL CHECK (CHAR_LENGTH(alias) BETWEEN 1 AND 255),
+  enabled TINYINT NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+  created_at_ms BIGINT NOT NULL CHECK ((created_at_ms BETWEEN 0 AND 9007199254740991)),
+  updated_at_ms BIGINT NOT NULL CHECK ((updated_at_ms BETWEEN 0 AND 9007199254740991)),
+  -- ⚠️ 这里**刻意不做生成列**。生成列会让「受控定义逐列核对」
+  --   （verifyTable 的 expectedColumns）多出一列由引擎维护的列，
+  --   而它并不在本文件的 DDL 文本里 —— 校验会报「列数不符」。
+  --   MySQL 的普通唯一索引把 NULL 视为相等，因此 (member_id, provider)
+  --   唯一索引天然就同时管住了「一个 provider 只能有一条全局规则」，
+  --   与 SQLite 侧的应用层查重语义一致。
+  CHECK ((scope = 'global' AND member_id IS NULL) OR (scope = 'member' AND member_id IS NOT NULL)),
+  CHECK (updated_at_ms >= created_at_ms),
+  FOREIGN KEY (member_id) REFERENCES members(member_id) ON DELETE RESTRICT ON UPDATE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;
+CREATE UNIQUE INDEX idx_provider_alias_member ON provider_alias (member_id, provider);
+CREATE INDEX idx_provider_alias_alias ON provider_alias (alias);
+CREATE INDEX idx_provider_alias_scope ON provider_alias (scope, enabled);
+`
+
+/**
+ * 权限码 `providers:read` / `providers:manage`。
+ *
+ * ⚠️ 两条语句都必须**幂等**（`SELECT ... WHERE NOT EXISTS`）：
+ *   SQLite 里它们是随建库语句一起跑的，MySQL 侧 DDL 会隐式提交、
+ *   迁移中途崩过一次就会重跑。写成裸 `INSERT` 会让 resume 直接撞主键。
+ *
+ * ★ 只授予**内置管理员角色**（`...0001`），与 v5 的 `groups:*` 处理一致：
+ *   `groups:*` 是显式列在 member 角色的 seed 里的，而这里的追加语句
+ *   不碰 member —— 普通成员不该能改全局供应商口径。
+ */
+export const PORTAL_V6_PERMISSION_SQL = [
+  "INSERT INTO permissions (permission_id,code,description,created_at_ms) SELECT '00000000-0000-4000-8000-000000000112','providers:read','providers:read',0 WHERE NOT EXISTS (SELECT 1 FROM permissions WHERE permission_id='00000000-0000-4000-8000-000000000112')",
+  "INSERT INTO permissions (permission_id,code,description,created_at_ms) SELECT '00000000-0000-4000-8000-000000000113','providers:manage','providers:manage',0 WHERE NOT EXISTS (SELECT 1 FROM permissions WHERE permission_id='00000000-0000-4000-8000-000000000113')",
+  "INSERT INTO role_permissions (role_id,permission_id) SELECT '00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000112' WHERE NOT EXISTS (SELECT 1 FROM role_permissions WHERE role_id='00000000-0000-4000-8000-000000000001' AND permission_id='00000000-0000-4000-8000-000000000112')",
+  "INSERT INTO role_permissions (role_id,permission_id) SELECT '00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000113' WHERE NOT EXISTS (SELECT 1 FROM role_permissions WHERE role_id='00000000-0000-4000-8000-000000000001' AND permission_id='00000000-0000-4000-8000-000000000113')",
+]
+
+/** 某后端上「v6 追加」的完整语句清单（建表 + 建索引 + 权限行）。 */
+export function portalV6Statements(kind: PortalBackendKind): string[] {
+  const additions = kind === 'mysql' ? PORTAL_MYSQL_V6_ADDITIONS : PORTAL_SQLITE_V6_ADDITIONS
+  return [...additions.replace(/^--.*$/gm, '').split(';').map(s => s.trim()).filter(Boolean), ...PORTAL_V6_PERMISSION_SQL]
+}
+
+/** 某后端上 v6 追加里的**表定义**（供迁移器逐列核对）。 */
+export function portalV6TableStatement(kind: PortalBackendKind, table: string): string {
+  const sql = portalV6Statements(kind).find(statement => statement.startsWith(`CREATE TABLE ${table} (`))
+  if (!sql) throw new Error(`缺少 v6 受控表定义：${table}`)
+  return sql
+}
+
+/**
+ * ★ **v7 追加**：模型单价表 + 两条权限码（费用统计）。
+ *
+ * ## 为什么定价粒度必须到 model
+ *
+ * 同一个供应商下不同模型的价差可以很大（实测 DeepSeek 官方 flash 与 pro
+ * 的输出单价差约 4.4 倍），所以粒度到 provider 是不够的。
+ * 一行 = 一个模型在 `[effective_from_ms, effective_to_ms]` 上的一套四类单价。
+ *
+ * ## 🚨 绝不存金额
+ *
+ * 表里只有 **token 单价**，没有 `cost` 列。费用在查询期现算：
+ * `input×p_in + output×p_out + cacheRead×p_cr + cacheWrite×p_cw`
+ * （口径在 `@ai-token-report/shared/price.ts`）。
+ * 存金额的后果是「单价后来改对了，历史账还是错的」，而且从页面上看不出来。
+ * 同理，单价带**生效区间**，所以补录或修正价格不会改写已发生的费用。
+ *
+ * ## 金额为什么是「整数微元 / 千 token」
+ *
+ * `*_micro_per_ktok`：1 微 = 1e-6 货币单位，按**千 token** 计价。
+ * 用整数是因为几十万行 × 小数累加必然出现分位误差。
+ * 上限 1e7 微/Ktok ≈ 10 货币单位/千 token，是现实最贵模型的数百倍余量。
+ *
+ * ## 与 `provider_alias` 的同一条纪律
+ *
+ * 单价表**参与费用计算**，但它是按 (provider, model) 把价格读进内存后相乘的，
+ * **绝不 JOIN 进聚合 SQL** —— 一个模型命中多行价格时 JOIN 会复制事件行，
+ * 把 `SUM()` 放大，而页面上只是数字变大（同 provider-alias.ts 的文件头）。
+ */
+export const PORTAL_SQLITE_V7_ADDITIONS = `
+-- ★ v7：模型单价（费用统计）。
+-- 精确匹配 (provider, model)；effective_to_ms = NULL 表示「至今有效」。
+-- 金额一律「整数微元 / 千 token」：1 微 = 1e-6 货币单位。
+-- 四种 token 类型各自独立定价，与 usage_event 的四列一一对应。
+CREATE TABLE model_price (
+  price_id TEXT NOT NULL PRIMARY KEY CHECK ((length(price_id) = 36 AND substr(price_id,9,1) = '-' AND substr(price_id,14,1) = '-' AND substr(price_id,19,1) = '-' AND substr(price_id,24,1) = '-' AND length(replace(price_id,'-','')) = 32 AND replace(price_id,'-','') NOT GLOB '*[^0-9a-f]*')),
+  provider TEXT NOT NULL CHECK (length(provider) BETWEEN 1 AND 255),
+  model TEXT NOT NULL CHECK (length(model) BETWEEN 1 AND 255),
+  currency TEXT NOT NULL CHECK (length(currency) = 3 AND currency = upper(currency) AND currency NOT GLOB '*[^A-Z]*'),
+  input_micro_per_ktok INTEGER NOT NULL CHECK ((typeof(input_micro_per_ktok) = 'integer' AND input_micro_per_ktok BETWEEN 0 AND 10000000)),
+  output_micro_per_ktok INTEGER NOT NULL CHECK ((typeof(output_micro_per_ktok) = 'integer' AND output_micro_per_ktok BETWEEN 0 AND 10000000)),
+  cache_read_micro_per_ktok INTEGER NOT NULL CHECK ((typeof(cache_read_micro_per_ktok) = 'integer' AND cache_read_micro_per_ktok BETWEEN 0 AND 10000000)),
+  cache_write_micro_per_ktok INTEGER NOT NULL CHECK ((typeof(cache_write_micro_per_ktok) = 'integer' AND cache_write_micro_per_ktok BETWEEN 0 AND 10000000)),
+  effective_from_ms INTEGER NOT NULL CHECK ((typeof(effective_from_ms) = 'integer' AND effective_from_ms BETWEEN 0 AND 9007199254740991)),
+  effective_to_ms INTEGER NULL CHECK (effective_to_ms IS NULL OR (typeof(effective_to_ms) = 'integer' AND effective_to_ms BETWEEN 0 AND 9007199254740991)),
+  note TEXT NULL CHECK (note IS NULL OR length(note) <= 255),
+  created_at_ms INTEGER NOT NULL CHECK ((typeof(created_at_ms) = 'integer' AND created_at_ms BETWEEN 0 AND 9007199254740991)),
+  updated_at_ms INTEGER NOT NULL CHECK ((typeof(updated_at_ms) = 'integer' AND updated_at_ms BETWEEN 0 AND 9007199254740991)),
+  CHECK (effective_to_ms IS NULL OR effective_to_ms >= effective_from_ms),
+  CHECK (updated_at_ms >= created_at_ms)
+);
+-- ⚠️ 唯一索引**两个后端逐字相同**（不用 SQLite 的部分索引，理由同 v6）。
+--   它只兜住「同一模型的同一生效起点只有一行」这一条**精确重复**；
+--   「区间不得重叠」数据库管不住（两行部分重叠的区间都能插进去），
+--   必须由应用层显式查重兜住（shared/price.ts 的 findPriceConflicts()）——
+--   两行重叠价格会让 resolvePrice() 任选一行，费用随机偏差且不报错。
+CREATE UNIQUE INDEX idx_model_price_span ON model_price (provider, model, effective_from_ms);
+CREATE INDEX idx_model_price_target ON model_price (provider, model);
+`
+
+/** MySQL 形态的 v7 追加（与 SQLite 侧**逐列同名**，只差方言与列宽写法）。 */
+export const PORTAL_MYSQL_V7_ADDITIONS = `
+-- ★ v7：模型单价（费用统计）。
+-- 精确匹配 (provider, model)；effective_to_ms = NULL 表示「至今有效」。
+-- 金额一律「整数微元 / 千 token」：1 微 = 1e-6 货币单位。
+-- int 足够：上限 1e7 远小于 int 的 2.1e9，且上限由应用层常量统一收口。
+CREATE TABLE model_price (
+  price_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY CHECK (price_id REGEXP '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'),
+  provider VARCHAR(255) NOT NULL CHECK (CHAR_LENGTH(provider) BETWEEN 1 AND 255),
+  model VARCHAR(255) NOT NULL CHECK (CHAR_LENGTH(model) BETWEEN 1 AND 255),
+  currency CHAR(3) CHARACTER SET ascii COLLATE ascii_bin NOT NULL CHECK (currency REGEXP '^[A-Z]{3}$'),
+  input_micro_per_ktok INT NOT NULL CHECK (input_micro_per_ktok BETWEEN 0 AND 10000000),
+  output_micro_per_ktok INT NOT NULL CHECK (output_micro_per_ktok BETWEEN 0 AND 10000000),
+  cache_read_micro_per_ktok INT NOT NULL CHECK (cache_read_micro_per_ktok BETWEEN 0 AND 10000000),
+  cache_write_micro_per_ktok INT NOT NULL CHECK (cache_write_micro_per_ktok BETWEEN 0 AND 10000000),
+  effective_from_ms BIGINT NOT NULL CHECK (effective_from_ms BETWEEN 0 AND 9007199254740991),
+  effective_to_ms BIGINT NULL CHECK (effective_to_ms IS NULL OR effective_to_ms BETWEEN 0 AND 9007199254740991),
+  note VARCHAR(255) NULL,
+  created_at_ms BIGINT NOT NULL CHECK (created_at_ms BETWEEN 0 AND 9007199254740991),
+  updated_at_ms BIGINT NOT NULL CHECK (updated_at_ms BETWEEN 0 AND 9007199254740991),
+  CHECK (effective_to_ms IS NULL OR effective_to_ms >= effective_from_ms),
+  CHECK (updated_at_ms >= created_at_ms)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;
+-- ⚠️ 这个唯一索引的键长是 255*4 + 255*4 + 8 = 2048 字节。
+--   它只在 InnoDB 的 DYNAMIC 行格式（MySQL 8 默认，上限 3072 字节）下合法；
+--   若把库建在 COMPACT 行格式上会直接 errno 1071。本仓要求 MySQL 8.0.16+
+--   （用到了 CHECK 约束与 utf8mb4_0900_bin），所以默认就是 DYNAMIC。
+CREATE UNIQUE INDEX idx_model_price_span ON model_price (provider, model, effective_from_ms);
+CREATE INDEX idx_model_price_target ON model_price (provider, model);
+`
+
+/**
+ * 权限码 `cost:read` / `pricing:manage`。
+ *
+ * UUID 续在 `providers:*`（`…112` / `…113`）之后，用 `…114` / `…115`。
+ * 幂等写法与理由同 v6（MySQL 的 DDL 会隐式提交，迁移崩过一次就会重跑）。
+ *
+ * ★ `cost:read` 只授予**内置管理员角色**：费用能反推预算与议价空间，
+ *   不是每个有 `stats:read` 的人都该看到。需要放开时在角色页显式授予，
+ *   而不是把它塞进基础角色 —— 默认可见的金额改不回「不可见」。
+ */
+export const PORTAL_V7_PERMISSION_SQL = [
+  "INSERT INTO permissions (permission_id,code,description,created_at_ms) SELECT '00000000-0000-4000-8000-000000000114','cost:read','cost:read',0 WHERE NOT EXISTS (SELECT 1 FROM permissions WHERE permission_id='00000000-0000-4000-8000-000000000114')",
+  "INSERT INTO permissions (permission_id,code,description,created_at_ms) SELECT '00000000-0000-4000-8000-000000000115','pricing:manage','pricing:manage',0 WHERE NOT EXISTS (SELECT 1 FROM permissions WHERE permission_id='00000000-0000-4000-8000-000000000115')",
+  "INSERT INTO role_permissions (role_id,permission_id) SELECT '00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000114' WHERE NOT EXISTS (SELECT 1 FROM role_permissions WHERE role_id='00000000-0000-4000-8000-000000000001' AND permission_id='00000000-0000-4000-8000-000000000114')",
+  "INSERT INTO role_permissions (role_id,permission_id) SELECT '00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000115' WHERE NOT EXISTS (SELECT 1 FROM role_permissions WHERE role_id='00000000-0000-4000-8000-000000000001' AND permission_id='00000000-0000-4000-8000-000000000115')",
+]
+
+/** 某后端上「v7 追加」的完整语句清单（建表 + 建索引 + 权限行）。 */
+export function portalV7Statements(kind: PortalBackendKind): string[] {
+  const additions = kind === 'mysql' ? PORTAL_MYSQL_V7_ADDITIONS : PORTAL_SQLITE_V7_ADDITIONS
+  return [...additions.replace(/^--.*$/gm, '').split(';').map(s => s.trim()).filter(Boolean), ...PORTAL_V7_PERMISSION_SQL]
+}
+
+/** 某后端上 v7 追加里的**表定义**（供迁移器逐列核对）。 */
+export function portalV7TableStatement(kind: PortalBackendKind, table: string): string {
+  const sql = portalV7Statements(kind).find(statement => statement.startsWith(`CREATE TABLE ${table} (`))
+  if (!sql) throw new Error(`缺少 v7 受控表定义：${table}`)
+  return sql
+}
+
 export const PORTAL_SQLITE_INGEST_SQL = `CREATE TABLE IF NOT EXISTS ingest_run (
   id                    INTEGER PRIMARY KEY CHECK (id = 1),
   last_ingest_ms        INTEGER NOT NULL,
@@ -661,11 +932,62 @@ export const PORTAL_MYSQL_INGEST_SQL = `CREATE TABLE IF NOT EXISTS ingest_run (
   providers_json          TEXT    NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`
 
-/** 设计 SQL 没有触发器或字符串内分号；只在本模块的受控 SQL 上拆句。 */
+/**
+ * 受控 DDL 的全部语句（= v5 结构 + v6 追加）。
+ *
+ * ★ 这是**唯一**的「当前版本有哪些表」的来源：建库、逐表核对、建索引
+ *   全都从这里取。往 `PORTAL_SQLITE_V6_ADDITIONS` 里加一张表，
+ *   上面三件事自动跟上 —— 不存在「新表建了但校验没覆盖」的空档。
+ *
+ * ⚠️ 权限行（`INSERT ... WHERE NOT EXISTS`）也会被返回。调用方有两种：
+ *   全新库初始化按顺序 `exec` 全部语句（正确）；
+ *   迁移器的 `ensureV5Indexes` 只挑 `CREATE INDEX` 前缀的（也正确）。
+ *   若将来有人把这里改回「只返回 DDL」，权限码就会在迁到 v6 之后缺失 ——
+ *   表现是管理员进不去配置页，而库的版本号明明是 6。
+ *
+ * 设计 SQL 没有触发器或字符串内分号；只在本模块的受控 SQL 上拆句。
+ */
 export function portalSchemaStatements(kind: PortalBackendKind): string[] {
   const source = kind === 'mysql' ? PORTAL_MYSQL_V5_SQL : PORTAL_SQLITE_V5_SQL
-  return source.replace(/^--.*$/gm, '').split(';').map(s => s.trim()).filter(s => s && !s.startsWith('PRAGMA'))
+  const base = source.replace(/^--.*$/gm, '').split(';').map(s => s.trim()).filter(s => s && !s.startsWith('PRAGMA'))
+  return [...base, ...portalV6Statements(kind), ...portalV7Statements(kind)]
 }
+/**
+ * 受控定义的文本摘要 —— 迁移账本据此识别「这个库的结构是不是当前版本」。
+ *
+ * 🚨 **它必须随受控定义一起变**：只把 `PORTAL_SCHEMA_VERSION` 改大、
+ *   而摘要还按旧文本算，会让已经迁到上一版的库**恰好**被判成 `current` ——
+ *   闸门放行，然后看板查询撞上不存在的表，
+ *   报错文案是「上报库不可用」，排查方向整个跑偏。
+ *   所以这里把 v6 与 v7 的追加一并算进摘要。
+ *
+ * ⚠️ 摘要只覆盖 **DDL 文本**，不含权限行：权限是数据而不是结构，
+ *   把它算进摘要会让「手工补了一条角色权限」把库判成「结构不符」。
+ */
 export function portalSchemaChecksum(kind: PortalBackendKind): string {
-  return createHash('sha256').update(kind === 'mysql' ? PORTAL_MYSQL_V5_SQL : PORTAL_SQLITE_V5_SQL).digest('hex')
+  const source = kind === 'mysql' ? PORTAL_MYSQL_V5_SQL : PORTAL_SQLITE_V5_SQL
+  const additions = kind === 'mysql'
+    ? `${PORTAL_MYSQL_V6_ADDITIONS}\n${PORTAL_MYSQL_V7_ADDITIONS}`
+    : `${PORTAL_SQLITE_V6_ADDITIONS}\n${PORTAL_SQLITE_V7_ADDITIONS}`
+  return createHash('sha256').update(`${source}\n${additions}`).digest('hex')
+}
+/**
+ * ★ **已发布的 v6 摘要，冻结于此**（= v5 文本 + v6 追加，不含 v7）。
+ *
+ * 🚨 它的作用与 `portalSchemaChecksumV4` 完全一样：让**已经迁到 v6 的库**
+ *   仍然能被认出来。`readPortalState()` 用它把这类库判成 `legacy`
+ *   （「结构是上一版，但完整、可迁移」）。
+ *
+ * 不冻结的后果：那些库的账本里记的是「v6 摘要」，而 `portalSchemaChecksum()`
+ *   现在返回「v7 摘要」，永远对不上 —— 它不再是「可迁移的起点」，
+ *   而是 `unsupported`，即**服务端拒绝启动、迁移脚本也拒绝接手**。
+ *   v7 是纯追加，这些库本来一条语句就能升上去，却会卡死在门口。
+ *
+ * ⚠️ v6 的两段文本一个字都不许再改：本函数按它们的**当前全文**求摘要，
+ *   改动会立刻让所有 v6 库的账本摘要失配。
+ */
+export function portalSchemaChecksumV6(kind: PortalBackendKind): string {
+  const source = kind === 'mysql' ? PORTAL_MYSQL_V5_SQL : PORTAL_SQLITE_V5_SQL
+  const additions = kind === 'mysql' ? PORTAL_MYSQL_V6_ADDITIONS : PORTAL_SQLITE_V6_ADDITIONS
+  return createHash('sha256').update(`${source}\n${additions}`).digest('hex')
 }

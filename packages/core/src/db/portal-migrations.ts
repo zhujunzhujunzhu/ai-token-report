@@ -23,12 +23,23 @@ import { existsSync, readFileSync, mkdirSync, statSync, writeFileSync } from 'no
 import { dirname, resolve } from 'node:path'
 import type { Database } from './driver.js'
 import { describePortalTarget, openRawPortalStore, type PortalStore, type PortalTarget } from './portal-connection.js'
-import { PORTAL_SCHEMA_VERSION, PORTAL_SQLITE_INGEST_SQL, PORTAL_MYSQL_INGEST_SQL, portalSchemaChecksum, portalSchemaStatements } from './portal-schema-v5.js'
+import { PORTAL_SCHEMA_VERSION, PORTAL_SQLITE_INGEST_SQL, PORTAL_MYSQL_INGEST_SQL, portalSchemaChecksum, portalSchemaStatements, portalV6Statements, portalV6TableStatement } from './portal-schema-v5.js'
 import { PORTAL_SQLITE_V4_INGEST_SQL, PORTAL_MYSQL_V4_INGEST_SQL, portalSchemaChecksumV4, portalSchemaStatementsV4 } from './portal-schema-v4.js'
 import { checkExpressions, sameChecks, normalizeTrigger } from './portal-catalog.js'
 
-/** 冻结基线版本：v3 库先迁到它，再由 v5 步骤接管。 */
+/**
+ * 冻结基线版本：v3 库先迁到它，再由 v5 步骤接管。
+ *
+ * ⚠️ **v5 是「结构改造步骤」而不是冻结基线**：它的 DDL 文本在升 v6 时
+ *   被追加了（`provider_alias` 与权限行），所以已迁到 v5 的库 digest 会变，
+ *   从而落入 `legacy` 并被要求显式迁移 —— 这正是我们要的。
+ */
 const BASELINE_VERSION = 4
+/**
+ * v5 的**结构**版本号。它的账本行仍然要能被认出来（那是「基线已就绪」的证据），
+ * 而 `PORTAL_SCHEMA_VERSION` 已经是 6。
+ */
+const V5_VERSION = 5
 type SchemaVersion = 4 | 5
 
 export interface PortalInspection {
@@ -83,6 +94,16 @@ async function readPortalState(store: PortalStore): Promise<Omit<PortalInspectio
     : tables.includes('portal_meta') ? Number((await store.get<{ schema_version: number }>('SELECT schema_version FROM portal_meta WHERE id=1'))?.schema_version ?? 0) : 0
   const current = await migrationRow(store, tables, PORTAL_SCHEMA_VERSION)
   const baseline = await migrationRow(store, tables, BASELINE_VERSION)
+  /**
+   * v5 账本行是否存在且完整。
+   *
+   * 🚨 判定「v4 基线是否就绪」**不能看 `state.version`**：v6 的 DDL 是在 v5
+   *   之上追加的，所以一个已经迁到 v5 的库版本号是 5、`dept` 早已改名
+   *   `group_name`。若按版本号判断，会得出「基线还没做」→ 重跑 v3→v4 →
+   *   `historyFingerprint('dept')` 抛 `Unknown column 'dept'`，此后每次 resume
+   *   都失败。v5 账本行一旦存在，基线步骤就早已过去。
+   */
+  const v5Row = await migrationRow(store, tables, V5_VERSION)
   let status: PortalInspection['status'] = 'unsupported'
   if (tables.length === 0 && version === 0) status = 'empty'
   else if (version === 0 && tables.length === 1 && tables[0] === 'portal_schema_migrations' && !current && !baseline) status = 'incomplete'
@@ -92,8 +113,11 @@ async function readPortalState(store: PortalStore): Promise<Omit<PortalInspectio
   else if (version === BASELINE_VERSION && baseline?.status === 'completed' && baseline.checksum === portalSchemaChecksumV4(store.kind)) status = 'legacy'
   // v3：一条账本行都没有的老库，先迁到 v4 基线再升 v5。
   else if (version === 3 && tables.includes('usage_event') && !current && !baseline) status = 'legacy'
-  // v5 账本存在但 checksum 不符（程序换了 SQL 或库被改过）会落到 'unsupported'，绝不冒充 current。
-  return { kind: store.kind, label: store.label, version, status, tables, migration: current ?? baseline }
+  // ★ v5：结构是「分组多对多」，但受控 DDL 已经追加了 provider_alias。
+  //   它的 digest 必然对不上 —— 落进 legacy，必须显式迁移到 v6。
+  else if (version === V5_VERSION && v5Row?.status === 'completed' && !current) status = 'legacy'
+  // v5/v6 账本存在但 checksum 不符（程序换了 SQL 或库被改过）会落到 'unsupported'，绝不冒充 current。
+  return { kind: store.kind, label: store.label, version, status, tables, migration: current ?? v5Row ?? baseline }
 }
 async function inspectStore(store: PortalStore): Promise<PortalInspection> {
   const state = await readPortalState(store)
@@ -137,15 +161,39 @@ async function verifyTable(store: PortalStore, table: string, sql: string, allow
   }
   await requireTransactionalTable(store,table)
   await verifyMysqlConstraints(store,table,sql)
-  const expectedUnique = [...sql.matchAll(/(?:PRIMARY KEY|UNIQUE) \(([^)]+)\)/g)].map(match => match[1]!.replace(/\s/g,''))
+  // ⚠️ 只认**表级**唯一约束，且必须是「关键字后紧跟列清单」的形状。
+  //   写成 `(?:PRIMARY KEY|UNIQUE) \(([^)]+)\)` 会**跨过中间的令牌**去匹配，
+  //   于是列级写法 `alias_id … NOT NULL PRIMARY KEY CHECK (alias_id REGEXP '…')`
+  //   会被捕获成 `alias_id REGEXP '^[0-9a-f]{8}-…'` —— 一个根本不存在的「列组合」，
+  //   让每一张主键写成列级约束的表都在 MySQL 上判成「唯一约束不一致」。
+  //   这个洞在 SQLite 上永不暴露（那里只比 `sqlite_master.sql` 全文，见上面 return），
+  //   所以它专挑「只有活体 MySQL 才走到」的路径发作。
+  const expectedUnique = [...sql.matchAll(/(?:PRIMARY KEY|UNIQUE) \(([^)]+)\)/g)]
+    .filter(match => /^[\s\w,]+$/.test(match[1]!))
+    .map(match => match[1]!.replace(/\s/g,''))
+  // 显式建的唯一索引（`CREATE UNIQUE INDEX <名> ON <表> (列…)`）：在受控 DDL 里它是
+  // **独立语句**，不在 `CREATE TABLE` 文本内，所以必须单独取 —— 只解析 `sql`
+  // 会漏掉 `provider_alias` 的 `(member_id, provider)`，MySQL 上直接判成不一致。
+  // ⚠️ **只认 `CREATE UNIQUE INDEX`**：`CREATE INDEX` 是普通索引，
+  //   把它算进来会让期望值多出一份不存在的唯一约束。
+  const create = new RegExp(`CREATE UNIQUE INDEX [A-Za-z_][\\w]* ON ${table} \\(([^)]+)\\)`)
+  for (const statement of portalSchemaStatements(store.kind)) {
+    const index = create.exec(statement)
+    if (index) expectedUnique.push(index[1]!.replace(/\s/g,''))
+  }
   for (const line of sql.split('\n')) {
     const name = /^  ([a-z_]+) /.exec(line)?.[1]
     if (name && /PRIMARY KEY|\bUNIQUE\b/.test(line)) expectedUnique.push(name)
   }
+  // ⚠️ 受控 DDL 里写的是**列名**（内联 `PRIMARY KEY` 没有索引名），
+  //   而 MySQL 的主键索引名恒为 `PRIMARY` —— 所以只比**列组合**，不比索引名：
+  //   比索引名会让每一张带主键的表都在 MySQL 上判成「约束不一致」。
+  //   顺序由 `seq_in_index` 固定，故先按索引名分组、再 join 是稳定的。
   const uniqueRows = await store.all<{ name: string; col: string }>('SELECT index_name AS name,column_name AS col FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name=$table AND non_unique=0 ORDER BY index_name,seq_in_index', { $table: table })
   const unique = new Map<string,string[]>()
   for (const row of uniqueRows) { const names = unique.get(row.name) ?? []; names.push(row.col); unique.set(row.name,names) }
-  if (JSON.stringify([...unique.values()].map(names => names.join(',')).sort()) !== JSON.stringify(expectedUnique.sort())) throw gate(`表 ${table} 的唯一约束与主键不一致。`)
+  const actualUnique = [...unique.values()].map(names => names.join(',')).sort()
+  if (JSON.stringify(actualUnique) !== JSON.stringify(expectedUnique.sort())) throw gate(`表 ${table} 的唯一约束与主键不一致。`)
 }
 async function verifyMysqlConstraints(store: PortalStore, table: string, sql: string): Promise<void> {
   const expectedForeign = [...sql.matchAll(/FOREIGN KEY \(([^)]+)\) REFERENCES (\w+)\(([^)]+)\) ON DELETE RESTRICT ON UPDATE RESTRICT/g)]
@@ -247,7 +295,7 @@ async function verifyCurrent(store: PortalStore, checkHistory = true): Promise<v
   for (const sql of portalSchemaStatements(store.kind)) {
     const match = /^CREATE TABLE (\w+) \(/.exec(sql)
     if (!match) continue
-    if (!tables.includes(match[1]!)) throw gate(`v5 缺少表 ${match[1]}。`)
+    if (!tables.includes(match[1]!)) throw gate(`v${PORTAL_SCHEMA_VERSION} 缺少表 ${match[1]}。`)
     await verifyTable(store, match[1]!, sql)
   }
   const columns = await eventColumns(store)
@@ -279,16 +327,18 @@ export function ensurePortalSqliteReady(db: Database): void {
       for (const sql of portalSchemaStatements('sqlite')) db.exec(sql)
       db.exec(PORTAL_SQLITE_INGEST_SQL)
       const now = Date.now()
-      db.query('INSERT INTO portal_schema_migrations (migration_id,version,checksum,status,last_completed_step,checkpoint_json,started_at_ms,completed_at_ms) VALUES ($id,5,$checksum,\'completed\',1,$checkpoint,$now,$now)').run({ $id: randomUUID(), $checksum: portalSchemaChecksum('sqlite'), $checkpoint: JSON.stringify({ sourceVersion: 0, historyHash: '', historyCount: 0 }), $now: now })
-      db.exec('PRAGMA user_version=5; COMMIT')
+      // ⚠️ 版本号与 checksum 都取**当前**常量：这里写死数字会让新库一建好
+      //   就被自己的版本闸门判成旧库（见 `verifyCurrent` 的逐表核对）。
+      db.query(`INSERT INTO portal_schema_migrations (migration_id,version,checksum,status,last_completed_step,checkpoint_json,started_at_ms,completed_at_ms) VALUES ($id,${PORTAL_SCHEMA_VERSION},$checksum,'completed',1,$checkpoint,$now,$now)`).run({ $id: randomUUID(), $checksum: portalSchemaChecksum('sqlite'), $checkpoint: JSON.stringify({ sourceVersion: 0, historyHash: '', historyCount: 0 }), $now: now })
+      db.exec(`PRAGMA user_version=${PORTAL_SCHEMA_VERSION}; COMMIT`)
     } catch (error) { try { db.exec('ROLLBACK') } catch { /* 保留原始错误 */ } throw error }
     return
   }
-  const migration = tables.includes('portal_schema_migrations') ? db.query<MigrationRow>('SELECT checksum,status FROM portal_schema_migrations WHERE version=5').get() : null
-  if (version !== PORTAL_SCHEMA_VERSION || migration?.status !== 'completed' || migration.checksum !== portalSchemaChecksum('sqlite')) throw gate(`上报库 schema 版本 ${version} 不符合当前 v5。`)
+  const migration = tables.includes('portal_schema_migrations') ? db.query<MigrationRow>('SELECT checksum,status FROM portal_schema_migrations WHERE version=$version').get({ $version: PORTAL_SCHEMA_VERSION }) : null
+  if (version !== PORTAL_SCHEMA_VERSION || migration?.status !== 'completed' || migration.checksum !== portalSchemaChecksum('sqlite')) throw gate(`上报库 schema 版本 ${version} 不符合当前 v${PORTAL_SCHEMA_VERSION}。`)
   for (const sql of portalSchemaStatements('sqlite')) {
     const table = /^CREATE TABLE (\w+)/.exec(sql)?.[1]
-    if (table && !tables.includes(table)) throw gate(`v5 缺少表 ${table}。`)
+    if (table && !tables.includes(table)) throw gate(`v${PORTAL_SCHEMA_VERSION} 缺少表 ${table}。`)
   }
 }
 
@@ -411,17 +461,20 @@ export async function migratePortalDatabase(target: PortalTarget, options: Porta
       if (state.status === 'incomplete' && !options.resume) throw gate('发现未完成迁移，必须显式 resume。')
 
       const baselineRow = await migrationRow(connection, state.tables, BASELINE_VERSION)
-      // 🚨 不能只看 `state.version`。v5 的结构已经就位、但 v5 账本行被标成
-      //   `started`/`failed` 的库（迁移中途崩过之后就是这副样子）版本号已经是 5，
+      // 🚨 不能只看 `state.version`。v5/v6 的结构已经就位、但账本行被标成
+      //   `started`/`failed` 的库（迁移中途崩过之后就是这副样子）版本号已经是 5 或 6，
       //   只按版本判断会得出「v4 基线还没做」，于是重跑 v3→v4 ——
       //   而那时 `dept` 早已改名 `group_name`，`historyFingerprint('dept')` 会抛
       //   「Unknown column 'dept'」，**resume 永久失败**（真实 MySQL 上实测到过）。
-      //   v5 的账本行一旦存在就说明基线步骤早就过去了，剩下的交给幂等的 upgradeV4ToV5。
-      const v5Bookkeeping = state.migration?.version === PORTAL_SCHEMA_VERSION
+      //   只要 **v5 或 v6 的账本行存在**，基线步骤就早已过去了。
+      const v5Bookkeeping = state.migration?.version === V5_VERSION || state.tables.includes('provider_alias')
       const baselineReady = v5Bookkeeping || (state.version === BASELINE_VERSION && baselineRow?.status === 'completed' && baselineRow.checksum === portalSchemaChecksumV4(store.kind))
       if (!baselineReady) await migrateToBaseline(connection, target, state, options)
-      // 基线到位后升 v5。v5 的每一步都自检目标状态，所以 resume 直接重跑即可。
-      await upgradeV4ToV5(connection, target, options)
+      // 基线到位后升 v5，再追加 v6。每一步都自检目标状态，所以 resume 直接重跑即可。
+      // ⚠️ `state.migration?.version === V5_VERSION` 才能说明「库里**原本就有** v5 账本行」：
+      //   在 v6 之上重跑时 `migration` 是 v6 行，此时 v5 行要么在（老 v5 库）、要么不存在
+      //   （v4 库刚走上来）—— 两者对「要不要补写 v5 账本行」的处理必须不同。
+      await upgradeV4ToV5(connection, target, options, state.migration?.version === V5_VERSION)
     })
     return await inspectStore(store)
   } finally { await store.close() }
@@ -560,17 +613,30 @@ async function ensureV5Indexes(store: PortalStore): Promise<void> {
 }
 
 /**
- * v4 → v5。
+ * v4 → v5 → v6。
  *
- * 三件事：表/列改名为「分组」、人员与分组改成多对多、事实表去掉单值分组列。
+ * ## v5 步骤：三件事
+ *
+ * 表/列改名为「分组」、人员与分组改成多对多、事实表去掉单值分组列。
+ *
+ * ## v6 步骤：只追加
+ *
+ * `provider_alias` 表 + 权限码 `providers:*`。事实表一个字节都不动 ——
+ * 供应商归一化是**查询时**应用的（见 `provider-alias.ts` 的文件头）。
  *
  * ★ **每一步都自检目标状态**（表/列是否存在），所以重复执行是安全的：
  *   MySQL 的 DDL 会隐式提交，中途崩溃后 resume 必须能接着跑下去，
  *   而不能靠 `last_completed_step` 记住「走到第几步」。
- * 🚨 迁移前后的**事件指纹必须逐位相同**，只是快照列换了名字 ——
+ *
+ * 🚨 **已经迁到 v5 的库只走 v6 步骤，不重跑 v5 的表重建。**
+ *   判断依据是 `provider_alias` 表在不在（而不是版本号）——
+ *   版本号在 v5 库上仍是 5，而 `dept` 早已改名 `group_name`，
+ *   重跑 `runV5Sqlite` 会在一个已经是 v5 的库上做无意义的表重建。
+ *
+ * 🚨 迁移前后的**事件指纹必须逐位相同**，v5 步骤里只是快照列换了名字 ——
  *   这是「没有一条历史用量被改写」的唯一证据。
  */
-async function upgradeV4ToV5(store: PortalStore, target: PortalTarget, options: PortalMigrationOptions): Promise<void> {
+async function upgradeV4ToV5(store: PortalStore, target: PortalTarget, options: PortalMigrationOptions, v5RowPresent: boolean): Promise<void> {
   const kind = store.kind
   const ledger = tableStatement(kind, 'portal_schema_migrations')
   if (!(await tablesOf(store)).includes('portal_schema_migrations')) await store.exec(ledger)
@@ -579,6 +645,11 @@ async function upgradeV4ToV5(store: PortalStore, target: PortalTarget, options: 
   const existing = await migrationRow(store, await tablesOf(store), PORTAL_SCHEMA_VERSION)
   if (existing && existing.checksum !== portalSchemaChecksum(kind)) throw gate('未完成迁移的 checksum 与当前程序不同，拒绝跳步。')
 
+  // ★ v5 的结构是否已经就位 —— 判据是**事实表的快照列名**（v5 把 `dept` 改名
+  //   `group_name`），而不是「provider_alias 在不在」：后者是 v6 的产物，
+  //   在一个 v4 库上完全可以手工建出来（那会让「跳过 v5 重建」被误判为真）。
+  const v5Ready = (await tableColumns(store, 'usage_event')).includes('group_name')
+
   let row = existing
   if (!row) {
     const before = await historyFingerprint(store, await usageSnapshotColumn(store))
@@ -586,10 +657,14 @@ async function upgradeV4ToV5(store: PortalStore, target: PortalTarget, options: 
     //   而 `historyCount === 0` 说明这张事实表本来就是空的（全新部署，或 v4 刚由空库建出来）。
     //   对一份没有保护对象的库索要备份证明，只会把「空库初始化」这条最常见的路径卡死 ——
     //   它恰恰是除 `--confirm-offline` 之外不需要任何人工准备的那条路。
-    const backup = kind === 'mysql'
+    //
+    // ⚠️ 库已经是 v5 时**不备份**：v6 只追加一张新表与两行权限，
+    //   既有数据一个字节都不动，没有可回退的对象。
+    //   对一份不会被改写的库索要备份证明，只会在运维流程里多出一次手工步骤。
+    const backup = v5Ready ? undefined : kind === 'mysql'
       ? (before.count === 0 ? undefined : backupProof(target, options))
       : await sqliteBackup(store, target, `${target.sqlitePath}.v4-backup-${Date.now()}.sqlite`, before)
-    const checkpoint: Checkpoint = { sourceVersion: BASELINE_VERSION, backup, historyHash: before.hash, historyCount: before.count }
+    const checkpoint: Checkpoint = { sourceVersion: v5Ready ? V5_VERSION : BASELINE_VERSION, backup, historyHash: before.hash, historyCount: before.count }
     await store.run('INSERT INTO portal_schema_migrations (migration_id,version,checksum,status,last_completed_step,checkpoint_json,started_at_ms) VALUES ($id,$version,$hash,\'started\',0,$checkpoint,$now)', { $id: randomUUID(), $version: PORTAL_SCHEMA_VERSION, $hash: portalSchemaChecksum(kind), $checkpoint: JSON.stringify(checkpoint), $now: Date.now() })
     row = { version: PORTAL_SCHEMA_VERSION, checksum: portalSchemaChecksum(kind), status: 'started', last_completed_step: 0, checkpoint_json: JSON.stringify(checkpoint) }
   }
@@ -601,20 +676,67 @@ async function upgradeV4ToV5(store: PortalStore, target: PortalTarget, options: 
   }
 
   try {
-    if (kind === 'sqlite') await runV5Sqlite(store)
-    else await runV5Mysql(store)
-    const after = await historyFingerprint(store, 'group_name')
-    if (checkpoint.historyHash && (after.hash !== checkpoint.historyHash || after.count !== checkpoint.historyCount)) {
+    // 🚨 **v6 的追加必须早于 v5 的表重建**：`provider_alias.member_id` 有外键
+    //   指向 `members`，而 SQLite 在重建 `members`（RENAME → 新建 → 拷贝 → 删旧）
+    //   的过程中会重新解析全部引用它的表 —— 那一刻 `provider_alias` 还不存在时，
+    //   RENAME 会直接抛 `no such table: main.provider_alias`，
+    //   而错误信息完全不提「是 v6 的表还没建」。
+    //   先建这张空表没有任何副作用：它此时必然是空的（v6 才引入）。
+    await upgradeV5ToV6(store)
+    if (!v5Ready) {
+      if (kind === 'sqlite') await runV5Sqlite(store)
+      else await runV5Mysql(store)
+      const after = await historyFingerprint(store, 'group_name')
+      if (checkpoint.historyHash && (after.hash !== checkpoint.historyHash || after.count !== checkpoint.historyCount)) {
+        throw gate('迁移前后原始事件不一致，拒绝标记完成。')
+      }
+    }
+    const final = await historyFingerprint(store, 'group_name')
+    if (checkpoint.historyHash && (final.hash !== checkpoint.historyHash || final.count !== checkpoint.historyCount)) {
       throw gate('迁移前后原始事件不一致，拒绝标记完成。')
     }
     await verifyCurrent(store)
     await store.transaction(async tx => {
       await tx.run('UPDATE portal_schema_migrations SET status=\'completed\',completed_at_ms=$now,last_completed_step=1 WHERE version=$version', { $now: Date.now(), $version: PORTAL_SCHEMA_VERSION })
+      // ★ 同时补一条 **v5 账本行**（如果这次是从 v4/v3 走上来的）。
+      //   理由不是形式主义：这台机器上可能还有旧版本的服务端进程，
+      //   它认的「当前版本」是 5 —— 少了这一行，那个进程会把一个结构完好的库
+      //   读成 `incomplete`，直接拒绝启动。多一行历史账本的成本是零。
+      //   ⚠️ 已经是 v5 的库（`v5RowPresent`）**不动**它原有的那一行：
+      //   账本一经 completed 就不该被改写（它的 checksum 是当时的证据）。
+      if (!v5RowPresent) {
+        await tx.run('INSERT INTO portal_schema_migrations (migration_id,version,checksum,status,last_completed_step,checkpoint_json,started_at_ms,completed_at_ms) VALUES ($id,$version,$hash,\'completed\',1,$checkpoint,$now,$now)', { $id: randomUUID(), $version: V5_VERSION, $hash: portalSchemaChecksum(kind), $checkpoint: JSON.stringify(checkpoint), $now: Date.now() })
+      }
     })
     await markVersion(store, PORTAL_SCHEMA_VERSION)
   } catch (error) {
     try { await store.exec(`UPDATE portal_schema_migrations SET status='failed',completed_at_ms=NULL WHERE version=${PORTAL_SCHEMA_VERSION}`) } catch { /* 保留最初的迁移失败原因 */ }
     throw error
+  }
+}
+
+/**
+ * v5 → v6：**只追加** `provider_alias` 与权限码 `providers:*`。
+ *
+ * 三件事，每件都先看目标状态再动手，所以 resume 重跑是安全的：
+ * 1. 建 `provider_alias`（SQLite 上没有 `ALTER`，直接 `CREATE TABLE` 就行）；
+ * 2. 建它的索引（走通用的 `ensureIndex`，会逐列核对已存在的索引）；
+ * 3. 补权限行（`WHERE NOT EXISTS`，幂等）。
+ *
+ * 🚨 **事实表一个字节都不动**。供应商归一化是查询时应用的：
+ *   规则写进这张表，`usage_event.provider` 永远是上报当时的原值。
+ *   这也意味着这一步**不需要**再比对一次事件指纹去证明「没改数据」——
+ *   v5 步骤已经比对过，而这里根本没有会改数据的语句。
+ */
+async function upgradeV5ToV6(store: PortalStore): Promise<void> {
+  const table = portalV6TableStatement(store.kind, 'provider_alias')
+  if (!(await tablesOf(store)).includes('provider_alias')) await store.exec(table)
+  await verifyTable(store, 'provider_alias', table)
+  for (const sql of portalV6Statements(store.kind)) {
+    if (sql.startsWith('CREATE INDEX')) await ensureIndex(store, sql, true)
+  }
+  for (const sql of portalV6Statements(store.kind)) {
+    if (sql.startsWith('INSERT')) await store.exec(sql)
   }
 }
 

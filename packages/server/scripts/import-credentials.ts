@@ -1,13 +1,13 @@
 /** 显式离线导入旧身份；不迁移 schema、不改原文件、不打印凭证或连接信息。 */
 import { resolve } from 'node:path'
-import { inspectPortalDatabase, closeAllMysqlBackends, type PortalTarget } from '@ai-token-report/core/db'
+import { inspectPortalDatabase, closeAllMysqlBackends, PORTAL_SCHEMA_VERSION, type PortalTarget } from '@ai-token-report/core/db'
 import { IdentityRepository, IdentityError, importCredentialFile, digest, type LegacyCredentialInput } from '../src/identity/index.js'
 import { hashPassword } from '../src/auth/password.js'
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2)
   if (args.includes('--help')) {
-    console.log('用法：bun run packages/server/scripts/import-credentials.ts --db <portal.sqlite> --credentials <credentials.json> --confirm-offline [--include-env-admin]\nMySQL：省略 --db，显式配置 ATR_MYSQL_URL。需先完成数据库 v5 结构迁移（v4 是冻结基线，v3 库需先迁到 v4 再迁 v5）。\n--include-env-admin：同时导入 ATR_ADMIN_TOKEN 管理员；可配 ATR_ADMIN_USERNAME 与 ATR_ADMIN_PASSWORD 或 ATR_ADMIN_PASSWORD_HASH。')
+    console.log('用法：bun run packages/server/scripts/import-credentials.ts --db <portal.sqlite> --credentials <credentials.json> --confirm-offline [--include-env-admin]\nMySQL：省略 --db，显式配置 ATR_MYSQL_URL。需先完成数据库 v6 结构迁移（v4 是冻结基线，v3 库需先迁到 v4、再迁 v5、最后 v6）。\n--include-env-admin：同时导入 ATR_ADMIN_TOKEN 管理员；可配 ATR_ADMIN_USERNAME 与 ATR_ADMIN_PASSWORD 或 ATR_ADMIN_PASSWORD_HASH。')
     return
   }
   let dbPath: string | undefined, credentialsPath: string | undefined, offline = false, includeEnv = false
@@ -30,9 +30,13 @@ async function main(): Promise<void> {
   if (!!dbPath === !!mysqlUrl) throw new IdentityError(400, '请只指定一个目标：--db 或 ATR_MYSQL_URL')
   const target: PortalTarget = { sqlitePath: dbPath ?? resolve('.unused-identity-import.sqlite'), ...(mysqlUrl ? { mysqlUrl } : {}) }
   const inspection = await inspectPortalDatabase(target)
-  // ★ 只接受**已经完成 v5 迁移**的库：本命令不建 schema、不迁移、不改历史。
-  //   写死版本号正是为了这个目的 —— v4 库要先显式跑 migrate-db（先迁 v4 再迁 v5）。
-  if (inspection.status !== 'current' || inspection.version !== 5) throw new IdentityError(409, '目标库尚未完成 v5 结构迁移；本命令不会初始化或迁移 schema')
+  // ★ 只接受**已经完成结构迁移**的库：本命令不建 schema、不迁移、不改历史。
+  //   用**当前版本常量**而不是写死数字 —— 写死 `5` 在升到 v6 之后会把一个
+  //   完全就绪的新库判成「没迁完」，而这条命令恰恰只能在**结构就位之后**跑，
+  //   于是它变成永远跑不了；错误信息还会把人指向已经做过的迁移。
+  if (inspection.status !== 'current' || inspection.version !== PORTAL_SCHEMA_VERSION) {
+    throw new IdentityError(409, `目标库尚未完成 v${PORTAL_SCHEMA_VERSION} 结构迁移；本命令不会初始化或迁移 schema`)
+  }
   let envAdmin: LegacyCredentialInput | undefined
   let envSourceChecksum: string | undefined
   if (includeEnv) {

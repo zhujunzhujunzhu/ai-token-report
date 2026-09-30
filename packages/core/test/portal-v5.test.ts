@@ -1,13 +1,19 @@
 /**
- * 在真实 SQLite / 可选隔离 MySQL 上验证 v5 闸门、事务与**无损迁移**。
+ * 在真实 SQLite / 可选隔离 MySQL 上验证上报库闸门、事务与**无损迁移**。
  *
- * 本轮（部门 → 分组 + 上报库 v4 → v5）新增的三块覆盖：
- * 1. **v5 契约**：新库直接建成 v5（19 张表）、权限码 `groups:*`、v4 基线文件仍逐字冻结；
- * 2. ★ **v4 → v5 迁移**：`departments` → `member_groups`、人员与分组改成多对多
- *    （新增 `member_group_assignments`）、`usage_event.dept` → `group_name`、
- *    两处 `department_id` 被删除；**迁移前后必须算出逐位相同的事件指纹** ——
- *    这是「没有一条历史用量被改写」的唯一证据；
- * 3. ★ **v3 → v5 一次迁移**：v4 是冻结基线，中间态也要留下自己的恢复点（两份备份）。
+ * ## 当前版本是 v6，本文件覆盖 v5 与 v6 两段
+ *
+ * | 版本 | 结构 | 本文件里的覆盖 |
+ * |---|---|---|
+ * | v4 | 冻结基线 | 逐字比对 `docs/database-v4/*.sql` |
+ * | v5 | 分组多对多 | v4→v5 / v3→v5 迁移、指纹逐位不变、触发器清空 |
+ * | **v6** | ★ **当前终态**：追加 `provider_alias` + `providers:*` | 新库表数、v5→v6 追加迁移 |
+ *
+ * 本轮（供应商归一化）新增的两块覆盖：
+ * 1. **v6 契约**：新库直接建成 v6（20 张表）、多出 `provider_alias` 与两条权限码；
+ * 2. ★ **v5 → v6 追加迁移**：只建表与补权限行，**事实表一个字节都不动**
+ *    （同样要算出逐位相同的事件指纹）；
+ * 3. ★ **v3 → v6 一次迁移**：v4 是冻结基线，中间态也要留下自己的恢复点（两份备份）。
  *
  * ⚠️ 契约文件（`docs/database-v5/*.sql`）与跨进程子脚本都在**仓库根**下。
  *   从 `packages/core` 直接 `bun test test/portal-v5.test.ts` 时
@@ -25,7 +31,7 @@ import { openPortalStore, inspectPortalDatabase, preparePortalDatabase, migrateP
 import { openRawPortalStore } from '../src/db/portal-connection.js'
 import { insertAttributedRecords, insertAttributedRecordsInTransaction, type IngestRecord } from '../src/db/ingest.js'
 import { PORTAL_MYSQL_V4_SQL, PORTAL_SQLITE_V4_SQL, PORTAL_MYSQL_V4_INGEST_SQL, PORTAL_SQLITE_V4_INGEST_SQL, portalSchemaChecksumV4, portalSchemaStatementsV4 } from '../src/db/portal-schema-v4.js'
-import { PORTAL_MYSQL_V5_SQL, PORTAL_SQLITE_V5_SQL, portalSchemaStatements } from '../src/db/portal-schema-v5.js'
+import { PORTAL_MYSQL_V5_SQL, PORTAL_SQLITE_V5_SQL, PORTAL_SCHEMA_VERSION, portalSchemaStatements } from '../src/db/portal-schema-v5.js'
 import { closeAllMysqlBackends, openMysqlBackend } from '../src/db/mysql.js'
 import { canonicalCheck } from '../src/db/portal-catalog.js'
 import { ensurePortalReady } from '../src/db/portal-migrations.js'
@@ -197,15 +203,16 @@ test('v5 运行时 SQL 与设计契约逐字一致，v4 基线仍逐字冻结', 
   expect(PORTAL_SQLITE_V4_SQL).toBe(readFileSync(join(repoRoot, 'docs/database-v4/schema.sqlite.sql'), 'utf8'))
   expect(PORTAL_MYSQL_V4_SQL).toBe(readFileSync(join(repoRoot, 'docs/database-v4/schema.mysql.sql'), 'utf8'))
 })
-test('SQLite 新库 v5、FULL、19 表及旧诊断表', async () => {
+test('SQLite 新库 v6、FULL、20 表及旧诊断表', async () => {
   const t = target()
   const info = await preparePortalDatabase(t)
   expect(info.status).toBe('current')
-  expect(info.version).toBe(5)
-  // v5 = v4 的 18 张表 + 多对多关联表 member_group_assignments（实跑确认，不是照抄文档）。
-  expect(info.tables.length).toBe(19)
+  expect(info.version).toBe(PORTAL_SCHEMA_VERSION)
+  // ★ v6 = v5 的 19 张表 + 供应商归一化规则表 provider_alias（实跑确认，不是照抄文档）。
+  expect(info.tables.length).toBe(20)
   expect(info.tables).toContain('member_groups')
   expect(info.tables).toContain('member_group_assignments')
+  expect(info.tables).toContain('provider_alias')
   expect(info.tables).not.toContain('departments')
   const store = await openPortalStore(t)
   expect(await store.get<Record<string, unknown>>('PRAGMA synchronous')).toEqual({ synchronous: 2 })
@@ -239,7 +246,10 @@ test('业务版本闸门不扫描事件历史，显式检查仍返回真实条�
     await ensurePortalReady(guarded)
     expect((await inspectPortalDatabase(t)).eventCount).toBe(2)
     expect((await preparePortalDatabase(t)).eventCount).toBe(2)
-    await store.exec("UPDATE portal_schema_migrations SET status='failed',completed_at_ms=NULL WHERE version=5")
+    // ★ 把**当前版本**的账本行标成失败：闸门必须按账本（而不是版本号）判定
+    //   「这个库是半迁移状态」。写成 `version=5` 在 v6 之后会失去意义 ——
+    //   那条行是历史遗留，改它不会影响当前版本的判定。
+    await store.exec(`UPDATE portal_schema_migrations SET status='failed',completed_at_ms=NULL WHERE version=${PORTAL_SCHEMA_VERSION}`)
     await expect(ensurePortalReady(guarded)).rejects.toThrow('incomplete')
   } finally { await store.close() }
 })
@@ -291,7 +301,7 @@ test('SQLite v4→v5：分组改名、归属搬进关联表、权限码保 ID、
   const migrated = await migratePortalDatabase(t, { confirmOffline: true })
 
   // a. 版本与状态推进到 v5，事件条数一条不少。
-  expect(migrated.version).toBe(5)
+  expect(migrated.version).toBe(PORTAL_SCHEMA_VERSION)
   expect(migrated.status).toBe('current')
   expect(migrated.eventCount).toBe(before.eventCount)
   const after = await openRawPortalStore(t)
@@ -363,7 +373,7 @@ test('SQLite v4→v5：分组改名、归属搬进关联表、权限码保 ID、
   // i. 幂等/resume：再迁一次不抛错，版本、事件数与指纹都不变（新增那条也不许被改写）。
   const stable = eventFingerprint(t.sqlitePath, 'group_name')
   const resumed = await migratePortalDatabase(t, { resume: true, confirmOffline: true })
-  expect(resumed.version).toBe(5)
+  expect(resumed.version).toBe(PORTAL_SCHEMA_VERSION)
   expect(resumed.status).toBe('current')
   expect(resumed.eventCount).toBe(stable.count)
   expect(eventFingerprint(t.sqlitePath, 'group_name').hash).toBe(stable.hash)
@@ -391,7 +401,7 @@ test('SQLite v3→v5 一次迁移：两份备份、token 四列逐位保留、�
   expect(before.status).toBe('legacy')
   const beforeFingerprint = eventFingerprint(t.sqlitePath, 'dept')
   const migrated = await migratePortalDatabase(t, { confirmOffline: true })
-  expect(migrated.version).toBe(5)
+  expect(migrated.version).toBe(PORTAL_SCHEMA_VERSION)
   expect(migrated.status).toBe('current')
   expect(migrated.eventCount).toBe(before.eventCount)
   const raw = await openRawPortalStore(t)
@@ -400,8 +410,10 @@ test('SQLite v3→v5 一次迁移：两份备份、token 四列逐位保留、�
     expect(await raw.get<Record<string, unknown>>('SELECT user_id,user_name,group_name,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,member_id,received_at_ms FROM usage_event')).toEqual({ user_id: '原姓名', user_name: '原姓名', group_name: '原部门', input_tokens: 11, output_tokens: 22, cache_read_tokens: 33, cache_write_tokens: 44, member_id: null, received_at_ms: null })
     // v3→v4 的补偿触发器在 v5 阶段必须被清空（理由见上一条用例）。
     expect(await raw.all("SELECT name FROM sqlite_master WHERE type='trigger'")).toEqual([])
-    // 账本两行：v4 基线与 v5 终态各自 completed。
-    expect(await raw.all('SELECT version,status FROM portal_schema_migrations ORDER BY version')).toEqual([{ version: 4, status: 'completed' }, { version: 5, status: 'completed' }])
+    // 账本三行：v4 基线、v5 终态、v6 终态各自 completed。
+    // ★ v5 那一行是**本次迁移补写的**：这台机器上可能还有旧版本进程，
+    //   它认的「当前版本」是 5（见 upgradeV4ToV5 里的注释）。
+    expect(await raw.all('SELECT version,status FROM portal_schema_migrations ORDER BY version')).toEqual([{ version: 4, status: 'completed' }, { version: 5, status: 'completed' }, { version: PORTAL_SCHEMA_VERSION, status: 'completed' }])
   } finally { await raw.close() }
   expect(eventFingerprint(t.sqlitePath, 'group_name').hash).toBe(beforeFingerprint.hash)
   // 两个版本步骤各留一份恢复点：v3→v4 那份与 v4→v5 那份，缺一不可（唯一副本没有第二个回退位）。
