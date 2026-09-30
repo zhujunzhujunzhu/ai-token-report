@@ -11,7 +11,9 @@
  *   README.md
  * ```
  *
- * 发布：仓库根目录 `bun run publish:cli`（强制完整验证）
+ * 发布：仓库根目录 `bun run publish:cli`（强制完整验证）；
+ * 迭代期可用 `bun run publish:cli:quick`（只验本包产物 + tarball 真启动）——
+ * 两条通道的边界见 `docs/发布检查与事故恢复.md`。
  *
  * ## 为什么是「打包 + 独立清单」而不是直接发布 workspace 包
  *
@@ -170,5 +172,6 @@ process.stdout.write(
     `   入口    cli.js（${(size / 1024).toFixed(1)} KB，零运行时依赖）\n` +
     `   资源    web-local/（内嵌本地页面）\n` +
     `   文件数  ${files.length}\n` +
-    `   发布    bun run publish:cli（强制完整验证）\n`,
+    `   发布    bun run publish:cli（强制完整验证）\n` +
+    `   快速发布 bun run publish:cli:quick（只验本包产物 + tarball 真启动，跳过全仓验证）\n`,
 )

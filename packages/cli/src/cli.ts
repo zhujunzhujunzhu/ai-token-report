@@ -52,7 +52,22 @@ import {
   resolveRange,
 } from '@ai-token-report/core'
 import { openStats, resetDb } from '@ai-token-report/core/db'
+import {
+  costByGroupOf,
+  costTotalsOf,
+  loadLocalPricing,
+  priceResolver,
+  unpricedTargetsOf,
+  type CostTotals,
+} from '@ai-token-report/core/db'
 import { derive, emptyDiagnostics, type UsageRecord } from '@ai-token-report/core'
+import {
+  costCsvSections,
+  costJsonPayload,
+  renderCostSection,
+  type CostView,
+} from './cost-view.js'
+import { PRICING_SYNC_USAGE, syncPricing } from './pricing-sync.js'
 // 身份兼容归一（`group ?? dept`）只在 shared 里实现一次，这里只调用它。
 import { toAssertion } from '@ai-token-report/shared'
 
@@ -63,6 +78,7 @@ dsh-token-report —— DSH token 用量统计
   dsh-token-report [选项]
   dsh-token-report web [选项]          起本地页面（内嵌服务 + 自动开浏览器）
   dsh-token-report report [选项]      增量上报（每 10 分钟由计划任务调用）
+  dsh-token-report pricing sync [选项]  拉取部门服务端的单价快照到本地
 
 ── 统计（默认）──────────────────────────────────────────
 数据维度:
@@ -95,6 +111,15 @@ dsh-token-report —— DSH token 用量统计
   --no-diag        不输出扫描诊断与总计
   --quiet          不输出扫描进度
 
+费用（估算，**默认关**）:
+  --cost           把金额一并算出来。**默认关**：不开时输出里一位金额都没有。
+                   金额是**估算，不是财务账单** —— 它按单价表逐条事件现算，
+                   不含折扣 / 预付 / 赠送额度，因此不会等于财务对账的数字。
+                   单价来自 <data-dir>/pricing.json 快照；没有快照时退回内置
+                   种子价并**显式告警**（内置价只覆盖 deepseek-official 几个模型）。
+                   未配单价的用量一律计入「未计价」，绝不当作 0 元。
+  --pricing-file <p>  指定单价快照文件（默认 <data-dir>/pricing.json）
+
 数据源:
   默认读本地 SQLite 增量库（缺省 ~/.ai-token-report/usage.sqlite，
   可用 --data-dir 或 DSH_TOKEN_REPORT_DATA_DIR 覆盖），
@@ -115,7 +140,7 @@ dsh-token-report —— DSH token 用量统计
   完全一致 —— 两者走同一个数据源与同一套口径公式。
 
   --port <n>       监听端口 (默认 8787，被占用自动 +1)
-  --portal <url>   部门服务端地址；配置后页面才能校验并保存署名
+  --portal <url>   部门服务端**根地址**（如 http://host:8787）；配置后页面才能校验并保存署名
   --no-open        不自动打开浏览器
 
 ── 增量上报 report ──────────────────────────────────────
@@ -136,6 +161,20 @@ dsh-token-report —— DSH token 用量统计
 
   未署名时跳过采集和上报。可先在本地页面署名，或显式提供 token。
   --dry-run / --no-save / --out-file 是主动的本地演练，无需署名。
+
+── 同步单价 pricing sync ───────────────────────────────
+  从部门服务端拉一份**只读单价快照**落到本地数据目录；之后 CLI 的 --cost、
+  本地页与插件宿主都按这份快照算金额（与看板同源）。
+
+  dsh-token-report pricing sync --portal <url> --token <token>
+
+  --portal <url>   部门服务端**根地址**（如 http://host:8787），与 web 的 --portal 同一语义
+  --token <t>      后台账号签发的、带 cost:read 的凭证；**不接受 appKey**
+
+  拉取 GET <portal>/api/v1/stats/pricing（门是 cost:read）。appKey（插件 / CLI
+  上报用的那把）范围固定为 usage:write + stats:read，按设计拿不到 cost:read ——
+  用后台账号签发一份带 cost:read 的凭证，或从别的机器手工拷贝 pricing.json 过来。
+  失败分类: 缺参数 / 地址非法 → 退出码 2；401 / 403 / 网络或响应异常 → 1
 
 其他:
   --dsh-home <p>   指定 DSH home（会话日志从哪读）;**可重复**以统计多套 DSH
@@ -168,6 +207,9 @@ dsh-token-report —— DSH token 用量统计
   dsh-token-report report --out-file out.jsonl   # 落本地文件演练
   dsh-token-report report --endpoint https://portal/api/v1/token-usage --token $env:DSH_REPORT_TOKEN
   dsh-token-report report --reset                # 清空水位线
+
+  dsh-token-report pricing sync --portal http://portal:8787 --token $env:ATR_COST_TOKEN
+  dsh-token-report --period month --cost         # 本月用量 + 金额（估算）
 `
 
 interface CliOptions {
@@ -183,6 +225,31 @@ interface CliOptions {
   period?: string
   format: 'table' | 'json' | 'csv'
   out?: string
+  /**
+   * `--cost`：把金额一并算出来。**默认关**。
+   *
+   * 关着的时候输出里一位金额都没有，而且**连金额都不算**（`core/db` 的计价函数
+   * 一次都不调用）——「算了再丢掉」在输出上看起来完全一样，但它让一次普通统计
+   * 白白物化全部记录。金额是估算，不是财务账单。
+   */
+  cost: boolean
+  /** `--pricing-file`：单价快照路径（缺省 `<data-dir>/pricing.json`）。 */
+  pricingFile?: string
+  /**
+   * 部门服务端**根地址**。
+   *
+   * `web` 与 `pricing sync` 共用同一个 `--portal`，语义也必须一致：
+   * 都是「根地址」，路径由各自的调用方拼（`/api/v1/identity/verify`、`/api/v1/stats/pricing`）。
+   */
+  portal?: string
+  /**
+   * 凭证（裸 token 或 `Bearer xxx`）。
+   *
+   * `report` 与 `pricing sync` 共用：两处都是「拿它去服务端证明自己是谁」。
+   * 刻意只留这一个字段，不让每条子命令各存一份 —— 那会出现「`--token` 只对其中
+   * 一个子命令生效」这种要读代码才知道的行为。
+   */
+  token?: string
   noDiag: boolean
   quiet: boolean
   /**
@@ -214,8 +281,8 @@ interface CliOptions {
    */
   dataDir?: string
   listProviders: boolean
-  /** 子命令：`report` 时走增量上报流程而非统计。 */
-  command?: 'report' | 'web'
+  /** 子命令：`report` / `web` / `pricing` 时走各自流程而非统计。 */
+  command?: 'report' | 'web' | 'pricing'
   report: ReportOptions
   web: WebOptions
 }
@@ -223,13 +290,6 @@ interface CliOptions {
 interface WebOptions {
   /** 监听端口。默认 8787；被占用时自动 +1。 */
   port?: number
-  /**
-   * 部门服务端地址。配置后本地页才能校验并保存署名。
-   *
-   * ⚠️ 未配置时页面**仍可看本机统计**，只是没法完成署名 ——
-   *   因为本地服务无从确认「你是谁」，存下来也没有意义。
-   */
-  portal?: string
   /** 不自动打开浏览器。 */
   noOpen: boolean
 }
@@ -243,7 +303,6 @@ interface ReportOptions {
   noSave: boolean
   /** 投递目标；未提供时与 dry-run 等价。 */
   endpoint?: string
-  token?: string
   /** 不联网，把记录追加到本地 JSONL（端到端演练）。 */
   outFile?: string
   timeoutMs: number
@@ -285,6 +344,7 @@ function parseArgs(argv: string[]): CliOptions | null {
     providers: [],
     models: [],
     format: 'table',
+    cost: false,
     noDiag: false,
     quiet: false,
     noDb: false,
@@ -310,6 +370,23 @@ function parseArgs(argv: string[]): CliOptions | null {
     argv = argv.slice(1)
   } else if (argv[0] === 'web') {
     opts.command = 'web'
+    argv = argv.slice(1)
+  } else if (argv[0] === 'pricing') {
+    // `pricing` 后面**必须**跟子命令。目前只有 `sync`：多一个取值就得多一套语义，
+    // 而「pricing 后面什么都不给」与「拼错了 sync」都只该得到一个用法提示。
+    opts.command = 'pricing'
+    argv = argv.slice(1)
+    const sub = argv[0]
+    // `-h` 与全局 `-h` 一致：打印帮助、退出码 0（不是「参数错误」）。
+    if (sub === '-h' || sub === '--help') return null
+    // 后面直接跟 flag（`pricing --data-dir x`）算「没给子命令」而不是「子命令叫 --data-dir」：
+    // 后者会打出一句让人去找 `--data-dir` 是什么意思的报错。
+    if (sub === undefined || sub.startsWith('-')) {
+      throw new UsageError('`pricing` 需要一个子命令。\n\n' + PRICING_SYNC_USAGE)
+    }
+    if (sub !== 'sync') {
+      throw new UsageError(`未知的 pricing 子命令 "${sub}"。目前只有 sync。\n\n` + PRICING_SYNC_USAGE)
+    }
     argv = argv.slice(1)
   }
 
@@ -346,7 +423,7 @@ function parseArgs(argv: string[]): CliOptions | null {
         i++
         break
       case '--token':
-        opts.report.token = takeValue(i, arg)
+        opts.token = takeValue(i, arg)
         i++
         break
       case '--out-file':
@@ -393,7 +470,7 @@ function parseArgs(argv: string[]): CliOptions | null {
         break
       }
       case '--portal':
-        opts.web.portal = takeValue(i, arg)
+        opts.portal = takeValue(i, arg)
         i++
         break
       case '--no-open':
@@ -477,6 +554,14 @@ function parseArgs(argv: string[]): CliOptions | null {
       }
       case '--out':
         opts.out = takeValue(i, arg)
+        i++
+        break
+      // ── 费用（估算）─────────────────────────────────────────────────────
+      case '--cost':
+        opts.cost = true
+        break
+      case '--pricing-file':
+        opts.pricingFile = takeValue(i, arg)
         i++
         break
       case '--dsh-home': {
@@ -744,6 +829,11 @@ async function main(): Promise<number> {
   // `--discover`：只回答「本机有哪些 DSH home」，不统计、不碰库。
   if (opts.discover) return printDiscover(paths)
 
+  // 🚨 `pricing sync` **不读会话日志**，所以必须在「有没有会话目录」这道检查之**前**分派：
+  //   一台还没装 DSH、或 home 在别处的机器，正是最需要先把单价同步下来的情形，
+  //   而放在检查之后会让它以「没有可用的会话目录」失败 —— 报错与真正的原因毫无关系。
+  if (opts.command === 'pricing') return runPricingCommand(opts, paths)
+
   // ★ 多根：缺失的根**逐项报出但不失败**，全部缺失才算失败 ——
   //   多写了一个暂时不存在的 home（外接盘没插、客户端刚卸载）不该让整个命令挂掉，
   //   但也不能静默：`⚠` 那行是使用者分辨「镜像去重」与「根本没读到」的唯一线索。
@@ -836,6 +926,11 @@ async function main(): Promise<number> {
 
   // 普通统计直接复用压缩索引的分组，只有交叉表和 JSON 的 provider 趋势需要原始记录。
   // 百万记录不能为了打印前 30 行而全部搬到 CLI 内存重新聚合。
+  // ★ `--cost` 也必须物化记录：单价带生效区间，**换价那一刻**两侧的用量适用不同的价，
+  //   按「分组 token 总量 × 一个价」算必然把换价前后的用量全按其中一个价算 ——
+  //   而它看起来完全正常。所以只能逐条事件按**它自己的时刻**取价（见 `core/db/cost.ts`）。
+  //   `--list-providers` 是「只列出后退出」模式，不产生任何费用输出，故不必为它物化。
+  const withCost = opts.cost && !opts.listProviders
   let records: UsageRecord[] = []
   const grouped = new Map<GroupDimension, GroupRow[]>()
   let series: SeriesPoint[] = []
@@ -846,7 +941,9 @@ async function main(): Promise<number> {
     dbStats = session.dbDiagnostics()
     const dims = opts.listProviders ? ['provider', 'provider-model'] as const : opts.by
     for (const dim of dims) grouped.set(dim, session.groups(dim).map(r => ({ ...r, metrics: derive(r.counts) })))
-    if ((opts.cross && opts.format === 'table') || (opts.series && opts.format === 'json')) records = session.records()
+    if ((opts.cross && opts.format === 'table') || (opts.series && opts.format === 'json') || withCost) {
+      records = session.records()
+    }
     if (opts.series) {
       series = opts.format === 'json' ? timeSeries(records, opts.series, false)
         : session.series(opts.series, opts.format === 'table').map(p => ({ ...p, metrics: derive(p.counts), byProvider: new Map() }))
@@ -860,6 +957,10 @@ async function main(): Promise<number> {
   const diagnostics = session.diagnostics ?? emptyDiagnostics()
   const degradedReason = session.degradedReason
   const source = session.source
+
+  // ★ 只有 `--cost` 时才取价、才算金额。关着的时候一位金额都没有，也一次都不调用
+  //   计价函数 —— 「算了再丢掉」在输出上看起来一样，但它让普通统计白白物化全部记录。
+  const costView = withCost ? buildCostView(paths, opts, records) : null
 
   // --list-providers：只报告发现的口径边界
   if (opts.listProviders) {
@@ -933,6 +1034,9 @@ async function main(): Promise<number> {
         avgTokensPerCall: derive(total).avgTokensPerCall,
       },
       groups,
+      // ★ 只有 `--cost` 时才有这个键。字段**缺席**（不是空对象、更不是 0）是
+      //   「这次没算金额」的完整表达 —— JSON 消费方靠它区分「没算」与「算了是 0」。
+      ...(costView ? { cost: costJsonPayload(costView, opts.by, grouped) } : {}),
       series: opts.series
         ? series.map((p) => ({
             bucket: p.bucket,
@@ -986,6 +1090,7 @@ async function main(): Promise<number> {
       chunks.push('# series')
       chunks.push(seriesToCsv(series))
     }
+    if (costView) chunks.push(...costCsvSections(costView, opts.by, grouped, opts.top))
     const text = chunks.join('\n')
     if (opts.out) {
       await writeFile(opts.out, text, 'utf8')
@@ -1010,6 +1115,8 @@ async function main(): Promise<number> {
   if (total.calls === 0) {
     out.push('')
     out.push('未匹配到任何计费记录。')
+    // 费用节在这里**刻意不打**：没有用量时「未计价 0%（0 Token）」是一句废话，
+    // 而它会把真正的原因（这段时间没有记录）挤到后面。
     if (!opts.noDiag) {
       out.push(source === 'sql' ? formatDbDiagnostics(dbStats) : formatDiagnostics(diagnostics))
     }
@@ -1020,6 +1127,10 @@ async function main(): Promise<number> {
   for (const dim of opts.by) {
     out.push(renderDimension(grouped.get(dim)!, dim, opts.top))
   }
+
+  // 费用节紧跟排行表：键与排行表**逐字相同**（见 `cost-view.ts` 的 `orderedCostKeys()`），
+  // 挨着看才好对照「哪个供应商贵」；交叉表与趋势不属于 `--by` 维度，所以排在后面。
+  if (costView) out.push(renderCostSection(costView, opts.by, grouped, opts.top, dimLabel))
 
   if (opts.cross) {
     out.push(renderCross(records, opts.top))
@@ -1042,6 +1153,79 @@ async function main(): Promise<number> {
   }
 
   process.stdout.write(out.join('\n') + '\n')
+  return 0
+}
+
+/**
+ * 把记录交给 `core/db` 的计价函数，得到一份可渲染的费用结果。
+ *
+ * ★ 取价、折叠、未计价比例**全部**在 `@ai-token-report/core/db` 的
+ *   `priceResolver()` / `costTotalsOf()` / `costByGroupOf()` 里，本函数只负责
+ *   「价从哪来」与「哪些维度要算」—— CLI 里**一处金额算术都没有**。
+ *   `pricing.json` 缺失或坏掉时 `loadLocalPricing()` 会退回内置种子价并把原因写进
+ *   `note`（展示层必须原样打出来，否则使用者会拿着与看板不一致的数去对账）。
+ */
+function buildCostView(
+  paths: ResolvedPaths,
+  opts: CliOptions,
+  records: readonly UsageRecord[],
+): CostView {
+  const pricing = loadLocalPricing({
+    dataDir: paths.dataDir,
+    ...(opts.pricingFile ? { file: opts.pricingFile } : {}),
+  })
+  const resolve = priceResolver(pricing.prices)
+  const groups = new Map<GroupDimension, Map<string, CostTotals>>()
+  for (const dim of opts.by) {
+    groups.set(dim, costByGroupOf(records, dim, resolve, pricing.provenance))
+  }
+  return {
+    pricing,
+    totals: {
+      ...costTotalsOf(records, resolve, pricing.provenance),
+      unpricedTargets: unpricedTargetsOf(records, resolve),
+    },
+    groups,
+  }
+}
+
+/**
+ * `pricing sync`：从部门服务端拉一份只读单价快照落到本地。
+ *
+ * 退出码：`0` 成功；`2` 参数错误（缺 `--portal` / `--token`，或地址非法）；`1` 运行期失败。
+ * 失败**分类明确**是这块的关键：401（凭证无效）、403（这份凭证没有 `cost:read`，
+ * 而 appKey 按设计拿不到它）、网络 / 响应异常各有各的处置办法，
+ * 全都报成「同步失败」等于把三种不同的行动项合并成一个。
+ */
+async function runPricingCommand(opts: CliOptions, paths: ResolvedPaths): Promise<number> {
+  if (!opts.portal || !opts.token) {
+    const missing = [
+      ...(opts.portal ? [] : ['--portal']),
+      ...(opts.token ? [] : ['--token']),
+    ]
+    process.stderr.write(`错误: pricing sync 缺少必需参数: ${missing.join(' ')}\n\n${PRICING_SYNC_USAGE}\n`)
+    return 2
+  }
+
+  const result = await syncPricing({
+    portal: opts.portal,
+    token: opts.token,
+    dataDir: paths.dataDir,
+    ...(opts.pricingFile ? { pricingFile: opts.pricingFile } : {}),
+  })
+  if (!result.ok) {
+    process.stderr.write(`错误: ${result.message}\n`)
+    // 参数错误附完整用法：只报「缺什么」而不给形状，使用者还得翻 --help。
+    if (result.code === 2) process.stderr.write(`\n${PRICING_SYNC_USAGE}\n`)
+    return result.code
+  }
+
+  process.stdout.write(
+    `已写入单价快照: ${result.path}\n` +
+      `  条数 ${result.count}  来源 ${result.endpoint}  同步于 ${fmtTime(result.syncedAtMs)}\n` +
+      `  本地页 / CLI 的金额从此按这份快照算（与看板同源）。\n` +
+      result.warnings.map((warning) => `⚠ ${warning}\n`).join(''),
+  )
   return 0
 }
 
@@ -1091,7 +1275,7 @@ async function runWebCommand(opts: CliOptions, paths: ResolvedPaths): Promise<nu
       dataDir: paths.dataDir,
       staticDir,
       enableLocalApi: true,
-      ...(opts.web.portal ? { portalUrl: opts.web.portal } : {}),
+      ...(opts.portal ? { portalUrl: opts.portal } : {}),
     })
   } catch (err) {
     process.stderr.write(
@@ -1109,7 +1293,7 @@ async function runWebCommand(opts: CliOptions, paths: ResolvedPaths): Promise<nu
   out.push(`  本地库    ${paths.dbPath}`)
   out.push(`  页面资源  ${staticDir}`)
   out.push(
-    `  署名校验  ${opts.web.portal ?? '未配置（--portal）—— 可看本机统计，但无法保存署名'}`,
+    `  署名校验  ${opts.portal ?? '未配置（--portal）—— 可看本机统计，但无法保存署名'}`,
   )
   out.push('')
   out.push('  只监听 127.0.0.1，仅本机可访问；数据来自本地库（不联网上报）。')
@@ -1233,7 +1417,7 @@ async function runReportCommand(opts: CliOptions, sessionsRoots: string[]): Prom
   // ★ 与本地页 / DSH 插件共用身份；显式提供 token 也表示主动授权上报。
   // 没有身份时必须在扫描及写 pending 之前退出，不能先收集再等服务端 401。
   const identity = readIdentity(resolvePaths({ dshHomes: opts.dshHomes, dataDir: opts.dataDir }).identityPath)
-  const token = (r.token ?? process.env['DSH_REPORT_TOKEN'] ?? identity.identity?.token)?.trim()
+  const token = (opts.token ?? process.env['DSH_REPORT_TOKEN'] ?? identity.identity?.token)?.trim()
   const localRehearsal = r.dryRun || r.noSave || !!r.outFile
   if (!localRehearsal && (!token || !token.replace(/^Bearer\s*/i, '').trim())) {
     process.stdout.write(
