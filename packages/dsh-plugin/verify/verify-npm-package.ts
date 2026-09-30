@@ -122,6 +122,19 @@ check(
   manifest.files.filter((f) => !existsSync(join(distDir, f))).join(', ') || '全部就位',
 )
 
+// 🚨 peer 范围有两份真源（源码清单 + build-npm.ts 的发布清单），
+//   只改一处会让「本地怎么测都行、同事装上去被 DSH 跳过」——
+//   而且被跳过的表现是**静默没有面板**，不是报错。这里把它们钉成同一份。
+const sourcePeers = (sourceManifest as { peerDependencies?: Record<string, string> }).peerDependencies ?? {}
+/** 序无关地比较两份 peer 表：键的书写顺序不是契约，值与集合才是。 */
+const peerSignature = (peers: Record<string, string>): string =>
+  JSON.stringify(Object.entries(peers).sort(([a], [b]) => (a < b ? -1 : 1)))
+check(
+  '发布清单的 peerDependencies == 源码清单（两份真源不许漂移）',
+  peerSignature(manifest.peerDependencies ?? {}) === peerSignature(sourcePeers),
+  `dist=${JSON.stringify(manifest.peerDependencies ?? {})} src=${JSON.stringify(sourcePeers)}`,
+)
+
 // ★★★ 最关键的一条：DSH loader 拿 patch 里的 name 去 import()
 const patchPath = join(distDir, 'cordis.patch.yml')
 check('dist/cordis.patch.yml 存在', existsSync(patchPath))
@@ -249,8 +262,19 @@ try {
   process.stdout.write(`  ℹ️ 宿主模块树：${hostModules}\n`)
 
   const probe = `
+    import { readFileSync } from 'node:fs'
     const mod = await import(${JSON.stringify('file:///' + join(sandbox, 'index.js').replace(/\\/g, '/'))})
     const d = mod.default
+    // ★ 让**宿主自己的**兼容判定给这份发布清单打分。
+    //   这就是同事那边打印 \`skipping profile bundle …\` 的那段代码
+    //   （dsh-app-boot 的 evaluatePluginCompatibility）：只认 @deepseek-ai/dsh*
+    //   的 peer 是否被 semver.satisfies(runtime, range, { includePrerelease: true })
+    //   接受，cordis 不参与。在本脚本里重写一遍判定就等于第二个实现 ——
+    //   而且它只会在宿主改了规则的那一天悄悄失效。
+    const compat = await import('@deepseek-ai/dsh-app-boot')
+    const manifest = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'))
+    const runtime = compat.getDshRuntimeVersion()
+    const accepts = (version) => compat.evaluatePluginCompatibility(manifest, {}, version) === undefined
     console.log(JSON.stringify({
       name: d?.name,
       hasApply: typeof d?.apply === 'function',
@@ -258,6 +282,11 @@ try {
       hasQueryUsage: typeof mod.queryUsage === 'function',
       node: process.version,
       isBun: typeof Bun !== 'undefined',
+      compatRuntime: runtime,
+      compatAcceptsRuntime: accepts(runtime),
+      // 声称支持的每一代都要被接受；不支持的必须被拒绝（下界防 0.1.x 混装，上界防跨代）。
+      compatClaimed: ['0.1.7-rc.2', '0.2.0-rc.2'].map((v) => [v, accepts(v)]),
+      compatRejected: ['0.1.6-alpha.2', '0.3.0-rc.1'].map((v) => [v, accepts(v)]),
     }))
   `
   const run = Bun.spawnSync([nodeBin, '--input-type=module', '-e', probe], {
@@ -279,6 +308,27 @@ try {
     // 🚨 inject 必须在**默认导出**上：写在类上会静默失效（类根本不会被实例化）
     check('inject 挂在默认导出上', info['injectOnDefault'] === true)
     check('导出 queryUsage()（供服务/工具复用）', info['hasQueryUsage'] === true)
+
+    // ── 兼容闸门：宿主说了算 ───────────────────────────────────────────
+    // ★ 这两条就是同事机器上「插件被跳过」的判据。缺了它们，
+    //   peer 写错只会在**别人的机器上**以「面板不见了」的形式暴露。
+    const claimed = (info['compatClaimed'] ?? []) as [string, boolean][]
+    const rejected = (info['compatRejected'] ?? []) as [string, boolean][]
+    check(
+      `当前宿主 ${String(info['compatRuntime'])} 接受这份 peer 声明`,
+      info['compatAcceptsRuntime'] === true,
+      info['compatAcceptsRuntime'] === true ? undefined : '宿主会以「incompatible / skipping profile bundle」跳过本插件',
+    )
+    check(
+      '声称支持的代际逐个被宿主判定为兼容（0.1.7-rc.2 / 0.2.0-rc.2）',
+      claimed.length === 2 && claimed.every(([, ok]) => ok === true),
+      claimed.map(([v, ok]) => `${v}=${ok ? '兼容' : '被拒'}`).join(' '),
+    )
+    check(
+      '未验证的代际必须被拒（0.1.6-alpha.2 / 0.3.0-rc.1）—— 上下界都要钉住',
+      rejected.length === 2 && rejected.every(([, ok]) => ok === false),
+      rejected.map(([v, ok]) => `${v}=${ok ? '★被接受（范围过宽）' : '已拒'}`).join(' '),
+    )
   }
 
   // 真 Node + 实际发布目录 + 实际 Worker。单测里把线程替换成假对象，或只验证
@@ -304,7 +354,7 @@ try {
       const root = join(${JSON.stringify(sandbox)}, 'worker-fixture');
       const sessionsRoot = join(root, 'sessions');
       mkdirSync(sessionsRoot, { recursive: true });
-      const ctx = { config: { localDb: true }, sessionsRoots: [sessionsRoot], dbPath: join(root, 'usage.sqlite'), backgroundQueries: true };
+      const ctx = { config: { localDb: true }, sessionsRoots: [sessionsRoot], dbPath: join(root, 'usage.sqlite'), dataDir: root, backgroundQueries: true };
       const empty = await queryUsage(ctx, { summaryOnly: true });
       assert.equal(empty.source, 'local-db');
       assert.equal(empty.totals.calls, 0);
@@ -438,6 +488,7 @@ process.stdout.write('\n' + '='.repeat(72) + '\n')
 if (failures.length === 0) {
   process.stdout.write('✅ 发布产物验证全部通过\n')
   process.stdout.write('   发布：仓库根目录 bun run publish:plugin（强制完整验证）\n')
+  process.stdout.write('   快速：bun run publish:plugin:quick（只验本包产物 + tarball 真启动，跳过全仓验证）\n')
 } else {
   process.stdout.write(`❌ ${failures.length} 项失败：\n`)
   for (const f of failures) process.stdout.write(`   - ${f}\n`)

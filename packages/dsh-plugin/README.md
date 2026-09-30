@@ -22,7 +22,7 @@ npm 包名：`dsh-plugin-token-report` · 仓内开发包名：`@ai-token-report
 
 ## 安装最新稳定版
 
-需要已经安装 DSH `0.1.7-rc.2`，并使用同代宿主模块（`@deepseek-ai/cordis ~4.0.4`、`@deepseek-ai/dsh-session-telemetry 0.1.7-rc.2`）。不要把 0.1.5 的 telemetry 与 0.1.7 宿主混装，否则旧版会把合法会话日志误报为损坏。Node.js 要求 **22.15.0 或更新版本**。
+需要已经安装 DSH **`0.1.7-rc.2` 或更高、`0.3` 之前**（本插件已在 `0.1.7-rc.2` 与 `0.2.0-rc.2` 上实测启动），并使用同代宿主模块（`@deepseek-ai/cordis ~4.0.4`）。不要把 0.1.5 / 0.1.6 的 telemetry 与 0.1.7 及以后的宿主混装，否则旧版会把合法会话日志误报为损坏。Node.js 要求 **22.15.0 或更新版本**。
 
 ```bash
 dsh plugin --profile web add dsh-plugin-token-report@latest
@@ -61,6 +61,102 @@ dsh --profile web --no-open
 选择工作区后，输入框上方会出现用量条（**0.3.0 起这是默认位置**）。想让面板改到会话标题栏右上角、或两个位置都要，见下方「调整面板位置」。安装后无需单独启动本地统计网页。
 
 > `dsh plugin` 内部调用宿主自己的包管理器。上面的安装命令用于 DSH profile；本仓开发、构建与发布使用 Bun。
+
+## 在 DSH Desktop（桌面端）上安装
+
+桌面端与命令行版走的是**同一条装配路**，只是 home 与 profile 换成了 Desktop 自己那套；
+但桌面端的**图形入口装不了本插件**，所以下面给的是命令行步骤。
+
+### 为什么不能用桌面端的插件界面装
+
+| 入口 | 能不能装 | 原因 |
+|---|---|---|
+| 侧边栏「插件」（社区插件市场 `dshmarket`） | ❌ | 市场**只允许安装 [awesome-dsh-plugin](https://awesome-dsh-plugin.com) 精选列表内的来源，其它一律拒绝**（其 README 明写）。实测该目录 `plugins.json`（约 5 MB）里 `token-report` **0 命中** |
+| 上游「插件」管理页（`@deepseek-ai/dsh-plugin-manager`） | ⚠️ 未实测 | 它接受 npm 包名 / 本地路径 / tarball / git，但在 Desktop 上包操作归 Desktop shell 所有，会走下面的 generation 管线 |
+
+想让同事在界面里一键装，唯一途径是把包 PR 进 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) 精选列表。
+
+### 桌面端与命令行版的四个差别
+
+| | 命令行版 | DSH Desktop |
+|---|---|---|
+| DSH home | `~/.dsh`（或 `$DSH_HOME`） | `%APPDATA%\dsh-desktop\harness`（macOS：`~/Library/Application Support/dsh-desktop/harness`） |
+| profile | 任意 | **只有 `web`** —— Desktop 只暴露这一个，别的名字直接抛错 |
+| 宿主 | 你自己装的 `dsh` | Desktop **自带一整套** harness，在 `<安装目录>\resources\app.asar.unpacked\node_modules\` 下（本机实测 `@deepseek-ai/dsh` = `0.1.7-rc.2`、`@deepseek-ai/cordis` = `4.0.4`、随包 Node `v24.9.0`） |
+| 包操作 | 你调 `dsh plugin …` | Desktop 启动时会做 profile maintenance：把非市场来源的插件迁成**不可变 generation**（`.generations/live/<...>`，一次 rename 上线），并写 `dsh.desktop.generationProjection` 与 `pnpm.overrides`；迁移失败会写 `profiles/web/.generations-deferred.json` 并**冻结**该迁移 |
+
+其余一律相同：数据目录仍是 `~/.ai-token-report`，**与命令行版共用**（身份 / appKey 填一次两边都生效，见上方「多套 DSH 并存」）；会话日志按本机全部 DSH 的**并集**统计。
+
+### 步骤
+
+**① 退出 DSH Desktop**（要写 profile 与 `node_modules`）。
+
+**② 打开一个 PowerShell**，把 home、宿主入口与 **Desktop 自己的 pnpm** 都指过去：
+
+```powershell
+# 安装目录按实际替换（本机在 D:\Program Files\DSH Desktop）
+$desktopRoot = "D:\Program Files\DSH Desktop"
+$desktopDsh  = "$desktopRoot\resources\app.asar.unpacked\node_modules\@deepseek-ai\dsh\lib\bin.js"
+
+$env:DSH_HOME = "$env:APPDATA\dsh-desktop\harness"
+$env:PATH     = "$env:DSH_HOME\.desktop-bin;$env:PATH"   # ★ 用 Desktop 的 pnpm，别用系统里那个
+```
+
+> `PATH` 这一行不是可有可无：Desktop 的 `pnpm.cmd` 会在 pnpm 跑动期间临时排除 generation 投影，
+> 换成另一个 pnpm 就绕开了这层保护。
+
+**③ 装包**（两种 spec 二选一）：
+
+```powershell
+# npm 稳定版
+node $desktopDsh plugin --profile web add dsh-plugin-token-report@latest
+
+# 本地 tarball：未发布的新版本 / 离线分发。
+#   先在仓里 `bun run publish:plugin:dry`（只打包、不发布），tgz 落在 .artifacts/releases/<时间戳>/ 下。
+#   ★ 路径用正斜杠；反斜杠会报 ERR_UNSUPPORTED_ESM_URL_SCHEME
+node $desktopDsh plugin --profile web add file:D:/Coding/ai-token-report/.artifacts/releases/<时间戳>/dsh-plugin-token-report-0.7.0.tgz
+```
+
+`add` 会自动在 `profiles/web/package.json` 的 `dsh.profile.bundles` 里登记包名；**不要再手动 `insert`**。
+
+**④ 合并 OTel 禁用**（`profiles/web/cordis.patch.yml`；从 `~/.dsh` 导入过配置的机器通常已经有了）：
+
+```yaml
+- id: session-telemetry-otel
+  disabled: true
+```
+
+**⑤ 核对**（只读，不起服务）：
+
+```powershell
+node $desktopDsh plugin --profile web list              # 本机实测：dsh-plugin-token-report@0.7.0
+node $desktopDsh --profile web --dump-config | Select-String token-report
+```
+
+**⑥ 重启 DSH Desktop。** 面板出现即装好（默认输入框上方；位置在面板「配置」里改，保存即生效）。
+
+### 装好之后
+
+- 启动日志会打印 `UI 用量面板数据通道已挂载 → GET /api/tokenReport.stats（面板位置：…）`。
+- 桌面端看不到宿主的终端输出（它写进 `%APPDATA%\dsh-desktop\logs\harness.log`），本次启动的完整地址（含 `?token=`）
+  就在那行 `dsh web: http://127.0.0.1:<端口>/?token=…` 里。想确认界面数据通道真的在跑，就用它取一次配置路由
+  （`/api` 前面有 Host/Origin 栅栏，所以要带 `Origin` 与上一步拿到的 cookie）：
+
+  ```powershell
+  $url = "http://127.0.0.1:<端口>/?token=<启动日志里那串>"
+  $jar = "$env:TEMP\dsh-cookies.txt"
+  curl.exe -s -o NUL -c $jar $url
+  curl.exe -s -b $jar -H "Origin: http://127.0.0.1:<端口>" "http://127.0.0.1:<端口>/api/tokenReport.config"
+  # 本机实测：200 + {"position":"dock"}
+  ```
+
+- 首次使用、填服务端与 appKey、看「上报调试」，都与命令行版一致，见「第一次使用」与「开启团队上报」。
+
+### 三个坑
+
+1. 🚨 **版本窗口**：当前代码里的 `peerDependencies` 是 `>=0.1.7-rc.2 <0.3.0-0`（放宽发生在 `0.6.1`），但**放宽后的版本还没发到 npm** —— 2026-09-30 实测 npm 上的 `latest` 仍是 `0.6.0`，那一版的 peer 钉的是精确 `0.1.7-rc.2`。所以想用放宽后的窗口，只能装本地构建的 tarball（见上一步）。Desktop 升到 `0.2.x` 之后，钉死精确版本的那一版会在启动时被**静默跳过** —— 日志只有一行 `skipping profile bundle …`，表现是「面板不见了 + 一条也不上报」，**不是报错**；要么换成放宽版，要么按 §9.1 最后一行用 `allow-version … --accept-risk`（自担风险，不等于已验证）。
+2. **不要把仓内源码包 `@ai-token-report/dsh-plugin` 装进 Desktop**：它的 `main` 指向 `src/index.ts`，而宿主跑在 **Node**（只有 Bun 直接吃 ts），加载即失败。桌面端要用构建产物、tarball 或发布包。
+3. **升级 / 卸载走同一条路，不要只手改 `package.json`**：一旦 Desktop 的 generation 迁移成功，插件会被搬进不可变的 `.generations/live/<...>`，那时只有重新 `add` 才换得了版本（`plugin remove` 会走 Desktop 的 generation 下线流程）。
 
 ## 第一次使用
 
@@ -193,6 +289,7 @@ DSH 升级会保留旧格式日志作为备份；同一会话存在多个规范�
 | 界面统计 | 用量条与标题栏入口（挂哪几个由 `ui.position` 决定，默认只挂输入框上方），共用详情面板 |
 | 时间分析 | 预设周期、双月日历、自定义范围、趋势切换 |
 | 明细分析 | 模型 / 服务商 / 项目 / 会话分组，展开与分页 |
+| 费用（估算） | 面板顶部一行「费用（估算）」+ 明细表每行的金额列；`token_usage` 工具也给出同样一段。金额是**本机按 `pricing.json` 快照（没有就退回内置种子价）现算的估算**，与部门看板可能不同 —— 所以那行口径说明（单价来源 / 未计价比例 / 「估算 ≠ 财务账单」）永远与金额一起出现 |
 | 多套 DSH 并集 | 缺省统计本机全部 DSH 的会话日志（互为镜像的会话按 event_id 去重，只算一次） |
 | 本地增量查询 | SQLite 增量索引；库不可用时自动回退日志扫描并提示 |
 | 上报连接 | 面板内填服务端地址 + appKey，验证后**立即生效**（无需重启） |
@@ -202,7 +299,11 @@ DSH 升级会保留旧格式日志作为备份；同一会话存在多个规范�
 | 上报调试 | 配置页「上报调试」页签：状态与原因、计数、**最近请求体原文与回执**、补报进度、立即上报 / 不发送预览 |
 | Agent 与插件集成 | `token_usage`、`token_usage_diagnostics`、`ctx.tokenReport` |
 
-只展示 token 数，不展示金额。只采集用量相关字段（包含模型名、工作目录、轮次等），不采集对话内容。上报失败不会阻塞 DSH 的会话循环；服务端按事件 ID 去重。
+**token 数永远只展示真值**；金额（估算）在面板与 `token_usage` 里也会出现，
+但**未计价的用量写「未计价」而不是 `¥0.00`**（「没配上价」与「没花钱」是两件事），
+金额一律由宿主算好、格式化好再透传给界面 —— 浏览器半不做任何换算。
+趋势图**刻意没有金额曲线**：多币种绝不跨币种相加，那条判定规则的唯一实现留在部门看板。
+只采集用量相关字段（包含模型名、工作目录、轮次等），不采集对话内容。上报失败不会阻塞 DSH 的会话循环；服务端按事件 ID 去重。
 
 ## 升级与常见问题
 
@@ -273,6 +374,7 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 |---|---|
 | `sessionTelemetry` 已注册 | 确认官方 OTel 后端已禁用，且没有重复挂载插件 |
 | 没有用量入口 | 确认安装在 `web` profile、bundle 数组包含发布包名，并已重启；`features.ui` 不能关闭 |
+| 桌面端（DSH Desktop）装不上 / 界面里搜不到 | 桌面端的社区市场只收 awesome-dsh-plugin 精选列表内的来源，本插件不在其中 —— 按上方「在 DSH Desktop（桌面端）上安装」走命令行 |
 | 401 / 未通过宿主鉴权 | 使用本次 DSH 启动时打印的完整地址重新打开 |
 | 首次统计较慢 | 等待首次索引完成；如显示降级，检查 SQLite 权限与宿主 Node 版本 |
 | 团队看板没有数据 | 先看配置页「上报调试」页签：它会直接说「未上报及原因」并列出最近请求与回执；再用 `token_usage_diagnostics` 看补报进度 |
@@ -537,7 +639,7 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 
 - **`appKey`**：管理员发放的上报凭证。没有它插件**不会上报**（这是合规底线）。
 - **`endpoint` 可达**：默认指向本仓部门服务端。
-- `@deepseek-ai/dsh-session-telemetry` `0.1.7-rc.2`（与 DSH 宿主严格同代）。
+- `@deepseek-ai/dsh-session-telemetry` `>=0.1.7-rc.2 <0.3.0-0`（与 DSH 宿主同代；已在 `0.1.7-rc.2` 与 `0.2.0-rc.2` 上实测启动）。
 
 > ⚠️ **与官方 OTel 后端互斥**：同一时刻只能挂载**一个** telemetry 后端
 > （cordis 重复注册同名服务会抛错）。装了本插件就不要同时启用
@@ -1202,6 +1304,7 @@ bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败
 | `service "sessionTelemetry" has been registered at <OpenTelemetrySessionBackend>` | 与官方 OTel 后端冲突 | 见 §2.3 ④，disable 掉 OTel |
 | `ERR_UNKNOWN_BUILTIN_MODULE: bun:sqlite` | 构建时把 `@ai-token-report/*` external 出去了，或 bundler 把 `bun:sqlite` 提到顶层 | 见 §2.2 的构建命令 |
 | `ERR_UNSUPPORTED_ESM_URL_SCHEME` | `file:` 依赖写成了 Windows 路径 | 用 `file:D:/...` 正斜杠形式 |
+| `skipping profile bundle "dsh-plugin-token-report": … is incompatible with dsh <版本>: peerDependencies {…}` | 插件声明的 `peerDependencies` 与当前 DSH **不同代**。判定由宿主 `dsh-app-boot` 的 `evaluatePluginCompatibility` 做（`semver.satisfies(runtime, range, { includePrerelease: true })`），只检查 `@deepseek-ai/dsh` / `@deepseek-ai/dsh-*` 这些 peer，`@deepseek-ai/cordis` 不参与 | ① **首选**：升级插件 —— `0.6.1` 起 peer 写作 `>=0.1.7-rc.2 <0.3.0-0`，同时接受 `0.1.7-rc.2` 与 `0.2.x`；② 若你跑的是 `0.3` 及以后，等插件的下个版本（届时需重新验证宿主 API）；③ 明知风险仍要强跑：按提示 `dsh plugin allow-version dsh-plugin-token-report@<版本> --dsh-version <版本> --accept-risk`。**②③ 都不是「已验证」** —— 插件会被跳过时，DSH 仍能正常启动，只是没有用量面板与上报 |
 
 ### 9.2 运行期
 
