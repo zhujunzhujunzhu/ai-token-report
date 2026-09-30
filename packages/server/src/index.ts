@@ -64,12 +64,26 @@ export interface ServerOptions {
    * 改成 `0.0.0.0` 前必须确保凭证已配置，否则等于把全员数据公开在内网。
    */
   host?: string
-  /** DSH home，用于本地日志扫描与身份文件。 */
+  /** DSH home（**单个**）：只决定**会话日志从哪读**（`<dshHome>/sessions`）。 */
   dshHome?: string
+  /**
+   * ★ DSH home **列表**（同一台机器上并存多套 DSH 时用）。
+   *
+   * 非空时完全覆盖 `dshHome`；两者都不给时由 `core/src/home.ts` 的对象自动发现。
+   * 多根共用**一份**本地库与身份（数据目录不跟随 home）—— 库只有一份，
+   * 统计才可能是一份并集。
+   */
+  dshHomes?: string[]
+  /**
+   * token-report 数据目录：身份文件、上报库默认位置都在这里。
+   *
+   * 默认 `~/.ai-token-report`（**与 `dshHome` 无关**）—— 见 `core/src/home.ts`。
+   */
+  dataDir?: string
   /**
    * **上报库**（服务端）的 SQLite 文件路径。
    *
-   * 默认 `<dshHome>/token-report/portal.sqlite`。
+   * 默认 `<dataDir>/portal.sqlite`（即 `~/.ai-token-report/portal.sqlite`）。
    * ⚠️ 与本地库 `usage.sqlite` 是两个不同的文件 —— 混用会让全员数据与本机数据
    * 相互污染且无法事后拆开（见 `core/db` 的 `portalDbFileName()`）。
    *
@@ -192,11 +206,15 @@ export async function createHandlerFor(options: ServerOptions = {}): Promise<Han
     maxRequests: options.ingestQueue?.maxRequests ?? envQueueInteger('ATR_INGEST_MAX_REQUESTS'),
     maxWaitMs: options.ingestQueue?.maxWaitMs ?? envQueueInteger('ATR_INGEST_MAX_WAIT_MS'),
   })
-  const paths = resolvePaths(options.dshHome)
+  const paths = resolvePaths({
+    ...(options.dshHome ? { dshHome: options.dshHome } : {}),
+    ...(options.dshHomes ? { dshHomes: options.dshHomes } : {}),
+    ...(options.dataDir ? { dataDir: options.dataDir } : {}),
+  })
   const localOnly = options.enableLocalApi === true && !options.dbPath && !options.mysqlUrl && !options.adminToken && !options.adminUsername && !options.adminPassword
   if (!localOnly && options.credentialsPath) throw new Error('credentialsPath 已不再是运行时身份源，请先通过显式数据库迁移导入旧凭证文件')
   // 身份、会话、上报和统计共享唯一数据库目标；连接失败不能回落文件或其他库。
-  const dbPath = options.dbPath ?? defaultPortalDbPath(paths.dshHome)
+  const dbPath = options.dbPath ?? defaultPortalDbPath(paths.dshHome, paths.dataDir)
   const mysqlUrl = localOnly ? undefined : options.mysqlUrl ?? process.env.ATR_MYSQL_URL
   const target = resolvePortalTarget({ sqlitePath: dbPath, mysqlUrl })
   const identityStore = localOnly ? undefined : new IdentityRepository(target)
@@ -214,6 +232,7 @@ export async function createHandlerFor(options: ServerOptions = {}): Promise<Han
 
   const identityRoute = new IdentityRoute({
     dshHome: paths.dshHome,
+    dataDir: paths.dataDir,
     ...(options.portalUrl ? { portalUrl: options.portalUrl } : {}),
     ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
   })
@@ -240,7 +259,11 @@ export async function createHandlerFor(options: ServerOptions = {}): Promise<Han
   // 白白持有一条指向本机日志/本地库的通路。
   // 数据源是本地 SQLite 增量库（`core/db`），库不可用时自动降级直扫日志。
   const localStats = options.enableLocalApi
-    ? new LocalStatsRouter(new CoreStatsProvider(paths.sessionsRoot, paths.dbPath))
+    ? new LocalStatsRouter(
+        new CoreStatsProvider(paths.sessionsRoots, paths.dbPath),
+        // ★ 只为了让页面能显示「数据目录在哪」（来源可见性），不参与取数
+        { dataDir: paths.dataDir },
+      )
     : null
 
   const app = createApp({
@@ -310,11 +333,15 @@ function envQueueInteger(name: string): number | undefined {
 }
 
 /**
- * 上报库的默认路径。
+ * 上报库的默认路径：`<dataDir>/portal.sqlite`（`dataDir` 缺省 `~/.ai-token-report`）。
  *
  * ⚠️ 与本地库 `usage.sqlite` **同目录但不同文件**：混用会让全员数据与本机数据
  * 相互污染，且事后无法拆开（库里没有「数据来源」列）。
  */
-export function defaultPortalDbPath(dshHome: string): string {
-  return join(dshHome, 'token-report', portalDbFileName())
+export function defaultPortalDbPath(dshHome: string, dataDir?: string): string {
+  const paths = resolvePaths({
+    ...(dshHome ? { dshHome } : {}),
+    ...(dataDir ? { dataDir } : {}),
+  })
+  return join(paths.dataDir, portalDbFileName())
 }

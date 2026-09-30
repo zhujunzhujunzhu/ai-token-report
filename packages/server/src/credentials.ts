@@ -37,7 +37,8 @@
  * ```
  *
  * 路径由调用方决定（`ServerOptions.credentialsPath` / `--credentials` 旗标），
- * 默认 `<dshHome>/token-report/credentials.json`。
+ * 旧版本按 `<dshHome>/token-report/credentials.json` 推导；**生产启动已拒绝该旗标**，
+ * 现在这个文件只是显式离线导入源（见 `scripts/import-credentials.ts`）。
  *
  * ⚠️ **这里没有 `ATR_CREDENTIALS` 环境变量**（旧注释提过它，但代码从未读取）：
  *   本模块只负责「把一段 JSON 解析成凭证表」，路径与来源都不归它管。

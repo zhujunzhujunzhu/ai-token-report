@@ -42,6 +42,7 @@ import {
   derive,
   resolveRange,
   type GroupDimension,
+  type SessionsRootInput,
 } from '@ai-token-report/core'
 import { openStats, type StatsSession } from '@ai-token-report/core/db'
 import { cacheHitRate, cacheLeverage } from '@ai-token-report/shared'
@@ -52,6 +53,7 @@ import type {
   LocalOverviewResponse,
   LocalRefreshResponse,
   LocalSeriesResponse,
+  LocalStatsSources,
 } from '@ai-token-report/shared'
 
 /** 本地页可用的分组维度。`user` 不在其中 —— 本机数据只有我一个人。 */
@@ -102,10 +104,16 @@ export interface StatsProvider {
  * 默认提供者：走 `core/db` 的 `openStats()`（SQL 优先，失败降级直扫）。
  */
 export class CoreStatsProvider implements StatsProvider {
-  readonly #sessionsRoot: string
+  /**
+   * ★ **一组**会话日志根（同一台机器上并存多套 DSH）。
+   *
+   * 与 CLI 的 `--dsh-home`（可重复）走的是**同一个** `openStats()`，
+   * 所以页面的数、命令行的数、`--no-db` 直扫的数三者必然一致。
+   */
+  readonly #sessionsRoot: SessionsRootInput
   readonly #dbPath: string
 
-  constructor(sessionsRoot: string, dbPath: string) {
+  constructor(sessionsRoot: SessionsRootInput, dbPath: string) {
     this.#sessionsRoot = sessionsRoot
     this.#dbPath = dbPath
   }
@@ -138,11 +146,35 @@ export class CoreStatsProvider implements StatsProvider {
  */
 export class LocalStatsRouter {
   readonly #provider: StatsProvider
+  /**
+   * token-report 自己的**数据目录**（身份 / 本地库 / outbox / 补报水位）。
+   *
+   * 只用于**展示来源**（页面上的「数据目录」那一行），不参与任何取数路径 ——
+   * 取数只认 provider 手里的会话日志根与本地库路径。`null` = 调用方没给（测试注入常见）。
+   */
+  readonly #dataDir: string | null
   /** 上次强制失效的时刻（`refresh` 用；现在只是给页面一个回执）。 */
   #lastInvalidatedAt: number | null = null
 
-  constructor(provider: StatsProvider) {
+  constructor(provider: StatsProvider, options: { dataDir?: string | null } = {}) {
     this.#provider = provider
+    this.#dataDir = options.dataDir ?? null
+  }
+
+  /**
+   * ★ 组装「数据来源」。
+   *
+   * 两组根都来自 `StatsSession`（`core/db/stats.ts`）—— 它同时拿着**存在的**
+   * 与**缺失的**两组，所以这里不做任何判断，只搬运。
+   * 注入式 `StatsProvider`（测试）可能不提供这两个字段，缺省成空数组而不是崩。
+   */
+  #sources(session: StatsSession): LocalStatsSources {
+    return {
+      // readonly → 可变数组：跨进程契约里必须是普通数组（两侧都能改，不共享引用）
+      sessionsRoots: [...(session.sessionsRoots ?? [])],
+      missingRoots: [...(session.missingRoots ?? [])],
+      dataDir: this.#dataDir,
+    }
   }
 
   /** `GET /api/local/stats/overview` */
@@ -160,6 +192,9 @@ export class LocalStatsRouter {
 
       const body: LocalOverviewResponse = {
         range: { from: parsed.sinceMs ?? null, to: parsed.untilMs ?? null, label: parsed.label },
+        // ★ 「这个数是从哪几处日志算出来的」—— 多套 DSH 并存时是并集，不给出处就分不清
+        //   「镜像去重」与「那个根根本没读到」
+        sources: this.#sources(session),
         totalTokens: total.total,
         inputTokens: total.input,
         outputTokens: total.output,
@@ -303,6 +338,8 @@ export class LocalStatsRouter {
             ? Object.fromEntries([...d.eventTypes].sort((a, b) => b[1] - a[1]))
             : {},
         providersSeen: persisted?.providersSeen ?? (d ? [...d.providersSeen].sort() : []),
+        // 与 overview 同一组根：诊断页对照「数字来自哪几处」时不必再去别处找
+        sources: this.#sources(session),
         scannedAt: session.scannedAt,
         cached: false,
       }

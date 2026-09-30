@@ -138,6 +138,17 @@ function scanRouter(): LocalStatsRouter {
   return new LocalStatsRouter(provider)
 }
 
+/**
+ * 带来源字段的响应体。
+ *
+ * 用局部结构类型而不是 import 共享类型：这里要断言的是**线上字段确实存在**，
+ * 而不是「类型系统认为它存在」—— 服务端漏填时它会是 `undefined`，两者必须能区分开。
+ */
+type SourcedBody = {
+  sources: { sessionsRoots: string[]; missingRoots: string[]; dataDir: string | null }
+  [key: string]: unknown
+}
+
 function params(init: Record<string, string> = {}): URLSearchParams {
   return new URLSearchParams(init)
 }
@@ -380,6 +391,41 @@ describe('本地统计数据新鲜度与并发', () => {
     expect(overview['totalTokens']).toBe(1010)
     expect((results[1]!.body as { points: unknown[] }).points.length).toBeGreaterThan(0)
     expect((results[2]!.body as { rows: unknown[] }).rows.length).toBe(1)
+  })
+
+  test('★ 来源可见性：overview 报出读了哪几个会话日志根与数据目录', async () => {
+    writeSession('proj-a', 'sess-1', [
+      { seq: 1, ts: todayAt(10), provider: 'dashscope', model: 'm-1', input: 100, output: 20, cacheRead: 900 },
+    ])
+
+    const r = new LocalStatsRouter(new CoreStatsProvider(sessionsRoot, dbPath), {
+      dataDir: '/tmp/atr-data-dir',
+    })
+    const overview = (await r.overview(params({ period: 'today' }))).body as SourcedBody
+    expect(overview.sources.sessionsRoots).toEqual([sessionsRoot])
+    expect(overview.sources.missingRoots).toEqual([])
+    expect(overview.sources.dataDir).toBe('/tmp/atr-data-dir')
+
+    // 诊断页给出**同一组**根：两处不一致的话页面会自相矛盾
+    const diagnostics = (await r.diagnostics(params({ period: 'today' }))).body as SourcedBody
+    expect(diagnostics.sources).toEqual(overview.sources)
+  })
+
+  test('★ 多根：全部根都报出，缺失的根逐项报出（绝不静默），未给 dataDir 时是 null', async () => {
+    writeSession('proj-a', 'sess-1', [
+      { seq: 1, ts: todayAt(10), provider: 'dashscope', model: 'm-1', input: 100, output: 20, cacheRead: 900 },
+    ])
+    const missing = join(home, 'no-such-home', 'sessions')
+
+    const r = new LocalStatsRouter(new CoreStatsProvider([sessionsRoot, missing], dbPath))
+    const body = (await r.overview(params({ period: 'today' }))).body as SourcedBody
+
+    // 存在的根照常统计（缺失的那个被跳过，但**必须报出来**）
+    expect(body.sources.sessionsRoots).toEqual([sessionsRoot])
+    expect(body.sources.missingRoots).toEqual([missing])
+    expect(body.sources.dataDir).toBeNull()
+    // 单根 + 一帧 100+20+900 = 1020：跳过缺失根不影响结果
+    expect(body['totalTokens']).toBe(1020)
   })
 
   test('SQL 路径与直扫路径返回相同的数字（接口级口径一致）', async () => {

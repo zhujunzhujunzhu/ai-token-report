@@ -20,16 +20,20 @@ import { PORTAL_SCHEMA_VERSION } from '@ai-token-report/core/db'
 import { seedDatabaseIdentity } from './database-fixture.js'
 
 const home = mkdtempSync(join(tmpdir(), 'atr-e2e-'))
+// ★ 数据目录**不跟随 DSH_HOME**：缺省在家目录下（~/.ai-token-report）。
+//   本脚本断言服务端把署名写进 fixture，所以必须显式指到 fixture ——
+//   否则它会去改写使用者真实的 identity.json。
+const DATA_DIR = join(home, 'token-report')
 
 // ── 准备凭证 ────────────────────────────────────────────────
 mkdirSync(join(home, 'token-report'), { recursive: true })
-const credPath = join(home, 'token-report', 'credentials.json')
+const credPath = join(DATA_DIR, 'credentials.json')
 writeFileSync(
   credPath,
   JSON.stringify([{ token: 'atr-zhangsan-9f3c', name: '张三', group: '研发一部' }]),
   'utf8',
 )
-await seedDatabaseIdentity({ sqlitePath: join(home, 'token-report', 'portal.sqlite') }, [
+await seedDatabaseIdentity({ sqlitePath: join(DATA_DIR, 'portal.sqlite') }, [
   { token: 'atr-zhangsan-9f3c', name: '张三', group: '研发一部' },
 ])
 
@@ -52,6 +56,7 @@ const portal = await createServer({
   port: 18787,
   host: '127.0.0.1',
   dshHome: home,
+  dataDir: DATA_DIR,
   mysqlUrl: '',
   enableLocalApi: false,
 })
@@ -95,6 +100,7 @@ const local = await createServer({
   port: 18788,
   host: '127.0.0.1',
   dshHome: home,
+  dataDir: DATA_DIR,
   portalUrl: portal.url,
   enableLocalApi: true,
 })
@@ -121,7 +127,7 @@ check('给出可展示的原因', typeof wrongSubmit.reason === 'string')
 // 4.2 关键：此时不应落盘
 let identityFileExists = true
 try {
-  readFileSync(join(home, 'token-report', 'identity.json'), 'utf8')
+  readFileSync(join(DATA_DIR, 'identity.json'), 'utf8')
 } catch {
   identityFileExists = false
 }
@@ -140,7 +146,7 @@ check('★ 姓名以服务端认定为准，而非用户输入', goodSubmit.name
 check('分组来自凭证表', goodSubmit.group === '研发一部')
 
 // 4.4 落盘内容验证
-const stored = JSON.parse(readFileSync(join(home, 'token-report', 'identity.json'), 'utf8'))
+const stored = JSON.parse(readFileSync(join(DATA_DIR, 'identity.json'), 'utf8'))
 check('落盘姓名 = 张三', stored.name === '张三')
 check('落盘分组 = 研发一部（只写新字段 group）', stored.group === '研发一部' && !('dept' in stored))
 check('落盘 token', stored.token === 'atr-zhangsan-9f3c')
@@ -158,6 +164,7 @@ const second = await createServer({
   port: 18788, // 已被 local 占用
   host: '127.0.0.1',
   dshHome: home,
+  dataDir: DATA_DIR,
   enableLocalApi: true,
 })
 check('端口被占用时自动换端口', second.port === 18789, `实际 ${second.port}`)
@@ -170,6 +177,7 @@ const staticProbe = await createServer({
   port: 0,
   host: '127.0.0.1',
   dshHome: home,
+  dataDir: DATA_DIR,
   enableLocalApi: true,
   staticDir: 'packages/web-local/dist',
 })

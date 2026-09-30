@@ -28,11 +28,14 @@ import { createServer } from '../src/index.js'
 import { seedDatabaseIdentity } from './database-fixture.js'
 
 const home = mkdtempSync(join(tmpdir(), 'atr-e2e-ingest-'))
+// ★ 数据目录**不跟随 DSH_HOME**：缺省在家目录下（~/.ai-token-report）。
+//   不显式指定的话，服务端会去开使用者真实的上报库 / 身份文件（还会把署名写进去）。
+const DATA_DIR = join(home, 'token-report')
 const PORT = 18801
 
-mkdirSync(join(home, 'token-report'), { recursive: true })
-const credPath = join(home, 'token-report', 'credentials.json')
-const dbPath = join(home, 'token-report', 'portal.sqlite')
+mkdirSync(DATA_DIR, { recursive: true })
+const credPath = join(DATA_DIR, 'credentials.json')
+const dbPath = join(DATA_DIR, 'portal.sqlite')
 writeFileSync(
   credPath,
   JSON.stringify([
@@ -160,6 +163,7 @@ const portal = await createServer({
   port: PORT,
   host: '127.0.0.1',
   dshHome: home,
+  dataDir: DATA_DIR,
   dbPath,
   mysqlUrl: '',
   enableLocalApi: false,
@@ -293,14 +297,15 @@ check('两条通路各自入库（张三 3 条 + 李四 1 条）', countByUser('
 
 // ── 8. 本地形态同样收上报 ───────────────────────────────────────────────────
 console.log('\n【8】单机形态（enableLocalApi）也注册上报接口')
-await seedDatabaseIdentity({ sqlitePath: join(home, 'token-report', 'portal-local.sqlite') }, [
+await seedDatabaseIdentity({ sqlitePath: join(DATA_DIR, 'portal-local.sqlite') }, [
   { token: 'atr-zhangsan-9f3c', name: '张三', group: '研发一部' },
 ])
 const local = await createServer({
   port: PORT + 1,
   host: '127.0.0.1',
   dshHome: home,
-  dbPath: join(home, 'token-report', 'portal-local.sqlite'),
+  dataDir: DATA_DIR,
+  dbPath: join(DATA_DIR, 'portal-local.sqlite'),
   mysqlUrl: '',
   enableLocalApi: true,
 })

@@ -65,7 +65,8 @@ function fixture() {
     credentials: store,
     portalAuth: auth,
     adminRoute: new AdminRoute({ store, admin }),
-    identityRoute: new IdentityRoute({ dshHome: dir }),
+    // 数据目录不跟随 dshHome：显式指到夹具目录，路径解析与夹具断言保持一致。
+    identityRoute: new IdentityRoute({ dshHome: dir, dataDir: join(dir, 'token-report') }),
     ingestRoute: new IngestRoute({
       credentials: store,
       dbPath: join(dir, 'portal.sqlite'),
@@ -413,6 +414,7 @@ describe('登录账号持久化与迁移', () => {
     const dbPath = join(f.dir, 'modern-portal.sqlite')
     const bundle = await createHandlerFor({
       dshHome: f.dir,
+      dataDir: join(f.dir, 'token-report'),
       dbPath,
       mysqlUrl: '',
       adminToken: 'env-token',
@@ -425,10 +427,10 @@ describe('登录账号持久化与迁移', () => {
     expect(identity?.roleCodes).toContain('admin')
     expect((await bundle.identityStore!.getViewer(identity!)).username).toBe('bootstrap')
     expect(bundle.credentials.size).toBe(0)
-    const restarted = await createHandlerFor({ dshHome: f.dir, dbPath, mysqlUrl: '', adminToken: 'changed-env-token', adminName: '被忽略', adminUsername: 'changed', adminPassword: password, requestLog: false })
+    const restarted = await createHandlerFor({ dshHome: f.dir, dataDir: join(f.dir, 'token-report'), dbPath, mysqlUrl: '', adminToken: 'changed-env-token', adminName: '被忽略', adminUsername: 'changed', adminPassword: password, requestLog: false })
     expect((await restarted.identityStore!.resolveBearer('env-token'))?.memberId).toBe(identity!.memberId)
     expect(await restarted.identityStore!.resolveBearer('changed-env-token')).toBeNull()
     expect(readFileSync(f.path, 'utf8')).toBe(original)
-    await expect(createHandlerFor({ dshHome: f.dir, dbPath, mysqlUrl: '', credentialsPath: f.path, requestLog: false })).rejects.toThrow('显式数据库迁移')
+    await expect(createHandlerFor({ dshHome: f.dir, dataDir: join(f.dir, 'token-report'), dbPath, mysqlUrl: '', credentialsPath: f.path, requestLog: false })).rejects.toThrow('显式数据库迁移')
   })
 })

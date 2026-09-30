@@ -34,8 +34,14 @@ import type {
 } from '@ai-token-report/shared'
 
 export interface IdentityRouteOptions {
-  /** DSH home，用于定位身份文件。 */
+  /** DSH home（会话日志根）。身份文件**不**在这里，见 `dataDir`。 */
   dshHome: string
+  /**
+   * token-report 数据目录。缺省 `~/.ai-token-report`（与 `dshHome` 无关）。
+   *
+   * 身份文件是 `dataDir/identity.json` —— 与 CLI、DSH 插件共用同一份。
+   */
+  dataDir?: string
   /**
    * 部门服务端地址。用于校验 token。
    *
@@ -56,19 +62,21 @@ const UNSIGNED_HINT =
 
 export class IdentityRoute {
   readonly #dshHome: string
+  readonly #dataDir: string | undefined
   readonly #portalUrl: string | undefined
   readonly #timeoutMs: number
   readonly #fetch: typeof fetch
 
   constructor(options: IdentityRouteOptions) {
     this.#dshHome = options.dshHome
+    this.#dataDir = options.dataDir
     this.#portalUrl = options.portalUrl
     this.#timeoutMs = options.verifyTimeoutMs ?? 8_000
     this.#fetch = options.fetchImpl ?? fetch
   }
 
   get #path(): string {
-    return identityPath(this.#dshHome)
+    return identityPath(this.#dshHome, this.#dataDir)
   }
 
   /** `GET /api/local/identity` —— 注意返回值里没有 token。 */

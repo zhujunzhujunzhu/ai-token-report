@@ -13,7 +13,7 @@
  * 否则任何人都能读全员数据。
  */
 
-import { resolvePaths } from '@ai-token-report/core'
+import { resolvePaths, splitHomeList } from '@ai-token-report/core'
 import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -24,6 +24,9 @@ interface Args {
   port: number
   host: string
   dshHome?: string
+  /** ★ 多个 DSH home（同一台机器上并存多套 DSH）。非空时覆盖 `dshHome`。 */
+  dshHomes?: string[]
+  dataDir?: string
   dbPath?: string
   /** 上报库改用 MySQL 的连接串（也可用环境变量 `ATR_MYSQL_URL`）。 */
   mysqlUrl?: string
@@ -57,8 +60,21 @@ function parseArgs(argv: string[]): Args | null {
         args.host = take(i, a)
         i++
         break
-      case '--dsh-home':
-        args.dshHome = take(i, a)
+      case '--dsh-home': {
+        // 可重复：多套 DSH 并存时逐个累加
+        args.dshHomes = [...(args.dshHomes ?? []), take(i, a)]
+        i++
+        break
+      }
+      case '--dsh-homes': {
+        const parts = splitHomeList(take(i, a))
+        if (parts.length === 0) throw new Error('--dsh-homes 没有给出任何有效路径')
+        args.dshHomes = [...(args.dshHomes ?? []), ...parts]
+        i++
+        break
+      }
+      case '--data-dir':
+        args.dataDir = take(i, a)
         i++
         break
       case '--db':
@@ -97,8 +113,10 @@ ai-token-report 部门服务端
 选项:
   --port <n>          监听端口 (默认 ${DEFAULT_PORT}，被占用自动 +1)
   --host <addr>       监听地址 (默认 127.0.0.1，对全组开放用 0.0.0.0)
-  --dsh-home <p>      DSH home (默认 $DSH_HOME 或 ~/.dsh)
-  --db <p>            上报库路径 (默认 <dsh-home>/token-report/portal.sqlite)
+  --dsh-home <p>      DSH home，只决定会话日志从哪读;**可重复**以支持多套 DSH
+  --dsh-homes <p>     一次给多个 home，用系统路径分隔符分隔 (Windows ';' / POSIX ':')
+  --data-dir <p>      数据目录：身份、上报库默认都在这里 (默认 ~/.ai-token-report)
+  --db <p>            上报库路径 (默认 <data-dir>/portal.sqlite)
   --mysql <url>       上报库改用 MySQL，如 mysql://user:pass@host:3306/ai_token_report
                       (也可用环境变量 ATR_MYSQL_URL；Bun 与 Node 均支持。
                        本机库 usage.sqlite 不受影响，永远是 SQLite)
@@ -139,7 +157,11 @@ async function main(): Promise<number> {
     return 0
   }
 
-  const paths = resolvePaths(args.dshHome)
+  const paths = resolvePaths({
+    ...(args.dshHome ? { dshHome: args.dshHome } : {}),
+    ...(args.dshHomes ? { dshHomes: args.dshHomes } : {}),
+    ...(args.dataDir ? { dataDir: args.dataDir } : {}),
+  })
 
   // 看板前端产物：显式 --static 优先，否则按仓库布局探测。
   // ⚠️ 探测不到时**不把不存在的目录传给服务**（否则每个页面请求都会去读一个
@@ -151,6 +173,8 @@ async function main(): Promise<number> {
     port: args.port,
     host: args.host,
     ...(args.dshHome ? { dshHome: args.dshHome } : {}),
+    ...(args.dshHomes ? { dshHomes: args.dshHomes } : {}),
+    ...(args.dataDir ? { dataDir: args.dataDir } : {}),
     ...(args.dbPath ? { dbPath: args.dbPath } : {}),
     ...(args.mysqlUrl ? { mysqlUrl: args.mysqlUrl } : {}),
     ...(args.credentialsPath ? { credentialsPath: args.credentialsPath } : {}),
@@ -164,7 +188,12 @@ async function main(): Promise<number> {
   if (handle.portShifted) {
     out.push(`  ⚠ 端口 ${args.port} 被占用，已改用 ${handle.port}`)
   }
-  out.push(`  DSH home  ${paths.dshHome}`)
+  out.push(
+    paths.dshHomes.length > 1
+      ? `  会话日志  ${paths.dshHomes.length} 个 DSH home: ${paths.dshHomes.join(' + ')}`
+      : `  DSH home  ${paths.dshHome}`,
+  )
+  out.push(`  数据目录  ${paths.dataDir}`)
   out.push(`  身份存储  数据库 v${handle.schemaVersion}（${handle.initialized ? '已初始化' : '待初始化'}）`)
   out.push(`  有效凭证  ${handle.credentialCount} 枚，可用管理员 ${handle.adminCount} 人`)
   // 上报库必须打印出来：它是全员数据的唯一副本，出问题时管理员要知道去备份哪个库。
@@ -184,7 +213,7 @@ async function main(): Promise<number> {
     out.push('')
     out.push('  ⚠ 数据库尚未建立可用管理入口。全新部署请配置 ATR_ADMIN_USERNAME / ATR_ADMIN_PASSWORD 后启动。')
   }
-  if (!args.dbPath && !args.dshHome && !args.mysqlUrl && !process.env.ATR_MYSQL_URL) {
+  if (!args.dbPath && !args.dshHome && !args.dshHomes?.length && !args.mysqlUrl && !process.env.ATR_MYSQL_URL) {
     out.push(`  ⚠ 上报库默认落在 DSH home 下；生产部署建议用 --db 指到独立数据盘，或用 --mysql。`)
   }
   if (args.host !== '127.0.0.1') {
