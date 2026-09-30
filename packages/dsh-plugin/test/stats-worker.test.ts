@@ -15,7 +15,9 @@ test('会话根目录是联接时，监听真实目录但增量路径保持调�
   const sessionsRoot = join(root, 'alias-sessions')
   mkdirSync(target)
   symlinkSync(target, sessionsRoot, process.platform === 'win32' ? 'junction' : 'dir')
-  const ctx: StatsContext = { config: { localDb: true }, sessionsRoots: [sessionsRoot], dbPath: join(root, 'usage.sqlite'), backgroundQueries: true }
+  // `dataDir` 是金额的取价来源（`pricing.json`）：钉在临时目录里，
+  // 免得读到开发者本机真实的单价快照，让断言随机器漂移。
+  const ctx: StatsContext = { config: { localDb: true }, sessionsRoots: [sessionsRoot], dbPath: join(root, 'usage.sqlite'), dataDir: join(root, 'data'), backgroundQueries: true }
   try {
     expect((await queryUsage(ctx, { summaryOnly: true })).totals.calls).toBe(0)
     const dir = join(target, 'project/session')
@@ -40,7 +42,7 @@ test('会话根目录是联接时，监听真实目录但增量路径保持调�
 test('Worker 超时拒绝排队请求，下一次查询可以重建线程', async () => {
   const root = mkdtempSync(join(tmpdir(), 'atr-worker-timeout-'))
   const ctx: StatsContext = { config: { localDb: true }, sessionsRoots: [join(root, 'sessions')],
-    dbPath: join(root, 'usage.sqlite'), backgroundQueries: true, queryTimeoutMs: 1 }
+    dbPath: join(root, 'usage.sqlite'), dataDir: join(root, 'data'), backgroundQueries: true, queryTimeoutMs: 1 }
   try {
     const pending = await Promise.allSettled([
       queryUsage(ctx, { summaryOnly: true }),
@@ -63,7 +65,20 @@ test('真实 Worker 支持摘要、精确分页、手动追加刷新及外部写
   const root = mkdtempSync(join(tmpdir(), 'atr-worker-test-'))
   const sessionsRoot = join(root, 'sessions')
   const dbPath = join(root, 'usage.sqlite')
-  const ctx: StatsContext = { config: { localDb: true }, sessionsRoots: [sessionsRoot], dbPath, backgroundQueries: true }
+  const ctx: StatsContext = { config: { localDb: true }, sessionsRoots: [sessionsRoot], dbPath, dataDir: join(root, 'data'), backgroundQueries: true }
+  /**
+   * ★ 单价快照放进 `dataDir`，用来证明 **Worker 通道真的把 `dataDir` 传进去了**。
+   *
+   * 漏传的后果是「金额照常有数」—— 它会安静地退回内置种子价并把原因写进 note，
+   * 于是使用者拿着与看板不一致的金额去对账，而没有任何地方报错。
+   * 所以这里断言 `pricingSource === 'snapshot'`（读到的是**这一份**快照），
+   * 以及金额确实按四类分价算出来了。
+   */
+  mkdirSync(ctx.dataDir, { recursive: true })
+  writeFileSync(join(ctx.dataDir, 'pricing.json'), JSON.stringify({ syncedAtMs: 0, prices: [
+    { provider: 'p', model: 'm', currency: 'CNY', inputMicroPerKtok: 1000, outputMicroPerKtok: 2000,
+      cacheReadMicroPerKtok: 500, cacheWriteMicroPerKtok: 4000, effectiveFromMs: 0, effectiveToMs: null },
+  ] }))
   const time = new Date(2026, 8, 25, 12).getTime()
   const frame = (seq: number) => zstdCompressSync(Buffer.from(JSON.stringify({ type: 'assistant/message', seq, time,
     data: { usage: { inputTokens: 10, outputTokens: 2, cacheReadTokens: 90, cacheWriteTokens: 3 },
@@ -84,6 +99,12 @@ test('真实 Worker 支持摘要、精确分页、手动追加刷新及外部写
     expect(summary.totals.calls).toBe(3)
     expect(summary.sessions).toBe(3)
     expect(summary.groups).toEqual([])
+    // ★ 金额也必须在 Worker 里算出来，且用的是 dataDir 里那一份快照：
+    //   3 条事件各 input 10 / output 2 / cacheRead 90 / cacheWrite 3 →
+    //   30×1000/1000 + 6×2000/1000 + 270×500/1000 + 9×4000/1000 = 213 微元。
+    expect(summary.cost.pricing.pricingSource).toBe('snapshot')
+    expect(summary.cost.costs).toEqual([{ currency: 'CNY', amountMicro: 213, tokens: 315 }])
+    expect(summary.cost.unpricedTokens).toBe(0)
     expect(ticks).toBeGreaterThan(0)
     const detail = await queryUsage(ctx, { by: ['session'], top: 2, offset: 2, series: 'hour' })
     expect(detail.groups[0]?.rowCount).toBe(3)

@@ -6,13 +6,25 @@ import type { UiPayload } from '../src/client/protocol.js'
 
 function result(query: UsageQuery = {}): UsageResult {
   const allRows = Array.from({ length: 103 }, (_, i) => ({ key: `session-${i}`, total: 103 - i,
-    input: 0, output: 0, cacheRead: 103 - i, cacheWrite: 0, calls: 1, sessions: 1, cacheHitRate: 1 }))
+    input: 0, output: 0, cacheRead: 103 - i, cacheWrite: 0, calls: 1, sessions: 1, cacheHitRate: 1,
+    // 真宿主的行上一定带金额（键命中不了才不带），所以用例也如实带上。
+    cost: { costs: [], pricedTokens: 0, unpricedTokens: 103 - i, totalTokens: 103 - i,
+      pricedRate: 0, unpricedRate: 1 } }))
   const dims: NonNullable<UsageQuery['by']> = query.by ?? ['provider-model']
   return {
     source: 'local-db', range: { since: 1, until: 2 }, rangeLabel: '今天',
     totals: { input: 0, output: 0, cacheRead: 10_000_000_000, cacheWrite: 0,
       reasoning: 0, calls: 103, total: 10_000_000_000 },
     metrics: { total: 10_000_000_000, cacheHitRate: 1, cacheLeverage: 0, avgTokensPerCall: 0 },
+    // 金额：这一份是「一条价都没配上」的那一态（`costs: []`，不是 ¥0.00）。
+    // 本用例只关心取数与分页，但金额字段必须是**真实的形状**：
+    // 少一个字段就会让 `toUiPayload` 的格式化在真机上才炸。
+    cost: {
+      costs: [], pricedTokens: 0, unpricedTokens: 10_000_000_000, totalTokens: 10_000_000_000,
+      pricedRate: 0, unpricedRate: 1,
+      pricing: { pricingSource: 'builtin', pricingSyncedAt: null },
+      unpricedTargets: ['p/m'], note: null,
+    },
     groups: query.summaryOnly ? [] : dims.map(by => ({ by, rowCount: allRows.length,
       rows: allRows.slice(query.offset ?? 0, (query.offset ?? 0) + (query.top ?? allRows.length)) })),
     ...(query.series ? { series: [{ bucket: '2026-09-26', total: 10_000_000_000, input: 0,

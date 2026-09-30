@@ -30,7 +30,9 @@ test('SQL 自定义范围包含首日零点与末日末刻，排除两侧事件'
         usage: { inputTokens: 10, outputTokens: 2, cacheReadTokens: 30, cacheWriteTokens: 4, totalTokens: 46 } },
     }))
     writeFileSync(join(dir, 'session.v3.jsonl.zstd'), zstdCompressSync(Buffer.from(records.map((r) => JSON.stringify(r)).join('\n') + '\n')))
-    const ctx = { config: resolveConfig({}), sessionsRoots: [sessionsRoot], dbPath: join(home, 'usage.sqlite') }
+    // `dataDir` 也必须钉在临时目录：金额的单价快照从那里读，
+    // 跟着默认值走会读到**开发者本机真实的** pricing.json，断言随机器漂移。
+    const ctx = { config: resolveConfig({}), sessionsRoots: [sessionsRoot], dbPath: join(home, 'usage.sqlite'), dataDir: home }
     const queries: UsageQuery[] = []
     const provider = createUiStatsProvider({ run: async (query) => { queries.push(query); return queryUsage(ctx, query) } })
     const route = makeStatsFetch(provider)

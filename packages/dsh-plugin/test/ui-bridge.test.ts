@@ -27,6 +27,27 @@ import {
 } from '../src/index.js'
 import type { UsageResult } from '../src/stats.js'
 
+/**
+ * 造一份金额（估算）。
+ *
+ * ★ 默认是**一条价都没配上**的那一态：`costs: []` 而不是 `¥0.00` ——
+ *   这是本功能最容易写错、也最危险的一态（未计价看起来像省了钱）。
+ */
+function sampleCost(overrides: Partial<UsageResult['cost']> = {}): UsageResult['cost'] {
+  return {
+    costs: [],
+    pricedTokens: 0,
+    unpricedTokens: 0,
+    totalTokens: 0,
+    pricedRate: 0,
+    unpricedRate: 0,
+    pricing: { pricingSource: 'builtin', pricingSyncedAt: null },
+    unpricedTargets: [],
+    note: null,
+    ...overrides,
+  }
+}
+
 /** 造一份最小可用的 `UsageResult`（字段值与 stats.ts 的产出一致）。 */
 function sampleResult(overrides: Partial<UsageResult> = {}): UsageResult {
   return {
@@ -43,6 +64,7 @@ function sampleResult(overrides: Partial<UsageResult> = {}): UsageResult {
       calls: 16_437,
     },
     metrics: { total: 2_392_609_771, cacheHitRate: 0.9705, cacheLeverage: 32.85, avgTokensPerCall: 145_560 },
+    cost: sampleCost(),
     groups: [
       {
         by: 'provider-model',
@@ -125,6 +147,110 @@ describe('★ 载荷只裁剪不改写（口径的唯一真源仍在 shared）',
     expect(payload.series?.length).toBeGreaterThan(31)
     expect(payload.series?.[0]?.bucket).toBe(result.series?.[0]?.bucket)
     expect(payload.series?.[0]?.total).toBe(result.series?.[0]?.total)
+  })
+})
+
+/**
+ * ★ 金额三态。
+ *
+ * 这三个状态在页面上必须长得**不一样**，否则
+ * 「拿不到金额」「这段没配价」「真的花了 0 元」会被读成同一件事：
+ *
+ * | 情形 | 载荷 | 页面 |
+ * |---|---|---|
+ * | 老宿主（不认识金额协议） | 没有 `cost` 字段 | 整块/整列都不出现 |
+ * | 新宿主，一条价都没配上 | `cost.text === null` | 「未计价」 |
+ * | 有金额 | `cost.text` 是格式化的串 | `¥…` |
+ */
+describe('★ 金额：只下发宿主格式化好的串，且「未计价」绝不写成 ¥0.00', () => {
+  test('一条价都没配上：text 是 null，note 说清为什么（绝不是 ¥0.00）', () => {
+    const payload = toUiPayload(sampleResult({ cost: sampleCost({
+      unpricedTokens: 2_392_609_771, totalTokens: 2_392_609_771, unpricedRate: 1,
+      unpricedTargets: ['dashscope/内部网关模型'],
+    }) }), 'today')
+    expect(payload.cost?.text).toBeNull()
+    expect(payload.cost?.text).not.toBe('¥0.00')
+    expect(payload.cost?.note).toContain('未计价 100.0%')
+    expect(payload.cost?.note).toContain('还没配单价 dashscope/内部网关模型')
+    // 「估算 ≠ 财务账单」必须每次都出现：金额旁边没有这句话就会被当成账单数字
+    expect(payload.cost?.note).toContain('不等于财务账单')
+    // 分组行同样没有金额字段 → 页面显示「未计价」而不是 0
+    expect(payload.groups[0]?.rows[0]?.cost).toBeUndefined()
+  })
+
+  test('有金额：多币种用 + 连接，行上带已格式化的串', () => {
+    const payload = toUiPayload(sampleResult({
+      cost: sampleCost({
+        costs: [
+          { currency: 'CNY', amountMicro: 12_345_678, tokens: 1_000 },
+          { currency: 'USD', amountMicro: 500_000, tokens: 100 },
+        ],
+        pricedTokens: 1_100, unpricedTokens: 0, totalTokens: 1_100, pricedRate: 1, unpricedRate: 0,
+        pricing: { pricingSource: 'snapshot', pricingSyncedAt: 1_767_225_600_000 },
+      }),
+      groups: [{
+        by: 'provider-model',
+        rows: [{
+          key: 'dashscope/deepseek-v4.1-flash', total: 100, input: 10, output: 1, cacheRead: 89,
+          cacheWrite: 0, calls: 3, sessions: 1, cacheHitRate: 0.899,
+          cost: {
+            costs: [{ currency: 'CNY', amountMicro: 12_345_678, tokens: 100 }],
+            pricedTokens: 100, unpricedTokens: 0, totalTokens: 100, pricedRate: 1, unpricedRate: 0,
+          },
+        }],
+      }],
+    }), 'today')
+    // 多币种**各自累加、绝不换算**：串里是两个币种，不是一个换算后的数。
+    // 0.5 美元走 `formatCostMicro` 的「小于 1 保留 4 位」分支 → `$0.5000`。
+    expect(payload.cost?.text).toBe('¥12.35 + $0.5000')
+    expect(payload.cost?.note).toContain('本机单价快照')
+    expect(payload.groups[0]?.rows[0]?.cost).toBe('¥12.35')
+  })
+
+  test('部分未计价：行上的串带 *，note 说明 * 的含义', () => {
+    const payload = toUiPayload(sampleResult({
+      cost: sampleCost({
+        costs: [{ currency: 'CNY', amountMicro: 1_000_000, tokens: 50 }],
+        pricedTokens: 50, unpricedTokens: 50, totalTokens: 100, pricedRate: 0.5, unpricedRate: 0.5,
+        unpricedTargets: ['other/model-y'],
+      }),
+      groups: [{
+        by: 'provider-model',
+        rows: [{
+          key: 'dashscope/a', total: 100, input: 10, output: 1, cacheRead: 89, cacheWrite: 0,
+          calls: 1, sessions: 1, cacheHitRate: 0.899,
+          cost: {
+            costs: [{ currency: 'CNY', amountMicro: 1_000_000, tokens: 100 }],
+            pricedTokens: 100, unpricedTokens: 40, totalTokens: 140, pricedRate: 100 / 140, unpricedRate: 40 / 140,
+          },
+        }],
+      }],
+    }), 'today')
+    expect(payload.cost?.note).toContain('未计价 50.0%')
+    expect(payload.cost?.note).toContain('带 * 的金额只覆盖已计价的那部分')
+    expect(payload.groups[0]?.rows[0]?.cost).toBe('¥1.00*')
+  })
+
+  test('退回内置种子价时 note 明说「可能与看板不同」，并原样带上宿主的解释', () => {
+    const payload = toUiPayload(sampleResult({
+      cost: sampleCost({ note: '还没有同步过单价快照（/x/pricing.json）：按内置种子价估算' }),
+    }), 'today')
+    expect(payload.cost?.note).toContain('内置种子价')
+    expect(payload.cost?.note).toContain('可能与看板不同')
+    // ★ 宿主那句解释必须**原样**出现：它带着可执行的动作（去同步哪份快照），
+    //   自己另写一句「内置种子价」会把动作吃掉。
+    expect(payload.cost?.note).toContain('还没有同步过单价快照（/x/pricing.json）')
+  })
+
+  test('快照坏了这种「有动作」的原因也要一路带到面板上', () => {
+    const payload = toUiPayload(sampleResult({
+      cost: sampleCost({
+        pricing: { pricingSource: 'builtin', pricingSyncedAt: null },
+        note: '单价快照解析失败（…/pricing.json）：按内置种子价估算，请重新 pricing sync',
+      }),
+    }), 'today')
+    expect(payload.cost?.note).toContain('解析失败')
+    expect(payload.cost?.note).toContain('pricing sync')
   })
 })
 
@@ -416,7 +542,7 @@ describe('配置通道（位置只能这样到页面）', () => {
 })
 
 describe('★ 路由安装：拿不到 connection 必须安静跳过', () => {
-  const stats = { config: {} as never, sessionsRoots: ['/tmp/sessions'], dbPath: '/tmp/db.sqlite' }
+  const stats = { config: {} as never, sessionsRoots: ['/tmp/sessions'], dbPath: '/tmp/db.sqlite', dataDir: '/tmp/atr-data' }
 
   /** 会记录 `register` 调用的假 connection。 */
   function fakeConnection(registered: unknown[]): unknown {

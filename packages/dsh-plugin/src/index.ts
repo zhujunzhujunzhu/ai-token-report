@@ -489,6 +489,9 @@ function buildStatsContext(config: EffectiveConfig): StatsContext {
     // ★ 一组根（多套 DSH 并存）；与 CLI / 本地页吃的是同一个 `openStats`
     sessionsRoots: paths.sessionsRoots,
     dbPath: paths.dbPath,
+    // 单价快照（`pricing.json`）就在数据目录里：金额是**本机**的估算，
+    // 所以「按哪份价算的」这件事必须跟着数据目录一起传下去。
+    dataDir: paths.dataDir,
     backgroundQueries: true,
   }
 }

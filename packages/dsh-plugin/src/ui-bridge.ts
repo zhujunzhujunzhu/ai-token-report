@@ -33,9 +33,23 @@
  *    `packages/server` 的身份接口也是这个思路（见 `本仓工程约定.md` §6.4）。
  * 3. **不能拖垮 headless**：`connection` 只在 web profile 里有，
  *    拿不到就安静地不注册，绝不 `inject` 成硬依赖。
+ *
+ * ## 🚨 金额在这一层**格式化成字符串**，而不是把数字发给浏览器半
+ *
+ * 浏览器半一个 workspace 包都不 import（`shared/price.ts` 进不去那张
+ * 「DSH 预置模块」的白名单）。所以：
+ *
+ * - 载荷里的金额是**已格式化好的串**（`¥12.35 + $0.5000`），浏览器半只排版；
+ * - 「未计价」与「金额为 0」在载荷里就必须长得不一样 ——
+ *   分组行没有 `cost` 字段就是未计价，**绝不下发 `¥0.00` 顶替**；
+ * - 顶部 `cost` 整块**缺字段** = 老宿主（根本不知道有金额这回事），
+ *   面板据此决定整块不出现，而不是显示 0。
  */
 
-import { queryUsage, type StatsContext, type UsageQuery, type UsageResult } from './stats.js'
+import { fmtCompact } from '@ai-token-report/core'
+
+import { formatRowCost, queryUsage, type StatsContext, type UsageQuery, type UsageResult, type UsageCost } from './stats.js'
+import { formatCostSummary } from '@ai-token-report/shared'
 import {
   UI_CONFIG_PATH,
   UI_DEFAULT_POSITION,
@@ -84,23 +98,35 @@ export function seriesFor(period: UiPeriod): 'day' | 'hour' {
  *   - `metrics` 整块照搬（**绝不在这里重算缓存命中率**），
  *   - 明细透传查询已经选出的行，序列点只做 `slice`，不动里面的数。
  *
+ * ⚠️ 唯一的例外是**金额**：它在这里由整数微元变成**已格式化的字符串**
+ *   （`formatCostSummary` / `formatRowCost`）。这不是「改写口径」——
+ *   格式化仍然只发生在 `shared/price.ts`，只是必须在宿主侧做完，
+ *   因为浏览器半进不去 workspace 包（见文件头）。数字本身一个不改。
+ *
  * 旧客户端仍可拿完整明细；新客户端由 provider 附带分页元数据，不在这里再次截断。
  */
 export function toUiPayload(result: UsageResult, period: UiPeriod, gen = 0): UiPayload {
   const groups = result.groups.map((group) => ({
     by: group.by,
     rows: group.rows.map(
-      (row): UiGroupRow => ({
-        key: row.key,
-        total: row.total,
-        input: row.input,
-        output: row.output,
-        cacheRead: row.cacheRead,
-        cacheWrite: row.cacheWrite,
-        calls: row.calls,
-        sessions: row.sessions,
-        cacheHitRate: row.cacheHitRate,
-      }),
+      (row): UiGroupRow => {
+        // ★ 金额在这里就变成**字符串**（浏览器半不 import shared，也不做换算）。
+        //   `undefined` = 这一行一条价都没配上 → 面板显示「未计价」，
+        //   绝不会是 ¥0.00。
+        const cost = row.cost ? formatRowCost(row.cost) : null
+        return {
+          key: row.key,
+          total: row.total,
+          input: row.input,
+          output: row.output,
+          cacheRead: row.cacheRead,
+          cacheWrite: row.cacheWrite,
+          calls: row.calls,
+          sessions: row.sessions,
+          cacheHitRate: row.cacheHitRate,
+          ...(cost !== null ? { cost } : {}),
+        }
+      },
     ),
   }))
 
@@ -138,9 +164,49 @@ export function toUiPayload(result: UsageResult, period: UiPeriod, gen = 0): UiP
     sessions: result.sessions,
     elapsedMs: result.elapsedMs,
     scannedAt: result.scannedAt,
+    // ★ 金额整块带出去：`text` 可能为 `null`（一条价都没配上），
+    //   这时面板写「未计价」而不是 ¥0.00；`note` 说明按哪份单价算的、
+    //   覆盖了多少用量、以及「估算 ≠ 财务账单」。
+    cost: { text: formatCostSummary(result.cost.costs), note: costNoteOf(result.cost) },
     // ★ 代次如实带出去：浏览器半靠它做「没变就别取数」的探针（见 protocol.ts）
     gen,
   }
+}
+
+/**
+ * 金额口径说明（面板里那一行小字）。
+ *
+ * 单独一个函数而不是内联进 `toUiPayload`：这条说明是**金额能不能被正确理解**的
+ * 全部依据（单价来源 / 未计价比例 / 估算声明），值得有自己的名字与测试。
+ */
+function costNoteOf(cost: UsageCost): string {
+  const parts: string[] = []
+  const { pricingSource, pricingSyncedAt } = cost.pricing
+  parts.push(
+    pricingSource === 'snapshot'
+      ? `单价来源 本机单价快照${
+          pricingSyncedAt !== null ? `（同步于 ${new Date(pricingSyncedAt).toLocaleString()}）` : ''
+        }`
+      : pricingSource === 'db'
+        ? '单价来源 服务端单价表'
+        : '单价来源 内置种子价（本机还没同步过快照，金额可能与看板不同）',
+  )
+  // ★ 宿主给的 `note` **原样附上**：它是「为什么不是那份同步价」的唯一解释，
+  //   而且带着可执行的动作（例如「快照解析失败，请重新同步」）。
+  //   自己另写一句「内置种子价」会把这条动作吃掉 —— 使用者只知道金额不对，不知道怎么办。
+  if (cost.note !== null) parts.push(cost.note)
+  if (cost.totalTokens > 0) {
+    parts.push(`未计价 ${(cost.unpricedRate * 100).toFixed(1)}%（${fmtCompact(cost.unpricedTokens)} token 没算钱）`)
+  }
+  if (cost.unpricedTargets.length > 0) {
+    const rest = cost.unpricedTargets.length - 3
+    parts.push(
+      `还没配单价 ${cost.unpricedTargets.slice(0, 3).join('、')}${rest > 0 ? ` 等 ${cost.unpricedTargets.length} 个` : ''}`,
+    )
+  }
+  if (cost.unpricedTokens > 0) parts.push('明细里带 * 的金额只覆盖已计价的那部分')
+  parts.push('估算，不等于财务账单（折扣 / 预付 / 赠送额度不在单价里）')
+  return parts.join(' · ')
 }
 
 /** 取数入口。抽成接口是为了让「缓存 / 合并并发」这层能被单测直接驱动。 */
