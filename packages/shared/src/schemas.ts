@@ -353,6 +353,59 @@ export const portalSetProviderAliasSchema = z.strictObject({
 export const portalProviderAliasIdSchema = z.strictObject({ alias_id: portalId })
 export const portalProviderAliasStatusSchema = z.strictObject({ alias_id: portalId, enabled: z.boolean() })
 /**
+ * 模型标识。
+ *
+ * ⚠️ 与 `providerName` **分开**，不能沿用它的字符集：模型 ID 里出现 `/` 是常态
+ *   （`deepseek/deepseek-chat` 这类网关前缀），而 `providerName` 恰好禁止 `/`。
+ *   字符集刻意宽松（只禁不可见字符、要求首尾无空格）—— 模型名由各供应商自己定，
+ *   卡死了只会让新模型录不进来，而录入者唯一的办法是改代码。
+ */
+const modelName = z.string().min(1, { error: '模型名不能为空' }).max(255, { error: '模型名不能超过 255 个字符' })
+  .refine((value) => !invisibleCharacters.test(value), { error: '模型名不能包含空格以外的空白或不可见字符' })
+  .refine((value) => value === value.trim(), { error: '模型名首尾不能是空格' })
+/** ISO 4217 三位大写 —— 与库里那条 CHECK（`^[A-Z]{3}$`）逐字一致。 */
+const currencyCode = z.string().regex(/^[A-Z]{3}$/, { error: '币种需要是三位大写字母的 ISO 4217 代码（如 USD、CNY）' })
+/**
+ * 单价：**整数微元 / 千 token**（1 微 = 1e-6 货币单位）。
+ *
+ * 🚨 上限与服务端常量 `MAX_MICRO_PER_KTOK`（1e7）**必须一致**，
+ *   而且库里的 CHECK 也是同一个数：这一层放松就会「填得进去、保存时报 500」；
+ *   这一层收紧就会让一个库里合法的价改不回去。
+ *   1e7 微/Ktok = 10 货币单位/千 token，是现实最贵模型的数百倍余量。
+ */
+const microPerKtok = z.int({ error: '单价需要是整数微元' }).min(0, { error: '单价不能是负数' })
+  .max(10_000_000, { error: '单价上限是 10000000 微元/千 token（约 10 货币单位/千 token）' })
+/** epoch 毫秒；与 `usage_event` 各时间列同一形状（非负安全整数）。 */
+const epochMs = z.int({ error: '时间需要是 epoch 毫秒' }).min(0, { error: '时间不能是负数' })
+/**
+ * 设置一条单价（upsert）。
+ *
+ * ⚠️ `effective_to_ms` 允许 `null`（至今有效）与省略（同 `null`）两种写法：
+ *   页面清空结束时间就是 `null`，而脚本常常干脆不写这个字段。
+ * 🚨 **区间重叠由服务端查重兜住**（回 `409`），不在这一层做 ——
+ *   这里拿不到库里已有的行，判断重叠必须读库。
+ */
+export const portalSetModelPriceSchema = z.strictObject({
+  provider: providerName,
+  model: modelName,
+  currency: currencyCode,
+  input_micro_per_ktok: microPerKtok,
+  output_micro_per_ktok: microPerKtok,
+  cache_read_micro_per_ktok: microPerKtok,
+  cache_write_micro_per_ktok: microPerKtok,
+  effective_from_ms: epochMs,
+  effective_to_ms: epochMs.nullable().optional(),
+  note: z.string().max(255, { error: '备注不能超过 255 个字符' }).nullable().optional(),
+})
+export const portalModelPriceIdSchema = z.strictObject({ price_id: portalId })
+/**
+ * 用内置种子价初始化空表。
+ *
+ * ⚠️ `confirm` 必须是显式 `true`：这是一个会**写库**的动作，
+ *   省略字段就执行等于「一个空 body 的 POST 也能改数据」。
+ */
+export const portalSeedModelPricesSchema = z.strictObject({ confirm: z.boolean().optional() })
+/**
  * 角色标识。
  *
  * ★ 建后不可改，所以这里必须一次卡死格式：它是稳定标识，将来若允许中文或大写，

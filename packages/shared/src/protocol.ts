@@ -28,6 +28,71 @@
 export const SCHEMA_VERSION = 1 as const
 
 // ─────────────────────────────────────────────────────────────
+// 费用（v7 模型单价）
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 一档用量的费用（挂在概览 / 排行行 / 趋势点上）。
+ *
+ * 🚨 **「字段缺席」与「金额是 0」是两件完全不同的事**：
+ *   - 调用方没有 `cost:read` → **整个 `cost` 字段不下发**（不是填 0）；
+ *   - 有权限、但这批用量一条价都没配上 → `costs: []` + `unpricedRate: 1`。
+ *
+ * 把第一种回成 0，会让「你没权限」和「这个月没花钱」长得一模一样；
+ * 把第二种回成 0，会让「漏配了价」看起来像「省下了钱」。
+ * 两种都是这一期最想避免的误读，所以 `cost` 是可选字段而不是默认 0。
+ *
+ * ⚠️ `pricing` 必须与金额一起下发：同一批用量在「服务端读库里的价」与
+ *   「离线端读快照的价」下会给出**两个不同的金额**，页面必须能说清
+ *   这一屏是按哪份单价算的。缺它就**不许渲染金额**。
+ */
+export interface StatsCostTotals {
+  /**
+   * 按币种分别累加，**绝不跨币种相加**（汇率是第二个口径的典型来源）。
+   * 按 `currency` 升序，保证同一份数据永远给出同一个顺序。
+   */
+  costs: import('./price.js').CostByCurrency[]
+  /** 有单价的 token 数。 */
+  pricedTokens: number
+  /** 无单价的 token 数。 */
+  unpricedTokens: number
+  totalTokens: number
+  pricedRate: number
+  unpricedRate: number
+  pricing: import('./price.js').PricingProvenance
+}
+
+/**
+ * 概览档次的费用：额外给出**未配价的目标清单**。
+ *
+ * ★ 只给一个 `unpricedRate` 是不够的：使用者知道有 12% 没算钱，
+ *   却不知道该去补哪个价。清单是「未计价」唯一可行动的形态。
+ */
+export interface StatsCost extends StatsCostTotals {
+  /** `provider/model` 形式，已排序、已截断。 */
+  unpricedTargets: string[]
+}
+
+/** 明细行的金额；`currency` 为 `null` = 这一条**没配上价**（不是 0 元）。 */
+export interface StatsRecordCost {
+  currency: string | null
+  amountMicro: number
+}
+
+/**
+ * `GET /api/v1/stats/pricing` —— 单价只读快照。
+ *
+ * ★ 与 `/api/v1/admin/pricing` **刻意分开**：那条是**配置**（读也要求
+ *   `pricing:manage`），这条是**看数据时的解释材料**（`cost:read`）。
+ *   离线端（CLI / 本地页 / 插件）靠它拿到与服务端同一份单价，
+ *   否则四个形态会各算一个金额。
+ */
+export interface StatsPricingResponse {
+  prices: import('./portal-identity.js').PortalModelPrice[]
+  pricing: import('./price.js').PricingProvenance
+}
+
+// ─────────────────────────────────────────────────────────────
 // 上报方向：CLI → Server（POST /api/v1/token-usage）
 // ─────────────────────────────────────────────────────────────
 
@@ -202,6 +267,11 @@ export interface OverviewResponse {
    * ★ 公式在 `metrics.ts` 的 `unattributedRate()`，服务端调用它而不是就地做除法。
    */
   unattributedRate: number
+  /**
+   * 费用汇总。**只有具备 `cost:read` 的调用方才会拿到这个字段** ——
+   * 没权限时它整个缺席（而不是 0），见 {@link StatsCostTotals} 的说明。
+   */
+  cost?: StatsCost
 }
 
 /** 趋势图的一个点。 */
@@ -214,6 +284,8 @@ export interface SeriesPoint {
   cacheReadTokens: number
   calls: number
   cacheHitRate: number
+  /** 该点的费用（同样只在有 `cost:read` 时下发）。 */
+  cost?: StatsCostTotals
 }
 
 export interface SeriesResponse {
@@ -236,6 +308,8 @@ export interface BreakdownRow {
   cacheWriteTokens: number
   calls: number
   cacheHitRate: number
+  /** 该行（这个人员 / 供应商 / 分组…）的费用。 */
+  cost?: StatsCostTotals
 }
 
 export interface BreakdownResponse {
@@ -278,6 +352,14 @@ export interface RecordRow {
   cacheReadTokens: number
   cacheWriteTokens: number
   cwd: string | null
+  /**
+   * 这一条事件的费用。
+   *
+   * ★ 明细是**唯一**能逐条核对金额的地方：同一页里两行同一个模型却给出不同
+   *   单价，正是「换价那一刻」的证据。缺这个字段（无 `cost:read`）时页面
+   *   不显示金额列，而不是显示一列 0。
+   */
+  cost?: StatsRecordCost
 }
 
 export interface RecordsResponse {
@@ -474,6 +556,19 @@ export interface LocalOverviewResponse {
   scannedAt: number
   /** 本次是否命中进程内缓存（未重扫日志）。 */
   cached: boolean
+  /**
+   * 费用（估算）。
+   *
+   * ★ 本地页**没有权限模型**（它只读本机日志、不出网），所以这个字段总是下发 ——
+   *   与部门看板不同，那里没有 `cost:read` 时**整个字段缺席**。
+   *   但「按哪份单价算的」这条信息在这里**更重要**，因为离线端读的是
+   *   `pricing.json` 快照、看板读的是库里的 `model_price`：
+   *   两者给出的金额会不一样，而都「看起来正常」（见 `CostTotals.pricing`）。
+   *
+   * ⚠️ 仍然写成可选：页面与它内嵌的服务端是两个产物，版本可能不同步。
+   *   页面按「字段在不在」决定出不出现，绝不当成 0。
+   */
+  cost?: StatsCostTotals
 }
 
 /** 本地趋势的一个点（`GET /api/local/stats/series`）。 */
@@ -487,6 +582,14 @@ export interface LocalSeriesPoint {
   cacheWriteTokens: number
   calls: number
   cacheHitRate: number
+  /**
+   * 该桶的费用（估算）。
+   *
+   * ★ 按**事件发生时刻**逐条取价后汇总，所以换价那一刻两侧的桶各用各的价 ——
+   *   不是「桶内 token 总量 × 一个价」（那会把换价前后的用量全按其中一个价算）。
+   *   多币种各自累加、绝不相加（`costs` 数组按币种分开）。
+   */
+  cost?: StatsCostTotals
 }
 
 export interface LocalSeriesResponse {
@@ -507,6 +610,14 @@ export interface LocalBreakdownRow {
   cacheWriteTokens: number
   calls: number
   cacheHitRate: number
+  /**
+   * 该行（维度值）的费用（估算）。
+   *
+   * ★ 分组键与 `key` **逐字相同**（服务端复用 `core/aggregate.ts` 的 `groupKey()`），
+   *   所以页面上这一行的金额与排行里那一行必然对得上 —— 自己拼一遍键的话，
+   *   「项目」与「按天」这两维会悄悄错开，而两张表看起来都正常。
+   */
+  cost?: StatsCostTotals
 }
 
 export interface LocalBreakdownResponse {

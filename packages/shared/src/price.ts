@@ -32,7 +32,9 @@ export type BillableUsage = Pick<TokenUsage, 'input' | 'output' | 'cacheRead' | 
 /**
  * 单价：**微元 / 千 token** 的整数。
  *
- * 1 微元 = 1e-6 个货币单位。例如 `$0.3 / 1M tokens = $0.0003 / 1K = 300 微元/千`。
+ * 1 微元 = 1e-6 个货币单位。例如 `¥2 / 1M tokens = ¥0.002 / 1K = 2000 微元/千`。
+ * ★ 顺带一个好用的换算：**1 微元/千 token ≡ 1 货币单位/百万 token**，
+ *   所以库里那个整数除以 1000 就是「元 / 百万 token」原值 —— 页面上显示的就是它。
  *
  * 为什么用整数微元而不是小数：金额要跨几十万条事件、跨模型累加，
  * 小数累加必然出现分位误差，而「金额对不上」是最难说服人的 bug。
@@ -195,7 +197,8 @@ export function findPriceConflicts(existing: readonly ModelPrice[], candidate: M
  * ★ 这是全平台唯一的取整点：任何一处直接写 `tokens / 1000 * price`
  *   都会引入浮点误差，而「金额对不上」是最难说服人的 bug。
  *
- * ★ 整数域内拆成「整千 + 余数」，避免 `tokens × price` 这个更大的中间量；
+ * ★ 整数域内先算整千、再补不足一千的余数（两者都是纯整数运算），
+ *   避免 `tokens × price` 这个更大的中间量；
  *   超出 {@link MAX_SAFE_BILLABLE_TOKENS} 时**抛错**，绝不返回一个已经丢精度的钱数
  *   —— 金额这种数字上，静默不准比明确失败糟得多。
  */
@@ -207,7 +210,7 @@ export function costMicroForTokens(tokens: number, microPerKtok: MicroPerKtok): 
   const result = whole * microPerKtok + Math.round((rest * microPerKtok) / 1000)
   if (!Number.isSafeInteger(result)) {
     throw new RangeError(
-      `计价超出安全整数范围（tokens=${tokens}，单价=${microPerKtok} 微元/千）：` +
+      `计价超出安全整数范围（tokens=${tokens}，单价=${microPerKtok} 微元/千 token）：` +
         '请检查单价是否录错，或该聚合量级是否已超出 MAX_SAFE_BILLABLE_TOKENS。',
     )
   }
@@ -361,6 +364,26 @@ export function formatCostMicro(amountMicro: number, currency: string): string {
 }
 
 /**
+ * 单价 → 展示字符串（**每百万 token** 的价钱）。
+ *
+ * 界面上一律按「货币单位 / 百万 token」呈现 —— 那是各家供应商价目表的原生单位
+ * （DeepSeek 官方页就是「元 / 百万 tokens」），也是人**能直接照着核对**的写法：
+ * 店里写 `¥2 / 百万`，框里就填 `2`。
+ *
+ * ★ 库里存的仍是「整数微元 / 千 token」，两者差 1000：
+ *   `microPerKtok / 1000` 就是「元 / 百万 token」原值。
+ * ★ 位数按**百万级**定：最小可表达增量是 1 微元/千 token = `1e-6` 元/百万，
+ *   即 6 位小数恰好精确（`0.2`、`0.00004`），末尾的 0 裁掉。
+ *   `microPerKtok / 1000` 是整数除 1000，浮点误差远在 6 位小数之外，不会显错。
+ */
+export function formatUnitPriceMicro(microPerKtok: number, currency: string): string {
+  const code = normalizeCurrency(currency) ?? currency
+  const text = (microPerKtok / 1000).toFixed(6).replace(/\.?0+$/, '')
+  const symbol = CURRENCY_SYMBOLS[code]
+  return `${symbol ? `${symbol}${text}` : `${code} ${text}`} / 百万 token`
+}
+
+/**
  * 汇总成一行可展示文本；多币种时用 ` + ` 连接（**不相加**）。
  * 没有任何币种（全部未定价）时返回 `null` —— 让调用方显式处理「无金额」，
  * 而不是渲染成 `$0.00`。
@@ -368,6 +391,63 @@ export function formatCostMicro(amountMicro: number, currency: string): string {
 export function formatCostSummary(costs: readonly CostByCurrency[]): string | null {
   if (costs.length === 0) return null
   return costs.map((cost) => formatCostMicro(cost.amountMicro, cost.currency)).join(' + ')
+}
+
+// ---------------------------------------------------------------------------
+// 线上契约 → 内存形态
+// ---------------------------------------------------------------------------
+
+/**
+ * 线上契约里的单价字段（snake_case）。
+ *
+ * ★ 刻意写成结构类型而**不** import `PortalModelPrice`：那个接口定义在同级的
+ *   `portal-identity.ts`，让它反过来依赖本模块会形成循环 import。
+ *   结构类型在这里是同构的 —— `PortalModelPrice` 原样满足它。
+ */
+export interface WireModelPriceFields {
+  provider: string
+  model: string
+  currency: string
+  input_micro_per_ktok: number
+  output_micro_per_ktok: number
+  cache_read_micro_per_ktok: number
+  cache_write_micro_per_ktok: number
+  effective_from_ms: number
+  /** `null` = 至今有效。**绝不允许归一成 0** —— 0 是一个合法的、早已过去的终点。 */
+  effective_to_ms: number | null
+}
+
+/**
+ * 线上单价 → `shared/price.ts` 的内存形态。
+ *
+ * ## 为什么这个转换必须只有一份
+ *
+ * 「NULL 怎么处理」与「字段叫什么」这两件事一旦有两份实现，它们分叉时
+ * **不会报错**：一边把 `effective_to_ms = NULL` 读成 `0`，那条价在页面上
+ * 就显示成「1970 年就结束了」，而且从此再也匹配不上任何事件 ——
+ * 金额看起来只是「少算了点」。
+ *
+ * 服务端从数据库行取值、CLI 从 HTTP 响应取值、都走这里（前者先经
+ * `modelPriceFromRow()` 把驱动返回值归一成数字）。
+ *
+ * ⚠️ 这里**不做** `normalizeCurrency()`：`model_price.currency` 有
+ *   `^[A-Z]{3}$` 的 CHECK，而 `PortalModelPrice` 是同一行数据的线上投影，
+ *   在这里归一会让「管理页显示 `RMB`、金额按 `RMB` 记账、快照里又变成别的」
+ *   这种不一致有了滋生的地方。只有**磁盘上的快照**才需要归一 ——
+ *   文件不经过数据库约束（见 `parsePricingSnapshot()`）。
+ */
+export function modelPriceFromWire(wire: WireModelPriceFields): ModelPrice {
+  return {
+    provider: wire.provider,
+    model: wire.model,
+    currency: wire.currency,
+    inputMicroPerKtok: wire.input_micro_per_ktok,
+    outputMicroPerKtok: wire.output_micro_per_ktok,
+    cacheReadMicroPerKtok: wire.cache_read_micro_per_ktok,
+    cacheWriteMicroPerKtok: wire.cache_write_micro_per_ktok,
+    effectiveFromMs: wire.effective_from_ms,
+    effectiveToMs: wire.effective_to_ms === null ? null : wire.effective_to_ms,
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -448,15 +528,20 @@ export function parsePricingSnapshot(text: string): PricingSnapshot | null {
  *
  * ## 来源与快照说明
  *
- * 取自 DeepSeek 官方定价页（https://api-docs.deepseek.com/quick_start/pricing）的
- * **高峰档**报价，单位 USD。官方原价目就是「cache hit / cache miss / output」三档，
- * 与这里的四类分价同构。
+ * 取自 DeepSeek 官方定价页（https://api-docs.deepseek.com/zh-cn/quick_start/pricing）的
+ * **高峰档**人民币报价 —— 官方原页的单位就是「元 / 百万 tokens」，
+ * 与库里的「整数微元/千 token」正好差 1000 倍（见 {@link MicroPerKtok}）。
+ * 官方原价目只有「cache hit / cache miss / output」三档，与这里的四类分价同构。
+ *
+ * | 模型 | 缓存命中 | 缓存未命中 | 输出 |
+ * |---|---|---|---|
+ * | `deepseek-flash` / `deepseek-v4.1-flash` | ¥0.04 | ¥2 | ¥8 |
+ * | `deepseek-v4-pro` | ¥0.30 | ¥9 | ¥27 |
  *
  * ## ⚠️ 两处刻意的口径简化，管理员必须知道
  *
- * 1. **只取高峰价。** 官方高峰/低谷差 2 倍，高峰窗为 UTC 01:00-04:00 与
- *    06:00-10:00（周一至周五），换算即**北京 09:00-12:00 与 14:00-18:00** ——
- *    正是国内工作时段。所以对本部门而言高峰价就是实际价。
+ * 1. **只取高峰价。** 官方空闲档是高峰的一半，而高峰窗（北京时间周一至周五
+ *    09:00-12:00 与 14:00-18:00）正是国内工作时段，所以对本部门而言高峰价就是实际价。
  *    按峰谷精确分类必须逐事件判定，会把时间口径复制进 SQL，
  *    与「时间分桶必须在 JS 侧做」的铁律冲突，故首版不做。
  *    界面上必须标注「未区分高峰/低谷」。
@@ -466,18 +551,22 @@ export function parsePricingSnapshot(text: string): PricingSnapshot | null {
  * ## 刻意不收录的
  *
  * `dashscope`（数字集团网关）与各内部网关的模型**不在此表**：
- * 没有可核对的公开 CNY 报价，编一个数字比留空更糟 —— 留空会进 `unpricedTokens`，
- * 由页面显式告诉使用者「这部分没算钱」，而编数字会让错误藏起来。
+ * 这些网关的结算价是另一套口径（转售、折扣、汇总账单），拿官方零售价套上去
+ * 会给出一个「看起来像官方价、其实不是自己付的钱」的数字 —— 那比留空更糟。
+ * 留空会进 `unpricedTokens`，由页面显式告诉使用者「这部分没算钱」。
  */
 export const BUILTIN_PRICES: readonly ModelPrice[] = [
   {
     provider: 'deepseek-official',
+    // ⚠️ `deepseek-flash` 与 `deepseek-v4.1-flash` 是**两条价**：官方明说旧模型名
+    //    `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp` 仍可调用并按 Flash 价计费，
+    //    而单价必须在**上报原值**上精确匹配（不做子串），所以别名要各配一行。
     model: 'deepseek-v4.1-flash',
-    currency: 'USD',
-    // cache hit $0.006/1M、cache miss $0.3/1M、output $1.2/1M（高峰档）
-    cacheReadMicroPerKtok: 6,
-    inputMicroPerKtok: 300,
-    outputMicroPerKtok: 1200,
+    currency: 'CNY',
+    // 缓存命中 ¥0.04/百万、缓存未命中 ¥2/百万、输出 ¥8/百万（高峰档）
+    cacheReadMicroPerKtok: 40,
+    inputMicroPerKtok: 2000,
+    outputMicroPerKtok: 8000,
     // DeepSeek 不单列缓存写入价：写入按 cache miss 输入计价。
     cacheWriteMicroPerKtok: 0,
     effectiveFromMs: 0,
@@ -486,10 +575,10 @@ export const BUILTIN_PRICES: readonly ModelPrice[] = [
   {
     provider: 'deepseek-official',
     model: 'deepseek-flash',
-    currency: 'USD',
-    cacheReadMicroPerKtok: 6,
-    inputMicroPerKtok: 300,
-    outputMicroPerKtok: 1200,
+    currency: 'CNY',
+    cacheReadMicroPerKtok: 40,
+    inputMicroPerKtok: 2000,
+    outputMicroPerKtok: 8000,
     cacheWriteMicroPerKtok: 0,
     effectiveFromMs: 0,
     effectiveToMs: null,
@@ -497,11 +586,11 @@ export const BUILTIN_PRICES: readonly ModelPrice[] = [
   {
     provider: 'deepseek-official',
     model: 'deepseek-v4-pro',
-    currency: 'USD',
-    // cache hit $0.044/1M、cache miss $1.32/1M、output $3.96/1M（高峰档）
-    cacheReadMicroPerKtok: 44,
-    inputMicroPerKtok: 1320,
-    outputMicroPerKtok: 3960,
+    currency: 'CNY',
+    // 缓存命中 ¥0.30/百万、缓存未命中 ¥9/百万、输出 ¥27/百万（高峰档）
+    cacheReadMicroPerKtok: 300,
+    inputMicroPerKtok: 9000,
+    outputMicroPerKtok: 27000,
     cacheWriteMicroPerKtok: 0,
     effectiveFromMs: 0,
     effectiveToMs: null,

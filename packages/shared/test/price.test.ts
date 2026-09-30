@@ -21,8 +21,10 @@ import {
   findPriceConflicts,
   formatCostMicro,
   formatCostSummary,
+  formatUnitPriceMicro,
   isPriceEffective,
   isValidPriceRates,
+  modelPriceFromWire,
   normalizeCurrency,
   parsePricingSnapshot,
   priceRangesOverlap,
@@ -44,6 +46,11 @@ const DASHSCOPE_USAGE: BillableUsage = {
 /**
  * DeepSeek Flash 高峰档单价，直接由官方「每 1M token 美元价」换算：
  * cache hit $0.006 / cache miss $0.3 / output $1.2 → 6 / 300 / 1200 微元每千。
+ *
+ * ⚠️ 这里刻意留 USD：内置种子价已经是人民币（见 §内置种子价 的测试），
+ *   而「多币种各自累加、绝不相加」这条口径**必须有不止一个币种**才验得出来 ——
+ *   拿 CNY 当这个夹具会让那几条断言退化成同币种自比。
+ *   人民币那侧的实测金额由下面 `CNY_FLASH` 提供（同一条官方价的人民币档）。
  */
 const FLASH: ModelPrice = {
   provider: 'deepseek-official',
@@ -57,16 +64,27 @@ const FLASH: ModelPrice = {
   effectiveToMs: null,
 }
 
+/**
+ * 同一条官方价的人民币高峰档：cache hit ¥0.04 / cache miss ¥2 / output ¥8
+ * → 40 / 2000 / 8000 微元每千（= 「元 / 百万 token」× 1000）。
+ */
+const CNY_FLASH: ModelPrice = { ...FLASH, currency: 'CNY', inputMicroPerKtok: 2_000, outputMicroPerKtok: 8_000, cacheReadMicroPerKtok: 40 }
+
 describe('单价单位换算（微元/千 token）', () => {
-  test('$0.3 / 1M tokens 就是 300 微元/千', () => {
+  test('$0.3 / 1M tokens 就是 300 微元/千，¥2 / 1M tokens 就是 2000 微元/千', () => {
     // 1M token × 300 微元/千 = 1000 千 × 300 = 300,000 微元 = $0.3
     expect(costMicroForTokens(1_000_000, 300)).toBe(300_000)
+    // 1M token × 2000 微元/千 = 2,000,000 微元 = ¥2
+    expect(costMicroForTokens(1_000_000, 2_000)).toBe(2_000_000)
   })
 
-  test('官方 Flash 三档换算与定价页一致', () => {
+  test('官方 Flash 三档换算与定价页一致（元 / 百万 token ÷ 1000 = 微元 / 千 token）', () => {
     expect(FLASH.inputMicroPerKtok / 1000).toBe(0.3) // $0.3 / 1M
     expect(FLASH.outputMicroPerKtok / 1000).toBe(1.2) // $1.2 / 1M
     expect(FLASH.cacheReadMicroPerKtok / 1000).toBe(0.006) // $0.006 / 1M
+    expect(CNY_FLASH.inputMicroPerKtok / 1000).toBe(2) // ¥2 / 1M
+    expect(CNY_FLASH.outputMicroPerKtok / 1000).toBe(8) // ¥8 / 1M
+    expect(CNY_FLASH.cacheReadMicroPerKtok / 1000).toBe(0.04) // ¥0.04 / 1M
   })
 })
 
@@ -108,7 +126,7 @@ describe('单类 token 计价', () => {
 })
 
 describe('四类分价（★ 不可合并）', () => {
-  // 逐项手算：
+  // 逐项手算（美元档：300 / 1200 / 6 微元每千）：
   //   input   11,561,323 @300  → 11561×300 + round(323×300/1000) = 3,468,300 + 97
   //   output   1,815,109 @1200 → 1815×1200 + round(109×1200/1000) = 2,178,000 + 131
   //   cacheRead 222,614,912 @6 → 222614×6 + round(912×6/1000)     = 1,335,684 + 5
@@ -117,6 +135,11 @@ describe('四类分价（★ 不可合并）', () => {
     expect(costMicroForTokens(DASHSCOPE_USAGE.output, 1200)).toBe(2_178_131)
     expect(costMicroForTokens(DASHSCOPE_USAGE.cacheRead, 6)).toBe(1_335_689)
     expect(costMicroOf(DASHSCOPE_USAGE, FLASH)).toBe(6_982_217)
+  })
+
+  test('同一条用量按人民币档算 = 46,548,114 微元（¥46.55）', () => {
+    // 人民币档贵约 6.67 倍（¥2/百万 ≈ $0.28/百万），正是「同一份用量、两个币种两个数」的实证。
+    expect(costMicroOf(DASHSCOPE_USAGE, CNY_FLASH)).toBe(46_548_114)
   })
 
   test('★ 用「单一价」计费会虚增约 10 倍', () => {
@@ -144,8 +167,14 @@ describe('缓存省下的钱', () => {
   })
 
   test('缓存比输入更贵时返回负数，不截断', () => {
-    const odd = { ...FLASH, cacheReadMicroPerKtok: 900 }
+    // 人民币档的输入价是 2000 微元/千，缓存读必须贵过它才会出现「缓存反而更贵」。
+    const odd = { ...FLASH, cacheReadMicroPerKtok: 2_500 }
     expect(cacheSavingMicro(DASHSCOPE_USAGE, odd)).toBeLessThan(0)
+  })
+
+  test('同一份用量在人民币档下的节省额（¥436.33）', () => {
+    // 222,614,912 × 2000/1000 = 445,229,824；减去按缓存价的 8,904,596 = 436,325,228 微元。
+    expect(cacheSavingMicro(DASHSCOPE_USAGE, CNY_FLASH)).toBe(436_325_228)
   })
 })
 
@@ -310,6 +339,38 @@ describe('金额格式化（四个形态共用一份）', () => {
   })
 })
 
+describe('单价格式化（每百万 token，与价目表同单位）', () => {
+  test('★ 呈现的是「元 / 百万 token」原值，库里那个整数除以 1000', () => {
+    // 官方 Flash 高峰价：2000 微元/千 = ¥2 / 百万 token（人可以直接照着价目表核对）。
+    expect(formatUnitPriceMicro(2_000, 'CNY')).toBe('¥2 / 百万 token')
+    expect(formatUnitPriceMicro(200, 'CNY')).toBe('¥0.2 / 百万 token')
+    expect(formatUnitPriceMicro(40, 'CNY')).toBe('¥0.04 / 百万 token')
+    expect(formatUnitPriceMicro(27_000, 'CNY')).toBe('¥27 / 百万 token')
+  })
+
+  test('★ 不能用总额那个函数：50 微元/千 token 是 ¥0.05/百万，不是 0.0001', () => {
+    // 把单价交给 `formatCostMicro()` 会得到 `¥0.0001` —— 一个**差 500 倍**、
+    // 且看起来完全正常的数字。这就是两个格式化函数必须分开的原因。
+    expect(formatUnitPriceMicro(50, 'CNY')).toBe('¥0.05 / 百万 token')
+    expect(formatCostMicro(50, 'CNY')).toBe('¥0.0001')
+  })
+
+  test('整数微元能被精确写出，末尾的 0 裁掉', () => {
+    expect(formatUnitPriceMicro(1, 'CNY')).toBe('¥0.001 / 百万 token')
+    expect(formatUnitPriceMicro(1, 'USD')).toBe('$0.001 / 百万 token')
+    expect(formatUnitPriceMicro(25_000, 'USD')).toBe('$25 / 百万 token')
+    expect(formatUnitPriceMicro(10_000_000, 'USD')).toBe('$10000 / 百万 token')
+  })
+
+  test('零价显示成 0（免费），不是空字符串', () => {
+    expect(formatUnitPriceMicro(0, 'CNY')).toBe('¥0 / 百万 token')
+  })
+
+  test('未知币种回退成代码前缀', () => {
+    expect(formatUnitPriceMicro(2_000, 'SGD')).toBe('SGD 2 / 百万 token')
+  })
+})
+
 describe('币种归一化', () => {
   test('小写与空白被归一化，非法格式拒绝', () => {
     expect(normalizeCurrency(' usd ')).toBe('USD')
@@ -360,6 +421,60 @@ describe('离线单价快照解析', () => {
   })
 })
 
+describe('线上单价 → 内存形态（映射只有一份）', () => {
+  /**
+   * 这个函数是**唯一**的 snake_case → camelCase 映射：服务端从数据库行取价
+   * （先经 `modelPriceFromRow()` 归一驱动返回值）与 CLI `pricing sync`
+   * 从 HTTP 取价都走它。各写一份的结果不会报错 —— 只会让「NULL 表示至今有效」
+   * 在其中一处变成 `0`（一个合法的、早已过去的终点），那条价从此匹配不上任何事件，
+   * 而金额看起来只是「少算了点」。
+   */
+  const wire = {
+    provider: 'dashscope',
+    model: 'm-1',
+    currency: 'CNY',
+    input_micro_per_ktok: 1000,
+    output_micro_per_ktok: 2000,
+    cache_read_micro_per_ktok: 100,
+    cache_write_micro_per_ktok: 0,
+    effective_from_ms: 500,
+    effective_to_ms: null,
+  }
+
+  test('字段逐项改名，值原样搬运', () => {
+    expect(modelPriceFromWire(wire)).toEqual({
+      provider: 'dashscope',
+      model: 'm-1',
+      currency: 'CNY',
+      inputMicroPerKtok: 1000,
+      outputMicroPerKtok: 2000,
+      cacheReadMicroPerKtok: 100,
+      cacheWriteMicroPerKtok: 0,
+      effectiveFromMs: 500,
+      effectiveToMs: null,
+    })
+  })
+
+  test('★ effective_to_ms = null 必须保持 null（绝不当成 0）', () => {
+    const open = modelPriceFromWire(wire)
+    expect(open.effectiveToMs).toBeNull()
+    // `0` 是「早就结束了」：这条价在 1 之后就不再生效 —— 与「至今有效」完全相反。
+    expect(isPriceEffective(open, 10_000)).toBe(true)
+
+    // 显式给了终点就照原样，且到点即失效
+    const bounded = modelPriceFromWire({ ...wire, effective_to_ms: 900 })
+    expect(bounded.effectiveToMs).toBe(900)
+    expect(isPriceEffective(bounded, 900)).toBe(true)
+    expect(isPriceEffective(bounded, 901)).toBe(false)
+  })
+
+  test('货币不在这里归一（那是快照文件的事）', () => {
+    // 线上字段来自 `model_price.currency`（有 `^[A-Z]{3}$` 的 CHECK），
+    // 而归一化只该发生在「磁盘上的快照」这条不受数据库约束的入口。
+    expect(modelPriceFromWire({ ...wire, currency: 'usd' }).currency).toBe('usd')
+  })
+})
+
 describe('内置种子价', () => {
   test('每一条都是合法单价与合法币种', () => {
     for (const price of BUILTIN_PRICES) {
@@ -376,7 +491,34 @@ describe('内置种子价', () => {
     }
   })
 
-  test('★ 刻意不收录 dashscope：没有可核对的 CNY 报价，留空好过编造', () => {
+  test('★ 刻意不收录 dashscope：它是转售/汇总账单口径，拿官方零售价套上去更糟', () => {
+    // 留空会进 `unpricedTokens`（页面显式说「这部分没算钱」），
+    // 而套一个官方零售价会给出一个「看起来像官方价、其实不是自己付的钱」的数字。
     expect(BUILTIN_PRICES.some((p) => p.provider === 'dashscope')).toBe(false)
+  })
+
+  test('★ 种子价是人民币官方高峰价（元 / 百万 token × 1000 = 微元 / 千 token）', () => {
+    // 逐条钉死：种子价是「首次部署立刻有数」的起点，被谁顺手改成美元或空闲档都不该无声通过。
+    const seed = (model: string): ModelPrice => {
+      const found = BUILTIN_PRICES.find((p) => p.model === model)
+      expect(found).toBeDefined()
+      return found!
+    }
+    for (const model of ['deepseek-flash', 'deepseek-v4.1-flash', 'deepseek-v4-pro']) {
+      expect(seed(model).currency).toBe('CNY')
+    }
+    // Flash：缓存命中 ¥0.04 / 未命中 ¥2 / 输出 ¥8
+    expect(seed('deepseek-flash')).toMatchObject({
+      cacheReadMicroPerKtok: 40, inputMicroPerKtok: 2_000, outputMicroPerKtok: 8_000, cacheWriteMicroPerKtok: 0,
+    })
+    expect(seed('deepseek-v4.1-flash')).toMatchObject({
+      cacheReadMicroPerKtok: 40, inputMicroPerKtok: 2_000, outputMicroPerKtok: 8_000, cacheWriteMicroPerKtok: 0,
+    })
+    // Pro：缓存命中 ¥0.30 / 未命中 ¥9 / 输出 ¥27
+    expect(seed('deepseek-v4-pro')).toMatchObject({
+      cacheReadMicroPerKtok: 300, inputMicroPerKtok: 9_000, outputMicroPerKtok: 27_000, cacheWriteMicroPerKtok: 0,
+    })
+    // 与页面呈现口径一致：2000 微元/千 显示成 `¥2 / 百万 token`
+    expect(formatUnitPriceMicro(seed('deepseek-flash').inputMicroPerKtok, 'CNY')).toBe('¥2 / 百万 token')
   })
 })

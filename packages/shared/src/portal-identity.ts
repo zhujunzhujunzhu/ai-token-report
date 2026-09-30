@@ -400,3 +400,87 @@ export interface PortalProviderAliasStatusRequest {
   alias_id: string
   enabled: boolean
 }
+
+// ---------------------------------------------------------------------------
+// 模型单价（v7 `model_price`）—— 费用统计的唯一计价来源
+// ---------------------------------------------------------------------------
+
+/**
+ * 一条模型单价。
+ *
+ * ★ **粒度是 `(provider, model)` 精确匹配，不是一个供应商一个价**：
+ *   同一个供应商下不同模型的价差可以很大（旗舰与轻量模型常常差 10 倍以上），
+ *   把供应商汇成一个价，必然有一半模型算错，而页面上只看得出「金额不对」。
+ * ⚠️ 金额一律是**整数微元 / 千 token**（1 微 = 1e-6 货币单位）：
+ *   用小数累加几十万行必然产生分位误差，而对账时那正是要命的位数。
+ * 🚨 **换币种绝不换算、绝不相加**：不同 `currency` 的费用各自累加，
+ *   展示时用 ` + ` 连接（见 `shared/price.ts` 的 `CostByCurrency`）。
+ *   汇率是一个会随时间变的外部事实，把它烧进查询结果等于给历史数字埋雷。
+ */
+export interface PortalModelPrice {
+  price_id: string
+  provider: string
+  model: string
+  /** ISO 4217 三位大写（`USD` / `CNY`）。 */
+  currency: string
+  input_micro_per_ktok: number
+  output_micro_per_ktok: number
+  cache_read_micro_per_ktok: number
+  cache_write_micro_per_ktok: number
+  /** 生效起点（含），epoch 毫秒。 */
+  effective_from_ms: number
+  /** 生效终点（含）；`null` = 至今有效。 */
+  effective_to_ms: number | null
+  /** 备注：为什么是这个价（对账时最有用的一栏）。 */
+  note: string | null
+  created_at_ms: number
+  updated_at_ms: number
+}
+
+export interface PortalModelPriceListResponse {
+  prices: PortalModelPrice[]
+}
+
+export interface PortalModelPriceResult extends PortalMutationResult {
+  price?: PortalModelPrice
+}
+
+/**
+ * 设置一条单价（upsert）。
+ *
+ * ⚠️ 业务主键是 `(provider, model, effective_from_ms)`：同一个模型的同一个
+ *   生效起点只有一行，再次提交是**改**而不是新增 ——
+ *   否则同一个起点会有两个价，结果取决于读取顺序。
+ * 🚨 **生效区间不得重叠**（同 `provider` + `model`）：重叠的两行会让
+ *   「某一时刻该用哪个价」变成读取顺序问题。服务端显式查重并回 `409`，
+ *   而不是任选一行 —— 唯一的例外是「同一 id 的自身更新」。
+ *   ⚠️ 数据库那条 UNIQUE 索引**拦不住**这种情况（它只认完全相同的
+ *   `effective_from_ms`），所以这条规则只有应用层兜着。
+ */
+export interface PortalSetModelPriceRequest {
+  provider: string
+  model: string
+  currency: string
+  input_micro_per_ktok: number
+  output_micro_per_ktok: number
+  cache_read_micro_per_ktok: number
+  cache_write_micro_per_ktok: number
+  effective_from_ms: number
+  effective_to_ms?: number | null
+  note?: string | null
+}
+
+export interface PortalModelPriceIdRequest {
+  price_id: string
+}
+
+/**
+ * 用内置种子价初始化**空**的单价表。
+ *
+ * ★ 只在表为空时放行：它存在的意义是「刚部署完，一个价都没有」那一步。
+ *   允许它对非空表执行，就等于把「覆盖我调好的价」做成一个按钮 ——
+ *   而使用者点它的时候，多半以为自己在做别的事。
+ */
+export interface PortalSeedModelPricesRequest {
+  confirm?: boolean
+}
