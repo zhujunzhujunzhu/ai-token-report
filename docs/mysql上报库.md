@@ -226,8 +226,10 @@ packages/core/src/db/
 3. **`close()` 的语义按后端不同**：SQLite 真的关；MySQL **空操作**（连接来自进程内
    共享池，每请求关池会让下一个请求重新 TCP + 认证握手）。上层照常
    `finally { await store.close() }`，两种后端形状一致。
-4. **MySQL Portal v5 使用 18 张身份/事实表、`ingest_run` 和 `portal_meta`**（v4 基线是 17 张：
-   `departments` 改为 `member_groups`，并新增多对多关联表 `member_group_assignments`）。
+4. **MySQL Portal 当前是 v6：18 张身份/事实表、`ingest_run`、`portal_meta`，加上 v6 的
+   `provider_alias`**（v5 基线是 18 张；v4 基线是 17 张，`departments` 改为 `member_groups`
+   并新增多对多关联表 `member_group_assignments`）。v5→v6 只增 `provider_alias` 与两个权限码，
+   不改既有列、不重建事实表。
    `file_watermark` / `session_state` 是**本机增量扫描**的水位线，
    部门服务端从不扫日志，建了永远是空表。
 
