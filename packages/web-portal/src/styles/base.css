@@ -622,6 +622,14 @@ code {
 .row-group-tag {
   margin-left: 6px;
 }
+/*
+ * 费用单元格里的「未计价 xx%」小字。
+ * ★ 它是**必须与金额同时可见**的一行：只给金额，使用者没法知道这个数
+ *   覆盖了多少用量，也就无从判断它能不能拿去汇报。
+ */
+.cost-unpriced {
+  font-size: 12px;
+}
 .rank-number {
   font-variant-numeric: tabular-nums;
   color: #9ba7b6;

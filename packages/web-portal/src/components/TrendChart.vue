@@ -78,6 +78,14 @@ const props = withDefaults(
     hint?: string
     /** 悬浮提示里的指标名，如「计费总量」。 */
     metricLabel: string
+    /**
+     * 数值格式化（悬浮提示用），缺省千分位。
+     * ★ 画金额时传 `formatCostMicro` 的包装：曲线的数值仍是**微元原值**，
+     *   换算只发生在显示这一步，画图层不做任何口径换算。
+     */
+    valueFormatter?: (value: number) => string
+    /** 刻度格式化，缺省「万 / 亿」。 */
+    tickFormatter?: (value: number) => string
   }>(),
   { kind: 'bar', hint: '' },
 )
@@ -108,6 +116,8 @@ function draw(): void {
     kind: props.kind,
     metricLabel: props.metricLabel,
     theme: readTrendChartTheme(el),
+    ...(props.valueFormatter ? { valueFormatter: props.valueFormatter } : {}),
+    ...(props.tickFormatter ? { tickFormatter: props.tickFormatter } : {}),
   })
 
   if (chart.value) {
@@ -130,6 +140,9 @@ onMounted(draw)
  *   于是「从没有数据变成有数据」的第一次绘制会被静默跳过。
  */
 watch(
+  // ⚠️ 刻意**不把两个格式化函数**列进依赖：父组件传的是内联箭头函数，
+  //   每次渲染都是新身份 —— 列进去会让「每次重渲染都重画一遍」，
+  //   而真正决定画什么的（指标名 / 数值 / 粒度）已经在依赖里了。
   () => [props.labels, props.values, props.kind, props.metricLabel] as const,
   draw,
   { flush: 'post' },

@@ -90,12 +90,24 @@ export interface TrendChartInput {
   /** 提示框里的指标名，如「计费总量」。 */
   metricLabel: string
   theme: TrendChartTheme
+  /**
+   * 数值的**逐点**格式化（悬浮提示用），缺省千分位。
+   *
+   * ★ 画金额时曲线的数值仍然是**服务端给的整数微元原值**：本模块只换
+   *   显示用的格式化函数，绝不在画图这一层做「微元 ÷ 1e6」这类换算 ——
+   *   那会在前端造出第二个「1 微是多少」的口径实现，而且它不会报错。
+   */
+  valueFormatter?: (value: number) => string
+  /** 刻度的紧凑格式化，缺省「万 / 亿」。 */
+  tickFormatter?: (value: number) => string
 }
 
 export function buildTrendChartConfig(
   input: TrendChartInput,
 ): ChartConfiguration<'bar' | 'line'> {
   const { labels, values, kind, metricLabel, theme } = input
+  const valueFormatter = input.valueFormatter ?? formatCount
+  const tickFormatter = input.tickFormatter ?? formatCompact
   const isArea = kind === 'area'
 
   return {
@@ -159,7 +171,7 @@ export function buildTrendChartConfig(
             maxTicksLimit: 4,
             font: { size: 11, family: theme.fontFamily },
             // 刻度用「万 / 亿」紧凑写法，完整数值留给悬浮提示
-            callback: (value) => formatCompact(Number(value)),
+            callback: (value) => tickFormatter(Number(value)),
           },
         },
       },
@@ -182,7 +194,7 @@ export function buildTrendChartConfig(
             // 不经过 Chart.js 的解析结果，少一次可能出偏差的转换
             title: (items) => labels[items[0]?.dataIndex ?? 0] ?? '',
             label: (item) =>
-              `${metricLabel}  ${formatCount(values[item.dataIndex] ?? 0)}`,
+              `${metricLabel}  ${valueFormatter(values[item.dataIndex] ?? 0)}`,
           },
         },
       },

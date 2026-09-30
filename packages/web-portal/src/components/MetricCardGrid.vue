@@ -9,12 +9,39 @@ import {
   ChatDotRound,
   DataLine,
   Warning,
+  Wallet,
 } from '@element-plus/icons-vue'
 import type { OverviewResponse } from '@ai-token-report/shared'
 import { formatCompact, formatCount, formatPercent } from '../utils/format.js'
+import { UNPRICED_TEXT, costText, pricingHint } from '../utils/cost.js'
 const props = defineProps<{ overview: OverviewResponse | null }>()
 const cards = computed(() => {
   const o = props.overview
+  /**
+   * ★ 费用卡片**只在服务端下发了 `cost` 时才出现**。
+   *
+   *   没有 `cost:read` 时该字段整个缺席 —— 这与「金额是 0」是两件不同的事，
+   *   所以这里判的是字段在不在，而不是数值大不大：一张 `¥0.00` 的卡片会让
+   *   「你没权限看金额」与「这段时间没花钱」长得一模一样。
+   *
+   * ⚠️ 金额是**估算**（自建计价 ≠ 财务账单：折扣 / 预付 / 赠送额度都不在单价里），
+   *   标题里必须带这两个字，页面上不能出现任何看起来像账单的数。
+   */
+  const costCards = o?.cost
+    ? [
+        {
+          label: '费用（估算）',
+          value: costText(o.cost) ?? UNPRICED_TEXT,
+          exact: costText(o.cost) ?? '',
+          unit: '',
+          // ⚠️ 未计价比例必须与金额同时出现在视野里：它决定这个数能信几分。
+          hint: pricingHint(o.cost),
+          icon: Wallet,
+          // 有未计费用量时用琥珀色：它不是错误，但绝不该看起来像「一切正常」。
+          tone: o.cost.unpricedTokens > 0 ? 'amber' : 'green',
+        },
+      ]
+    : []
   return [
     {
       label: '计费总量',
@@ -25,6 +52,7 @@ const cards = computed(() => {
       icon: Coin,
       tone: 'blue',
     },
+    ...costCards,
     {
       label: '缓存命中率',
       value: o ? formatPercent(o.cacheHitRate) : '—',

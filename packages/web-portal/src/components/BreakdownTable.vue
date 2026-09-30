@@ -6,11 +6,15 @@
  *   要经分组候选目录翻成名字才看得懂。默认直接显示 `key`（provider / model /
  *   project 维度的 `key` 本来就是可读的）。
  * ★ 人员维度的行带 `group_names`（多对多），原样渲染成标签 —— 页面不重算归属。
+ * ★ 费用列同样**按「服务端有没有下发 `cost`」决定出不出现**（理由见
+ *   `RankingTable.vue`）：字段缺席 = 没权限，`costs` 为空 = 没配价，两者措辞不同。
  */
 import { ElTable, ElTableColumn, ElTag } from 'element-plus'
+import { computed } from 'vue'
 import type { BreakdownRow } from '@ai-token-report/shared'
 import { formatCount, formatPercent } from '../utils/format.js'
-defineProps<{
+import { UNPRICED_TEXT, costText, unpricedText } from '../utils/cost.js'
+const props = defineProps<{
   rows: BreakdownRow[]
   /** 行显示名；缺省显示 `row.key`。 */
   labelOf?: (row: BreakdownRow) => string
@@ -23,6 +27,7 @@ defineProps<{
    */
   dimensionLabel?: string
 }>()
+const showCost = computed(() => props.rows.some((row) => row.cost))
 /**
  * 表格插槽给的 `row` 是 Element Plus 自己的 `DefaultRow`（`Record<PropertyKey, any>`），
  * 不是本组件的契约类型，而模板里做不了类型断言 —— 所以入口收 `unknown`、
@@ -76,6 +81,19 @@ const rowBreakdown = (row: unknown): BreakdownRow => row as BreakdownRow
         formatCount(row.calls)
       }}</template></el-table-column
     >
+    <el-table-column
+      v-if="showCost"
+      label="费用（估算）"
+      min-width="150"
+      align="right"
+    >
+      <template #default="{ row }">
+        <span class="tabular">{{ costText(row.cost) ?? UNPRICED_TEXT }}</span>
+        <div v-if="unpricedText(row.cost)" class="muted cost-unpriced">
+          {{ unpricedText(row.cost) }}
+        </div>
+      </template>
+    </el-table-column>
     <el-table-column label="缓存命中率" min-width="110" align="right"
       ><template #default="{ row }">{{
         formatPercent(row.cacheHitRate)

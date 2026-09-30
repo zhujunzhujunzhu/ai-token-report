@@ -8,7 +8,7 @@ import { renderToString } from 'vue/server-renderer'
 import { createPinia, disposePinia } from 'pinia'
 import { createMemoryHistory } from 'vue-router'
 import { ID_INJECTION_KEY, ZINDEX_INJECTION_KEY } from 'element-plus'
-import type { BreakdownRow } from '@ai-token-report/shared'
+import type { BreakdownRow, OverviewResponse } from '@ai-token-report/shared'
 const server = await createServer({
   root: process.cwd(),
   server: { middlewareMode: true },
@@ -76,6 +76,7 @@ try {
     { path: '/roles', name: 'roles', title: '角色管理' },
     { path: '/groups', name: 'groups', title: '分组管理' },
     { path: '/providers', name: 'providers', title: '供应商归一化' },
+    { path: '/pricing', name: 'pricing', title: '模型单价' },
   ]
   for (const page of managementPages) {
     await router.push(page.path)
@@ -99,6 +100,9 @@ try {
     // ★ 归一化改的是「按供应商看用量」的口径，与分组管理**不共用**权限：
     //   能管分组的人不该顺带获得改全平台供应商口径的能力。
     { label: '供应商只读者', permissions: ['providers:read'], allowed: ['providers'] },
+    // ★ 单价决定**每一笔费用怎么算**，是配置而不是「看一眼的数字」：
+    //   读也要求 `pricing:manage`，所以「能看供应商口径」与「能看/改计价」互不附带。
+    { label: '单价管理者', permissions: ['pricing:manage'], allowed: ['pricing'] },
   ]
   for (const entry of permissionCases) {
     session.identity = { name: '测试成员', username: 'member', role: 'member', permissions: entry.permissions }
@@ -114,7 +118,7 @@ try {
     check(`${entry.label}管理导航遵循各自权限`, !!navigationHtml && managementPages.every((page) =>
       navigationHtml.includes(page.title) === entry.allowed.includes(page.name)))
   }
-  session.identity = { member_id: '00000000-0000-4000-8000-000000000001', name: '测试管理员', username: 'admin', role: 'admin', permissions: ['members:read', 'members:manage', 'groups:read', 'groups:manage', 'roles:read', 'roles:assign', 'tokens:manage', 'providers:read', 'providers:manage'] }
+  session.identity = { member_id: '00000000-0000-4000-8000-000000000001', name: '测试管理员', username: 'admin', role: 'admin', permissions: ['members:read', 'members:manage', 'groups:read', 'groups:manage', 'roles:read', 'roles:assign', 'tokens:manage', 'providers:read', 'providers:manage', 'cost:read', 'pricing:manage'] }
   session.generation++
   for (const page of managementPages) {
     await router.push(page.path)
@@ -124,15 +128,19 @@ try {
   await router.push('/members')
   const layoutHtml = await render('/src/layouts/PortalLayout.vue')
   const navigationHtml = layoutHtml.match(/<aside\b[\s\S]*?<\/aside>/)?.[0] ?? ''
-  check('管理导航依次为人员、appKey、角色、分组、供应商五个独立入口',
+  check('管理导航依次为人员、appKey、角色、分组、供应商、单价六个独立入口',
     navigationHtml.indexOf('人员管理') >= 0 &&
     navigationHtml.indexOf('人员管理') < navigationHtml.indexOf('appKey 管理') &&
     navigationHtml.indexOf('appKey 管理') < navigationHtml.indexOf('角色管理') &&
     navigationHtml.indexOf('角色管理') < navigationHtml.indexOf('分组管理') &&
-    navigationHtml.indexOf('分组管理') < navigationHtml.indexOf('供应商归一化'))
+    navigationHtml.indexOf('分组管理') < navigationHtml.indexOf('供应商归一化') &&
+    navigationHtml.indexOf('供应商归一化') < navigationHtml.indexOf('模型单价'))
 
   const dashboard = useDashboardStore(pinia)
-  dashboard.overview = {
+  // ⚠️ 留一份**没有 `cost`** 的花生（fixture）：下面验金额时要临时挂上 `cost`
+  //   再渲染一次，验完必须恢复 —— 否则后面那条「统计页不出现 ¥」的断言会被
+  //   自己造的数据打成失败，而失败原因看起来像「页面泄漏了金额」。
+  const overviewFixture: OverviewResponse = {
     range: { from: null, to: null, label: '最近 7 天（自然日）' },
     totalTokens: 1500,
     inputTokens: 15,
@@ -145,6 +153,7 @@ try {
     avgTokensPerCall: 500,
     unattributedRate: 0.333,
   }
+  dashboard.overview = overviewFixture
   dashboard.series = { bucket: 'day', points: [] }
   dashboard.diagnostics = {
     totalEvents: 5,
@@ -193,6 +202,71 @@ try {
     '项目',
   ])
     check(`分析页含 ${label}`, analysisHtml.includes(label))
+  // ★ 金额指标同样按「服务端有没有下发 `cost`」出现/消失，三种状态分别钉住。
+  check('分析页：趋势点没有金额（无 cost:read）时不出现费用指标',
+    analysisHtml.includes('费用（估算）') === false)
+  const costPoints = [
+    {
+      bucket: '2026-09-20',
+      totalTokens: 100,
+      inputTokens: 10,
+      outputTokens: 5,
+      cacheReadTokens: 85,
+      calls: 1,
+      cacheHitRate: 0.89,
+      cost: {
+        costs: [{ currency: 'CNY', amountMicro: 1_200 }],
+        pricedTokens: 100,
+        unpricedTokens: 0,
+        totalTokens: 100,
+        pricedRate: 1,
+        unpricedRate: 0,
+        pricing: { pricingSource: 'db' as const, pricingSyncedAt: null },
+      },
+    },
+    {
+      bucket: '2026-09-21',
+      totalTokens: 200,
+      inputTokens: 20,
+      outputTokens: 10,
+      cacheReadTokens: 170,
+      calls: 2,
+      cacheHitRate: 0.89,
+      cost: {
+        costs: [{ currency: 'CNY', amountMicro: 5_000 }],
+        pricedTokens: 200,
+        unpricedTokens: 0,
+        totalTokens: 200,
+        pricedRate: 1,
+        unpricedRate: 0,
+        pricing: { pricingSource: 'db' as const, pricingSyncedAt: null },
+      },
+    },
+  ]
+  dashboard.series = { bucket: 'day', points: costPoints }
+  const costAnalysisHtml = await render('/src/views/AnalysisView.vue')
+  check('分析页：趋势点带金额时出现「费用（估算）」指标（按币种画，不相加）',
+    costAnalysisHtml.includes('费用（估算）'))
+  // 多币种：指标出现但**禁用**，并明确说明为什么不叠加。
+  dashboard.series = {
+    bucket: 'day',
+    points: [
+      costPoints[0]!,
+      {
+        ...costPoints[1]!,
+        cost: {
+          ...costPoints[1]!.cost,
+          costs: [{ currency: 'USD', amountMicro: 500 }],
+        },
+      },
+    ],
+  }
+  const mixedAnalysisHtml = await render('/src/views/AnalysisView.vue')
+  check('分析页：多币种时金额指标禁用并说明原因（绝不挑一个币种偷偷画）',
+    mixedAnalysisHtml.includes('2 种币种') &&
+    mixedAnalysisHtml.includes('CNY / USD') &&
+    mixedAnalysisHtml.includes('绝不跨币种相加'))
+  dashboard.series = { bucket: 'day', points: [] }
   // Element Plus 在 mounted 时注册表格列，普通 SSR 不输出数据单元格。
   // 先执行真实表格组件，再渲染收集到的真实列插槽，验证字段绑定与格式化。
   const { default: BreakdownTable } = await server.ssrLoadModule('/src/components/BreakdownTable.vue')
@@ -218,6 +292,83 @@ try {
     cells.get('未缓存输入') === '<td>1,300</td>' &&
     cells.get('输出') === '<td>260</td>' &&
     cells.get('缓存读') === '<td>13,000</td>')
+  // ── 金额（v7）─────────────────────────────────────────────────────────
+  // ★ 三种「没有数」在页面上必须长得不一样，这一组用例逐个钉住：
+  //   ① 没有 `cost:read`（字段整个缺席）→ 卡片与列都不出现（由下面的 `allHtml` 断言兜住）；
+  //   ② 有权限、这段用量没配价 → **「未计价」**，不是 `¥0`；
+  //   ③ 有权限、配了价 → 货币符号 + 金额，并附上单价来源。
+  const costCell = async (row: BreakdownRow): Promise<string | undefined> => {
+    const collected: Array<{ label: string; slot: Slot | undefined }> = []
+    const app = createRenderApp({ render: () => h(BreakdownTable, { rows: [row] }) })
+    app.mixin({
+      created() {
+        if (this.$options.name === 'ElTableColumn')
+          collected.push({ label: String(this.$props.label), slot: this.$slots.default })
+      },
+    })
+    await renderToString(app)
+    const column = collected.find((entry) => entry.label === '费用（估算）')
+    if (!column) return undefined
+    return await renderToString(createSSRApp({
+      render: () => h('td', column.slot?.({ row })),
+    }))
+  }
+  const pricedRow: BreakdownRow = {
+    ...modelRow,
+    cost: {
+      costs: [{ currency: 'CNY', amountMicro: 1_234_567, tokens: 14_690 }],
+      pricedTokens: 14_690,
+      unpricedTokens: 0,
+      totalTokens: 14_690,
+      pricedRate: 1,
+      unpricedRate: 0,
+      pricing: { pricingSource: 'db', pricingSyncedAt: null },
+    },
+  }
+  const pricedCell = await costCell(pricedRow)
+  check('分布表：服务端给出金额时才出现费用列，且直接展示服务端算好的金额',
+    pricedCell?.includes('¥1.23') === true)
+  // ② 没配价：金额是空的，但**必须**说「未计价」，而且带上比例。
+  const unpricedCell = await costCell({
+    ...modelRow,
+    cost: {
+      costs: [],
+      pricedTokens: 0,
+      unpricedTokens: 14_690,
+      totalTokens: 14_690,
+      pricedRate: 0,
+      unpricedRate: 1,
+      pricing: { pricingSource: 'db', pricingSyncedAt: null },
+    },
+  })
+  check('分布表：未配价显示「未计价 100.0%」而不是 ¥0',
+    unpricedCell?.includes('未计价') === true &&
+    unpricedCell?.includes('100.0%') === true &&
+    unpricedCell?.includes('¥') === false)
+  // ① 字段缺席：整列不出现（不是显示一列空值或 0）。
+  check('分布表：没有 cost 字段时费用列整列不出现',
+    (await costCell(modelRow)) === undefined)
+  // 概览卡片同款三态：金额 + 未计价提示 + 单价来源。
+  dashboard.overview = {
+    ...overviewFixture,
+    cost: {
+      ...pricedRow.cost!,
+      unpricedTokens: 1_483,
+      unpricedRate: 0.9886,
+      pricedTokens: 17,
+      unpricedTargets: ['dashscope/unpriced-model'],
+    },
+  }
+  const costDashboardHtml = await render('/src/views/DashboardView.vue')
+  check('总览：有金额时出现费用卡片，金额、未计价比例与单价来源同时可见',
+    costDashboardHtml.includes('费用（估算）') &&
+    costDashboardHtml.includes('¥1.23') &&
+    costDashboardHtml.includes('未计价 98.9%') &&
+    costDashboardHtml.includes('按服务端数据库中的单价现算') &&
+    costDashboardHtml.includes('dashscope/unpriced-model'))
+  dashboard.overview = overviewFixture
+  check('总览：没有 cost 字段（无 cost:read）时费用卡片不出现',
+    (await render('/src/views/DashboardView.vue')).includes('费用（估算）') === false)
   const recordsHtml = await render('/src/views/RecordsView.vue')
   check(
     '明细页及分页说明',
@@ -395,6 +546,23 @@ try {
     providersHtml.includes('没有配规则的供应商保持自己的原始名') &&
     providersHtml.includes('明细里始终同时显示原值'))
   check('供应商归一化不混排人员或分组列表', !providersHtml.includes('人员列表') && !providersHtml.includes('分组列表'))
+  const pricingHtml = await render('/src/views/PricingView.vue')
+  check('模型单价独立展示计价目录、新增入口与种子初始化',
+    ['模型单价', '计价目录', '新增单价', '用内置种子价初始化'].every((label) => pricingHtml.includes(label)))
+  // ★ 这一页最容易误解的三件事必须写在页面上，而不是只写在代码注释里：
+  //   ① 粒度是「供应商 → 模型」，同一供应商下不同模型可以各配各的价；
+  //   ② 只存单价、不存金额，所以改价不改写历史用量；
+  //   ③ 未配单价的用量是「未计价」，**不是 0 元**。
+  check('模型单价写明按「供应商 + 模型」粒度定价',
+    pricingHtml.includes('同一供应商下不同模型可以各不相同') &&
+    pricingHtml.includes('区间不得重叠'))
+  check('模型单价写明「只存单价不存金额」与「未计价不是 0 元」',
+    pricingHtml.includes('而历史用量一个字节都不会被动') &&
+    pricingHtml.includes('未计价') &&
+    pricingHtml.includes('缓存读价通常比输入价便宜一个数量级') &&
+    pricingHtml.includes('多币种各自累加，绝不换算也绝不相加') &&
+    pricingHtml.includes('自建计价永远不会等于财务账单'))
+  check('模型单价不混排人员或分组列表', !pricingHtml.includes('人员列表') && !pricingHtml.includes('分组列表'))
   const allHtml =
     loginHtml +
     dashboardHtml +
@@ -407,8 +575,22 @@ try {
     rolesHtml +
     groupsHtml +
     providersHtml
+  // ★ 这条断言被**改写过**（原来是「全站不出现金额」）：v7 起单价有了来源，
+  //   `/pricing` 这一页的主体就是单价（它当然要显示 `CNY` 与 `¥`），
+  //   所以「不出现金额」现在指的是**统计页**——用量总览 / 分析 / 明细 / 诊断 / 管理页
+  //   依然一个字都不显示金额。它们的数据来自 `/api/v1/stats/*`，而那些接口
+  //   在 `cost:read` 之外**整个 `cost` 字段都不发**，页面也就无从显示。
+  //   把 `pricingHtml` 拼进 `allHtml` 会让这条断言重新变成「全站不许有货币符号」，
+  //   那与「页面要能让人核对单价」直接冲突 —— 于是它只会被删掉，而不是被满足。
   for (const term of ['消费金额', 'CNY', '¥', '充值余额', '80,642,909'])
-    check(`不包含金额或旧 mock：${term}`, !allHtml.includes(term))
+    check(`统计页不包含金额或旧 mock：${term}`, !allHtml.includes(term))
+  // 反过来：计价页必须把「单价的单位」说清楚，否则人填进去的数字没有意义。
+  // ⚠️ 这里断言不到货币码（`CNY`）：币种只出现在**每条价的标签**与下拉候选里，
+  //   而 SSR 时列表为空、`el-dialog` 的内容进的是 teleport 载荷而非返回的 HTML。
+  //   想把「币种确实渲染出来了」也钉住，只能等有数据的那一层（真浏览器 / 组件测试）。
+  const pricingLabels = ['货币单位 / 百万 token', '整数微元', '每百万 token 2 元']
+  const pricingMissing = pricingLabels.filter((label) => !pricingHtml.includes(label))
+  check(`计价页写明单价的单位与微元口径${pricingMissing.length ? `（缺 ${pricingMissing.join('、')}）` : ''}`, pricingMissing.length === 0)
   session.expire()
   await router.push('/analysis')
   check('退出后无法进入统计路由', router.currentRoute.value.name === 'login')

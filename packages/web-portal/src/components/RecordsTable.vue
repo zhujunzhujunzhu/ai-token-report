@@ -7,10 +7,12 @@ import {
   ElTable,
   ElTableColumn,
 } from 'element-plus'
+import { computed } from 'vue'
 import type { RecordRow, StatsGroupOption } from '@ai-token-report/shared'
 import { formatCount, formatDateTime } from '../utils/format.js'
+import { UNPRICED_TEXT, currencyText } from '../utils/cost.js'
 import { recordGroupNames, userLabel } from '../types/portal.js'
-defineProps<{
+const props = defineProps<{
   rows: RecordRow[]
   total: number
   page: number
@@ -20,6 +22,8 @@ defineProps<{
   groups: StatsGroupOption[]
 }>()
 defineEmits<{ page: [value: number] }>()
+/** 费用列只在服务端下发了 `cost` 时出现（无 `cost:read` 时字段整个缺席）。 */
+const showCost = computed(() => props.rows.some((row) => row.cost))
 /**
  * 表格插槽给的 `row` 是 Element Plus 自己的 `DefaultRow`（`Record<PropertyKey, any>`），
  * 不是本页的契约类型，而模板里做不了类型断言 —— 所以入口收 `unknown`、
@@ -118,6 +122,24 @@ const rowRecord = (row: unknown): RecordRow => row as RecordRow
         ><strong>{{ formatCount(row.totalTokens) }}</strong></template
       ></el-table-column
     >
+    <!--
+      ★ 明细是**唯一**能逐条核对金额的地方：这一列的价按**该行自己的时刻**解析，
+        所以同一页里同一个模型的两行可以给出不同金额 —— 那正是「换价那一刻」的证据。
+      ⚠️ 三种「没有数」措辞不同：整列不出现（无权限）/ `未计价`（没配价）/ 有金额。
+    -->
+    <el-table-column
+      v-if="showCost"
+      label="费用（估算）"
+      min-width="140"
+      align="right"
+    >
+      <template #default="{ row }">
+        <span v-if="row.cost && row.cost.currency" class="tabular">{{
+          currencyText(row.cost.amountMicro, row.cost.currency)
+        }}</span>
+        <span v-else class="muted">{{ UNPRICED_TEXT }}</span>
+      </template>
+    </el-table-column>
   </el-table>
   <div class="table-footer">
     <span>共 {{ formatCount(total) }} 条调用记录</span
