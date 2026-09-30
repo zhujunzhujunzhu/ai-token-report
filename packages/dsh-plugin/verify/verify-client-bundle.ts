@@ -359,6 +359,23 @@ check(
   '样式里用的是 DSH 主题变量（不是写死的颜色）',
   styles[0]?.textContent.includes('--dsw-alias-') === true,
 )
+/**
+ * ★ 用量条的宽度必须自己减掉宿主的两侧留白（`--dsh-composer-side-clearance`）。
+ *
+ * 它挂在 `conversation.input.dock`，而那个 slot 是 composerStack 的**直接子元素**：
+ * 宿主不给内边距、也不套容器（第一方 GoalBar 同样是自己按公式缩进），
+ * 输入框卡片才是坐在 `padding:0 var(--dsh-composer-side-clearance)` 里的那一个。
+ * 只写 `width:100%` 时两边**只在宽屏等宽** —— 那时卡片与用量条都被
+ * `max-width:--dsh-composer-card-max-width` 卡住；窗口一窄（卡片 max-width
+ * 不再生效）就露出 2×clearance 的差：实拍 701px 窗口是用量条 622px 对输入框
+ * 591px，四角对不齐。这个偏差在窄窗口之外完全看不见，所以钉在这里。
+ */
+const stripRule = (styles[0]?.textContent ?? '').match(/\.atr-strip\{[^}]*\}/)?.[0] ?? ''
+check(
+  '★ 用量条宽度减掉两侧留白（只写 100% 时窄窗口下比输入框每侧宽出 16px）',
+  stripRule.includes('width:calc(100% - 2 * var(--dsh-composer-side-clearance,0px))'),
+  stripRule === '' ? '（没找到 .atr-strip 规则）' : stripRule,
+)
 await mount('dock')
 check('重复装配不重复插样式（HMR 会重新执行工厂）', styles.length === 1, `实际 ${styles.length} 个`)
 

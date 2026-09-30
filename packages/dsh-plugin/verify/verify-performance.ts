@@ -106,7 +106,7 @@ try {
   } finally { db.close() }
   const seedMs = performance.now() - seedStart
   const databaseBefore = databaseBytes()
-  const configuration = { moduleUrl: pathToFileURL(modulePath).href, dbPath, sessionsRoots: [sessionsRoot], records, sessions,
+  const configuration = { moduleUrl: pathToFileURL(modulePath).href, dbPath, sessionsRoots: [sessionsRoot], dataDir: work, records, sessions,
     totals: { ...totals, total: TOTAL }, expectedSessions, daily, expectedGroupSizes }
   writeFileSync(join(work, 'fixture.json'), JSON.stringify(configuration))
 
@@ -119,7 +119,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 assert.equal(typeof globalThis.Bun, 'undefined', '必须由真实 Node 执行');
 const fixture = JSON.parse(readFileSync(new URL('./fixture.json', import.meta.url), 'utf8'));
 const { queryUsage, toUiPayload } = await import(fixture.moduleUrl);
-const ctx = { config: { localDb: true }, dbPath: fixture.dbPath, sessionsRoots: fixture.sessionsRoots, backgroundQueries: true };
+const ctx = { config: { localDb: true }, dbPath: fixture.dbPath, sessionsRoots: fixture.sessionsRoots, dataDir: fixture.dataDir, backgroundQueries: true };
 const range = { since: '2026-01-01', until: '2026-12-31' };
 const fields = ['input', 'output', 'cacheRead', 'cacheWrite', 'calls'];
 function assertCounts(actual, expected) {

@@ -597,6 +597,56 @@ describe('readUiResponse：不可信输入的边界', () => {
     expect(dirty.ok && dirty.payload.gen).toBeUndefined()
   })
 
+  /**
+   * ★ 金额的「字段在不在」语义。
+   *
+   * 这是整个金额展示的**开关**：面板靠 `cost === undefined` 判断宿主认不认识金额协议。
+   * 所以这里必须钉死「缺字段」与「有字段但 text 是 null」是两件事 ——
+   * 前者是老宿主（整块不出现），后者是新宿主且这段没配价（显示「未计价」）。
+   */
+  test('★ cost：缺字段 = 老宿主；有字段但 text 是 null = 未计价（两者不能合并）', () => {
+    const missing = payloadBody()
+    delete missing['cost']
+    const none = readUiResponse(missing)
+    expect(none.ok && none.payload.cost).toBeUndefined()
+
+    const unpriced = readUiResponse(payloadBody({ cost: { text: null, note: '未计价 100.0%' } }))
+    expect(unpriced.ok && unpriced.payload.cost).toEqual({ text: null, note: '未计价 100.0%' })
+    expect(unpriced.ok && unpriced.payload.cost?.text).toBeNull()
+
+    const priced = readUiResponse(payloadBody({ cost: { text: '¥12.35 + $0.5000', note: '单价来源 本机单价快照' } }))
+    expect(priced.ok && priced.payload.cost?.text).toBe('¥12.35 + $0.5000')
+
+    // 脏值（数字 / 非对象）一律当成「没有金额」，绝不渲染进 DOM
+    const dirtyBlock = readUiResponse(payloadBody({ cost: 12.35 }))
+    expect(dirtyBlock.ok && dirtyBlock.payload.cost).toBeUndefined()
+    const dirtyText = readUiResponse(payloadBody({ cost: { text: 0, note: '' } }))
+    expect(dirtyText.ok && dirtyText.payload.cost).toEqual({ text: null, note: null })
+  })
+
+  test('★ 行金额：只认非空字符串（数字 / 空串当成未计价，不是 0 元）', () => {
+    /** 一行的四个 token 列必须齐全，否则边界层会把它降级成 0（另一条既有断言）。 */
+    const row = (key: string, cost?: unknown): Record<string, unknown> => ({
+      key, total: 100, input: 10, output: 1, cacheRead: 89, cacheWrite: 0,
+      calls: 3, sessions: 1, cacheHitRate: 0.899,
+      ...(cost === undefined ? {} : { cost }),
+    })
+    const result = readUiResponse(payloadBody({
+      groups: [{ by: 'provider-model', rows: [
+        row('a', '¥12.35'), row('b', 12.35), row('c', ''), row('d'),
+      ] }],
+    }))
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      const rows = result.payload.groups[0]!.rows
+      expect(rows[0]!.cost).toBe('¥12.35')
+      // 三种「没有金额」都必须落到 `undefined`（页面据此写「未计价」）
+      expect(rows[1]!.cost).toBeUndefined()
+      expect(rows[2]!.cost).toBeUndefined()
+      expect(rows[3]!.cost).toBeUndefined()
+    }
+  })
+
   test('ok 载荷原样还原四个 token 列', () => {
     const result = readUiResponse(payloadBody())
     expect(result.ok).toBe(true)

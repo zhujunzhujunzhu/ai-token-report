@@ -248,6 +248,86 @@ describe('详情体', () => {
   })
 })
 
+describe('★ 金额（估算）在面板里的三态', () => {
+  /**
+   * 三种载荷必须画出**三种不同的东西**：
+   *
+   * | 载荷 | 页面 |
+   * |---|---|
+   * | 没有 `cost`（老宿主） | 整块与整列都不出现（不是 0） |
+   * | `cost.text === null`（一条价都没配上） | 「未计价」 |
+   * | `cost.text === '¥12.35'` | 金额 + 口径说明 |
+   *
+   * 三者混成一个「0」或一个空白，都会让「拿不到金额」被读成「没花钱」。
+   */
+  test('老宿主（载荷没有 cost）→ 整块与整列都不出现，绝不显示 ¥0.00', async () => {
+    const store = await readyStore() // defaultBody() 刻意不带 cost
+    const html = renderToStaticMarkup(createElement(UsageDetail, { state: store.getSnapshot(), store }))
+    expect(html).not.toContain('atr-cost')
+    expect(html).not.toContain('费用（估算）')
+    expect(html).not.toContain('未计价')
+    expect(html).not.toContain('¥0.00')
+    // 明细表头也不该多出金额列
+    expect(html).not.toContain('atr-row-cost')
+  })
+
+  test('一条价都没配上 → 写「未计价」，并且不写 ¥0.00', async () => {
+    const body = defaultBody()
+    const store = await readyStore({
+      ...body,
+      cost: { text: null, note: '单价来源 内置种子价（本机还没同步过快照，金额可能与看板不同） · 未计价 100.0%（2.39B token 没算钱） · 估算，不等于财务账单' },
+    })
+    const html = renderToStaticMarkup(createElement(UsageDetail, { state: store.getSnapshot(), store }))
+    expect(html).toContain('atr-cost')
+    expect(html).toContain('费用（估算）')
+    expect(html).toContain('未计价')
+    expect(html).not.toContain('¥0.00')
+    // 口径说明必须一起出现：金额单独一个大数字会被当成账单金额
+    expect(html).toContain('不等于财务账单')
+    expect(html).toContain('未计价 100.0%')
+  })
+
+  test('有金额 → 画出金额与口径说明，明细多出金额列（含「未计价」行）', async () => {
+    const body = defaultBody()
+    const rows = body.groups as { by: string; rows: Record<string, unknown>[] }[]
+    const store = await readyStore({
+      ...body,
+      // 一行有金额、一行没有：金额行画 `¥12.35`，未计价行画「未计价」
+      groups: [{ by: 'provider-model', rows: [
+        { ...rows[0]!.rows[0]!, cost: '¥12.35' },
+        { ...rows[0]!.rows[0]!, key: 'other/model-y' },
+      ] }],
+      cost: { text: '¥12.35 + $0.5000', note: '单价来源 本机单价快照（同步于 2026/1/1 09:00） · 未计价 10.6%（1.2M token 没算钱） · 估算，不等于财务账单' },
+    })
+    const html = renderToStaticMarkup(createElement(UsageDetail, { state: store.getSnapshot(), store }))
+    expect(html).toContain('费用（估算）')
+    // 多币种**原样**显示：页面不做任何换算（那是第二个口径实现）
+    expect(html).toContain('¥12.35 + $0.5000')
+    expect(html).toContain('本机单价快照')
+    // 明细表的金额列：有金额的行与未计价的行必须画得不一样
+    expect(html).toContain('atr-row-cost')
+    expect(html).toContain('¥12.35')
+    expect(html).toContain('未计价')
+  })
+
+  test('金额是宿主给的串：脏值（数字 / 空串）一律当「未计价」，不渲染进 DOM', async () => {
+    const body = defaultBody()
+    const rows = body.groups as { by: string; rows: Record<string, unknown>[] }[]
+    // 载荷解析层只认非空字符串，所以这里走的是真实边界：数字被丢弃
+    const store = await readyStore({
+      ...body,
+      groups: [{ by: 'provider-model', rows: [{ ...rows[0]!.rows[0]!, cost: 12.35 }] }],
+      cost: { text: 0, note: '口径' },
+    })
+    const state = store.getSnapshot()
+    const html = renderToStaticMarkup(createElement(UsageDetail, { state, store }))
+    // `cost` 整块因为 text 不是字符串而按 `null` 处理 → 「未计价」
+    expect(html).toContain('未计价')
+    expect(html).not.toContain('12.35')
+    expect(state.data?.groups[0]?.rows[0]?.cost).toBeUndefined()
+  })
+})
+
 describe('两个挂载点', () => {
   test('用量条画出摘要 + 详情按钮', async () => {
     const store = await readyStore()

@@ -27,13 +27,19 @@ message:{source:{kind:'model',provider:'test',model:'model'}},
 usage:{inputTokens:100,outputTokens:20,cacheReadTokens:300,cacheWriteTokens:40,reasoningTokens:5,totalTokens:460}}});
 const frame = rows => zstdCompressSync(Buffer.from(rows.map(JSON.stringify).join('\\n')+'\\n'));
 writeFileSync(file, frame([{type:'session',version:3,id:'session-1',createdAt:time,cwd:'project'},event(1)]));
-const context = {config:resolveConfig({dshHome:home}),sessionsRoots:[join(home,'sessions')],dbPath:join(home,'usage.sqlite')};
+// dataDir 也钉在临时 home：金额的单价快照从那里读（缺文件就走内置种子价），
+// 不钉住就会读到开发者本机真实的 pricing.json。
+const context = {config:resolveConfig({dshHome:home}),sessionsRoots:[join(home,'sessions')],dbPath:join(home,'usage.sqlite'),dataDir:home};
 const query = {period:'today',by:['provider-model','project','session','day','hour'],series:'hour'};
 const sql = await queryUsage(context, query);
 assert.equal(sql.source,'local-db');
 assert.equal(sql.totals.total,460);
 const scan = await queryUsage({...context,config:{...context.config,localDb:false}},query);
-for(const key of ['totals','metrics','groups','series','sessions']) assert.deepEqual(sql[key],scan[key]);
+// ★ cost 也逐位比对：金额是逐条事件取价后折叠的，两条路径必须拿到**同一批事件**
+//   （SQL 路径来自 queryRecords，直扫路径来自内存记录）。少一条或多一条，
+//   金额与分组行的金额列都会与 token 数对不上，而数字看着都正常。
+//   ⚠️ 本文件整体是一个模板字符串，注释里**不能出现反引号**（会提前结束它）。
+for(const key of ['totals','metrics','groups','series','sessions','cost']) assert.deepEqual(sql[key],scan[key]);
 const hot = await queryUsage(context,query);
 assert.deepEqual(hot.totals,sql.totals);
 appendFileSync(file,frame([event(2)]));

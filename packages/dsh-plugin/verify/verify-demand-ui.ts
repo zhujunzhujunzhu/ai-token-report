@@ -35,7 +35,11 @@ function sample(query: UsageQuery): UsageResult {
     const count = by === 'session' ? 1000 : by === 'provider-model' ? 25 : by === 'provider' ? 5 : 20
     const rows = Array.from({ length: count }, (_, index) => ({ key: `${by}-${String(index + 1).padStart(4, '0')}`,
       total: total / count, input: 0, output: 0, cacheRead: total / count, cacheWrite: 0,
-      calls: 1000 / count, sessions: 1000 / count, cacheHitRate: 1 }))
+      calls: 1000 / count, sessions: 1000 / count, cacheHitRate: 1,
+      // 行金额与顶部金额同源（合成样例）：人工验收要能一眼看出
+      // 明细里的金额列**不是**空的、也不是 0。
+      cost: { costs: [{ currency: 'CNY', amountMicro: 12_345_678, tokens: total / count }],
+        pricedTokens: total / count, unpricedTokens: 0, totalTokens: total / count, pricedRate: 1, unpricedRate: 0 } }))
     return { by, rowCount: count, rows: rows.slice(query.offset ?? 0, (query.offset ?? 0) + (query.top ?? count)) }
   })
   const points = query.series === 'hour' ? 24 : 100
@@ -44,6 +48,14 @@ function sample(query: UsageQuery): UsageResult {
     range: { since: 0, until: 1 },
     totals: { total, input: 0, output: 0, cacheRead: total, cacheWrite: 0, reasoning: 0, calls: 1000 },
     metrics: { total, cacheHitRate: 1, cacheLeverage: 0, avgTokensPerCall: 10_000_000 },
+    // 合成一份**有金额**的价：人工验收时要能看见「费用（估算）」那一块
+    // 与明细表的金额列（多币种刻意用 + 连接，绝不换算）。
+    cost: {
+      costs: [{ currency: 'CNY', amountMicro: 12_345_678, tokens: total }],
+      pricedTokens: total, unpricedTokens: 0, totalTokens: total, pricedRate: 1, unpricedRate: 0,
+      pricing: { pricingSource: 'snapshot', pricingSyncedAt: Date.UTC(2026, 0, 1, 9) },
+      unpricedTargets: [], note: null,
+    },
     groups, sessions: 1000, elapsedMs: 0, scannedAt: Date.now(),
     ...(!query.summaryOnly && query.series ? { series: Array.from({ length: points }, (_, index) => {
       const value = Math.floor(total / points) + (index === points - 1 ? total % points : 0)

@@ -195,6 +195,17 @@ export interface UiGroupRow {
   calls: number
   sessions: number
   cacheHitRate: number
+  /**
+   * ★ 该行的金额，**宿主已经格式化好的字符串**（例如 `¥12.35 + $0.5000`）。
+   *
+   * 🚨 浏览器半不 import `@ai-token-report/shared`，所以这里**只可能是串**，
+   *   页面也不许做任何换算（那是第二个口径实现，且它不会报错）。
+   *
+   * ⚠️ `undefined` = **未计价**（这一行一条价都没配上），页面必须写「未计价」，
+   *   **绝不许写 `¥0.00`** —— 未定价看起来像「省了钱」，是本功能最危险的误读。
+   *   以 `*` 结尾 = 只有部分 token 配上了价（金额只覆盖已计价的那部分）。
+   */
+  cost?: string
 }
 
 /** 趋势图的一个点。 */
@@ -237,6 +248,19 @@ export interface UiPayload {
   sessions: number
   elapsedMs: number
   scannedAt: number
+  /**
+   * ★ 总量金额（估算），**宿主格式化好的串**。
+   *
+   * 🚨 整块可选，而且「缺字段」与「没花钱」必须长得不一样：
+   *   - 缺 `cost` = **老宿主**，它根本不知道有金额这回事 →
+   *     面板整块不出现（绝不显示 0）；
+   *   - `cost.text === null` = 新宿主，但这段区间**一条价都没配上** →
+   *     显示「未计价」（同样绝不显示 `¥0.00`）。
+   *
+   * `note` 是那行费用口径说明（单价来源 / 未计价比例 / 「估算 ≠ 财务账单」），
+   * 同样由宿主拼好 —— 浏览器半不重算任何比例。
+   */
+  cost?: { text: string | null; note: string | null }
   /**
    * ★ 数据代次：宿主每次**采集到**新的计费记录就加一。
    *
@@ -343,6 +367,10 @@ export function readUiResponse(value: unknown): { ok: true; payload: UiPayload }
     for (const item of Array.isArray(group['rows']) ? group['rows'] : []) {
       const row = record(item)
       if (row === undefined) continue
+      // ★ 金额只认**非空字符串**：`""` / 数字 / null 一律当成「没有这个字段」→
+      //   页面显示「未计价」。把空串渲染成一个空格会让「未计价」看起来像「金额忘了显示」，
+      //   而把数字透传进 DOM 则等于让不可信输入决定页面上写什么。
+      const rowCost = row['cost']
       rows.push({
         key: text(row['key'], '(未命名)'),
         total: count(row['total']),
@@ -353,6 +381,7 @@ export function readUiResponse(value: unknown): { ok: true; payload: UiPayload }
         calls: count(row['calls']),
         sessions: count(row['sessions']),
         cacheHitRate: count(row['cacheHitRate']),
+        ...(typeof rowCost === 'string' && rowCost !== '' ? { cost: rowCost } : {}),
       })
     }
     groups.push({ by: text(group['by'], '?'), rows })
@@ -377,6 +406,14 @@ export function readUiResponse(value: unknown): { ok: true; payload: UiPayload }
   // ★ 代次只认有限数字；缺字段/脏值时**整个字段不带**，
   //   让浏览器半能区分「宿主说自己没变过（0）」与「宿主根本不认识这个协议」。
   const gen = raw['gen']
+  // ★ 金额整块：只有**认得出 `cost` 是个对象**时才带。
+  //   `text` 允许是 `null`（一条价都没配上），但必须真的是 `null` 或字符串 ——
+  //   脏值一律当成「没有金额」而不是渲染到页面上。
+  const rawCost = record(raw['cost'])
+  const cost = rawCost === undefined ? undefined : {
+    text: typeof rawCost['text'] === 'string' ? rawCost['text'] : null,
+    note: typeof rawCost['note'] === 'string' && rawCost['note'] !== '' ? rawCost['note'] : null,
+  }
   const rawPage = record(raw['pagination'])
   const pagination = rawPage !== undefined && UI_GROUP_BY.includes(rawPage['by'] as UiGroupBy)
     && Number.isSafeInteger(rawPage['page']) && Number(rawPage['page']) >= 1
@@ -417,6 +454,7 @@ export function readUiResponse(value: unknown): { ok: true; payload: UiPayload }
       sessions: count(raw['sessions']),
       elapsedMs: count(raw['elapsedMs']),
       scannedAt: count(raw['scannedAt']),
+      ...(cost !== undefined ? { cost } : {}),
       ...(typeof gen === 'number' && Number.isFinite(gen) ? { gen } : {}),
     },
   }

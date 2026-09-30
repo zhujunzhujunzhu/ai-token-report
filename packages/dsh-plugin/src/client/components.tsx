@@ -98,15 +98,23 @@ function Cell(props: { label: string; value: number; hint?: string }): ReactNode
   )
 }
 
-/** 一行排行。 */
-function Row(props: { row: UiGroupRow }): ReactNode {
+/** 一行排行。`showCost` = 本次载荷带金额（老宿主不带时整列不出现，而不是显示 0）。 */
+function Row(props: { row: UiGroupRow; showCost: boolean }): ReactNode {
   const row = props.row
   return createElement('details', { className: 'atr-row-detail' },
-    createElement('summary', { className: 'atr-row' },
+    createElement('summary', { className: props.showCost ? 'atr-row atr-row-cost' : 'atr-row' },
       createElement('span', { className: 'atr-row-k', title: row.key }, row.key),
       createElement('span', { className: 'atr-row-n', title: fmtInt(row.total) }, fmtCompact(row.total)),
       createElement('span', { className: 'atr-row-n' }, fmtPct(row.cacheHitRate)),
-      createElement('span', { className: 'atr-row-n' }, `${fmtInt(row.calls)} 次`)),
+      createElement('span', { className: 'atr-row-n' }, `${fmtInt(row.calls)} 次`),
+      /**
+       * ★ 没有金额时写「未计价」，**绝不写 ¥0.00**：
+       *   「这一行没配上价」与「这一行没花钱」是两件事，前者要人去补价。
+       *   带 `*` 的串由宿主生成（只覆盖已计价的那部分），这里原样显示、不做任何加工。
+       */
+      props.showCost
+        ? createElement('span', { className: 'atr-row-n atr-row-cost-v' }, row.cost ?? '未计价')
+        : null),
     createElement('div', { className: 'atr-breakdown' },
       ...([['未缓存输入', row.input], ['输出', row.output], ['缓存读', row.cacheRead],
         ['缓存写', row.cacheWrite], ['会话数', row.sessions]] as const).map(([label, value]) =>
@@ -211,6 +219,16 @@ export function UsageDetail(props: { state: UsageState; store: UsageStore; onClo
   }
   const visibleRows = remote ? topGroup?.rows
     : topGroup?.rows.slice((currentPage - 1) * pageSize, currentPage * pageSize)
+  /**
+   * ★ 金额列出不出现，只看**载荷里有没有 `cost`**。
+   *
+   * 老宿主（不认识金额协议）不带这个字段 → 整列、整块都不出现。
+   * 新宿主一定带（`text` 可能是 `null` = 一条价都没配上）→ 出现，
+   * 且金额为 null 时写「未计价」而不是 `¥0.00`。
+   * 这两种情况在页面上必须**长得不一样**，否则「拿不到金额」会被读成「没花钱」。
+   */
+  const cost = data.cost
+  const showCost = cost !== undefined
 
   return createElement(
     'div',
@@ -236,6 +254,35 @@ export function UsageDetail(props: { state: UsageState; store: UsageStore; onClo
       t.cacheWrite > 0 ? createElement('span', null, '缓存写 ', createElement('b', null, fmtCompact(t.cacheWrite))) : null,
     ),
 
+    /**
+     * ★ 金额（估算）。
+     *
+     * 数字本身是宿主算好、格式化好的串，这里只排版 —— 面板里没有一处算术。
+     * 金额永远和那行口径说明一起出现（单价来源 / 未计价比例 / 估算 ≠ 账单）：
+     * 单独一个大数字会被当成财务账单上的数。
+     */
+    showCost
+      ? createElement(
+          'div',
+          { className: 'atr-cost' },
+          createElement('span', { className: 'atr-cost-k' }, '费用（估算）'),
+          createElement('b', { className: 'atr-cost-v' }, cost.text ?? '未计价'),
+          cost.note !== null ? createElement('span', { className: 'atr-cost-note' }, cost.note) : null,
+        )
+      : null,
+
+    /**
+     * ★ 趋势**刻意没有「费用」这一项**，这是口径决定，不是没做完。
+     *
+     * 金额在多币种时绝不相加（那是口径错误），所以「能不能把钱加成一条线」
+     * 需要一条判定规则。那条规则的唯一实现是部门看板的
+     * `packages/web-portal/src/utils/cost.ts` 的 `costSeriesOf` ——
+     * 在这里照抄一遍就是第二个「什么时候可以把钱加起来」的实现，
+     * 分叉时不会报错，只会让两处的图一个有线、一个没有。
+     *
+     * 金额该去哪看：本页顶部的总额、明细表每行的金额列，
+     * 以及部门看板的分布表费用列（那边按币种分开列，不画线）。
+     */
     createElement('section', { className: 'atr-section' },
       createElement('div', { className: 'atr-head' }, createElement('div', null,
         createElement('strong', { className: 'atr-section-title' }, '用量趋势'),
@@ -258,14 +305,17 @@ export function UsageDetail(props: { state: UsageState; store: UsageStore; onClo
         'aria-selected': by === (topGroup?.by ?? groupBy), 'aria-pressed': by === (topGroup?.by ?? groupBy),
         onClick: () => pickGroup(by),
       }, GROUP_LABELS[by] ?? by)))),
-    createElement('div', { className: 'atr-row atr-table-head' },
-      ...['明细（点击展开）', 'Token 总量', '命中率', '调用数'].map((label) => createElement('span', { key: label }, label))),
+    createElement('div', { className: showCost ? 'atr-row atr-row-cost atr-table-head' : 'atr-row atr-table-head' },
+      ...(showCost
+        ? ['明细（点击展开）', 'Token 总量', '命中率', '调用数', '费用（估算）']
+        : ['明细（点击展开）', 'Token 总量', '命中率', '调用数']
+      ).map((label) => createElement('span', { key: label }, label))),
 
     topGroup !== undefined && topGroup.rows.length > 0
       ? createElement(
           'div',
           { className: 'atr-rows' },
-          ...(visibleRows ?? []).map((row) => createElement(Row, { key: `${topGroup.by}:${row.key}`, row })),
+          ...(visibleRows ?? []).map((row) => createElement(Row, { key: `${topGroup.by}:${row.key}`, row, showCost })),
         )
       : createElement('div', { className: 'atr-empty' }, detailPending ? '正在读取用量明细…' : `${data.rangeLabel}没有计费事件。`),
     pageCount > 1 ? createElement('nav', { className: 'atr-pagination', 'aria-label': '用量明细分页' },

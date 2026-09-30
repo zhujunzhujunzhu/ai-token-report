@@ -24,7 +24,18 @@ import calendarCss from 'react-day-picker/style.css' with { type: 'text' }
 export const STYLE_TAG_ID = '@ai-token-report/dsh-plugin/client.css'
 
 export const CSS = calendarCss.replaceAll('.rdp-', '.atr-rdp-') + `
-.atr-strip{box-sizing:border-box;width:100%;max-width:var(--dsh-composer-card-max-width,748px);margin:0 auto;display:flex;align-items:center;gap:10px;height:34px;padding:0 12px;border:0.5px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-specific-tip,var(--dsw-alias-bg-layer-1));font-size:12px;line-height:1;color:var(--dsw-alias-label-secondary)}
+/* ★ 用量条的宽度必须自己减掉两侧的 --dsh-composer-side-clearance。
+   本条的 slot（conversation.input.dock）是 composerStack 的**直接子元素**：
+   宿主既不给内边距也不套容器（第一方 GoalBar 同样是自己按公式缩进），
+   而输入框卡片坐在一个 padding:0 var(--dsh-composer-side-clearance) 的容器里。
+   所以只写 width:100% 时两边**只在宽屏对齐** —— 那时卡片与用量条都被
+   max-width:--dsh-composer-card-max-width 卡住，宽度同为 card-max-width；
+   窗口一窄（卡片 max-width 不再生效）就会露出 2×clearance 的差，
+   实拍 701px 窗口：用量条 622px、输入框 591px，四角对不齐。
+   减掉之后两条公式恒等（都是 min(容器宽 - 2×clearance, card-max-width)）。
+   ⚠️ fallback 必须给 0px：旧宿主没有这些变量时退回 width:100%，与改动前一致；
+      写成无 fallback 的 var() 会让 calc 在**计算值阶段**失效，width 直接变 auto。 */
+.atr-strip{box-sizing:border-box;width:calc(100% - 2 * var(--dsh-composer-side-clearance,0px));max-width:var(--dsh-composer-card-max-width,748px);margin:0 auto;display:flex;align-items:center;gap:10px;height:34px;padding:0 12px;border:0.5px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-specific-tip,var(--dsw-alias-bg-layer-1));font-size:12px;line-height:1;color:var(--dsw-alias-label-secondary)}
 .atr-strip-label{flex:none;font-weight:600;color:var(--dsw-alias-label-primary)}
 .atr-strip-period{flex:none;color:var(--dsw-alias-label-tertiary)}
 .atr-strip-metrics{min-width:0;flex:1;display:flex;align-items:baseline;gap:14px;overflow:hidden;white-space:nowrap}
@@ -53,6 +64,15 @@ export const CSS = calendarCss.replaceAll('.rdp-', '.atr-rdp-') + `
 
 .atr-metrics{display:flex;gap:16px;flex-wrap:wrap;color:var(--dsw-alias-label-secondary)}
 .atr-metrics b{color:var(--dsw-alias-label-primary);font-weight:600}
+
+/* 费用（估算）：金额 + 一行口径说明。金额是**估算**，说明必须跟着它一起出现
+   （单价来源 / 未计价比例 / 估算 ≠ 财务账单），否则一个大数字会被当成账单金额。 */
+.atr-cost{display:flex;align-items:baseline;flex-wrap:wrap;gap:6px 10px;padding:8px 10px;border:0.5px solid var(--dsw-alias-border-l1);border-radius:9px;background:var(--dsw-alias-bg-base)}
+.atr-cost-k{color:var(--dsw-alias-label-tertiary);font-size:11px}
+.atr-cost-v{color:var(--dsw-alias-label-primary);font-size:14px;font-weight:600;font-variant-numeric:tabular-nums}
+.atr-cost-note{flex-basis:100%;color:var(--dsw-alias-label-caption,var(--dsw-alias-label-tertiary));font-size:11px;line-height:1.5}
+/* 「未计价」是状态而不是金额：刻意不用金额的字重/字号，免得被读成一个数。 */
+.atr-row-cost-v{color:var(--dsw-alias-label-tertiary)}
 .atr-note{color:var(--dsw-alias-label-caption,var(--dsw-alias-label-tertiary));font-size:11px}
 
 .atr-bars{display:flex;align-items:flex-end;gap:2px;height:38px}
@@ -64,6 +84,9 @@ export const CSS = calendarCss.replaceAll('.rdp-', '.atr-rdp-') + `
 .atr-pagination{display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:12px;margin-top:16px;padding-top:12px;border-top:1px solid var(--dsw-alias-border-l1);font-size:12px;color:var(--dsw-alias-label-secondary)}
 .atr-page-summary{margin-right:auto}
 .atr-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto auto;gap:10px;align-items:baseline;padding:2px 0}
+/* 带金额时多一列。⚠️ 列数必须跟着子元素数走：轨道少了第 5 个格子会被挤到第二行，
+   整张表看起来「错位」而不是「少了一列」。表头与数据行共用这个类。 */
+.atr-row-cost{grid-template-columns:minmax(0,1fr) auto auto auto minmax(64px,auto)}
 .atr-row-k{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-primary-dimmed)}
 .atr-row-n{text-align:right;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums}
 .atr-row-n b{color:var(--dsw-alias-label-primary);font-weight:600}
@@ -85,6 +108,7 @@ export const CSS = calendarCss.replaceAll('.rdp-', '.atr-rdp-') + `
 .atr-section{border:1px solid var(--dsw-alias-border-l1);border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:18px}
 .atr-bars{height:130px;gap:5px}.atr-bar{border-radius:4px 4px 0 0}
 .atr-row{grid-template-columns:minmax(130px,1fr) 100px 75px 75px;padding:12px 6px;align-items:center}
+.atr-row-cost{grid-template-columns:minmax(130px,1fr) 100px 75px 75px minmax(96px,auto)}
 .atr-row-detail{border-bottom:1px solid var(--dsw-alias-border-l1)}
 .atr-row-detail summary{cursor:pointer}.atr-row-detail summary:hover{background:var(--dsw-alias-interactive-bg-hover)}
 .atr-row-k:before{content:'▸ ';color:var(--dsw-alias-label-tertiary)}
