@@ -26,10 +26,11 @@ import { join } from 'node:path'
 
 import { insertRecords, openPortalDb } from '@ai-token-report/core/db'
 import { cacheHitRate, unattributedRate, UNATTRIBUTED_USER } from '@ai-token-report/shared'
-import type { BreakdownResponse } from '@ai-token-report/shared'
+import type { BreakdownResponse, StatsMembersResponse } from '@ai-token-report/shared'
 
 import { CredentialStore } from '../src/credentials.js'
 import { IngestRoute } from '../src/ingest-route.js'
+import { IdentityRepository, MEMBER_ROLE_ID } from '../src/identity/index.js'
 import { StatsRoute, type StatsRouteResult } from '../src/stats-route.js'
 
 let home: string
@@ -532,5 +533,88 @@ describe('上报库不可重建（S7 时期也不能破例）', () => {
     expect(reason).toContain('上报库')
     // 明确告诉管理员该怎么办，而不是一句「内部错误」
     expect(reason).toContain('备份')
+  })
+})
+
+describe('人员候选目录（GET /api/v1/stats/members）', () => {
+  /**
+   * 名册来自**与用量共用的 portal 数据库**，所以这里用真身份库（不是凭证表）。
+   *
+   * ★ 这条接口存在的全部理由：它是人员下拉里**唯一**能列出「当前时间窗内
+   *   没有用量的人」的来源。老做法只从用量行里取候选，于是选中一个分组之后
+   *   整个下拉会空掉 —— 那看起来像数据丢了，而不像「这段时间没人用」。
+   */
+  async function roster() {
+    const repository = new IdentityRepository({ sqlitePath: dbPath })
+    await repository.initialize({
+      adminToken: 'tok-admin',
+      adminName: '管理员',
+      adminUsername: 'admin',
+      adminPassword: 'test-password-2026',
+    })
+    const admin = (await repository.resolveBearer('tok-admin'))!
+    const group = (await repository.createGroup(admin, { name: '数字建造中心-开发' })).group!
+    const zhang = (await repository.createMember(admin, { name: '张三', role_ids: [MEMBER_ROLE_ID] })).member!
+    const li = (await repository.createMember(admin, { name: '李四', role_ids: [MEMBER_ROLE_ID] })).member!
+    await repository.updateMember(admin, {
+      member_id: zhang.member_id,
+      expected_version: zhang.version,
+      group_ids: [group.group_id],
+    })
+    return {
+      route: new StatsRoute({ identityStore: repository, dbPath }),
+      repository,
+      admin,
+      group,
+      zhang,
+      li,
+    }
+  }
+
+  test('★ 列出全部人员及其当前分组 —— 一条用量都没有也照样列出', async () => {
+    const { route, group, zhang, li } = await roster()
+    const res = await route.handle('members', new URLSearchParams(), 'Bearer tok-admin')
+    expect(res.status).toBe(200)
+    const members = (res.body as StatsMembersResponse).members
+    const byName = new Map(members.map((member) => [member.name, member]))
+
+    expect(byName.get('张三')?.member_id).toBe(zhang.member_id)
+    expect(byName.get('张三')?.group_ids).toEqual([group.group_id])
+    // 未分组是**有意义的状态**（空数组），不是「没加载出来」
+    expect(byName.get('李四')?.member_id).toBe(li.member_id)
+    expect(byName.get('李四')?.group_ids).toEqual([])
+    expect(byName.get('管理员')).toBeDefined()
+    expect(members.every((member) => member.status === 'active')).toBe(true)
+    // ★ 只回筛选要用的三样：角色 / 权限 / 账号属于管理面，不因为看得见用量就下发
+    expect(Object.keys(byName.get('张三')!).sort()).toEqual([
+      'group_ids',
+      'member_id',
+      'name',
+      'status',
+    ])
+  })
+
+  test('停用人员照样列出（停用只影响「以后还能不能选他」）', async () => {
+    const { route, repository, admin, li } = await roster()
+    await repository.setMemberStatus(admin, {
+      member_id: li.member_id,
+      expected_version: li.version,
+      status: 'disabled',
+    })
+    const res = await route.handle('members', new URLSearchParams(), 'Bearer tok-admin')
+    const members = (res.body as StatsMembersResponse).members
+    expect(members.find((member) => member.name === '李四')?.status).toBe('disabled')
+    expect(members.find((member) => member.name === '张三')?.status).toBe('active')
+  })
+
+  test('缺 Authorization → 401（与其它看板接口同一道门）', async () => {
+    const { route } = await roster()
+    expect((await route.handle('members', new URLSearchParams(), null)).status).toBe(401)
+  })
+
+  test('凭证表形态没有名册：200 + 空名册（页面据此不做收窄）', async () => {
+    const res = await get('members')
+    expect(res.status).toBe(200)
+    expect((res.body as StatsMembersResponse).members).toEqual([])
   })
 })

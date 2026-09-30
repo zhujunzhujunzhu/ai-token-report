@@ -461,6 +461,28 @@ try {
   same('records 逐位一致（含 (ts, seq) 定序结果）', recordsLite, recordsMy)
   check('records 总数正确', recordsMy['total'] === EXPECTED.events, JSON.stringify(recordsMy['total']))
 
+  // ★ 人员候选目录（`/api/v1/stats/members`）**不能逐位比对**：两侧的
+  //   `member_id` / `group_id` 由各自的隔离库随机生成，逐位比对必然不等。
+  //   要比的是「这句查询在两个后端上等价」：名册（显示名 + 状态）与分组关联条数。
+  //   方言写错（保留字、`ORDER BY` 的列名）时这里要么抛错、要么条数对不上，
+  //   而它在 SQLite 上永远是对的 —— 只有活体 MySQL 才算证据。
+  const rosterOf = (rows: Record<string, unknown>[]): string[] =>
+    rows
+      .map((row) => `${row['name']}:${row['status']}:${(row['group_ids'] as string[]).length}`)
+      .sort()
+  const membersLite = (await stats(sqlite, 'members'))['members'] as Record<string, unknown>[]
+  const membersMy = (await stats(mysql, 'members'))['members'] as Record<string, unknown>[]
+  check(
+    '★ members 两个后端的名册一致（人员候选目录）',
+    JSON.stringify(rosterOf(membersLite)) === JSON.stringify(rosterOf(membersMy)),
+    `\n     SQLite: ${JSON.stringify(rosterOf(membersLite))}\n     MySQL : ${JSON.stringify(rosterOf(membersMy))}`,
+  )
+  check(
+    'members 带上分组关联，且名册不只是管理员一个人',
+    membersMy.length >= 3 && membersMy.some((row) => (row['group_ids'] as string[]).length > 0),
+    JSON.stringify(rosterOf(membersMy)),
+  )
+
   // ── 6. 直接钉住 `||` 那个坑 ───────────────────────────────────────────────
   console.log('\n【6】★ provider-model 分组键必须是 `a/b` 拼接结果，不是 0/1')
   const pmRows = (await stats(mysql, 'breakdown', { period: 'today', by: 'provider-model' }))['rows'] as {

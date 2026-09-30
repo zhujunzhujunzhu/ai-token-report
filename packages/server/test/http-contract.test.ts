@@ -388,6 +388,15 @@ describe('现状契约：GET /api/v1/stats/*', () => {
     expect(r.status).toBe(404)
     expect(reason(r)).toBe('未找到 /api/v1/stats/a/b')
   })
+
+  test('★ 人员候选目录是看板接口：缺 Authorization → 401，带 token → 200', async () => {
+    // 它喂的是筛选下拉，权限必须与其它看板接口同一道门（`stats:read`），
+    // 而不是人员管理接口的 `members:read`。
+    expect((await call(dept, 'GET', '/api/v1/stats/members')).status).toBe(401)
+    const r = await call(dept, 'GET', '/api/v1/stats/members', { headers: MEMBER })
+    expect(r.status).toBe(200)
+    expect(r.body).toHaveProperty('members')
+  })
 })
 
 // ─────────────────────────────────────────────────────────────

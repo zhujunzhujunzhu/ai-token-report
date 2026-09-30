@@ -10,6 +10,7 @@
  * | `/api/v1/stats/breakdown?by=user\|group\|model\|provider\|project\|…` | ★ **人员排行 / 分组排行** |
  * | `/api/v1/stats/records?limit&offset` | 明细（分页） |
  * | `/api/v1/stats/groups` | ★ **分组候选项**（筛选下拉用） |
+ * | `/api/v1/stats/members` | ★ **人员候选项**（筛选下拉用；带当前分组 ID） |
  * | `/api/v1/stats/diagnostics` | 覆盖率 / 未归属 / 数据边界 |
  *
  * 响应结构全部来自 `shared/src/protocol.ts`，前端与之共用 —— 字段对不上时
@@ -61,6 +62,8 @@ import {
   type SeriesResponse,
   type StatsGroupOption,
   type StatsGroupsResponse,
+  type StatsMemberOption,
+  type StatsMembersResponse,
 } from '@ai-token-report/shared'
 
 import type { CredentialStore } from './credentials.js'
@@ -158,10 +161,12 @@ export class StatsRoute {
       return { status: 404, body: { ok: false, reason: `未找到 /api/v1/stats/${sub}` } }
     }
 
-    // ★ 分组候选项与时间窗、人员筛选全都无关（它回答「库里有哪些分组」），
-    //   所以放在开统计会话之前：一个筛选下拉不该顺带开一次统计会话。
+    // ★ 候选目录（分组 / 人员）与时间窗、用量筛选全都无关 —— 它们回答的是
+    //   「库里有哪些分组、名册上有哪些人」，所以放在开统计会话之前：
+    //   一个筛选下拉不该顺带开一次统计会话。
     //   鉴权已经在上面做完了，401/503 的语义与其它子路径完全一致。
     if (sub === 'groups') return await this.#groups()
+    if (sub === 'members') return await this.#members()
 
     // ── 2. 参数（时间窗在服务端解析，前端不做日期换算）──────────────
     const window = parseWindow(params)
@@ -359,6 +364,65 @@ export class StatsRoute {
       await store.close()
     }
   }
+
+  /**
+   * `GET /api/v1/stats/members` —— 看板的人员候选项。
+   *
+   * ★ 权限是 `stats:read`（与其它看板接口同一道门），**不是** `members:read`：
+   *   页面上一个筛选下拉需要的只是「名册上有谁、他在哪个分组」，
+   *   让它顺带具备人员目录的管理权限，等于把名册变成看板的副作用。
+   *
+   * 🚨 它是人员下拉里**唯一**能列出「当前时间窗内没有用量的人」的来源。
+   *   从用量行里取候选的老做法在选中分组之后会整个空掉（见协议注释）——
+   *   那是这一条接口存在的全部理由，别为了省一次查询把它删掉。
+   *
+   * ⚠️ 只回筛选要用的三样（稳定 ID / 显示名 / 当前分组 ID）。角色、权限、
+   *   登录账号一律不下发：它们属于管理面，`/api/v1/admin/members` 才是那份答案。
+   * ⚠️ 已停用人员照样列出（同分组候选）：停用只影响「以后还能不能选他」。
+   */
+  async #members(): Promise<StatsRouteResult> {
+    let store: PortalStore
+    try {
+      store = await openPortalStore(this.#target)
+    } catch (err) {
+      if (this.#identityStore) return { status: 503, body: { ok: false, reason: '统计数据库暂时不可用，请稍后重试' } }
+      return { status: 500, body: { ok: false, reason: `上报库不可用: ${msg(err)}` } }
+    }
+
+    try {
+      // ★ 两条查询 + 内存归并，既不是 JOIN 也不是 `GROUP_CONCAT`：
+      //   与关联表 JOIN 会让每个人员按分组数复制成多行（同 `#groups` 的注释），
+      //   而 `GROUP_CONCAT` 在两个后端上的写法与分隔符并不一致。
+      //   排序交给 SQL，页面按名册顺序展示。
+      const members = await store.all<{ member_id: string; display_name: string; status: string }>(
+        'SELECT member_id, display_name, status FROM members ORDER BY display_name, member_id',
+      )
+      const assignments = await store.all<{ member_id: string; group_id: string }>(
+        'SELECT member_id, group_id FROM member_group_assignments ORDER BY group_id',
+      )
+      const groupIds = new Map<string, string[]>()
+      for (const row of assignments) {
+        const memberId = String(row.member_id)
+        const list = groupIds.get(memberId) ?? []
+        list.push(String(row.group_id))
+        groupIds.set(memberId, list)
+      }
+      const body: StatsMembersResponse = {
+        members: members.map((row) => ({
+          member_id: String(row.member_id),
+          name: String(row.display_name),
+          status: String(row.status) as StatsMemberOption['status'],
+          group_ids: groupIds.get(String(row.member_id)) ?? [],
+        })),
+      }
+      return { status: 200, body }
+    } catch (err) {
+      if (this.#identityStore) return { status: 503, body: { ok: false, reason: '统计数据库暂时不可用，请稍后重试' } }
+      return { status: 500, body: { ok: false, reason: `查询失败: ${msg(err)}` } }
+    } finally {
+      await store.close()
+    }
+  }
 }
 
 /** 已实现的子路径。写成常量而不是散落的 if，便于一处看清「有哪些接口」。 */
@@ -368,6 +432,7 @@ const KNOWN_SUBS: readonly string[] = [
   'breakdown',
   'records',
   'groups',
+  'members',
   'diagnostics',
 ] as const
 
