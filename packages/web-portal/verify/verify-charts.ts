@@ -56,6 +56,7 @@ const theme = {
   surface: '#ffffff',
   border: '#e8e8e8',
   title: '#1a1a1a',
+  series: ['#111111', '#222222', '#333333'],
   fontFamily: 'sans-serif',
 }
 
@@ -108,6 +109,77 @@ try {
     '⚠️ 折线不做平滑插值（平滑会在两个低点之间鼓出不存在的峰值）',
     areaSet.tension === 0,
   )
+  // ── 1b. 分层（堆叠柱 / 多条折线）────────────────────────────────
+  //
+  // ★ 这一节验的是「按用户 / 按模型展开」的全部实现：柱状图必须**堆叠**，
+  //   折线图必须**不堆叠**，两种图形的提示框都要把同一横坐标上的每一层都列出来。
+  const { trendSeriesOf } = (await server.ssrLoadModule('/src/utils/trend.ts')) as {
+    trendSeriesOf: (stack: unknown, metric: string) => Array<{ label: string; values: number[]; merged?: boolean }>
+  }
+
+  const stack = {
+    by: 'user',
+    mergedCount: 1,
+    items: [
+      { key: 'm-1', label: '张三', values: [10, 20, 30], calls: [1, 2, 3], cost: [100, 200, 300] },
+      { key: 'm-2', label: '李四', values: [1, 2, 3], calls: [4, 5, 6], cost: [7, 8, 9] },
+      { key: '__other__', label: '其余 2 人', merged: true, values: [0, 0, 5], calls: [0, 0, 1], cost: [0, 0, 50] },
+    ],
+  }
+
+  check('分层映射：token 取 values 列', JSON.stringify(trendSeriesOf(stack, 'totalTokens').map((s) => s.values)) === JSON.stringify([[10, 20, 30], [1, 2, 3], [0, 0, 5]]))
+  check('分层映射：调用次数取 calls 列', trendSeriesOf(stack, 'calls')[0]!.values[2] === 3)
+  check('分层映射：金额取 cost 列（整数微元原值，不换算）', trendSeriesOf(stack, 'cost')[0]!.values[0] === 100)
+  check('分层映射：合并项带上标记，图例与提示框能认出它不是某个人', trendSeriesOf(stack, 'totalTokens')[2]!.merged === true)
+  // 🚨 金额整块缺席（多币种 / 没算过）时必须回落成单序列，而不是补一串 0
+  check('分层映射：缺金额那一列时整块回落（不补 0）',
+    trendSeriesOf({ by: 'user', mergedCount: 0, items: [
+      { key: 'm-1', label: '张三', values: [1], calls: [1],
+        cost: undefined },
+    ] }, 'cost').length === 0)
+  check('分层映射：金额列逐层齐全时才可用', trendSeriesOf(stack, 'cost').length === 3)
+  check('分层映射：没有 stack 字段时返回空（退回单序列）', trendSeriesOf(undefined, 'totalTokens').length === 0)
+
+  const layered = trendSeriesOf(stack, 'totalTokens')
+  const stackedBar = buildTrendChartConfig({ ...common, kind: 'bar', series: layered })
+  const stackedBarSets = stackedBar.data?.datasets ?? []
+  check('堆叠柱：一层一条 dataset（图例才对得上）', stackedBarSets.length === 3)
+  check('★ 堆叠柱：所有层同属一个 stack（否则会并排成 n 根细柱，柱高不再等于总量）',
+    stackedBarSets.every((set) => set['stack'] === 'total'))
+  check('★ 堆叠柱：Y 轴开启 stacked', stackedBar.options?.scales?.y?.stacked === true)
+  check('堆叠柱：多序列显示图例', stackedBar.options?.plugins?.legend?.display === true)
+  check('堆叠柱：配色按顺序取自主题的分层色板', stackedBarSets[0]!['backgroundColor'] === theme.series[0] && stackedBarSets[1]!['backgroundColor'] === theme.series[1])
+  check('堆叠柱：数值取自服务端那一列，不再乘任何东西', JSON.stringify(stackedBarSets[1]!['data']) === JSON.stringify([1, 2, 3]))
+
+  const stackedTooltip = stackedBar.options?.plugins?.tooltip ?? {}
+  check('堆叠柱：提示框列出每一层的色块（否则分不清颜色与名字）', stackedTooltip.displayColors === true)
+  check('★ 堆叠柱：提示框按 datasetIndex 取回该层的服务端数值',
+    stackedTooltip.callbacks?.label?.({ datasetIndex: 0, dataIndex: 2 }) === '张三  30')
+  check('★ 堆叠柱：提示框尾行给出该点的合计（服务端的数，不是前端相加）',
+    stackedTooltip.callbacks?.footer?.([{ dataIndex: 2 }]) === '合计  567,890')
+  check('★ 堆叠柱：整条时间槽可命中（矮柱子也能悬浮）',
+    stackedBar.options?.interaction?.mode === 'index' && stackedBar.options?.interaction?.intersect === false)
+
+  const layeredArea = buildTrendChartConfig({ ...common, kind: 'area', series: layered })
+  const areaSets = layeredArea.data?.datasets ?? []
+  check('折线图：一层一条折线', areaSets.length === 3)
+  check('★ 折线图不堆叠（堆叠折线只有最上面那条的高度可读）',
+    layeredArea.options?.scales?.y?.stacked === undefined &&
+    areaSets.every((set) => set['stack'] === undefined))
+  check('★ 多条折线不填充（色块不表达任何信息，还会盖住下层）',
+    areaSets.every((set) => set['fill'] === false))
+  check('折线图同样按 index 命中并能列出每一层',
+    layeredArea.options?.plugins?.tooltip?.displayColors === true &&
+    layeredArea.options?.plugins?.tooltip?.callbacks?.label?.({ datasetIndex: 2, dataIndex: 2 }) === '其余 2 人  5')
+
+  // 单序列的回落：分层为空数组时，图上必须还是原来那一条
+  const fallback = buildTrendChartConfig({ ...common, kind: 'bar', series: [] })
+  check('★ 分层为空时回落成单序列（旧接口 / 金额缺席都走这条路）',
+    fallback.data?.datasets?.length === 1 &&
+    fallback.options?.plugins?.legend?.display === false &&
+    fallback.options?.plugins?.tooltip?.displayColors === false &&
+    fallback.options?.scales?.y?.stacked === undefined)
+
 
   // ── 2. 渲染层 ────────────────────────────────────────────────────
   const { default: TrendChart } = (await server.ssrLoadModule('/src/components/TrendChart.vue')) as {
@@ -135,6 +207,13 @@ try {
   check('无数据时显示空态文案', empty.includes('这段时间没有数据'))
   check('无数据时不渲染 canvas', !empty.includes('<canvas'))
   check('合计值原样展示（口径不由前端算）', withData.includes('569,124'))
+  const layeredHtml: string = await renderToString(
+    createSSRApp({ render: () => h(TrendChart as never, { ...props, series: layered }) }),
+  )
+  check('分层模式的 canvas 无障碍名说明按几层展开',
+    layeredHtml.includes('3 个分层堆叠'))
+  check('单序列的无障碍名不提分层', !withData.includes('个分层堆叠'))
+
 
   console.log('')
   if (failures.length > 0) {

@@ -39,7 +39,9 @@ import {
   loadProviderAliases,
   openPortalStats,
   openPortalStore,
+  type CostTotals,
   resolvePortalTarget,
+  type PortalStackSeries,
   type PortalRecordRow,
   type PortalStatsSession,
   type PortalStore,
@@ -51,6 +53,7 @@ import {
   cacheHitRate,
   computeTotal,
   summarizeCosts,
+  SERIES_STACK_MERGED_KEY,
   unattributedRate,
   UNATTRIBUTED_USER,
   type BreakdownResponse,
@@ -60,12 +63,15 @@ import {
   type OverviewResponse,
   type RecordRow,
   type RecordsResponse,
+  type SeriesStackBy,
+  type SeriesStackItem,
   type SeriesResponse,
   type StatsCostTotals,
   type StatsGroupOption,
   type StatsGroupsResponse,
   type StatsMemberOption,
   type StatsMembersResponse,
+  type StatsProvidersResponse,
   type StatsPricingResponse,
 } from '@ai-token-report/shared'
 
@@ -278,6 +284,14 @@ export class StatsRoute {
       return { status: 400, body: { ok: false, reason: `bucket 只支持 day 或 hour，收到 "${raw}"` } }
     }
     const bucket: Bucket = raw
+    // ⚠️ 与 `by` / `bucket` 同一套规矩：未知取值必须 400，不许静默退回单序列 ——
+    //   那样「按用户展开」的页面会画出一条合计线，而图上没有任何迹象说明它没展开。
+    const rawStack = params.get('stack')
+    if (rawStack !== null && rawStack !== 'user' && rawStack !== 'model') {
+      return { status: 400, body: { ok: false, reason: `stack 只支持 user 或 model，收到 "${rawStack}"` } }
+    }
+    const stackBy: SeriesStackBy | null = rawStack
+
 
     const points = (await session.series(bucket, true)).map((p) => ({
       bucket: p.bucket,
@@ -292,7 +306,11 @@ export class StatsRoute {
       ...(p.cost ? { cost: p.cost } : {}),
     }))
 
-    const body: SeriesResponse = { bucket, points }
+    const body: SeriesResponse = {
+      bucket,
+      points,
+      ...(stackBy ? { stack: await buildStack(session, stackBy, bucket, points) } : {}),
+    }
     return { status: 200, body }
   }
 
@@ -528,6 +546,108 @@ export class StatsRoute {
     }
   }
 }
+/**
+ * 堆叠趋势的载荷：把「每个桶 × 每个分层」的交叉值对齐到 `points` 的下标。
+ *
+ * ## 四条不许破的性质
+ *
+ * 1. ★ **各层之和 ≡ `points[].totalTokens`**（`calls` 同理）。尾部超出的层
+ *    不是被丢掉，而是折进一项 `merged: true` 的「其余 N 个」——
+ *    少了这一项，堆叠柱的总高就会低于趋势总量，而图上没有任何迹象说明为什么。
+ * 2. ★ **对齐只按桶键做**。补零之后的桶序由 `series()` 决定，分层只提供
+ *    「这个桶有多少」，缺桶就是 0。让分层自己再补一次零，早晚会出现
+ *    「图上有这个桶、某一层里没有」。
+ * 3. **排序用窗口总量降序**，与人员排行的名次同源；键名升序只作稳定兜底
+ *    （总量相同的两层之间不许每次刷新换位置）。
+ * 4. ★ **金额只在一个币种时才逐层下发**。多币种时整块 `cost` 缺席 ——
+ *    页面上那条「金额绝不跨币种相加」的规则已经会让金额指标不可选，
+ *    这里再挑一个币种画出来，等于在堆叠柱上偷偷做一次换算。
+ */
+async function buildStack(
+  session: PortalStatsSession,
+  by: SeriesStackBy,
+  bucket: Bucket,
+  points: SeriesResponse['points'],
+): Promise<NonNullable<SeriesResponse['stack']>> {
+  const stacks = await session.stackSeries(by, bucket)
+  const ranked = [...stacks].sort(
+    (a, b) => b.totalTokens - a.totalTokens || a.key.localeCompare(b.key),
+  )
+  const kept = ranked.slice(0, SERIES_STACK_TOP)
+  const rest = ranked.slice(SERIES_STACK_TOP)
+
+  const align = (map: Map<string, number>): number[] =>
+    points.map((point) => map.get(point.bucket) ?? 0)
+
+  // ★ 币种必须由**全部层**共同决定：某一层只有 CNY 而另一层只有 USD 时，
+  //   逐层各自「只有一个币种」，加起来却是两个币种 —— 那正是要拦住的情况。
+  const currencies = new Set<string>()
+  for (const row of stacks) {
+    for (const totals of row.costByBucket?.values() ?? []) {
+      for (const entry of totals.costs) currencies.add(entry.currency)
+    }
+  }
+  const currency = currencies.size === 1 ? [...currencies][0]! : null
+  /**
+   * 某一层在某个桶上的金额（微元）。
+   *
+   * ⚠️ 币种由**调用方**给出，这里找不到就返回 0 —— 但那条路根本走不到：
+   *   `currency` 非空时它来自上面那份**全部层**的币种并集，
+   *   所以每一层在这个币种上要么有钱、要么是未计价（0）。
+   */
+  const microIn = (totals: CostTotals | undefined, unit: string): number =>
+    totals?.costs.find((entry) => entry.currency === unit)?.amountMicro ?? 0
+  const alignCost = (row: PortalStackSeries): number[] | null =>
+    currency === null
+      ? null
+      : points.map((point) => microIn(row.costByBucket?.get(point.bucket), currency))
+
+  const items: SeriesStackItem[] = kept.map((row) => {
+    const cost = alignCost(row)
+    return {
+      key: row.key,
+      label: row.label,
+      ...(by === 'user' ? { member_id: row.memberId ?? null } : {}),
+      ...(row.groupNames ? { group_names: row.groupNames } : {}),
+      ...(row.attributionStatus ? { attribution_status: row.attributionStatus } : {}),
+      values: align(row.tokensByBucket),
+      calls: align(row.callsByBucket),
+      ...(cost ? { cost } : {}),
+    }
+  })
+
+  if (rest.length > 0) {
+    const tokens = new Map<string, number>()
+    const calls = new Map<string, number>()
+    for (const row of rest) {
+      for (const [key, value] of row.tokensByBucket) tokens.set(key, (tokens.get(key) ?? 0) + value)
+      for (const [key, value] of row.callsByBucket) calls.set(key, (calls.get(key) ?? 0) + value)
+    }
+    // ★ 「其余」的金额必须**逐桶相加**，而不是在其中取一个：
+    //   同币种内相加是合法的（币种由上面那份并集保证唯一），
+    //   直接 `set()` 会让合并项的金额等于最后一层的金额，而图上看起来完全正常。
+    const cost =
+      currency === null
+        ? null
+        : points.map((point) =>
+            rest.reduce(
+              (sum, row) => sum + microIn(row.costByBucket?.get(point.bucket), currency),
+              0,
+            ),
+          )
+    items.push({
+      key: SERIES_STACK_MERGED_KEY,
+      label: by === 'user' ? `其余 ${rest.length} 人` : `其余 ${rest.length} 个模型`,
+      merged: true,
+      values: align(tokens),
+      calls: align(calls),
+      ...(cost ? { cost } : {}),
+    })
+  }
+
+  return { by, items, mergedCount: rest.length }
+}
+
 
 /** 已实现的子路径。写成常量而不是散落的 if，便于一处看清「有哪些接口」。 */
 const KNOWN_SUBS: readonly string[] = [
@@ -536,6 +656,9 @@ const KNOWN_SUBS: readonly string[] = [
   'breakdown',
   'records',
   'groups',
+  // ★ 供应商候选项（筛选下拉用）。与分组 / 人员候选同类：它是一份**目录**，
+  //   不带时间窗、不带筛选，也不含任何用量数字。
+  'providers',
   'members',
   'diagnostics',
   // ★ 单价只读快照（`cost:read`）。与管理的 `/api/v1/admin/pricing` 是两件事：
@@ -785,3 +908,4 @@ function intParam(params: URLSearchParams, name: string): number | undefined | '
 function msg(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
+

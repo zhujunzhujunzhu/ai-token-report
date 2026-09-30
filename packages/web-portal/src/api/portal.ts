@@ -113,14 +113,22 @@ export function fetchOverview(
   return request<OverviewResponse>(`/api/v1/stats/overview?${toQuery(filter)}`)
 }
 
-/** 趋势序列。 */
+/**
+ * 趋势序列。
+ *
+ * @param stack 可选的分层维度（`user` / `model`）—— 带上它服务端会多算一趟
+ *   「每个桶 × 每个分层」的交叉值（含逐层金额），页面据此画堆叠柱 / 多条折线。
+ *   `undefined` = 不展开，载荷里不会有 `stack` 字段（老客户端的行为不变）。
+ */
 export function fetchSeries(
   filter: PortalFilter,
+  stack?: 'user' | 'model',
   bucket: 'day' | 'hour',
 ): Promise<ApiResult<SeriesResponse>> {
-  return request<SeriesResponse>(
-    `/api/v1/stats/series?${toQuery(filter)}&bucket=${bucket}`,
-  )
+  const params = new URLSearchParams(toQuery(filter))
+  params.set('bucket', bucket)
+  if (stack) params.set('stack', stack)
+  return request<SeriesResponse>(`/api/v1/stats/series?${params.toString()}`)
 }
 
 /** 分组排行（`by=user` 即人员排行）。 */
@@ -152,3 +160,4 @@ export function fetchDiagnostics(
     `/api/v1/stats/diagnostics?${toQuery(filter)}`,
   )
 }
+

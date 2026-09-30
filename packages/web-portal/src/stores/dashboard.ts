@@ -31,6 +31,16 @@ import {
 } from '../types/portal.js'
 import { useSessionStore } from './session.js'
 
+/**
+ * 趋势图的分层维度。
+ *
+ * ★ `'none'` 不是「另一个维度」，而是**不展开**：此时服务端连 `stack` 字段
+ *   都不下发，页面画的是原来那条合计。用 `''` / `null` 之类当哨兵会让
+ *   「参数没给」与「参数给空」两种请求在日志里长得一样。
+ */
+export type TrendStack = 'none' | 'user' | 'model'
+/** 趋势图上看哪个指标。 */
+export type TrendMetric = 'totalTokens' | 'cost' | 'calls'
 export type StatsSection = 'overview' | 'analysis' | 'records' | 'diagnostics'
 export interface DashboardFilters {
   period: string
@@ -97,6 +107,15 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
   const session = useSessionStore()
   const filters = ref(initialFilters())
   const section = ref<StatsSection | null>(null)
+  /**
+   * 趋势图的**分层维度**（合计 / 按用户 / 按模型）。
+   *
+   * ★ 放在 store 而不是某个页面里：总览与分析是同一个问题的两种看法，
+   *   使用者在总览选了「按用户」，跳到分析页时不该被重置回合计。
+   */
+  const stackBy = ref<TrendStack>('none')
+  /** 趋势图的指标（token / 元 / 调用次数），同样跨页保留。 */
+  const trendMetric = ref<TrendMetric>('totalTokens')
   const breakdownBy = ref<GroupBy>('provider-model')
   const overview = ref<OverviewResponse | null>(null)
   const series = ref<SeriesResponse | null>(null)
@@ -132,6 +151,33 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
    *   而看板使用者不一定有管理目录的权限。也刻意**不带筛选**，
    *   否则选中一个分组后下拉会塌缩成一项（自锁定）。
    */
+  /**
+   * 供应商目录（`GET /api/v1/stats/providers`，`stats:read`）。
+   *
+   * ★ 名字已经是**归一化后**的展示名 —— 它就是筛选时该用的名字（同一份映射）。
+   * ⚠️ 与分组 / 人员候选同样**不带筛选**：候选必须始终是完整集合，
+   *   否则选中一个供应商之后下拉会塌缩成一项（自锁定）。
+   * ⚠️ 它是**候选来源**，不是数字来源：请求失败不能拖垮看板（见 `load()`），
+   *   回落成「只有使用者自建的项 + 现敲现用」。
+   */
+  const providerOptions = ref<string[]>([])
+  /**
+   * 使用者自建的供应商名（**只存在本机浏览器**，见 `utils/providerCatalog.ts`）。
+   *
+   * 🚨 绝不写上报库：供应商名是**用量行上的事实**，库里那份可编辑配置是
+   *   归一化规则（`provider_alias`），属于管理面。往库里插一个「供应商」
+   *   只会得到一个永远查不出数据的幽灵选项，而且没有地方能删掉它。
+   */
+  const customProviders = ref<string[]>(readCustomProviders())
+  /**
+   * 供应商下拉的候选 = 库里的目录 ∪ 使用者自建的（唯一实现见 `providerFilterOptions`）。
+   *
+   * ⚠️ 页面只负责渲染这一份：自己在模板里拼接会把「同名以目录为准」
+   *   这条规则复制到第二个地方。
+   */
+  const providerChoices = computed<ProviderFilterOption[]>(() =>
+    providerFilterOptions(providerOptions.value, customProviders.value),
+  )
   const groupOptions = ref<StatsGroupOption[]>([])
   /**
    * 人员下拉的选项 = 名册 ∪ 用量派生键，再按所选分组收窄。
@@ -242,7 +288,10 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     // ★ 人员名册：下拉里「窗口内没有用量的人」唯一的来源，同样不带筛选。
     //   它只喂候选，不参与任何数字；失败也不能拖垮整页（见下面的处理）。
     const memberCandidates = fetchMemberOptions()
-    const [ov, opts, gopts, mo, se, rank, groupRank, bd, rec, diag] =
+    // ★ 供应商目录：同样是**不带任何筛选**的完整集合（否则选中一项后下拉会塌缩）。
+    //   它只喂候选，不参与任何数字；失败也不能拖垮整页。
+    const providerCandidates = fetchProviderOptions()
+    const [ov, opts, gopts, mo, pv, se, rank, groupRank, bd, rec, diag] =
       await Promise.all([
         fetchOverview(filter),
         // ★ 候选不能带人员筛选，否则选择一个人后再也选不到其他人。
@@ -473,3 +522,4 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     closeUser,
   }
 })
+

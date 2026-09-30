@@ -287,9 +287,75 @@ export interface SeriesPoint {
   /** 该点的费用（同样只在有 `cost:read` 时下发）。 */
   cost?: StatsCostTotals
 }
+/**
+ * 趋势图的**分层维度**（堆叠柱 / 多条折线按谁展开）。
+ *
+ * ★ 只有这两个：`user` 与 `model` 是使用者真正会问的「这段时间是谁 / 是哪个模型
+ *   在用」。供应商、项目、分组刻意不在协议里 —— 供应商与项目由分布表回答，
+ *   而分组是**多对多**展开（一条事件计入所属的每个分组），画成堆叠柱会让
+ *   「各层之和 > 总量」看起来像画错了。
+ */
+export type SeriesStackBy = 'user' | 'model'
+
+/**
+ * 被合并成「其余 N 个」的那一层的分组键。
+ *
+ * ⚠️ 它**不是一个真实的用户 / 模型**：真实键是人员 UUID、`legacy:…`、`unknown`
+ *   或模型名，都不可能等于这个带双下划线的哨兵。页面要认出它并把说明写清楚
+ *   （「其余 12 个」），否则使用者会把这一层当成某个人。
+ */
+export const SERIES_STACK_MERGED_KEY = '__other__' as const
+
+/**
+ * 堆叠趋势里的一层（一个用户 / 一个模型）。
+ *
+ * ★ `values` 与 `calls` 都**与 `points` 按下标一一对齐**（服务端补零之后的桶序），
+ *   页面只按下标取值 —— 让前端自己去对桶键等于把时间分桶口径复制到第二个地方。
+ * ★ 各层之和**恒等于**同一下标的 `points[].totalTokens` / `points[].calls`：
+ *   被截断的那些层进了 `merged` 那一项，所以堆叠柱的总高永远等于趋势总量。
+ * ★ `cost` 是**单币种**的逐桶整数微元（与 `values` 同样按下标对齐）。整块缺席 =
+ *   这次没算金额（没有 `cost:read`）**或**区间内不止一种币种 ——
+ *   两者都绝不允许页面自己挑一个币种去画（多币种绝不换算、绝不相加）。
+ *   币种本身在 `points[].cost.costs[].currency` 上，页面不必再看第二处定义。
+ */
+export interface SeriesStackItem {
+  /** 人员 UUID / `legacy:…` / `unknown` / 模型名 / {@link SERIES_STACK_MERGED_KEY}。 */
+  key: string
+  /** 已经拼好的展示名（与人员排行的行名同源）。 */
+  label: string
+  /** 只有 `by: 'user'` 且有稳定人员 ID 时才有：同名消歧要用。 */
+  member_id?: string | null
+  /** 该人员**当前**所属的分组名；`by: 'model'` 与未分组人员都没有。 */
+  group_names?: string[]
+  attribution_status?: import('./portal-identity.js').PortalAttributionStatus
+  /** `true` = 「其余 N 个」的合并项，不是单个人 / 单个模型。 */
+  merged?: boolean
+  /** 与 `points` 对齐的**计费总量**。 */
+  values: number[]
+  /** 与 `points` 对齐的**调用次数**。 */
+  calls: number[]
+  /** 与 `points` 对齐的**金额（整数微元，单币种）**；缺席见上面的说明。 */
+  cost?: number[]
+}
+
+export interface SeriesStack {
+  by: SeriesStackBy
+  /** 按窗口内总量降序；合并项（若有）恒在最后一项。 */
+  items: SeriesStackItem[]
+  /** 被合并进「其余」的层数；`0` = 没有截断，`items` 就是全部。 */
+  mergedCount: number
+}
+
 
 export interface SeriesResponse {
   bucket: Bucket
+  /**
+   * 分层明细，**只在请求带了 `stack=user|model` 时才下发**。
+   *
+   * ⚠️ 缺字段 = 「没要过分层」，不是「这段时间没人」：页面据此决定画单序列
+   *   还是堆叠图。回一个空 `items` 会让「旧服务端」与「真的没有用量」长得一样。
+   */
+  stack?: SeriesStack
   points: SeriesPoint[]
 }
 
@@ -891,3 +957,4 @@ export interface AdminMemberResponse {
   /** 本次操作涉及的人员（含**新签发的 token**，供管理员复制转发）。 */
   member?: AdminMember
 }
+

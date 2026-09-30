@@ -179,6 +179,12 @@ try {
     '分组排行',
   ])
     check(`总览含 ${label}`, dashboardHtml.includes(label))
+  // ★ 趋势图上的两个开关必须真的渲染出来：没有它们，使用者只能看到一条合计线，
+  //   而「按用户 / 按模型」这件事在页面上根本无从表达。
+  for (const label of ['合计', '按用户', '按模型', 'Token 用量'])
+    check(`总览趋势含开关：${label}`, dashboardHtml.includes(label))
+  check('总览：没有 cost 字段（无 cost:read）时金额开关不出现',
+    dashboardHtml.includes('费用（估算）') === false)
   check('总览直接展示接口总量', dashboardHtml.includes('1,500'))
   // ★ 多对多的口径说明必须**真的渲染出来**：它是「各分组之和 > 总量」这一定义
   //   在页面上唯一的解释，少一句就会被当成 bug 去查。
@@ -204,6 +210,9 @@ try {
     check(`分析页含 ${label}`, analysisHtml.includes(label))
   // ★ 金额指标同样按「服务端有没有下发 `cost`」出现/消失，三种状态分别钉住。
   check('分析页：趋势点没有金额（无 cost:read）时不出现费用指标',
+  // 分层维度开关在分析页同样必须在（折线图的多条线由它决定）
+  for (const label of ['合计', '按用户', '按模型'])
+    check(`分析页趋势含分层开关：${label}`, analysisHtml.includes(label))
     analysisHtml.includes('费用（估算）') === false)
   const costPoints = [
     {
@@ -602,3 +611,4 @@ try {
   disposePinia(pinia)
   await server.close()
 }
+

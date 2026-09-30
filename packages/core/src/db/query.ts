@@ -765,6 +765,70 @@ export function timeBucketRowsQuery(
   ].join(', ')
   return { sql: `SELECT ${cols}\n       FROM ${EVENT_TABLE}${sql}`, params }
 }
+/**
+ * 堆叠趋势（按人 / 按模型展开）用的**原始行**。
+ *
+ * ★ 分桶的理由与 {@link timeBucketRowsQuery} 完全相同：时间键必须在 JS 侧用
+ *   `toDayKey()` / `toHourKey()` 算（SQLite 的 `'localtime'` 按操作系统时区、
+ *   JS 按进程 TZ，在 `bun test` 下差 8 小时）。
+ *
+ * ⚠️ 数值列一律 `unknown`：`SUM()` 在 MySQL 驱动下是字符串（见 `toNumber()`）。
+ *   这一支只取原始行、不做任何 SUM，但列类型仍然按同一约定声明。
+ */
+export interface StackRow {
+  ts: unknown
+  /** `model` 维度的分组键。`user` 维度没有这一列。 */
+  stack_key?: unknown
+  /** `user` 维度的归属三列 —— 键在 JS 侧算（成员视图与旧视图的键不同形）。 */
+  member_id?: unknown
+  user_id?: unknown
+  user_name?: unknown
+  /** 只在要算金额时才取（`(provider, model)` 是单价的匹配键）。 */
+  provider?: unknown
+  model?: unknown
+  input_tokens: unknown
+  output_tokens: unknown
+  cache_read_tokens: unknown
+  cache_write_tokens: unknown
+}
+
+/**
+ * 堆叠趋势的取数：**原始行**，不聚合。
+ *
+ * ★ 为什么不像 `groupsQuery()` 那样把分组键交给 SQL：
+ *
+ * - `user` 维度的键有两种形态（成员视图是稳定 `member_id`、旧视图是 `user_id`），
+ *   把这段 CASE 写进 SQL 就等于在 SQL 里再造一份归属口径 ——
+ *   而它必须与 `PortalStatsSession.memberGroups()` **逐字相同**；
+ * - 时间桶无论如何都在 JS 侧做，行反正要过一遍 JS。
+ *
+ * ⚠️ `member_id` / `user_id` / `user_name` 是**上报库专有**的列（本地
+ *   `usage.sqlite` 那三列恒为 NULL，也只由 `portal.ts` 调用本函数）。
+ */
+export function stackRowsQuery(
+  dim: 'user' | 'model',
+  filter: QueryFilter = {},
+  normalize?: ProviderNormalizer,
+  /**
+   * 是否连 `provider` / `model` 一起取。
+   *
+   * ★ 只有**要算金额**时才取：金额必须按每条事件**当时的价**算，而价是按
+   *   `(provider, model)` 定的。少了这两列就只能拿整个桶的总量去乘一个
+   *   「平均单价」—— 那是错的（世上没有平均单价）。
+   *   理由与 `timeBucketRowsQuery()` 的第 4 个参数完全相同。
+   */
+  withTarget = false,
+): SqlQuery {
+  const { sql, params } = buildWhere(filter, normalize)
+  const keyCols = dim === 'model' ? 'model AS stack_key' : 'member_id, user_id, user_name'
+  return {
+    sql: `SELECT ts, ${keyCols}, ${withTarget ? 'provider, model, ' : ''}
+                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+          FROM ${EVENT_TABLE}${sql}`,
+    params,
+  }
+}
+
 
 /**
  * `project` 维度的第一段：按 cwd 聚合。
@@ -1461,3 +1525,4 @@ function countRows(db: Database): number {
     db.query<{ c: number }, []>(`SELECT COUNT(*) AS c FROM ${EVENT_TABLE}`).get()?.c ?? 0
   )
 }
+

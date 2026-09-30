@@ -16,6 +16,18 @@
  * - **`interaction: { mode: 'index', intersect: false }`**：整条时间槽都可命中，
  *   0 值和很矮的柱子同样能悬浮出数值。默认的 `intersect: true` 要求鼠标
  *   精确压在图形上，矮柱子几乎点不到。
+ * ## ★ 分层（堆叠柱 / 多条折线）
+ *
+ * 传了 `series` 时每个分层是一条 dataset：
+ *
+ * | 图形 | 堆叠 | 为什么 |
+ * |---|---|---|
+ * | 柱状 | **堆叠**（`stack: 'total'` + `y.stacked`） | 柱高代表总量，各层之和 ≡ 总量 |
+ * | 折线 / 面积 | **不堆叠**，多条独立折线 | 折线堆叠之后只有最上面那条的高度可读，下面几条的值要靠相邻两条相减才能得到 —— 那是一个不会报错的读图陷阱 |
+ *
+ * 两种图形都靠 `interaction.mode: 'index'` 让**同一横坐标上的每一层**一起进提示框，
+ * 这就是「鼠标移上去看到每个用户 / 每个模型的用量」的全部实现。
+ *
  *
  * ⚠️ canvas **不认 `var(--c-chart-bar)`**：把 CSS 变量名直接当颜色传进去会得到
  *   一块黑。所以颜色必须先经 `readTrendChartTheme()` 解析成具体色值。
@@ -26,6 +38,9 @@
  */
 import type { ChartConfiguration } from 'chart.js'
 
+import type { TrendChartSeries } from '@/utils/trend'
+
+export type { TrendChartSeries }
 import { formatCompact, formatCount } from '@/utils/format'
 
 /** 从页面上解析出来的具体色值。 */
@@ -39,8 +54,33 @@ export interface TrendChartTheme {
   surface: string
   border: string
   title: string
+  /**
+   * 分层配色（按顺序取，超出就循环）。
+   *
+   * ★ 必须与「合计」那一条的蓝色明显不同：堆叠图的第一层如果和单序列同色，
+   *   使用者在两个模式之间切换时会以为图没变。
+   */
+  series: string[]
   fontFamily: string
 }
+/**
+ * 分层配色的兜底表。
+ *
+ * ⚠️ 顺序即「哪一层先出现」：排在最前的是用量最大的那一层，
+ *   所以第一个颜色是主蓝色（与单序列的 `--c-chart-bar` 同族但更深，免得被
+ *   当成没切换）。相邻两色刻意在明度上拉开，灰度打印时也分得开。
+ */
+const SERIES_FALLBACK = [
+  '#3275ed',
+  '#21a68e',
+  '#9274df',
+  '#c78b27',
+  '#37a5c3',
+  '#dc5961',
+  '#5b7ba6',
+  '#8cc152',
+] as const
+
 
 /**
  * 读 CSS 变量并给出兜底色值。
@@ -64,6 +104,9 @@ export function readTrendChartTheme(el: HTMLElement): TrendChartTheme {
     border: read('--c-border', '#e8e8e8'),
     title: read('--c-text-primary', '#1a1a1a'),
     // 图表文字要跟随页面字体，否则提示框里的中文会掉进 Helvetica 的兜底字形
+    series: SERIES_FALLBACK.map((fallback, index) =>
+      read(`--c-chart-series-${index + 1}`, fallback),
+    ),
     fontFamily: css.fontFamily || 'sans-serif',
   }
 }
@@ -80,15 +123,30 @@ function withAlpha(color: string, alpha: number): string {
   const value = Number.parseInt(hex, 16)
   return `rgba(${(value >> 16) & 0xff}, ${(value >> 8) & 0xff}, ${value & 0xff}, ${alpha})`
 }
+/** 堆叠柱共用的 stack id；名字本身无意义，只要所有层一致。 */
+const STACK_ID = 'total'
+
 
 export interface TrendChartInput {
   /** 每个点的标签（已格式化，如 `09-21` / `14:00`）。 */
   labels: string[]
-  /** 每个点的数值（服务端算好，本模块不重算）。 */
+  /**
+   * 每个点的**合计**数值（服务端算好，本模块不重算）。
+   *
+   * ★ 它同时是「合计」那条线的数据、以及分层模式下提示框尾行的合计值 ——
+   *   后者正是「各层之和 ≡ 总量」在页面上的可见证据。
+   */
   values: number[]
   kind: 'bar' | 'area'
   /** 提示框里的指标名，如「计费总量」。 */
   metricLabel: string
+  /**
+   * 分层序列（堆叠柱 / 多条折线）。空数组或省略 = 单序列。
+   *
+   * ⚠️ 空数组与省略必须走**同一条**分支：服务端没给 `stack`（旧版）、
+   *   以及给了但金额整块缺席，都会走到这里，两者都该退回单序列。
+   */
+  series?: TrendChartSeries[]
   theme: TrendChartTheme
   /**
    * 数值的**逐点**格式化（悬浮提示用），缺省千分位。
@@ -108,13 +166,51 @@ export function buildTrendChartConfig(
   const { labels, values, kind, metricLabel, theme } = input
   const valueFormatter = input.valueFormatter ?? formatCount
   const tickFormatter = input.tickFormatter ?? formatCompact
+  const series = input.series ?? []
+  const layered = series.length > 0
+  const colorAt = (index: number): string =>
+    theme.series[index % theme.series.length] ?? theme.areaStroke
   const isArea = kind === 'area'
 
-  return {
-    type: isArea ? 'line' : 'bar',
-    data: {
-      labels,
-      datasets: [
+  const datasets = layered
+    ? series.map((entry, index) => {
+        const color = colorAt(index)
+        return isArea
+          ? {
+              label: entry.label,
+              data: entry.values,
+              borderColor: color,
+              backgroundColor: color,
+              borderWidth: 2,
+              // ★ 多条折线**不填充**：一层叠一层的半透明色块会让「哪条线在上面」
+              //   变成比高度还显眼的信息，而填充本身不表达任何东西。
+              fill: false,
+              // ★ 直线连接真实采样点：平滑插值会在两个低点之间鼓出不存在的峰值
+              tension: 0,
+              pointRadius: 0,
+              pointHoverRadius: 4,
+              pointHoverBackgroundColor: color,
+              pointHoverBorderColor: theme.surface,
+              pointHoverBorderWidth: 2,
+            }
+          : {
+              label: entry.label,
+              data: entry.values,
+              backgroundColor: color,
+              // ⚠️ 刻意**不设** `hoverBackgroundColor`：单序列时它是「这一槽被选中」
+              //   的反馈，而堆叠图里 `mode: 'index'` 会把**整槽**都算作 active，
+              //   于是所有层一起变成同一个深蓝 —— 颜色与层名的对应关系在悬浮的
+              //   那一刻反而丢了。悬浮的反馈交给提示框（它同时列出每一层与色块）。
+              borderWidth: 0,
+              borderRadius: 2,
+              // ★ 堆叠柱必须同属一个 stack，否则它们会并排成 n 根细柱 ——
+              //   图上看起来完全正常，只是「柱高 = 总量」这件事悄悄没了
+              stack: STACK_ID,
+              maxBarThickness: 28,
+              barPercentage: 0.75,
+            }
+      })
+    : [
         {
           label: metricLabel,
           data: values,
@@ -138,8 +234,11 @@ export function buildTrendChartConfig(
           pointHoverBorderColor: theme.surface,
           pointHoverBorderWidth: 2,
         },
-      ],
-    },
+      ]
+
+  return {
+    type: isArea ? 'line' : 'bar',
+    data: { labels, datasets },
     options: {
       responsive: true,
       maintainAspectRatio: false,
@@ -162,6 +261,9 @@ export function buildTrendChartConfig(
           },
         },
         y: {
+          // ★ 只有堆叠柱需要 `stacked`：折线是各画各的，堆叠折线会让
+          //   「最上面那条 = 合计、下面几条 = 各自的值」这件事不再成立
+          ...(layered && !isArea ? { stacked: true } : {}),
           beginAtZero: true,
           border: { display: false },
           grid: { color: theme.grid, drawTicks: false },
@@ -175,6 +277,21 @@ export function buildTrendChartConfig(
           },
         },
       },
+        // ★ 多序列必须有图例：没有它，提示框里的名字和柱子颜色的对应关系
+        //   只能靠鼠标一个个试出来。单序列不显示（一个色块纯属噪音）。
+        legend: {
+          display: layered,
+          position: 'bottom',
+          labels: {
+            color: theme.text,
+            boxWidth: 9,
+            boxHeight: 9,
+            usePointStyle: true,
+            pointStyle: isArea ? 'line' : 'rectRounded',
+            padding: 14,
+            font: { size: 11, family: theme.fontFamily },
+          },
+        },
       plugins: {
         tooltip: {
           backgroundColor: theme.surface,
@@ -184,20 +301,45 @@ export function buildTrendChartConfig(
           borderWidth: 1,
           cornerRadius: 10,
           padding: 12,
-          // 只有一个序列，色块纯属噪音
-          displayColors: false,
+          // 单序列时色块纯属噪音；分层时色块是**唯一**把提示行与柱子对上的线索
+          displayColors: layered,
+          boxWidth: 8,
+          boxHeight: 8,
+          boxPadding: 4,
+          usePointStyle: true,
           titleMarginBottom: 6,
           titleFont: { size: 12, family: theme.fontFamily, weight: 600 },
+          footerFont: { size: 12, family: theme.fontFamily, weight: 600 },
+          footerColor: theme.title,
+          footerMarginTop: 6,
           bodyFont: { size: 12, family: theme.fontFamily },
           callbacks: {
             // 标签与数值都取自父组件透传的原始数组：显示的是**服务端的数**，
             // 不经过 Chart.js 的解析结果，少一次可能出偏差的转换
             title: (items) => labels[items[0]?.dataIndex ?? 0] ?? '',
-            label: (item) =>
-              `${metricLabel}  ${valueFormatter(values[item.dataIndex] ?? 0)}`,
+            label: (item) => {
+              if (!layered)
+                return `${metricLabel}  ${valueFormatter(values[item.dataIndex] ?? 0)}`
+              // ⚠️ 按 `datasetIndex` 取回**服务端那一列**，而不是读 Chart.js 解析后的
+              //   `item.parsed`：两者在本仓的取值路径上必须只有一条。
+              const row = series[item.datasetIndex]
+              return `${row?.label ?? ''}  ${valueFormatter(row?.values[item.dataIndex] ?? 0)}`
+            },
+            // ★ 尾行的合计就是「各层之和 ≡ 总量」在页面上的可见证据。
+            //   它取自 `values`（服务端算的合计），不是把各层相加算出来的 ——
+            //   相加在数学上一样，但它会成为前端第二个合计口径。
+            ...(layered
+              ? {
+                  footer: (items) =>
+                    items.length === 0
+                      ? ''
+                      : `合计  ${valueFormatter(values[items[0]?.dataIndex ?? 0] ?? 0)}`,
+                }
+              : {}),
           },
         },
       },
     },
   }
 }
+

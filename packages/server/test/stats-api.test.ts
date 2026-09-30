@@ -25,8 +25,18 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { insertRecords, openPortalDb } from '@ai-token-report/core/db'
-import { cacheHitRate, unattributedRate, UNATTRIBUTED_USER } from '@ai-token-report/shared'
-import type { BreakdownResponse, StatsMembersResponse } from '@ai-token-report/shared'
+import {
+  cacheHitRate,
+  SERIES_STACK_MERGED_KEY,
+  unattributedRate,
+  UNATTRIBUTED_USER,
+} from '@ai-token-report/shared'
+import type {
+  BreakdownResponse,
+  SeriesResponse,
+  StatsMembersResponse,
+  StatsProvidersResponse,
+} from '@ai-token-report/shared'
 
 import { CredentialStore } from '../src/credentials.js'
 import { IngestRoute } from '../src/ingest-route.js'
@@ -49,7 +59,15 @@ afterEach(() => {
   }
 })
 
-/** 三个人：张三 / 张三丰 用于验证按人筛选是精确匹配而不是子串匹配。 */
+/**
+ * 四个人：张三 / 张三丰 用于验证按人筛选是精确匹配而不是子串匹配。
+ *
+ * ★ **管理员凭证是刻意的**：本文件绝大多数断言看的是**全部门**的聚合数字
+ *   （「张三 + 李四 + 未署名」），而数据范围从 v7 起收窄成
+ *   「非内置管理员只能看到自己」（见 `stats-route.ts` 的 `applyDataScope()`）。
+ *   拿 member 凭证去断言全部门数字，等于在验一个已经不存在的行为。
+ *   数据范围本身由「★ 数据范围」那一块专门断言，那里会显式用 member 凭证。
+ */
 const STORE = CredentialStore.from([
   { token: 'tok-zhang', name: '张三', group: '研发一部' },
   { token: 'tok-zhangsf', name: '张三丰', group: '研发一部' },
@@ -372,6 +390,49 @@ describe('★ 人员排行（部门看板的核心诉求）', () => {
     expect((upper.body as Record<string, number>)['calls']).toBe(1)
     const byModel = await get('overview', { period: 'today', model: 'gpt-4o' })
     expect((byModel.body as Record<string, number>)['calls']).toBe(1)
+
+  /**
+   * ★ 供应商多选：**重复的同名参数**（页面走的就是这条路）与逗号分隔都生效。
+   *
+   * 两种写法都要认：页面发的是一值一参（一个值里带逗号时两种写法含义不同），
+   * 而历史上 CLI / 老客户端发的是逗号。只认其中一种的表现是
+   * 「筛了一个供应商却像没筛」—— 数字看着正常，条件其实被吞了。
+   */
+  test('★ 供应商多选：重复参数与逗号分隔都生效（OR 子串）', async () => {
+    await report('tok-zhang', [
+      rec('mp1', { provider: 'dashscope', model: 'deepseek-v4.1-flash' }),
+      rec('mp2', { seq: 2, provider: 'openai', model: 'gpt-4o' }),
+      rec('mp3', { seq: 3, provider: 'bailian-tpp', model: 'deepseek-v4.1-flash' }),
+    ])
+    const repeated = await stats().handle(
+      'overview',
+      new URLSearchParams([
+        ['period', 'today'],
+        ['provider', 'openai'],
+        ['provider', 'bailian-tpp'],
+      ]),
+      'Bearer tok-admin',
+    )
+    expect(repeated.status).toBe(200)
+    expect((repeated.body as Record<string, number>)['calls']).toBe(2)
+    // 逗号分隔（历史写法）等价
+    const comma = await get('overview', {
+      period: 'today',
+      provider: 'openai,bailian-tpp',
+    })
+    expect((comma.body as Record<string, number>)['calls']).toBe(2)
+    // 重复值不放大结果：同一条件写两遍仍是一条「OR 里的一项」
+    const duplicates = await stats().handle(
+      'overview',
+      new URLSearchParams([
+        ['period', 'today'],
+        ['provider', 'OPENAI'],
+        ['provider', 'openai'],
+      ]),
+      'Bearer tok-admin',
+    )
+    expect((duplicates.body as Record<string, number>)['calls']).toBe(1)
+  })
   })
 })
 
@@ -617,4 +678,297 @@ describe('人员候选目录（GET /api/v1/stats/members）', () => {
     expect(res.status).toBe(200)
     expect((res.body as StatsMembersResponse).members).toEqual([])
   })
+
+/**
+ * 趋势分层（`series?stack=user|model`）。
+ *
+ * ## 这些断言在守什么
+ *
+ * 1. ★ **各层之和 ≡ 同一下标的 `points[].totalTokens`**。堆叠柱的总高就是趋势
+ *    总量，少一分钱都说明有一层被悄悄丢掉了 —— 而图上只会「矮一点」。
+ * 2. ★ **按人分层的键与人员排行同源**（稳定 `member_id`），否则图上「张三」
+ *    这一层与排行里的「张三」不是同一个键，而两边各自看起来都很正常。
+ * 3. **不带 `stack` 时载荷里没有 `stack` 字段**（老客户端行为一个字节不改）。
+ * 4. ★ **没有 `cost:read` 时连金额都不算**（不是算完再丢掉）；
+ *    多币种时逐层金额**整块缺席**（绝不挑一个币种偷偷画）。
+ */
+describe('★ 趋势分层（按用户 / 按模型）', () => {
+  /** 各层在第 i 个桶上的和，必须等于该桶的合计。 */
+  function expectStackSumsToTotals(body: SeriesResponse): void {
+    const items = body.stack?.items ?? []
+    expect(items.length).toBeGreaterThan(0)
+    body.points.forEach((point, index) => {
+      const tokens = items.reduce((sum, item) => sum + (item.values[index] ?? 0), 0)
+      const calls = items.reduce((sum, item) => sum + (item.calls[index] ?? 0), 0)
+      expect(tokens).toBe(point.totalTokens)
+      expect(calls).toBe(point.calls)
+    })
+  }
+
+  test('不带 stack 时载荷里没有 stack 字段（老客户端行为不变）', async () => {
+    await report('tok-zhang', [rec('a1')])
+    const res = await get('series', { bucket: 'day', period: 'today' })
+    expect(res.status).toBe(200)
+    expect('stack' in (res.body as object)).toBe(false)
+  })
+
+  test('stack=model：逐桶对齐，各层之和等于每个点的总量', async () => {
+    await report('tok-zhang', [
+      rec('m1', { seq: 1, ts: todayAt(9), model: 'a-model', input_tokens: 100, output_tokens: 0, cache_read_tokens: 0 }),
+      rec('m2', { seq: 2, ts: todayAt(9), model: 'b-model', input_tokens: 200, output_tokens: 0, cache_read_tokens: 0 }),
+      rec('m3', { seq: 3, ts: todayAt(10), model: 'a-model', input_tokens: 50, output_tokens: 0, cache_read_tokens: 0 }),
+    ])
+
+    const res = await get('series', { bucket: 'hour', period: 'today', stack: 'model' })
+    expect(res.status).toBe(200)
+    const body = res.body as SeriesResponse
+    expect(body.stack?.by).toBe('model')
+    // 按窗口总量降序：b-model 200 > a-model 150
+    expect(body.stack!.items.map((item) => item.key)).toEqual(['b-model', 'a-model'])
+    expect(body.stack!.mergedCount).toBe(0)
+    // 模型没有人员 ID / 分组名（那是 `by=user` 专有的字段）
+    expect('member_id' in body.stack!.items[0]!).toBe(false)
+    expectStackSumsToTotals(body)
+  })
+
+  test('stack=user：旧视图（凭证表）的键就是人名', async () => {
+    await report('tok-zhang', [rec('z1')])
+    await report('tok-li', [rec('l1', { seq: 2 })])
+
+    const res = await get('series', { bucket: 'day', period: 'today', stack: 'user' })
+    expect(res.status).toBe(200)
+    const body = res.body as SeriesResponse
+    expect(body.stack!.items.map((item) => item.key).sort()).toEqual(['张三', '李四'].sort())
+    expectStackSumsToTotals(body)
+  })
+
+  test('未归属用量照样成层（不会被分层丢掉）', async () => {
+    await report('tok-zhang', [rec('z1')])
+    seedUnattributed([
+      { eventId: 'u1', sessionId: 's-u', seq: 1, ts: todayAt(11), input: 700, output: 0, cacheRead: 0 },
+    ])
+
+    const res = await get('series', { bucket: 'day', period: 'today', stack: 'user' })
+    const body = res.body as SeriesResponse
+    const unknown = body.stack!.items.find((item) => item.key === UNATTRIBUTED_USER)
+    expect(unknown).toBeDefined()
+    expect(unknown!.label).toBe('未署名')
+    expectStackSumsToTotals(body)
+  })
+
+  test('★ 超过 8 层时尾部合并成「其余 N 个」，合计仍然逐桶相等', async () => {
+    await report(
+      'tok-zhang',
+      // 10 个模型，用量递减 —— 前 8 名留下，后 2 个必须进「其余」
+      Array.from({ length: 10 }, (_, i) =>
+        rec(`k${i}`, { seq: i + 1, ts: todayAt(10), model: `m${i}`, input_tokens: 1000 - i * 10, output_tokens: 0, cache_read_tokens: 0 }),
+      ),
+    )
+
+    const res = await get('series', { bucket: 'day', period: 'today', stack: 'model' })
+    const body = res.body as SeriesResponse
+    const items = body.stack!.items
+    expect(items.length).toBe(9)
+    expect(body.stack!.mergedCount).toBe(2)
+    const merged = items.at(-1)!
+    expect(merged.merged).toBe(true)
+    // ★ 合并项的键是协议里的哨兵，不可能是某个真实模型名
+    expect(merged.key).toBe(SERIES_STACK_MERGED_KEY)
+    expect(merged.label).toBe('其余 2 个模型')
+    expectStackSumsToTotals(body)
+  })
+
+  test('空窗口返回空分层而不是抛错', async () => {
+    const res = await get('series', { bucket: 'day', period: 'today', stack: 'user' })
+    expect(res.status).toBe(200)
+    const stack = (res.body as SeriesResponse).stack!
+    expect(stack.items).toEqual([])
+    expect(stack.mergedCount).toBe(0)
+  })
+
+  /**
+   * 真身份库 + 真 appKey 上报：只有这条路才走得到 `identity_view=member`
+   * 的归属键（稳定 `member_id`），而看板页面发的就是它。
+   */
+  async function memberWorld() {
+    const repository = new IdentityRepository({ sqlitePath: dbPath })
+    await repository.initialize({
+      adminToken: 'tok-admin',
+      adminName: '管理员',
+      adminUsername: 'admin',
+      adminPassword: 'test-password-2026',
+    })
+    const admin = (await repository.resolveBearer('tok-admin'))!
+    const group = (await repository.createGroup(admin, { name: '研发一部' })).group!
+    const zhang = (await repository.createMember(admin, { name: '张三', role_ids: [MEMBER_ROLE_ID] })).member!
+    const li = (await repository.createMember(admin, { name: '李四', role_ids: [MEMBER_ROLE_ID] })).member!
+    await repository.updateMember(admin, {
+      member_id: zhang.member_id,
+      expected_version: zhang.version,
+      group_ids: [group.group_id],
+    })
+    const zhangKey = (await repository.issueAppKey(admin, { member_id: zhang.member_id })).token_secret
+    const liKey = (await repository.issueAppKey(admin, { member_id: li.member_id })).token_secret
+    const ingest = new IngestRoute({ identityStore: repository, dbPath })
+    const send = async (secret: string, records: unknown[]): Promise<void> => {
+      const res = await ingest.submit(
+        {
+          schemaVersion: 1,
+          client: { userId: 'ignored', userName: 'ignored' },
+          generatedAt: new Date().toISOString(),
+          records,
+        },
+        `Bearer ${secret}`,
+      )
+      expect(res.status).toBe(200)
+    }
+    return { repository, admin, group, zhang, li, zhangKey, liKey, send }
+  }
+
+  const memberRoute = (repository: IdentityRepository): StatsRoute =>
+    new StatsRoute({ identityStore: repository, dbPath })
+
+  test('★ stack=user：键是稳定人员 ID、标签是显示名，且与人员排行的键同源', async () => {
+    const { repository, group, zhang, zhangKey, liKey, send } = await memberWorld()
+    await send(zhangKey, [rec('z1')])
+    await send(liKey, [rec('l1', { seq: 2, input_tokens: 500, output_tokens: 0, cache_read_tokens: 0 })])
+    const route = memberRoute(repository)
+    const query = { bucket: 'day', period: 'today', stack: 'user', identity_view: 'member' }
+
+    const res = await route.handle('series', new URLSearchParams(query), 'Bearer tok-admin')
+    expect(res.status).toBe(200)
+    const body = res.body as SeriesResponse
+    const items = body.stack!.items
+    const zhangItem = items.find((item) => item.key === zhang.member_id)!
+    expect(zhangItem.label).toBe('张三')
+    expect(zhangItem.member_id).toBe(zhang.member_id)
+    // 分组名与人员排行同源（多对多下的「当前归属」）
+    expect(zhangItem.group_names).toEqual([group.name])
+    expect(zhangItem.attribution_status).toBe('member')
+    expectStackSumsToTotals(body)
+
+    // ★ 与 `breakdown?by=user` 的键逐个对得上 —— 图上的一层就是排行里的一行
+    const ranking = await route.handle('breakdown', new URLSearchParams(query), 'Bearer tok-admin')
+    expect((ranking.body as BreakdownResponse).rows.map((row) => row.key).sort())
+      .toEqual(items.map((item) => item.key).sort())
+  })
+
+  test('★ stack=model 在成员视图下仍然用模型名（不能套用人员那套标签判定）', async () => {
+    // 🚨 这一条是实测踩出来的：成员视图 + 按模型展开时，模型行既没有 `member_id`
+    //   也没有 `user_id`，套用人员的标签判定会把**每一层都标成「未归属」** ——
+    //   图例上所有模型都叫「未归属」，而数字全对，所以只有断言标签才抓得住。
+    const { repository, zhangKey, send } = await memberWorld()
+    await send(zhangKey, [
+      rec('m1', { seq: 1, model: 'alpha-model', input_tokens: 900, output_tokens: 0, cache_read_tokens: 0 }),
+      rec('m2', { seq: 2, model: 'beta-model', input_tokens: 100, output_tokens: 0, cache_read_tokens: 0 }),
+    ])
+    const route = memberRoute(repository)
+    const res = await route.handle(
+      'series',
+      new URLSearchParams({ bucket: 'day', period: 'today', stack: 'model', identity_view: 'member' }),
+      'Bearer tok-admin',
+    )
+    expect(res.status).toBe(200)
+    const body = res.body as SeriesResponse
+    const items = body.stack!.items
+    expect(items.map((item) => item.key)).toEqual(['alpha-model', 'beta-model'])
+    // 标签就是模型名本身，且不带任何归属状态（模型没有归属这回事）
+    expect(items.map((item) => item.label)).toEqual(['alpha-model', 'beta-model'])
+    expect(items.every((item) => !('attribution_status' in item))).toBe(true)
+    expect(items.every((item) => !('member_id' in item))).toBe(true)
+    expectStackSumsToTotals(body)
+  })
+
+  test('★ 没有 cost:read 时分层里连金额都不算（不是算完再丢掉）', async () => {
+    const { repository, zhangKey, send } = await memberWorld()
+    await send(zhangKey, [rec('z1')])
+    const route = memberRoute(repository)
+    // appKey 的范围固定是 usage:write + stats:read，**不含** `cost:read`
+    const res = await route.handle(
+      'series',
+      new URLSearchParams({ bucket: 'day', period: 'today', stack: 'user', identity_view: 'member' }),
+      `Bearer ${zhangKey}`,
+    )
+    expect(res.status).toBe(200)
+    const body = res.body as SeriesResponse
+    expect('cost' in body.points[0]!).toBe(false)
+    expect('cost' in body.stack!.items[0]!).toBe(false)
+  })
+
+  test('★ 单币种时逐层下发金额，各层（含「其余」）之和等于该点的合计金额', async () => {
+    const { repository, admin, zhangKey, send } = await memberWorld()
+    await repository.setModelPrice(admin, {
+      provider: 'dashscope', model: 'deepseek-v4.1-flash', currency: 'CNY',
+      input_micro_per_ktok: 2_000, output_micro_per_ktok: 8_000,
+      cache_read_micro_per_ktok: 200, cache_write_micro_per_ktok: 2_000,
+      effective_from_ms: 1_000,
+    })
+    // 10 个人、用量递减：前 8 名留下，最后 2 个必须进「其余」——
+    // 只有这样才能验到「合并项的金额是逐桶相加，而不是其中取一个」。
+    const keys = [zhangKey]
+    for (let i = 0; i < 9; i++) {
+      const member = (await repository.createMember(admin, {
+        name: `成员${i}`,
+        role_ids: [MEMBER_ROLE_ID],
+      })).member!
+      keys.push((await repository.issueAppKey(admin, { member_id: member.member_id })).token_secret)
+    }
+    for (const [index, key] of keys.entries()) {
+      await send(key, [
+        rec(`c${index}`, { input_tokens: 1000 - index * 10, output_tokens: 0, cache_read_tokens: 0 }),
+      ])
+    }
+
+    const route = memberRoute(repository)
+    const res = await route.handle(
+      'series',
+      new URLSearchParams({ bucket: 'day', period: 'today', stack: 'user', identity_view: 'member' }),
+      'Bearer tok-admin',
+    )
+    expect(res.status).toBe(200)
+    const body = res.body as SeriesResponse
+    const items = body.stack!.items
+    expect(items.length).toBe(9)
+    expect(items.every((item) => Array.isArray(item.cost))).toBe(true)
+    // ★ 逐层金额之和 ≡ 该点的合计金额 —— 堆叠柱的总高 = 趋势总额
+    body.points.forEach((point, index) => {
+      const total = point.cost!.costs[0]!.amountMicro
+      const sum = items.reduce((acc, item) => acc + (item.cost?.[index] ?? 0), 0)
+      expect(sum).toBe(total)
+    })
+    // 🚨 合并项必须是**两层之和**：写成「取最后一层」时它会小于最大的那一层，
+    //   而图上只会矮一截，没有任何报错。
+    const merged = items.at(-1)!
+    expect(merged.merged).toBe(true)
+    const keptMax = Math.max(...items.slice(0, -1).map((item) => item.cost![0]!))
+    expect(merged.cost![0]!).toBeGreaterThan(keptMax)
+  })
+
+  test('🚨 多币种时逐层金额整块缺席（绝不挑一个币种偷偷画）', async () => {
+    const { repository, admin, zhangKey, liKey, send } = await memberWorld()
+    const base = {
+      output_micro_per_ktok: 0, cache_read_micro_per_ktok: 0, cache_write_micro_per_ktok: 0,
+      effective_from_ms: 1_000,
+    }
+    await repository.setModelPrice(admin, { ...base, provider: 'dashscope', model: 'deepseek-v4.1-flash', currency: 'CNY', input_micro_per_ktok: 2_000 })
+    await repository.setModelPrice(admin, { ...base, provider: 'openai', model: 'gpt-4o', currency: 'USD', input_micro_per_ktok: 3_000 })
+    await send(zhangKey, [rec('z1', { model: 'deepseek-v4.1-flash' })])
+    await send(liKey, [rec('l1', { seq: 2, provider: 'openai', model: 'gpt-4o' })])
+
+    const route = memberRoute(repository)
+    const res = await route.handle(
+      'series',
+      new URLSearchParams({ bucket: 'day', period: 'today', stack: 'user', identity_view: 'member' }),
+      'Bearer tok-admin',
+    )
+    const body = res.body as SeriesResponse
+    // 区间里确实有两种币种（页面据此禁用金额指标）
+    const currencies = new Set(body.points.flatMap((point) => (point.cost?.costs ?? []).map((entry) => entry.currency)))
+    expect([...currencies].sort()).toEqual(['CNY', 'USD'])
+    // 而逐层的 `cost` 必须整块缺席：挑一个币种画出来就是偷偷做了一次换算
+    expect(body.stack!.items.every((item) => !('cost' in item))).toBe(true)
+    expectStackSumsToTotals(body)
+  })
 })
+})
+

@@ -25,6 +25,7 @@ import {
   BarElement,
   CategoryScale,
   Chart,
+  Legend,
   Filler,
   LineController,
   LineElement,
@@ -43,6 +44,7 @@ import {
 
 import {
   buildTrendChartConfig,
+  type TrendChartSeries,
   readTrendChartTheme,
 } from './trendChartConfig.js'
 
@@ -50,8 +52,9 @@ import {
  * 只注册用得到的部件（Chart.js 4 的 tree-shaking 方式）。
  *
  * ⚠️ 少注册一个控制器，图会**静默地什么都不画**（不报错、控制台也不一定有提示），
- *   所以这里列的都是实际用到的：柱 / 线 / 点 + 类目轴 + 提示框 + 面积填充。
- *   没注册 `Legend` 是刻意的 —— 单序列图不需要图例。
+ *   所以这里列的都是实际用到的：柱 / 线 / 点 + 类目轴 + 提示框 + 面积填充 + 图例。
+ *   图例只在分层模式（按用户 / 按模型）下显示 —— 没有它，提示框里的名字与
+ *   柱子颜色的对应关系只能靠鼠标一个个试出来。
  */
 Chart.register(
   BarController,
@@ -61,6 +64,7 @@ Chart.register(
   PointElement,
   CategoryScale,
   LinearScale,
+  Legend,
   Tooltip,
   Filler,
 )
@@ -69,7 +73,7 @@ const props = withDefaults(
   defineProps<{
     /** 每个点的标签（已格式化，如 `09-21`）。 */
     labels: string[]
-    /** 每个点的数值。 */
+    /** 每个点的**合计**数值（分层模式下同时用作提示框尾行）。 */
     values: number[]
     kind?: 'bar' | 'area'
     /** 合计值文案（右上角）。 */
@@ -77,6 +81,13 @@ const props = withDefaults(
     /** 数据说明，作为标题与无障碍名。 */
     hint?: string
     /** 悬浮提示里的指标名，如「计费总量」。 */
+    /**
+     * 分层序列（堆叠柱 / 多条折线）。
+     *
+     * ★ 空数组 = 单序列。它同时是「服务端这一次没给分层」（旧版接口）
+     *   与「金额整块缺席」的回落点，两条路都退回原来那张图。
+     */
+    series?: TrendChartSeries[]
     metricLabel: string
     /**
      * 数值格式化（悬浮提示用），缺省千分位。
@@ -87,7 +98,7 @@ const props = withDefaults(
     /** 刻度格式化，缺省「万 / 亿」。 */
     tickFormatter?: (value: number) => string
   }>(),
-  { kind: 'bar', hint: '' },
+  { kind: 'bar', hint: '', series: () => [] },
 )
 
 const canvas = ref<HTMLCanvasElement | null>(null)
@@ -115,6 +126,7 @@ function draw(): void {
     values: props.values,
     kind: props.kind,
     metricLabel: props.metricLabel,
+    series: props.series,
     theme: readTrendChartTheme(el),
     ...(props.valueFormatter ? { valueFormatter: props.valueFormatter } : {}),
     ...(props.tickFormatter ? { tickFormatter: props.tickFormatter } : {}),
@@ -142,8 +154,10 @@ onMounted(draw)
 watch(
   // ⚠️ 刻意**不把两个格式化函数**列进依赖：父组件传的是内联箭头函数，
   //   每次渲染都是新身份 —— 列进去会让「每次重渲染都重画一遍」，
-  //   而真正决定画什么的（指标名 / 数值 / 粒度）已经在依赖里了。
-  () => [props.labels, props.values, props.kind, props.metricLabel] as const,
+  //   而真正决定画什么的（指标名 / 数值 / 粒度 / 分层）已经在依赖里了。
+  //   `series` 必须列进去：切换「合计 / 按用户 / 按模型」时合计值往往一模一样，
+  //   漏了它会出现「点了切换但图没变」。
+  () => [props.labels, props.values, props.series, props.kind, props.metricLabel] as const,
   draw,
   { flush: 'post' },
 )
@@ -165,7 +179,9 @@ onBeforeUnmount(() => {
       <canvas
         ref="canvas"
         role="img"
-        :aria-label="`${hint}趋势图，共 ${labels.length} 个时间点；鼠标移上去可查看每个点的数值`"
+        :aria-label="`${hint}趋势图，共 ${labels.length} 个时间点${
+          series.length > 0 ? `，按 ${series.length} 个分层堆叠` : ''
+        }；鼠标移上去可查看每个点的数值`"
       />
     </div>
 
@@ -214,3 +230,4 @@ onBeforeUnmount(() => {
   text-align: center;
 }
 </style>
+

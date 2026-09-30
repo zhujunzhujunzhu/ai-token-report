@@ -142,7 +142,9 @@ describe('统计状态', () => {
     expect(calls).toBe(0)
   })
   test('全员排行复用候选请求，筛人后仍保留完整候选', async () => {
-    signIn()
+    // ★ 用人筛选的断言必须用**管理员**身份：只看自己的身份不会把人员筛选
+    //   留在查询里（服务端一律收窄，见 `数据范围` 那条用例）。
+    signIn('admin')
     const urls: URL[] = []
     respond((raw) => {
       const url = new URL(raw, 'http://test')
@@ -156,7 +158,8 @@ describe('统计状态', () => {
     })
     const dashboard = useDashboardStore()
     await dashboard.activate('overview')
-    // 总览一轮 6 个请求：指标、人员候选（用量）、分组候选、**人员名册**、趋势、分组排行。
+    // 总览一轮 7 个请求：指标、人员候选（用量）、分组候选、**人员名册**、
+    // **供应商目录**、趋势、分组排行。
     // ★ 分组候选走看板接口 `/api/v1/stats/groups`（`stats:read`），
     //   不是管理接口 `/api/v1/admin/groups`（那是 `groups:read`）。
     // ★ 人员名册同理走 `/api/v1/stats/members`：它是「窗口内没有用量的人」
@@ -276,7 +279,7 @@ describe('统计状态', () => {
         u.pathname.endsWith('/api/v1/stats/groups') ||
         u.pathname.endsWith('/api/v1/stats/members'),
     )
-    expect(candidates).toHaveLength(6)
+    expect(candidates).toHaveLength(9)
     expect(candidates.every((u) => u.searchParams.size === 0)).toBe(true)
     expect(records?.searchParams.get('member_id')).toBe(
       '00000000-0000-4000-8000-000000000003',
@@ -435,7 +438,7 @@ describe('统计状态', () => {
         period: 'custom',
         customFrom: '',
         customTo: '',
-        provider: '',
+        providers: [],
         model: '',
         users: [],
       }).error,
@@ -624,3 +627,4 @@ describe('人员管理状态', () => {
     expect(admin.storage).toBeNull()
   })
 })
+

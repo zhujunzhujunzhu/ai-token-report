@@ -71,6 +71,7 @@ import {
   recordProjection,
   seriesFromRows,
   sessionCountQuery,
+  stackRowsQuery,
   sortGroupRows,
   timeBoundsQuery,
   timeBucketRowsQuery,
@@ -84,6 +85,7 @@ import {
   type QueryFilter,
   type QueryGroupRow,
   type RawCostRow,
+  type StackRow,
   type RawGroupRow,
   type TimeBucketRow,
 } from './query.js'
@@ -177,6 +179,36 @@ const numOrNull = toNumberOrNull
 export interface PortalSeriesPoint extends SeriesPointCounts {
   cost?: CostTotals
 }
+/**
+ * 堆叠趋势里的一层（一个用户 / 一个模型）—— {@link PortalStatsSession.stackSeries} 的产出。
+ *
+ * ★ `tokensByBucket` / `callsByBucket` **缺桶就是 0**：补零是调用方按 `points`
+ *   对齐时的事（与 `series()` 用同一份 `renderSeriesGaps()`），
+ *   两层各补一次零早晚会出现「图上有这个桶、分层里没有」。
+ */
+export interface PortalStackSeries {
+  /** 归属键：人员 UUID / `legacy:…` / `unknown` / 模型名。 */
+  key: string
+  /** 展示名（成员视图与人员排行同源）。 */
+  label: string
+  memberId?: string | null
+  groupNames?: string[]
+  attributionStatus?: 'member' | 'legacy' | 'unattributed'
+  /** 窗口内的计费总量，供调用方排序取前 N。 */
+  totalTokens: number
+  calls: number
+  tokensByBucket: Map<string, number>
+  callsByBucket: Map<string, number>
+  /**
+   * 逐桶金额（只在会话带 `withCost` 时才有）。
+   *
+   * ⚠️ 缺桶 = 这一层在这个桶上**未计价**（不是 0 元），但页面看到的仍是一个
+   *   数字数组 —— 真正回答「未计价多少」的是 `points[].cost.unpricedRate`，
+   *   它才是必须与金额同时可见的那句话。
+   */
+  costByBucket?: Map<string, CostTotals>
+}
+
 
 /** 明细行的金额：`currency` 为 `null` = **未计价**（不是 0 元）。 */
 export interface PortalRecordCost {
@@ -699,6 +731,185 @@ export class PortalStatsSession {
     // 而不是让 `cost` 时有时无：后者会让页面在「有金额」和「没金额」之间闪。
     return filled.map((point) => ({ ...point, cost: this.summarize(parts.get(point.bucket) ?? []) }))
   }
+  /**
+   * 堆叠趋势：按**人 / 模型**把每个时间桶拆开。
+   *
+   * ## 为什么不是把 `groups()` 按桶跑一遍
+   *
+   * 需要的是「每个桶 × 每个分层」的交叉值，而 `groups(dim)` 只有窗口总量。
+   * 于是这里退回到**原始行**：时间桶无论如何都要在 JS 侧算
+   * （见 `query.ts` 的 `dimensionExpression` 注释），行反正要过一遍 JS。
+   *
+   * ## 🚨 键必须与 `groups('user')` 逐字相同
+   *
+   * 成员视图下的归属键有三种形态（稳定 `member_id` / `legacy:…` / `unknown`），
+   * 展示名也有三种拼法。这里**刻意复制 `memberGroups()` 的那套判定**：
+   * 两者一旦分叉，图上「张三」这一层与人员排行里的「张三」就不是同一个键，
+   * 而图与表各自看起来都很正常。
+   *
+   * ⚠️ 本方法**不截断**：前 N 名与「其余」的合并发生在路由层
+   *   （`stats-route.ts`），因为那是**展示取舍**，不是取数口径。
+   *   这里给出全部层与它们的窗口总量，路由才排得出名次。
+   *
+   * ★ 有 `cost:read` 时**顺带按 (桶, 层) 算金额**（逐条事件按当时的价）。
+   *   与趋势线同一条规矩：价按 `(provider, model)` 定，
+   *   所以金额**不能**由「这一层的总量 × 某个价」重算。
+   *   一元钱也没有的层照样有 `costs: []`（= 未计价），不是缺席。
+   */
+  async stackSeries(
+    dim: 'user' | 'model',
+    granularity: 'day' | 'hour',
+  ): Promise<PortalStackSeries[]> {
+    const q = stackRowsQuery(dim, this.#filter, this.#normalize, this.#withCost)
+    const rows = await this.#store.all<StackRow>(q.sql, q.params)
+    /**
+     * 只有 `user` 维度才有归属可言。
+     *
+     * 🚨 少了这个开关，模型维度会走进人员那套标签判定：模型行既没有
+     *   `member_id` 也没有 `user_id`，于是每一层都被标成「未归属」——
+     *   实测在图例上表现为**所有模型都叫「未归属」**，而数字全对。
+     */
+    const userDim = dim === 'user'
+    const memberView = userDim && this.#filter.identityView === 'member'
+    const priceList = this.#withCost ? (await this.prices()).list : []
+
+    interface Pending {
+      label: string
+      memberId: string | null
+      attributionStatus: 'member' | 'legacy' | 'unattributed' | undefined
+      /** 历史身份的快照名，取 `MIN(user_name)`（与 `memberGroups()` 同一判定）。 */
+      snapshot: string | null
+      totalTokens: number
+      calls: number
+      tokensByBucket: Map<string, number>
+      callsByBucket: Map<string, number>
+      costParts: Map<string, CostPart[]>
+    }
+    const merged = new Map<string, Pending>()
+
+    for (const row of rows) {
+      const ts = num(row.ts)
+      const bucket = granularity === 'day' ? toDayKey(ts) : toHourKey(ts)
+      const key = dim === 'model' ? String(row.stack_key ?? '') : this.identityKeyOf(row, memberView)
+      let entry = merged.get(key)
+      if (!entry) {
+        entry = {
+          // 标签先占位，等人员名册 / 分组名查回来再补（见下面的两趟查询）。
+          label: key,
+          memberId: memberView ? this.memberIdOf(row) : null,
+          attributionStatus: memberView ? this.attributionOf(row) : undefined,
+          snapshot: null,
+          totalTokens: 0,
+          calls: 0,
+          tokensByBucket: new Map(),
+          callsByBucket: new Map(),
+          costParts: new Map(),
+        }
+        merged.set(key, entry)
+      }
+      // ★ `MIN(user_name)` 在 JS 侧同样按字典序取最小 —— 直接取「第一条」会让
+      //   图上的历史人员名与人员排行里的名字不一致（同一批数据、两个名字）。
+      if (memberView && typeof row.user_name === 'string') {
+        if (entry.snapshot === null || row.user_name < entry.snapshot) entry.snapshot = row.user_name
+      }
+      const usage = this.usageOf(row)
+      const tokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite
+      entry.totalTokens += tokens
+      entry.calls += 1
+      entry.tokensByBucket.set(bucket, (entry.tokensByBucket.get(bucket) ?? 0) + tokens)
+      entry.callsByBucket.set(bucket, (entry.callsByBucket.get(bucket) ?? 0) + 1)
+      if (this.#withCost) {
+        PortalStatsSession.push(entry.costParts, bucket, {
+          usage,
+          // ★ 逐条按**它自己的时刻**取价：一个桶里可能横跨一次换价。
+          price: resolvePrice(priceList, String(row.provider ?? ''), String(row.model ?? ''), ts),
+        })
+      }
+    }
+
+    const memberIds = [...merged.values()].map((entry) => entry.memberId)
+    // ⚠️ 两趟查询都只在**成员视图的人员维度**才有意义：模型维度没有归属可言，
+    //   而旧视图的键就是 `user_id` 本身（没有稳定人员 ID，也就没有名册可查）。
+    const names = memberView ? await this.displayNamesOf(memberIds) : new Map<string, string>()
+    const groups = memberView ? await this.groupsOf(memberIds) : new Map<string, { groupId: string; name: string }[]>()
+
+    return [...merged.entries()].map(([key, entry]) => ({
+      key,
+      // ★ 三个分支：模型维度直接用键（模型名）；人员维度再分成员视图与旧视图。
+      label: !userDim
+        ? key
+        : memberView
+          ? this.stackLabelOf(entry, names)
+          : key === UNATTRIBUTED_USER ? '未署名' : key,
+      ...(userDim ? { memberId: entry.memberId } : {}),
+      ...(memberView && entry.memberId
+        ? { groupNames: (groups.get(entry.memberId) ?? []).map((group) => group.name) }
+        : {}),
+      ...(entry.attributionStatus ? { attributionStatus: entry.attributionStatus } : {}),
+      totalTokens: entry.totalTokens,
+      calls: entry.calls,
+      tokensByBucket: entry.tokensByBucket,
+      callsByBucket: entry.callsByBucket,
+      ...(this.#withCost ? { costByBucket: this.costsOf(entry.costParts) } : {}),
+    }))
+  }
+
+  /** 一个分层的逐桶金额（只在 `withCost` 时被调用）。 */
+  private costsOf(parts: Map<string, CostPart[]>): Map<string, CostTotals> {
+    const result = new Map<string, CostTotals>()
+    for (const [bucket, list] of parts) result.set(bucket, this.summarize(list))
+    return result
+  }
+
+  /** 成员视图下的归属键；与 `memberGroups()` 的三分支**逐字相同**。 */
+  private identityKeyOf(row: StackRow, memberView: boolean): string {
+    if (!memberView) return typeof row.user_id === 'string' ? row.user_id : UNATTRIBUTED_USER
+    const memberId = this.memberIdOf(row)
+    if (memberId) return memberId
+    const legacy = typeof row.user_id === 'string' ? row.user_id : null
+    return legacy === null ? UNATTRIBUTED_USER : `legacy:${Buffer.from(legacy, 'utf8').toString('base64url')}`
+  }
+
+  private memberIdOf(row: StackRow): string | null {
+    return typeof row.member_id === 'string' && row.member_id.length > 0 ? row.member_id : null
+  }
+
+  private attributionOf(row: StackRow): 'member' | 'legacy' | 'unattributed' {
+    if (this.memberIdOf(row)) return 'member'
+    return typeof row.user_id === 'string' ? 'legacy' : 'unattributed'
+  }
+
+  /** 分层展示名；三分支与 `memberGroups()` 的 `label` 拼法相同。 */
+  private stackLabelOf(
+    entry: { memberId: string | null; snapshot: string | null },
+    names: Map<string, string>,
+  ): string {
+    if (entry.memberId) return names.get(entry.memberId) ?? '已停用人员'
+    if (entry.snapshot !== null) return `历史人员：${entry.snapshot}（待确认）`
+    return '未归属'
+  }
+
+  /**
+   * 稳定人员 ID → 显示名（分批查询，理由同 `groupsOf()`）。
+   *
+   * ⚠️ 查不到的 ID 留在 `members` 表之外（人员被物理删除只可能来自直接改库），
+   *   由调用方回落成「已停用人员」，与 `memberGroups()` 的 `LEFT JOIN` 同义。
+   */
+  private async displayNamesOf(members: readonly (string | null)[]): Promise<Map<string, string>> {
+    const unique = [...new Set(members.filter((id): id is string => !!id))]
+    const map = new Map<string, string>()
+    for (let start = 0; start < unique.length; start += 200) {
+      const chunk = unique.slice(start, start + 200)
+      const params: Record<string, string> = {}
+      chunk.forEach((id, i) => { params[`$n${i}`] = id })
+      const rows = await this.#store.all<{ member_id: string; display_name: string }>(
+        `SELECT member_id, display_name FROM members
+         WHERE member_id IN (${chunk.map((_, i) => `$n${i}`).join(',')})`, params)
+      for (const row of rows) map.set(String(row.member_id), String(row.display_name))
+    }
+    return map
+  }
+
 
   /** 明细分页（最新在前）。返回总行数供页面算分页。 */
   async records(limit: number, offset: number): Promise<{ total: number; rows: PortalRecordRow[] }> {
@@ -827,3 +1038,4 @@ export class IdentityViewRequiredError extends Error {
   readonly code = 'identity_view_required'
   constructor() { super('当前归属无法用旧版人员视图准确表达，请使用 identity_view=member') }
 }
+

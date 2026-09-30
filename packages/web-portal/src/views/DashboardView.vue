@@ -1,12 +1,20 @@
 <script setup lang="ts">
-/** 总览只组织关键指标、趋势、人员排行与分组排行，其余业务有独立路由。 */
-import { ElCard, ElTag } from 'element-plus'
+/**
+ * 总览只组织关键指标、趋势、人员排行与分组排行，其余业务有独立路由。
+ *
+ * ★ 趋势图的三个开关（指标 / 分层维度 / 时间粒度）全部读 store：
+ *   总览与分析是同一个问题的两种看法，在一边选了「按用户 + 元」，
+ *   跳到另一边不该被重置。页面只负责渲染，不做任何口径换算。
+ */
+import { ElCard, ElRadioButton, ElRadioGroup, ElTag } from 'element-plus'
 import type { BreakdownRow } from '@ai-token-report/shared'
-import { useDashboardStore } from '../stores/dashboard.js'
+import { computed } from 'vue'
+import { useDashboardStore, type TrendMetric, type TrendStack } from '../stores/dashboard.js'
 import MetricCardGrid from '../components/MetricCardGrid.vue'
 import RankingTable from '../components/RankingTable.vue'
 import BreakdownTable from '../components/BreakdownTable.vue'
 import TrendChart from '../components/TrendChart.vue'
+import { COST_LABEL, costText, costTickFormatter } from '../utils/cost.js'
 import { formatBucket, formatCount } from '../utils/format.js'
 import { groupLabelOf } from '../types/portal.js'
 const dashboard = useDashboardStore()
@@ -18,6 +26,68 @@ const dashboard = useDashboardStore()
  *   这里只做展示映射，不参与任何数值计算。
  */
 const groupName = (row: BreakdownRow): string =>
+/** 趋势点（同一份数组同时喂给标签与数值，保证两个序列**按下标对齐**）。 */
+const seriesPoints = computed(() => dashboard.series?.points ?? [])
+const chartLabels = computed(() =>
+  seriesPoints.value.map((p) => formatBucket(p.bucket, dashboard.granularity)),
+)
+/**
+ * 图上「合计」那一列的数值。
+ *
+ * ⚠️ 三个指标的值**全部来自服务端**：金额取 `costSeries.values` 的同一批
+ *   整数微元（下标与 `seriesPoints` 一一对应），画图层不做任何口径换算。
+ *   展开成按用户 / 按模型时，这一列同时是提示框尾行的合计值。
+ */
+const chartValues = computed(() =>
+  seriesPoints.value.map((p, index) => {
+    if (dashboard.activeMetric === 'calls') return p.calls
+    if (dashboard.activeMetric === 'cost')
+      return dashboard.costSeries?.values[index] ?? 0
+    return p.totalTokens
+  }),
+)
+const chartTotal = computed(() => {
+  if (!dashboard.overview) return '—'
+  if (dashboard.activeMetric === 'calls') return formatCount(dashboard.overview.calls)
+  // ⚠️ 金额合计用 `costText`（多币种 ` + ` 拼接），**不是**千分位。
+  if (dashboard.activeMetric === 'cost')
+    return costText(dashboard.overview.cost) ?? '未计价'
+  return formatCount(dashboard.overview.totalTokens)
+})
+const chartMetricLabel = computed(() =>
+  dashboard.activeMetric === 'calls'
+    ? '调用次数'
+    : dashboard.activeMetric === 'cost'
+      ? COST_LABEL
+      : '计费总量',
+)
+/**
+ * 图表标题行兼无障碍名。
+ *
+ * ★ 展开时必须把「前 N 名 + 其余合并」说清楚：少了这句，使用者会以为
+ *   图上那几层就是全部，而堆叠柱的总高其实仍然等于总量。
+ */
+const chartHint = computed(() => {
+  const grain = dashboard.granularity === 'hour' ? '按小时统计' : '按天统计'
+  if (dashboard.stackBy === 'none') {
+    return dashboard.activeMetric === 'cost'
+      ? `${grain} · 按每笔事件发生时刻的单价估算 · 币种 ${dashboard.costSeries?.currency ?? 'CNY'}`
+      : grain
+  }
+  const who = dashboard.stackBy === 'user' ? '按用户展开' : '按模型展开'
+  const merged = dashboard.stackMergedCount
+  return `${grain} · ${who}${merged > 0 ? `（按用量取前 8 名，其余合并）` : ''}`
+})
+/** 金额曲线的刻度与悬浮值都显示成货币；其它指标用缺省的「万 / 亿」与千分位。 */
+const chartFormatter = computed(() =>
+  dashboard.activeMetric === 'cost'
+    ? costTickFormatter(dashboard.costSeries?.currency ?? 'CNY')
+    : undefined,
+)
+const onMetric = (value: string | number | boolean | undefined): void =>
+  dashboard.setTrendMetric(value as TrendMetric)
+const onStack = (value: string | number | boolean | undefined): void =>
+  void dashboard.setStack(value as TrendStack)
   groupLabelOf(row, dashboard.groupOptions)
 </script>
 <template>
@@ -33,17 +103,14 @@ const groupName = (row: BreakdownRow): string =>
       </div></template
     >
     <TrendChart
-      :labels="
-        (dashboard.series?.points ?? []).map((p) =>
-          formatBucket(p.bucket, dashboard.granularity),
-        )
-      "
-      :values="(dashboard.series?.points ?? []).map((p) => p.totalTokens)"
-      :total="
-        dashboard.overview ? formatCount(dashboard.overview.totalTokens) : '—'
-      "
-      :hint="dashboard.granularity === 'hour' ? '按小时统计' : '按天统计'"
-      metric-label="计费总量"
+      :labels="chartLabels"
+      :values="chartValues"
+      :series="dashboard.trendSeries"
+      :total="chartTotal"
+      :metric-label="chartMetricLabel"
+      :hint="chartHint"
+      :value-formatter="chartFormatter"
+      :tick-formatter="chartFormatter"
     />
   </el-card>
   <el-card shadow="never"
@@ -81,4 +148,5 @@ const groupName = (row: BreakdownRow): string =>
       一名成员可属于多个分组，同一笔用量会同时计入其所属的每个分组，因此各分组之和可能大于总量；未分组的成员不计入任何分组行。
     </p>
   </el-card>
+
 </template>
