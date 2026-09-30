@@ -55,11 +55,15 @@ import type { TokenCounts } from '../types.js'
 import { renderSeriesGaps, type SeriesPointCounts } from './stats.js'
 import {
   buildWhere,
+  costByCwdQuery,
+  costByDimensionQuery,
+  costTotalsQuery,
   distinctUsersQuery,
   groupsQuery,
   groupRowsFromProject,
   groupRowsFromTime,
   ingestMomentQuery,
+  mapCostRows,
   mapGroupRows,
   mapRecordProvider,
   projectGroupsQuery,
@@ -79,12 +83,73 @@ import {
   type QueryDimension,
   type QueryFilter,
   type QueryGroupRow,
+  type RawCostRow,
   type RawGroupRow,
   type TimeBucketRow,
 } from './query.js'
 import { providerNormalizer, type ProviderAliasMap, type ProviderNormalizer } from './provider-alias.js'
 import { EVENT_TABLE } from './schema.js'
+import { PRICE_TABLE } from './query.js'
+// ★ 费用类型与「未计价清单上限」的唯一来源：离线路径（本地页 / CLI）用同一份，
+//   见 `./cost.js` 的模块注释。
+import { MAX_UNPRICED_TARGETS } from './cost.js'
+import type { CostTotals, CostTotalsWithTargets } from './cost.js'
+import {
+  costMicroOf,
+  resolvePrice,
+  summarizeCosts,
+  type BillableUsage,
+  type CostPart,
+  type CostSummary,
+  type ModelPrice,
+  type PricingProvenance,
+} from '@ai-token-report/shared'
+// ⚠️ `toDayKey()` / `toHourKey()` / `projectName()` 是**内核**的（`aggregate.ts`），
+//   不是 shared 的：它们定义的是「怎么分桶 / 怎么切项目名」。
+//   这里复用同一份实现 —— 与 `groups()` 用同一套键，金额才能按组对上号。
+import { projectName, toDayKey, toHourKey } from '../aggregate.js'
 import { Buffer } from 'node:buffer'
+
+/**
+ * 带金额的一档汇总（线上契约 `StatsCostTotals` 的内核形状）。
+ *
+ * ⚠️ `pricing` **不是装饰**：同一批用量在「服务端读库里的价」与
+ *   「离线端读快照的价」下会给出**两个不同的金额**，所以任何展示金额的地方
+ *   都必须能回答「这是按哪份单价、什么时候算的」。缺它就不许渲染金额。
+ *
+ * ★ 类型与常量**定义在 `./cost.js`**（离线路径也用同一份），这里只是转出 ——
+ *   各写一份的话，给 `CostTotals` 加一个字段时只会改到其中一处，
+ *   而另一处仍然编译通过（结构类型下多一个字段不算错），分叉就此开始。
+ */
+export type { CostTotals, CostTotalsWithTargets } from './cost.js'
+
+/** 单价目录一次读入后的两份索引。 */
+interface PriceIndex {
+  list: readonly ModelPrice[]
+  byId: Map<string, ModelPrice>
+}
+
+/** 单价表的取数行（snake_case 只活在这一层）。 */
+interface PortalPriceSqlRow {
+  price_id: unknown
+  provider: unknown
+  model: unknown
+  currency: unknown
+  input_micro_per_ktok: unknown
+  output_micro_per_ktok: unknown
+  cache_read_micro_per_ktok: unknown
+  cache_write_micro_per_ktok: unknown
+  effective_from_ms: unknown
+  effective_to_ms: unknown
+}
+
+/**
+ * 未计价目标最多列这么多条：多到几十条时「去补价」这件事本身就该换个做法了。
+ *
+ * ★ 常量本体在 `./cost.js`（离线路径用同一个上限）—— 两处各写一个数字的话，
+ *   同一次用量在看板上是 20 条、在 CLI 上是 30 条，而两边都不会报错。
+ */
+export { MAX_UNPRICED_TARGETS } from './cost.js'
 
 /**
  * 数值归一 —— ★ **本仓唯一的口径边界**。
@@ -108,6 +173,17 @@ const num = toNumber
 const numOrNull = toNumberOrNull
 
 /** 明细表的一行（上报库比本机库多一列归属）。 */
+/** 趋势点 + 该点的金额（只在 `withCost` 时带上 `cost`）。 */
+export interface PortalSeriesPoint extends SeriesPointCounts {
+  cost?: CostTotals
+}
+
+/** 明细行的金额：`currency` 为 `null` = **未计价**（不是 0 元）。 */
+export interface PortalRecordCost {
+  currency: string | null
+  amountMicro: number
+}
+
 export interface PortalRecordRow {
   memberId?: string | null
   userNameSnapshot?: string | null
@@ -132,6 +208,16 @@ export interface PortalRecordRow {
   output: number
   cacheRead: number
   cacheWrite: number
+  /**
+   * 这一条事件的费用。
+   *
+   * ⚠️ 三种状态要分清（页面上对应三件不同的事）：
+   *   - 字段**整个缺席** = 调用方没有 `cost:read`（这一趟根本没算过）；
+   *   - `cost.currency === null` = 算了，这一条**没配上价**；
+   *   - 有币种 + 金额 = 算出来了。
+   *   第二种**绝不能**折成 0 元 —— 那会让「漏配价」看起来像「这条不要钱」。
+   */
+  cost?: PortalRecordCost
 }
 
 /** 明细 SQL 的原始行（数值列在 MySQL 下可能是字符串，必须经 `num()`）。 */
@@ -181,6 +267,17 @@ export class PortalStatsSession {
    * 此时所有 SQL 与迁移前**逐字相同**，本机库路径也走这一支。
    */
   readonly #normalize: ProviderNormalizer | undefined
+  /**
+   * 是否连**金额**一起算。
+   *
+   * 🚨 由调用方按 `cost:read` 决定，而且这里是**真不查、真不算** ——
+   *   不是「算完再决定要不要发出去」。理由与「缺字段必须按 member 处理」同源：
+   *   只要金额曾经存在于某个中间对象里，就迟早会有一条日志、一个错误响应
+   *   或一次页面状态把它带出去。没算过的东西泄不出去。
+   */
+  readonly #withCost: boolean
+  /** 单价目录（v7）。**惰性读一次**：一次查询里三种金额都要用同一份价。 */
+  #prices: PriceIndex | null = null
   #closed = false
 
   constructor(init: {
@@ -188,6 +285,7 @@ export class PortalStatsSession {
     target: PortalTarget
     filter?: QueryFilter
     aliases?: ProviderAliasMap
+    withCost?: boolean
   }) {
     this.#store = init.store
     this.#dialect = portalDialect(init.store.kind)
@@ -201,6 +299,149 @@ export class PortalStatsSession {
       ? providerNormalizer(init.aliases, this.#dialect)
       : undefined
     this.openedAt = Date.now()
+    this.#withCost = init.withCost === true
+  }
+
+  // -------------------------------------------------------------------------
+  // 费用（v7 模型单价）
+  // -------------------------------------------------------------------------
+
+  /** 这批金额是按哪份单价算的。服务端读的是数据库表，所以是 `db` + `null`。 */
+  get pricingProvenance(): PricingProvenance {
+    return { pricingSource: 'db', pricingSyncedAt: null }
+  }
+
+  /**
+   * 单价目录（惰性、只读一次）。
+   *
+   * ⚠️ 表不存在时不能让它炸掉整个看板：v7 之前的库由 `openPortalDb()` 挡在
+   *   启动那一步（版本不符直接抛错），所以走到这里表一定在。真查失败时如实抛出 ——
+   *   把「读价失败」降级成「未计价」会让整个看板的金额静默变成 0，
+   *   那正是这一期最想避免的误读。
+   */
+  private async prices(): Promise<PriceIndex> {
+    if (this.#prices === null) {
+      const rows = await this.#store.all<PortalPriceSqlRow>(
+        `SELECT price_id, provider, model, currency,
+                input_micro_per_ktok, output_micro_per_ktok,
+                cache_read_micro_per_ktok, cache_write_micro_per_ktok,
+                effective_from_ms, effective_to_ms
+         FROM ${PRICE_TABLE}`,
+      )
+      const list: ModelPrice[] = rows.map((row) => ({
+        provider: String(row.provider ?? ''),
+        model: String(row.model ?? ''),
+        currency: String(row.currency ?? ''),
+        inputMicroPerKtok: num(row.input_micro_per_ktok),
+        outputMicroPerKtok: num(row.output_micro_per_ktok),
+        cacheReadMicroPerKtok: num(row.cache_read_micro_per_ktok),
+        cacheWriteMicroPerKtok: num(row.cache_write_micro_per_ktok),
+        effectiveFromMs: num(row.effective_from_ms),
+        effectiveToMs: toNumberOrNull(row.effective_to_ms),
+      }))
+      const byId = new Map<string, ModelPrice>()
+      rows.forEach((row, index) => byId.set(String(row.price_id), list[index]!))
+      this.#prices = { list, byId }
+    }
+    return this.#prices
+  }
+
+  /** 单个分组键下的一撮计价单元。 */
+  private static push(parts: Map<string, CostPart[]>, key: string, part: CostPart): void {
+    const list = parts.get(key)
+    if (list) list.push(part)
+    else parts.set(key, [part])
+  }
+
+  /** 把一撮计价单元汇总成带来源的金额。 */
+  private summarize(parts: readonly CostPart[]): CostTotals {
+    return { ...summarizeCosts(parts), pricing: this.pricingProvenance }
+  }
+
+  /**
+   * 整体金额 + 未配价的目标清单。
+   *
+   * ★ 有 `cost:read` 之外的情况返回 `null`（而不是 0 元）：
+   *   **「没权限看金额」与「这段时间没花钱」是两件事**，后者会让一个有权限的人
+   *   以为自己上个月一分钱没花。
+   */
+  async costTotals(): Promise<CostTotalsWithTargets | null> {
+    if (!this.#withCost) return null
+    const { byId } = await this.prices()
+    const q = costTotalsQuery(this.#filter, this.#normalize)
+    const rows = mapCostRows(await this.#store.all<RawCostRow>(q.sql, q.params))
+    const targets = new Set<string>()
+    for (const row of rows) {
+      // 未计价的行才进清单；`price_id` 非空说明这条用量已经有价了。
+      if (row.priceId === null && row.provider !== null) targets.add(`${row.provider}/${row.model ?? ''}`)
+    }
+    return {
+      ...this.summarize(rows.map((row) => ({ usage: row.usage, price: this.priceOf(row.priceId, byId) }))),
+      unpricedTargets: [...targets].sort().slice(0, MAX_UNPRICED_TARGETS),
+    }
+  }
+
+  /** 按 `price_id` 取价；取不到就按**未计价**处理（宁可少算，不可按 0 元算）。 */
+  private priceOf(priceId: string | null, byId: Map<string, ModelPrice>): ModelPrice | null {
+    if (priceId === null) return null
+    return byId.get(priceId) ?? null
+  }
+
+  /**
+   * 按任意分组维度取金额，键与 `groups(dim)` 的 `key` **逐字相同**。
+   *
+   * ★ 这正是它必须留在本文件的原因：分组键的口径（归一化后的 provider、
+   *   稳定人员 ID、按项目名合并、按本地时区分桶）只有一份实现，
+   *   让路由层自己去对键，就会多出第二份「什么算同一组」的判断。
+   *
+   * 三个分支对应 `dimensionExpression` 的三种归宿：
+   *   - SQL 侧可分组（provider / model / provider-model / user / group）→ 一次带 JOIN 的聚合；
+   *   - `project` → 先按 `cwd` 取金额，再按项目名合并（与分组路径同样的合并规则）；
+   *   - `day` / `hour` → 取原始行、在 JS 侧分桶（**分桶必须在 JS 侧**，见 `query.ts`）。
+   */
+  async costByGroup(dim: QueryDimension): Promise<Map<string, CostTotals>> {
+    const result = new Map<string, CostTotals>()
+    if (!this.#withCost) return result
+    const { list, byId } = await this.prices()
+    const parts = new Map<string, CostPart[]>()
+
+    if (dim === 'day' || dim === 'hour') {
+      // ⚠️ 逐行的价必须按**每条事件自己的时刻**解析（`resolvePrice`），
+      //   不能拿分桶后的总量去乘一个价：一个桶里可能横跨一次换价。
+      const q = timeBucketRowsQuery(this.#filter, false, this.#normalize, true)
+      const rows = await this.#store.all<TimeBucketRow & { provider?: unknown; model?: unknown }>(q.sql, q.params)
+      for (const row of rows) {
+        const ts = num(row.ts)
+        PortalStatsSession.push(parts, dim === 'day' ? toDayKey(ts) : toHourKey(ts), {
+          usage: this.usageOf(row),
+          price: resolvePrice(list, String(row.provider ?? ''), String(row.model ?? ''), ts),
+        })
+      }
+    } else if (dim === 'project') {
+      const q = costByCwdQuery(this.#filter, this.#normalize)
+      for (const row of mapCostRows(await this.#store.all<RawCostRow>(q.sql, q.params))) {
+        PortalStatsSession.push(parts, projectName(row.key), { usage: row.usage, price: this.priceOf(row.priceId, byId) })
+      }
+    } else {
+      const q = costByDimensionQuery(dim, this.#filter, this.#dialect, this.#normalize)
+      if (!q) return result
+      for (const row of mapCostRows(await this.#store.all<RawCostRow>(q.sql, q.params))) {
+        PortalStatsSession.push(parts, row.key ?? '', { usage: row.usage, price: this.priceOf(row.priceId, byId) })
+      }
+    }
+
+    for (const [key, list2] of parts) result.set(key, this.summarize(list2))
+    return result
+  }
+
+  /** 四类 token 的读取（逐行路径与聚合路径共用一处转换）。 */
+  private usageOf(row: { input_tokens: unknown; output_tokens: unknown; cache_read_tokens: unknown; cache_write_tokens: unknown }): BillableUsage {
+    return {
+      input: num(row.input_tokens),
+      output: num(row.output_tokens),
+      cacheRead: num(row.cache_read_tokens),
+      cacheWrite: num(row.cache_write_tokens),
+    }
   }
 
   /** 总计（四项独立 + calls）。派生指标请用 `derive()` / `shared/metrics.ts`。 */
@@ -435,11 +676,28 @@ export class PortalStatsSession {
    *   同一份实现。自己再写一遍补零，会让「命令行 30 个点、页面 4 个点」
    *   这种差异出现，而且没有任何报错。
    */
-  async series(granularity: 'day' | 'hour', fillGaps = true): Promise<SeriesPointCounts[]> {
-    const q = timeBucketRowsQuery(this.#filter, false, this.#normalize)
-    const rows = await this.#store.all<TimeBucketRow>(q.sql, q.params)
+  async series(granularity: 'day' | 'hour', fillGaps = true): Promise<PortalSeriesPoint[]> {
+    // ⚠️ `withCost` 时连 provider / model 一起取：每个点的金额必须按**该点里
+    //   每条事件当时的价**算，而价是按 (provider, model) 定的。
+    //   拿「这个点一共多少 token」× 某个价 = 用一个平均单价算账，那是错的。
+    const q = timeBucketRowsQuery(this.#filter, false, this.#normalize, this.#withCost)
+    const rows = await this.#store.all<TimeBucketRow & { provider?: unknown; model?: unknown }>(q.sql, q.params)
     const points = seriesFromRows(rows, granularity)
-    return fillGaps ? renderSeriesGaps(points, granularity) : points
+    const filled = fillGaps ? renderSeriesGaps(points, granularity) : points
+    if (!this.#withCost) return filled
+
+    const { list } = await this.prices()
+    const parts = new Map<string, CostPart[]>()
+    for (const row of rows) {
+      const ts = num(row.ts)
+      PortalStatsSession.push(parts, granularity === 'day' ? toDayKey(ts) : toHourKey(ts), {
+        usage: this.usageOf(row),
+        price: resolvePrice(list, String(row.provider ?? ''), String(row.model ?? ''), ts),
+      })
+    }
+    // 补零出来的点没有用量 —— 给一份全 0 的金额（币种列表为空），
+    // 而不是让 `cost` 时有时无：后者会让页面在「有金额」和「没金额」之间闪。
+    return filled.map((point) => ({ ...point, cost: this.summarize(parts.get(point.bucket) ?? []) }))
   }
 
   /** 明细分页（最新在前）。返回总行数供页面算分页。 */
@@ -469,28 +727,48 @@ export class PortalStatsSession {
       { ...projection.params, ...params, $limit: limit, $offset: offset },
     )
     const groups = await this.groupsOf(rows.map((row) => row.member_id))
+    // ★ 明细是**唯一**能逐条核对金额的地方：一行一条事件，它的价按它自己的
+    //   `(provider, model, ts)` 解析 —— 同一页里两行同一个模型却不同价，
+    //   正是「换价那一刻」的证据，页面必须能显示这个。
+    const priceIndex = this.#withCost ? await this.prices() : null
 
     return {
       total: num(totalRow?.c),
-      rows: rows.map((r) => ({
-        eventId: r.event_id,
-        sessionId: r.session_id,
-        seq: num(r.seq),
-        ts: num(r.ts),
-        userId: r.user_id,
-        ...(this.#filter.identityView === 'member' ? {
-          memberId: r.member_id, userNameSnapshot: r.user_name,
-          groupIds: (r.member_id ? groups.get(r.member_id) ?? [] : []).map((group) => group.groupId),
-          groupNameSnapshot: r.group_name, attributionStatus: r.member_id ? 'member' as const : r.user_id !== null ? 'legacy' as const : 'unattributed' as const,
-        } : {}),
-        ...mapRecordProvider(r),
-        model: r.model,
-        cwd: r.cwd,
-        input: num(r.input_tokens),
-        output: num(r.output_tokens),
-        cacheRead: num(r.cache_read_tokens),
-        cacheWrite: num(r.cache_write_tokens),
-      })),
+      rows: rows.map((r) => {
+        const usage: BillableUsage = {
+          input: num(r.input_tokens),
+          output: num(r.output_tokens),
+          cacheRead: num(r.cache_read_tokens),
+          cacheWrite: num(r.cache_write_tokens),
+        }
+        const price = priceIndex === null
+          ? null
+          : resolvePrice(priceIndex.list, r.provider, r.model, num(r.ts))
+        return {
+          eventId: r.event_id,
+          sessionId: r.session_id,
+          seq: num(r.seq),
+          ts: num(r.ts),
+          userId: r.user_id,
+          ...(this.#filter.identityView === 'member' ? {
+            memberId: r.member_id, userNameSnapshot: r.user_name,
+            groupIds: (r.member_id ? groups.get(r.member_id) ?? [] : []).map((group) => group.groupId),
+            groupNameSnapshot: r.group_name, attributionStatus: r.member_id ? 'member' as const : r.user_id !== null ? 'legacy' as const : 'unattributed' as const,
+          } : {}),
+          ...mapRecordProvider(r),
+          model: r.model,
+          cwd: r.cwd,
+          input: usage.input,
+          output: usage.output,
+          cacheRead: usage.cacheRead,
+          cacheWrite: usage.cacheWrite,
+          // `currency: null` = 没配上价。**绝不写 0 元**：那会让「漏配价」
+          // 在明细里看起来像「这条不要钱」。
+          ...(priceIndex === null ? {} : {
+            cost: { currency: price?.currency ?? null, amountMicro: price === null ? 0 : costMicroOf(usage, price) },
+          }),
+        }
+      }),
     }
   }
 
@@ -523,11 +801,22 @@ export async function openPortalStats(
   target: PortalTarget,
   filter: QueryFilter = {},
   loadAliases?: (store: PortalStore) => Promise<ProviderAliasMap>,
+  /**
+   * 是否连金额一起算。由**路由层按 `cost:read` 决定**，core 不认权限概念。
+   *
+   * ⚠️ 默认 `false`：金额是「另算一趟」的东西（多了 JOIN 与单价表读取），
+   *   而绝大多数请求只是想看看 token 数。默认开会让每一次看板刷新都替
+   *   没有金额权限的人白算一遍。
+   */
+  withCost = false,
 ): Promise<PortalStatsSession> {
   const store = await openPortalStore(target)
   try {
     const aliases = loadAliases ? await loadAliases(store) : undefined
-    const session = new PortalStatsSession({ store, target, filter, ...(aliases && aliases.size > 0 ? { aliases } : {}) })
+    const session = new PortalStatsSession({
+      store, target, filter, withCost,
+      ...(aliases && aliases.size > 0 ? { aliases } : {}),
+    })
     await session.assertLegacyIdentityView()
     return session
   } catch (error) { await store.close(); throw error }

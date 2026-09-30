@@ -24,6 +24,10 @@ export * from './ingest.js'
 export * from './query.js'
 export * from './stats.js'
 export * from './local-rollup.js'
+// ★ 费用聚合的公共件：**离线路径**（本地页 / CLI，价来自 `pricing.json` 快照）
+//   与上报库路径（部门看板，价来自 `model_price` 表）共用同一份折叠与类型 ——
+//   两条路径的差别只在「价从哪来」，不在「怎么算」。
+export * from './cost.js'
 // ★ 上报库：部门看板的取数入口。与 `stats.js` 并列导出，
 //   因为两者服务的是**两个不同的库**（usage.sqlite vs portal.sqlite/MySQL），
 //   调用方必须显式选一个，不能靠「默认值」蒙对。

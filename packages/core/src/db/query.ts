@@ -43,7 +43,7 @@ import {
   providerModelKey,
   type ProviderNormalizer,
 } from './provider-alias.js'
-import { UNATTRIBUTED_USER } from '@ai-token-report/shared'
+import { UNATTRIBUTED_USER, type BillableUsage } from '@ai-token-report/shared'
 
 /**
  * 查询层可用的分组维度 = 内核维度 + `user`。
@@ -509,6 +509,179 @@ export function groupsQuery(
   }
 }
 
+// ---------------------------------------------------------------------------
+// 费用取数（v7 模型单价）
+// ---------------------------------------------------------------------------
+
+/**
+ * 模型单价表（portal v7）。
+ *
+ * ⚠️ 与事件表无关：这张表**只被金额取数读**，一行的存活期覆盖一段时间区间，
+ *   金额按「事件发生时刻」选中的那一行算 —— 所以改价即时生效，
+ *   而 `usage_event` 一个字节都不会被动。
+ */
+export const PRICE_TABLE = 'model_price'
+
+/**
+ * 金额取数的原始行。
+ *
+ * ★ 这里**只出 `SUM(原始列)` 与分组键，一个算术式都没有**（铁律：
+ *   本地库只定义存储、不定义口径）。四类 token 各乘各自的价是
+ *   `shared/price.ts` 的 `costMicroOf()`，在 JS 侧调用。
+ */
+export interface RawCostRow {
+  grp_key?: string | null
+  /** 仅整体金额取数带这两列（用于回答「哪些模型没配价」）。 */
+  provider?: string | null
+  model?: string | null
+  price_id: string | null
+  currency: string | null
+  input: unknown
+  output: unknown
+  cache_read: unknown
+  cache_write: unknown
+}
+
+/**
+ * 金额取数的公共骨架。
+ *
+ * ## 为什么是 LEFT JOIN + 按 `price_id` 分组，而不是在 SQL 里写乘法
+ *
+ * 把 `SUM(input * p_in + …)` 写进 SQL 看似少一趟，但它会**在 SQL 里造出
+ * 第二个口径实现** —— 换价、加币种、改四类拆分时两边必然漂移，而它不会报错。
+ * 所以这里只做两件 SQL 擅长的事：
+ *
+ * 1. `LEFT JOIN` 把每条事件**在它自己的时刻**能匹配到的价行取出来
+ *    （`LEFT` 而不是 `JOIN`：没配价的事件必须留下来，它们要被计成「未计价」，
+ *     而不是从结果里消失 —— 后者会让「没配价」看起来像「没用量」）；
+ * 2. 按 `(分组键, price_id)` 分组求和四类 token。
+ *
+ * 于是「未定价」那一撮天然落进 `price_id IS NULL` 的那一行，
+ * 不需要 `SUM(CASE WHEN …)` 这类把口径混进 SQL 的写法。
+ *
+ * ⚠️ 两条已知代价（都刻意接受）：
+ *   - 这是**区间连接**，代价约 O(事件数 × 单价行数)。单价只有几十行，
+ *     所以实际影响很小；真要优化需要给 `usage_event(provider, model)` 加索引，
+ *     那是一次 schema 变更（加索引 = 改受控 DDL = 改校验和），不在这一期做。
+ *   - 区间**重叠**时一条事件会命中两行、被算两次。写入路径由
+ *     `findPriceConflicts()` 回 409 挡住重叠，所以只可能来自直接改库；
+ *     这条风险记在 `docs/费用统计方案.md`。
+ *
+ * 🚨 JOIN 条件里的 `provider` 用的是**事件表的原值**，不是归一化后的展示名：
+ *   单价按上报原值匹配，供应商归一化只是查询期的显示口径。
+ *   分组键（`grp_key`）才用归一化表达式 —— 两者刻意不同名不同义。
+ */
+function costQueryFor(
+  dimExpr: string | null,
+  filter: QueryFilter,
+  normalize: ProviderNormalizer | undefined,
+  dimParams: Record<string, string | number>,
+  withTarget = false,
+): SqlQuery {
+  const { sql, params: whereParams } = buildWhere(filter, normalize)
+  const targetCols = withTarget ? 'provider, model, ' : ''
+  const targetGroup = withTarget ? 'provider, model, ' : ''
+  const select = dimExpr === null ? '' : `${dimExpr} AS grp_key,\n                 `
+  const group = dimExpr === null ? '' : 'grp_key, '
+  return {
+    sql: `SELECT ${select}${targetCols}mp.price_id AS price_id,
+                 mp.currency  AS currency,
+                 SUM(input_tokens)       AS input,
+                 SUM(output_tokens)      AS output,
+                 SUM(cache_read_tokens)  AS cache_read,
+                 SUM(cache_write_tokens) AS cache_write
+          FROM ${EVENT_TABLE}
+          LEFT JOIN (
+                 -- 🚨 必须把 provider / model 两列**改名**再 JOIN：它们在两张表里同名，
+                 --   而分组维度表达式（dimensionExpression）产出的是裸列名
+                 --   （provider / model / provider 与 model 的拼接）。
+                 --   直接 LEFT JOIN model_price mp 会让它们变成**歧义列**：
+                 --   SQLite 报 ambiguous column name: provider、MySQL 报 errno 1052，
+                 --   于是「按供应商 / 按模型看金额」整条路径直接不可用。
+                 --   子查询改名之后，外层作用域里的 provider / model 只属于事件表。
+                 SELECT price_id, provider AS mp_provider, model AS mp_model, currency,
+                        effective_from_ms, effective_to_ms
+                   FROM ${PRICE_TABLE}
+                 ) mp
+                 ON mp.mp_provider = ${EVENT_TABLE}.provider
+                AND mp.mp_model = ${EVENT_TABLE}.model
+                AND ts >= mp.effective_from_ms
+                AND (mp.effective_to_ms IS NULL OR ts <= mp.effective_to_ms)${sql}
+          GROUP BY ${group}${targetGroup}mp.price_id, mp.currency`,
+    // ⚠️ 与 `groupsQuery` 同样的合并理由：`dimExpr` 内联了归一化映射的绑定值。
+    params: { ...dimParams, ...whereParams },
+  }
+}
+
+/**
+ * 按维度取金额。**返回 `null` 表示该维度必须走 JS 侧**（`day` / `hour` / `project`），
+ * 与 {@link dimensionExpression} 的语义一致 —— `project` 走
+ * {@link costByCwdQuery}，`day` / `hour` 走 {@link timeBucketRowsQuery} 的逐行路径。
+ */
+export function costByDimensionQuery(
+  dim: QueryDimension,
+  filter: QueryFilter = {},
+  dialect: PortalDialect = SQLITE_DIALECT,
+  normalize?: ProviderNormalizer,
+): SqlQuery | null {
+  const dimParams: Record<string, string | number> = {}
+  const dimExpr = dimensionExpression(dim, dialect, normalize, dimParams)
+  if (!dimExpr) return null
+  return costQueryFor(dimExpr, filter, normalize, dimParams)
+}
+
+/**
+ * 整体金额（顶部卡片用）：不按任何维度分组。
+ *
+ * ★ **绝不改成「总量 × 某个均价」**。这里仍然按 `(price_id)` 分组求和，
+ *   也就是说每个价各自乘自己那部分用量 —— 这是「先按 (provider, model) 分组
+ *   算完再求和」的等价实现（价与 `(provider, model)` 一一对应）。
+ *
+ * ★ 额外按 `(provider, model)` 分组，是为了让**同一趟**就能回答
+ *   「哪些 `(provider, model)` 一条价都没配上」（那些行的 `price_id` 是 NULL）。
+ *   把它们显示出来是「未计价」唯一可行动的形态 —— 只给一个比例，
+ *   使用者知道有 12% 没算钱，却不知道该去补哪个价。
+ */
+export function costTotalsQuery(filter: QueryFilter = {}, normalize?: ProviderNormalizer): SqlQuery {
+  return costQueryFor(null, filter, normalize, {}, true)
+}
+
+/** `project` 维度的金额：先按 `cwd` 取，再在 JS 侧按项目名合并（同分组路径）。 */
+export function costByCwdQuery(filter: QueryFilter = {}, normalize?: ProviderNormalizer): SqlQuery {
+  return costQueryFor('cwd', filter, normalize, {})
+}
+
+/** 金额取数行 → 内核形状（`SUM` 的字符串归一化只此一处，理由同 `mapGroupRows`）。 */
+export interface CostRowCounts {
+  /** 分组键；整体金额时为 `null`。 */
+  key: string | null
+  /** 命中的单价行 ID；`null` = **未计价**（不是 0 元）。 */
+  priceId: string | null
+  /** 该单价行的币种；未计价时为 `null`。 */
+  currency: string | null
+  /** 仅整体金额取数带这两列（未计价的行靠它指出「该去补哪个价」）。 */
+  provider: string | null
+  model: string | null
+  usage: BillableUsage
+}
+
+export function mapCostRows(rows: readonly RawCostRow[]): CostRowCounts[] {
+  const text = (value: unknown): string | null => (value === null || value === undefined ? null : String(value))
+  return rows.map((row) => ({
+    key: text(row.grp_key),
+    priceId: text(row.price_id),
+    currency: text(row.currency),
+    provider: text(row.provider),
+    model: text(row.model),
+    usage: {
+      input: toNumber(row.input),
+      output: toNumber(row.output),
+      cacheRead: toNumber(row.cache_read),
+      cacheWrite: toNumber(row.cache_write),
+    },
+  }))
+}
+
 /**
  * 明细行的**取数**投影（只出列与表达式，拼接 WHERE / ORDER BY / LIMIT 由调用方做）。
  *
@@ -573,11 +746,23 @@ export function timeBucketRowsQuery(
   filter: QueryFilter = {},
   withSessionId = false,
   normalize?: ProviderNormalizer,
+  /**
+   * 是否连 `provider` / `model` 一起取。
+   *
+   * ★ 只有**要算金额**时才取（`withCost`）：金额必须按**每条事件当时的价**算，
+   *   而价是按 `(provider, model)` 定的 —— 少了这两列就只能拿整个时间桶的
+   *   总量去乘一个「平均单价」，那是错的（世上没有平均单价）。
+   *   代价是每次扫描多两列，所以默认关。
+   */
+  withTarget = false,
 ): SqlQuery {
   const { sql, params } = buildWhere(filter, normalize)
-  const cols = withSessionId
-    ? 'ts, session_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens'
-    : 'ts, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens'
+  const cols = [
+    'ts',
+    ...(withSessionId ? ['session_id'] : []),
+    ...(withTarget ? ['provider', 'model'] : []),
+    'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens', 'reasoning_tokens',
+  ].join(', ')
   return { sql: `SELECT ${cols}\n       FROM ${EVENT_TABLE}${sql}`, params }
 }
 
