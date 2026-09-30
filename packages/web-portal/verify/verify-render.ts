@@ -75,6 +75,7 @@ try {
     { path: '/appkeys', name: 'appkeys', title: 'appKey 管理' },
     { path: '/roles', name: 'roles', title: '角色管理' },
     { path: '/groups', name: 'groups', title: '分组管理' },
+    { path: '/providers', name: 'providers', title: '供应商归一化' },
   ]
   for (const page of managementPages) {
     await router.push(page.path)
@@ -95,6 +96,9 @@ try {
     { label: '凭证管理者', permissions: ['tokens:manage'], allowed: ['appkeys'] },
     { label: '角色查看者', permissions: ['roles:read'], allowed: ['roles'] },
     { label: '分组管理者', permissions: ['groups:read', 'groups:manage'], allowed: ['groups'] },
+    // ★ 归一化改的是「按供应商看用量」的口径，与分组管理**不共用**权限：
+    //   能管分组的人不该顺带获得改全平台供应商口径的能力。
+    { label: '供应商只读者', permissions: ['providers:read'], allowed: ['providers'] },
   ]
   for (const entry of permissionCases) {
     session.identity = { name: '测试成员', username: 'member', role: 'member', permissions: entry.permissions }
@@ -110,7 +114,7 @@ try {
     check(`${entry.label}管理导航遵循各自权限`, !!navigationHtml && managementPages.every((page) =>
       navigationHtml.includes(page.title) === entry.allowed.includes(page.name)))
   }
-  session.identity = { member_id: '00000000-0000-4000-8000-000000000001', name: '测试管理员', username: 'admin', role: 'admin', permissions: ['members:read', 'members:manage', 'groups:read', 'groups:manage', 'roles:read', 'roles:assign', 'tokens:manage'] }
+  session.identity = { member_id: '00000000-0000-4000-8000-000000000001', name: '测试管理员', username: 'admin', role: 'admin', permissions: ['members:read', 'members:manage', 'groups:read', 'groups:manage', 'roles:read', 'roles:assign', 'tokens:manage', 'providers:read', 'providers:manage'] }
   session.generation++
   for (const page of managementPages) {
     await router.push(page.path)
@@ -120,11 +124,12 @@ try {
   await router.push('/members')
   const layoutHtml = await render('/src/layouts/PortalLayout.vue')
   const navigationHtml = layoutHtml.match(/<aside\b[\s\S]*?<\/aside>/)?.[0] ?? ''
-  check('管理导航依次为人员、appKey、角色、分组四个独立入口',
+  check('管理导航依次为人员、appKey、角色、分组、供应商五个独立入口',
     navigationHtml.indexOf('人员管理') >= 0 &&
     navigationHtml.indexOf('人员管理') < navigationHtml.indexOf('appKey 管理') &&
     navigationHtml.indexOf('appKey 管理') < navigationHtml.indexOf('角色管理') &&
-    navigationHtml.indexOf('角色管理') < navigationHtml.indexOf('分组管理'))
+    navigationHtml.indexOf('角色管理') < navigationHtml.indexOf('分组管理') &&
+    navigationHtml.indexOf('分组管理') < navigationHtml.indexOf('供应商归一化'))
 
   const dashboard = useDashboardStore(pinia)
   dashboard.overview = {
@@ -373,6 +378,17 @@ try {
   check('分组管理写明成员与分组是多对多',
     groupsHtml.includes('一名成员可同时属于多个分组') &&
     groupsHtml.includes('用量会按其所属的每个分组统计'))
+  const providersHtml = await render('/src/views/ProvidersView.vue')
+  check('供应商归一化独立展示规则列表、搜索、作用范围与新增入口',
+    ['供应商归一化', '规则列表', '搜索供应商或归一化名', '全部作用范围', '添加规则'].every((label) => providersHtml.includes(label)))
+  // ★ 这一页最容易配错的两件事必须写在页面上，而不是只写在代码注释里：
+  //   ① 原始名是大小写敏感的精确匹配（写错就静默不命中）；
+  //   ② 没配规则的供应商保持原始名（归一化不是「统一改名」）。
+  check('供应商归一化写明匹配规则与「未配置者保持原值」',
+    providersHtml.includes('一字不差') &&
+    providersHtml.includes('没有配规则的供应商保持自己的原始名') &&
+    providersHtml.includes('明细里始终同时显示原值'))
+  check('供应商归一化不混排人员或分组列表', !providersHtml.includes('人员列表') && !providersHtml.includes('分组列表'))
   const allHtml =
     loginHtml +
     dashboardHtml +
@@ -383,7 +399,8 @@ try {
     appKeyHtml +
     issuedHtml +
     rolesHtml +
-    groupsHtml
+    groupsHtml +
+    providersHtml
   for (const term of ['消费金额', 'CNY', '¥', '充值余额', '80,642,909'])
     check(`不包含金额或旧 mock：${term}`, !allHtml.includes(term))
   session.expire()

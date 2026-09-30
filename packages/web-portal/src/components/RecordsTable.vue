@@ -79,12 +79,19 @@ const rowRecord = (row: unknown): RecordRow => row as RecordRow
         recordGroupNames(rowRecord(row), groups)
       }}</template></el-table-column
     >
-    <el-table-column
-      prop="provider"
-      label="厂商"
-      min-width="115"
-      show-overflow-tooltip
-    />
+    <!--
+      ★ 厂商列显示**归一化后**的名字（与分布图同一个口径），并在配过规则时
+      用括号补出上报原值 —— 明细是人用来核对「归一化规则配得对不对」的地方，
+      只显示归一化名的话，一条把 `dashscope` 错配成别家的规则会表现得完全正常。
+
+      ⚠️ 原值只在**与展示名不同**时由服务端下发（`providerRaw`），所以这里
+      不需要「有没有配规则」的额外状态：字段在就是不一样。
+    -->
+    <el-table-column label="厂商" min-width="150" show-overflow-tooltip>
+      <template #default="{ row }">
+        {{ row.provider }}<span v-if="row.providerRaw" class="muted">（{{ row.providerRaw }}）</span>
+      </template>
+    </el-table-column>
     <el-table-column
       prop="model"
       label="模型"

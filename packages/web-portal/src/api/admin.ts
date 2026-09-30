@@ -6,9 +6,12 @@ import type {
   PortalIssueTokenRequest, PortalTokenVersionRequest, PortalTokenScopesRequest, PortalTokenExpiryRequest,
   PortalIssueAppKeyRequest, PortalAppKeyListResponse,
   PortalMemberResult, PortalTokenResult, PortalGroupResult, PortalGroupVersionRequest,
+  PortalMutationResult,
   PortalRoleListResponse, PortalCreateRoleRequest, PortalRoleUpdateRequest,
   PortalRoleStatusRequest, PortalRoleResult,
   PortalLegacyAttribution, PortalConfirmLegacyRequest, PortalLegacyResult,
+  PortalProviderAliasListResponse, PortalProviderAliasResult,
+  PortalSetProviderAliasRequest, PortalProviderAliasIdRequest, PortalProviderAliasStatusRequest,
 } from '@ai-token-report/shared'
 import { post, request } from './request.js'
 
@@ -96,3 +99,15 @@ export const setTokenExpiry = (input: PortalTokenExpiryRequest) => post<PortalTo
 export const createGroup = (name: string) => post<PortalGroupResult>(root + '/groups', { name })
 export const updateGroup = (input: PortalGroupVersionRequest & { name: string }) => post<PortalGroupResult>(root + '/groups/update', input)
 export const updateGroupStatus = (input: PortalGroupVersionRequest & { status: 'active' | 'disabled' }) => post<PortalGroupResult>(root + '/groups/status', input)
+/**
+ * 供应商归一化规则（v6）。
+ *
+ * ★ 这是**查询期**的展示映射，不是数据改写：配一条规则之后，看板里
+ *   「按供应商分组」的分组名立刻变，而明细里的原值列原样保留。
+ *   所以这里没有「应用 / 回填」按钮，也不需要版本号做并发保护 ——
+ *   一次设置就是使用者想要的结果（服务端按 `(scope, member_id, provider)` upsert）。
+ */
+export const fetchProviderAliases = () => request<PortalProviderAliasListResponse>(root + '/provider-aliases')
+export const setProviderAlias = (input: PortalSetProviderAliasRequest) => post<PortalProviderAliasResult>(root + '/provider-aliases', input)
+export const setProviderAliasStatus = (input: PortalProviderAliasStatusRequest) => post<PortalProviderAliasResult>(root + '/provider-aliases/status', input)
+export const deleteProviderAlias = (input: PortalProviderAliasIdRequest) => post<PortalMutationResult>(root + '/provider-aliases/delete', input)

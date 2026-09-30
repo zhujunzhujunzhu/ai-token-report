@@ -82,6 +82,14 @@ export function createPortalRouter(
             component: () => import('../views/GroupsView.vue'),
             meta: { title: '分组管理', requiredPermission: 'groups:manage' },
           },
+          {
+            path: 'providers',
+            name: 'providers',
+            component: () => import('../views/ProvidersView.vue'),
+            // ★ 与分组管理**不共用**权限：归一化改的是「按供应商看用量」的口径，
+            //   对全平台的统计口径都有影响，所以读要 providers:read、写要 providers:manage。
+            meta: { title: '供应商归一化', requiredPermission: 'providers:read' },
+          },
         ],
       },
       { path: '/:pathMatch(.*)*', redirect: '/overview' },
@@ -106,7 +114,7 @@ export function createPortalRouter(
 /** 回跳只接受本站已知页面，避免把登录参数当作外部跳转地址。 */
 export function loginDestination(value: unknown): string {
   return typeof value === 'string' &&
-    /^\/(overview|analysis|records|diagnostics|members|appkeys|roles|groups)(\?.*)?$/.test(value)
+    /^\/(overview|analysis|records|diagnostics|members|appkeys|roles|groups|providers)(\?.*)?$/.test(value)
     ? value
     : '/overview'
 }

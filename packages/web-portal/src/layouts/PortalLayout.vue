@@ -24,6 +24,7 @@ import {
   Key,
   Ticket,
   OfficeBuilding,
+  Connection,
   Fold,
   Expand,
   ArrowDown,
@@ -56,6 +57,11 @@ const navigation = computed(() => [
     : []),
   ...(session.can('groups:manage')
     ? [{ path: '/groups', label: '分组管理', icon: OfficeBuilding }]
+    : []),
+  // ★ 归一化改的是「按供应商看用量」的口径，与分组管理是两件事，
+  //   所以不共用权限：能管分组的人不一定该改全平台的供应商口径。
+  ...(session.can('providers:read')
+    ? [{ path: '/providers', label: '供应商归一化', icon: Connection }]
     : []),
 ])
 watch(
