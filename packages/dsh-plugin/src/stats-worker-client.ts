@@ -47,7 +47,7 @@ export function queryInStatsWorker(ctx: StatsContext, query: UsageQuery): Promis
     own.pending.set(id, { resolve, reject, timer })
     own.worker.ref()
     try {
-      own.worker.postMessage({ id, query, ctx: { sessionsRoot: ctx.sessionsRoot, dbPath: ctx.dbPath, config: { localDb: ctx.config.localDb } } })
+      own.worker.postMessage({ id, query, ctx: { sessionsRoots: ctx.sessionsRoots, dbPath: ctx.dbPath, config: { localDb: ctx.config.localDb } } })
     } catch (error) { own.fail(error instanceof Error ? error : new Error(String(error))) }
   })
 }

@@ -125,8 +125,13 @@ export interface UsageResult {
 /** 本次统计是否可用（供服务层快速判断，避免把异常抛给调用方）。 */
 export interface StatsContext {
   config: Pick<EffectiveConfig, 'localDb'>
-  /** 会话日志根目录。 */
-  sessionsRoot: string
+  /**
+   * ★ 会话日志根 —— **一组**（同一台机器上并存多套 DSH）。
+   *
+   * 传给 `openStats` 的与 CLI `--dsh-home`（可重复）、本地页 `CoreStatsProvider`
+   * 是**同一个**入参，所以三个形态的数字必然一致。
+   */
+  sessionsRoots: string[]
   /** 本地库路径。 */
   dbPath: string
   /** DSH 宿主启用独立线程，直接调用方仍可使用当前线程。 */
@@ -177,7 +182,7 @@ export async function executeQuery(ctx: StatsContext, query: UsageQuery, options
 
   // 驱动选择集中在 core/db/driver.ts，构建时内联 core，运行时才加载 SQLite。
   const session = await openStats({
-    sessionsRoot: ctx.sessionsRoot,
+    sessionsRoot: ctx.sessionsRoots,
     dbPath: ctx.dbPath,
     forceScan: !ctx.config.localDb,
     rollup: query.summaryOnly ? 'summary' : true,

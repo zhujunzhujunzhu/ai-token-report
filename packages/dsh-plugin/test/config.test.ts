@@ -22,6 +22,18 @@ import {
 /** 本次用例里设过的环境变量，便于逐个还原。 */
 const touched: string[] = []
 
+/**
+ * 进程启动时这些变量的原值（含 `bun test` preload 设的 `DSH_TOKEN_REPORT_DATA_DIR`）。
+ *
+ * ⚠️ 必须**还原原值**，不能只 `delete`：`DSH_TOKEN_REPORT_DATA_DIR` 是
+ *   `scripts/test-preload.ts` 用来把数据目录钉在临时目录里的隔离。删掉不还原，
+ *   这个文件之后跑的**所有**测试都会读写使用者真实的 `~/.ai-token-report`
+ *   —— 而它们全绿。
+ */
+const originalEnv = new Map<string, string | undefined>(
+  Object.values(ENV).map((key) => [key, process.env[key]]),
+)
+
 function setEnv(key: string, value: string): void {
   process.env[key] = value
   touched.push(key)
@@ -35,6 +47,10 @@ beforeEach(() => {
 
 afterEach(() => {
   for (const key of touched) delete process.env[key]
+  for (const [key, value] of originalEnv) {
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
 })
 
 describe('默认值', () => {
@@ -217,5 +233,43 @@ describe('包含对话内容这件事没有开关', () => {
   test('★ 配置与类型里都不存在能把内容带出去的字段', () => {
     const c = resolveConfig({}) as unknown as Record<string, unknown>
     expect('includeContent' in c).toBe(false)
+  })
+})
+
+/**
+ * `dshHome` / `dataDir` —— DSH Desktop 与命令行版 DSH 共存时唯一需要关心的两项。
+ *
+ * ★ 这里只钉「配置层收下了什么」：与 `~` 展开、绝对化、以及「谁决定
+ *   sessionsRoot」有关的口径断言在 `paths.test.ts` 与 core 的 `home.test.ts`。
+ */
+describe('目录配置', () => {
+  test('两项都没配时都不出现在生效配置里（让 core 走 $DSH_HOME 兜底）', () => {
+    const c = resolveConfig({})
+    expect(c.dshHome).toBeUndefined()
+    expect(c.dataDir).toBeUndefined()
+  })
+
+  test('config.dataDir 原样收下，环境变量次之', () => {
+    expect(resolveConfig({ dataDir: '/shared/tr' }).dataDir).toBe('/shared/tr')
+    setEnv(ENV.dataDir, '/env/tr')
+    expect(resolveConfig({}).dataDir).toBe('/env/tr')
+    expect(resolveConfig({ dataDir: '/shared/tr' }).dataDir).toBe('/shared/tr')
+  })
+
+  test('空白视为没配（半份配置不许悄悄生效）', () => {
+    expect(resolveConfig({ dataDir: '   ' }).dataDir).toBeUndefined()
+    expect(resolveConfig({ dshHome: '  ' }).dshHome).toBeUndefined()
+  })
+
+  test('两侧空白只裁掉，不改写用户写下的路径（~ 展开留给 core 的路径解析）', () => {
+    expect(resolveConfig({ dataDir: '  ~/.dsh/token-report  ' }).dataDir).toBe('~/.dsh/token-report')
+    expect(resolveConfig({ dshHome: ' /h ' }).dshHome).toBe('/h')
+  })
+
+  test('★ dshHome 与 dataDir 是两个独立字段，不会被对方顺手填上', () => {
+    const onlyData = resolveConfig({ dataDir: '/shared/tr' })
+    expect(onlyData.dshHome).toBeUndefined()
+    const onlyHome = resolveConfig({ dshHome: '/desktop' })
+    expect(onlyHome.dataDir).toBeUndefined()
   })
 })

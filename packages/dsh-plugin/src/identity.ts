@@ -1,15 +1,17 @@
 /**
  * 插件侧身份解析。
  *
- * ## 与本地页共用同一份身份文件
+ * ## 与本地页、CLI 共用同一份身份文件
  *
  * ```
- * $DSH_HOME/token-report/identity.json
+ * <数据目录>/identity.json        # 缺省 ~/.ai-token-report/identity.json
  * ```
  *
  * 也就是说：**员工在哪里填一次就够了**。
  * - 先在本地页填 → 插件读同一份文件，立刻生效
  * - 先在插件里填 → 本地页读同一份文件，不重复问
+ * - DSH Desktop 与命令行版 DSH **默认就共用**同一份署名（数据目录与 `dshHome` 无关，
+ *   见 `core/src/home.ts`）；只有想刻意分开时才显式配 `dataDir`
  *
  * 复用 `@ai-token-report/core` 的存储实现，而不是自己再写一遍读写 ——
  * 两处实现必然漂移，而身份文件是双方都要解析的格式。
@@ -24,17 +26,18 @@
  * 单纯抱怨「你没填」。
  */
 
-import { resolvePaths, readIdentity, writeIdentity, clearIdentity } from '@ai-token-report/core'
+import { readIdentity, writeIdentity, clearIdentity } from '@ai-token-report/core'
 import { isSigned, toAssertion, type Identity, type IdentityAssertion } from '@ai-token-report/shared'
+
+import type { PathConfig } from './paths.js'
+import { reportPaths } from './paths.js'
 
 /** 身份就绪状态。 */
 export type IdentityState =
   | { ready: true; identity: Identity; assertion: IdentityAssertion }
   | { ready: false; reason: 'missing' | 'corrupt'; detail?: string }
 
-export interface IdentityResolverOptions {
-  /** DSH home。默认 `$DSH_HOME` 或 `~/.dsh`。 */
-  dshHome?: string
+export interface IdentityResolverOptions extends PathConfig {
   /**
    * 插件配置里直接写死的署名（最高优先级）。
    *
@@ -45,19 +48,20 @@ export interface IdentityResolverOptions {
 }
 
 export class IdentityResolver {
-  readonly #dshHome: string
+  /** ★ 路径在构造时解析一次并留下：身份文件路径必须与其它消费方**逐字节一致**。 */
+  readonly #identityPath: string
   readonly #configIdentity: { name: string; token: string; group?: string } | undefined
 
   /** 每个进程生命周期只提示一次，避免每次会话都打扰用户。 */
   #warned = false
 
   constructor(options: IdentityResolverOptions = {}) {
-    this.#dshHome = resolvePaths(options.dshHome).dshHome
+    this.#identityPath = reportPaths(options).identityPath
     this.#configIdentity = options.configIdentity
   }
 
   get identityFilePath(): string {
-    return resolvePaths(this.#dshHome).identityPath
+    return this.#identityPath
   }
 
   /**

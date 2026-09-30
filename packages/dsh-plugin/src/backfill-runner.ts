@@ -7,13 +7,15 @@
  */
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import {
-  listSessionFiles, resolveDshHome, scanIncremental, SESSION_SCAN_REVISION,
+  listSessionFiles, scanIncremental, SESSION_SCAN_REVISION,
   type IncrementalFileResult, type UsageRecord,
 } from '@ai-token-report/core'
 import type { EffectiveConfig } from './config.js'
 import type { BillingRecord, FoldIdentity } from './fold.js'
+import { reportBackfillDir } from './paths.js'
 import { Reporter } from './reporter.js'
 
 export interface BackfillStats {
@@ -36,7 +38,8 @@ export function emptyBackfillStats(): BackfillStats {
 export interface BackfillPassOptions {
   config: EffectiveConfig
   identity: FoldIdentity
-  sessionsRoot: string
+  /** ★ 一组会话日志根（多套 DSH 并存）。 */
+  sessionsRoots: string[]
   /** 传入上一轮快照时累计确认数；不传时返回本次执行的计数。 */
   stats?: BackfillStats
   onProgress?: (stats: BackfillStats) => void
@@ -46,10 +49,21 @@ export interface BackfillPassOptions {
 interface Checkpoint { version: 1; file: IncrementalFileResult }
 const digest = (text: string) => createHash('sha256').update(text).digest('hex')
 
-/** 目标服务器或凭证改变时重新核对全部历史；明文凭证绝不进入文件。 */
-export function resolveBackfillDir(config: EffectiveConfig, sessionsRoot: string): string {
-  const scope = digest(JSON.stringify([SESSION_SCAN_REVISION, config.endpoint, config.appKey, resolve(sessionsRoot)]))
-  return join(resolveDshHome(config.dshHome), 'token-report', 'backfill', scope)
+/**
+ * 目标服务器、凭证或**日志根集合**任一改变时都要重新核对全部历史。
+ *
+ * ★ 根集合必须进作用域：否则「新加了一个 home」会复用旧作用域的水位目录，
+ *   那套 home 的历史会被当成「已经确认过」而**永远不补报**，
+ *   且不会报任何错 —— 只会让部门看板少掉一台机器的历史。
+ */
+export function resolveBackfillDir(config: EffectiveConfig, sessionsRoots: readonly string[]): string {
+  const scope = digest(JSON.stringify([
+    SESSION_SCAN_REVISION,
+    config.endpoint,
+    config.appKey,
+    sessionsRoots.map((root) => resolve(root)),
+  ]))
+  return reportBackfillDir(config, scope)
 }
 
 async function loadCheckpoint(path: string, filePath: string): Promise<IncrementalFileResult | undefined> {
@@ -108,11 +122,17 @@ export async function runBackfillPass(options: BackfillPassOptions): Promise<Bac
     }
     // listSessionFiles 为交互统计容忍不存在的目录；补报必须将它报告为失败，
     // 否则根目录配错或失去访问权限会被伪装成“所有历史已完成”。
-    if (!(await stat(options.sessionsRoot)).isDirectory()) throw new Error('会话日志根路径不是目录')
-    await readdir(options.sessionsRoot)
-    const files = await listSessionFiles(options.sessionsRoot, { strictErrors: true })
+    // ★ 多根：**逐根**检查并指名道姓 —— 一个笼统的「扫描失败」在配了两个根时
+    //   没法告诉使用者是哪个 home 出了问题。这里刻意不学统计路径的「跳过缺失根」：
+    //   补报的承诺是「全部历史都已核对」，静默少一个根就是在谎报完成。
+    for (const root of options.sessionsRoots) {
+      if (!existsSync(root)) throw new Error(`会话日志根不存在：${root}`)
+      if (!(await stat(root)).isDirectory()) throw new Error(`会话日志根路径不是目录：${root}`)
+      await readdir(root)
+    }
+    const files = await listSessionFiles(options.sessionsRoots, { strictErrors: true })
     progress.filesTotal = files.length
-    const checkpointDir = resolveBackfillDir(options.config, options.sessionsRoot)
+    const checkpointDir = resolveBackfillDir(options.config, options.sessionsRoots)
     await mkdir(checkpointDir, { recursive: true })
     const maxRecords = Math.max(1, Math.min(200, Math.floor(options.config.batch.maxRecords)))
     const cwdBySession = new Map<string, string | null>()
@@ -123,7 +143,7 @@ export async function runBackfillPass(options: BackfillPassOptions): Promise<Bac
       const previous = await loadCheckpoint(checkpointPath, meta.filePath)
       let deliveryFailed = false
       try {
-        const scan = await scanIncremental(options.sessionsRoot, {
+        const scan = await scanIncremental(options.sessionsRoots, {
           sessionFiles: [meta],
           watermarks: {
             sizeOf: () => previous?.size,

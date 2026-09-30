@@ -17,7 +17,7 @@ try {
   const sessionsRoot = join(work, 'sessions')
   cpSync(resolve(args[1]!), sessionsRoot, { recursive: true })
   mkdirSync(join(work, 'db'))
-  writeFileSync(join(work, 'fixture.json'), JSON.stringify({ sessionsRoot,
+  writeFileSync(join(work, 'fixture.json'), JSON.stringify({ sessionsRoots: [sessionsRoot],
     dbPath: join(work, 'db/usage.sqlite'),
     moduleUrl: pathToFileURL(resolve(import.meta.dir, '../lib/index.js')).href }))
   writeFileSync(join(work, 'runner.mjs'), String.raw`

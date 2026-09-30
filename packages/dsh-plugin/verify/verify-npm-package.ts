@@ -304,7 +304,7 @@ try {
       const root = join(${JSON.stringify(sandbox)}, 'worker-fixture');
       const sessionsRoot = join(root, 'sessions');
       mkdirSync(sessionsRoot, { recursive: true });
-      const ctx = { config: { localDb: true }, sessionsRoot, dbPath: join(root, 'usage.sqlite'), backgroundQueries: true };
+      const ctx = { config: { localDb: true }, sessionsRoots: [sessionsRoot], dbPath: join(root, 'usage.sqlite'), backgroundQueries: true };
       const empty = await queryUsage(ctx, { summaryOnly: true });
       assert.equal(empty.source, 'local-db');
       assert.equal(empty.totals.calls, 0);
@@ -375,8 +375,8 @@ try {
     });
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     const worker = new Worker(new URL('./backfill-worker.js', import.meta.url), { workerData: {
-      sessionsRoot: join(home, 'sessions'),
-      config: { dshHome: home, name: 'verify-history', appKey: 'synthetic-token',
+      sessionsRoots: [join(home, 'sessions')],
+      config: { dshHome: home, dataDir: join(home, 'token-report'), name: 'verify-history', appKey: 'synthetic-token',
         endpoint: 'http://127.0.0.1:' + server.address().port + '/api/v1/token-usage',
         batch: { maxRecords: 1, flushIntervalMillis: 1000, timeoutMillis: 3000 },
         outbox: { enabled: false, maxBytes: 1 }, features: { reporting: true } },

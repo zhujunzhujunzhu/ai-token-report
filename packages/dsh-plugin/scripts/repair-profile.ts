@@ -5,6 +5,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, renam
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { resolvePaths } from '@ai-token-report/core'
 import { assertSinglePlugin, repairProfileData } from '../src/profile-repair.js'
 
 export function hostRequire(profileDir: string) {
@@ -30,10 +31,16 @@ export async function repairProfile(profileDir: string, home: string, apply: boo
   const fixed = repairProfileData(original, patches)
   const anchor = req.resolve('@deepseek-ai/dsh/package.json')
   const layers = fixed.manifest['dsh'] as { profile: { bundles: string[] } }
-  const bundlePatches = layers.profile.bundles.map((name) => {
+  const bundlePatches = layers.profile.bundles.flatMap((name) => {
     const dir = boot.resolveBundleDir('token-report-repair', name, anchor, profileDir)
     const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
-    return boot.loadOverlayPatches('token-report-repair', join(dir, pkg.dsh.bundle.patch))
+    // 🚨 宿主的 dsh.bundle.patch **允许字符串或字符串数组**（实测 `dsh-web-app` 声明了 5 个文件）。
+    //   自己 `join(dir, pkg.dsh.bundle.patch)` 在真 Node 上抛
+    //   「The "path" argument must be of type string. Received an instance of Array」，
+    //   而 **Bun 的 join 不校验类型** —— 于是这个 bug 在 Bun 下的单测里全绿，
+    //   只有同事用真 Node 跑修复工具时才崩。解析一律交给宿主的 bundlePatchPaths。
+    return boot.bundlePatchPaths(dir, pkg.dsh.bundle)
+      .map((file: string) => boot.loadOverlayPatches('token-report-repair', file))
   })
   // 宿主真实合并算法；全局层若再次插入，会在任何写入之前拒绝。
   assertSinglePlugin(boot.composeEntries([...bundlePatches, fixed.patches, homePatches]))
@@ -47,7 +54,10 @@ export async function repairProfile(profileDir: string, home: string, apply: boo
     represent: (v: { __jsExpr: string }) => v.__jsExpr,
   })
   const output = yaml.dump(fixed.patches, { schema: yaml.JSON_SCHEMA.extend(js), lineWidth: -1, noRefs: true })
-  const backup = join(home, 'token-report', 'plugin-backups', `repair-${Date.now()}-${process.pid}`)
+  // ★ 备份放**数据目录**里（缺省 `~/.ai-token-report/plugin-backups`），不是
+  //   `<dshHome>/token-report` —— 数据目录刻意不跟随 `DSH_HOME`，写死后者会在
+  //   桌面版与命令行版之间分裂成两份互不可见的备份。
+  const backup = join(resolvePaths({ dshHome: home }).dataDir, 'plugin-backups', `repair-${Date.now()}-${process.pid}`)
   mkdirSync(backup, { recursive: true })
   copyFileSync(manifestPath, join(backup, 'package.json'))
   if (originalPatch !== undefined) copyFileSync(patchPath, join(backup, 'cordis.patch.yml'))

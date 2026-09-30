@@ -31,6 +31,9 @@ function check(label: string, success: boolean): void {
 
 const home = mkdtempSync(join(tmpdir(), 'atr-backfill-e2e-'))
 const sessionsRoot = join(home, 'sessions')
+// ★ 数据目录**不跟随 DSH_HOME**：补报水位默认落在 ~/.ai-token-report，
+//   显式指到临时目录，否则会把使用者的真实水位写乱。
+const dataDir = join(home, 'token-report')
 const dbPath = join(home, 'portal.sqlite')
 const target = { sqlitePath: dbPath }
 const token = 'isolated-backfill-member-key'
@@ -97,7 +100,7 @@ async function assertParity(label: string): Promise<void> {
 
 console.log('历史自动补报端到端验证（临时日志、真实 HTTP、真实 portal SQLite）')
 await seedDatabaseIdentity(target, [{ token, name: '历史验证成员', group: '测试分组' }])
-const bundle = await createHandlerFor({ dshHome: home, dbPath, mysqlUrl: '', enableLocalApi: false, requestLog: false })
+const bundle = await createHandlerFor({ dshHome: home, dataDir, dbPath, mysqlUrl: '', enableLocalApi: false, requestLog: false })
 let reportRequests = 0
 let duplicateReceipts = 0
 let failFromRequest = Infinity
@@ -118,11 +121,13 @@ const server = Bun.serve({
   },
 })
 const config = resolveConfig({
-  dshHome: home, endpoint: `http://127.0.0.1:${server.port}/api/v1/token-usage`, appKey: token,
+  dshHome: home,
+  dataDir,
+  endpoint: `http://127.0.0.1:${server.port}/api/v1/token-usage`, appKey: token,
   batch: { maxRecords: 2, flushIntervalMillis: 60_000, timeoutMillis: 5000 },
   outbox: { enabled: false },
 })
-const options = { config, identity, sessionsRoot }
+const options = { config, identity, sessionsRoots: [sessionsRoot] }
 
 try {
   // 文件名顺序刻意先高 seq 再低 seq，不能拿全会话最大 seq 过滤未扫描的历史文件。

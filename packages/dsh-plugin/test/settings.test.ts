@@ -8,7 +8,7 @@
  *    调 `host.apply()`，**不需要重启 DSH**；宿主没提供入口时才回退成重启。
  */
 import { test, expect, beforeEach, afterEach } from 'bun:test'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { readIdentity, resolvePaths } from '@ai-token-report/core'
@@ -20,8 +20,27 @@ import {
 } from '../src/settings.js'
 
 let home: string
-beforeEach(() => { home = mkdtempSync(join(tmpdir(), 'atr-settings-')) })
-afterEach(() => { rmSync(home, { recursive: true, force: true }) })
+/** 用例内额外建的临时目录（DSH Desktop 场景要两个 home）。 */
+const extraDirs: string[] = []
+
+/** 建一个本次用例结束就删掉的临时目录。 */
+function tempDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'atr-settings-'))
+  extraDirs.push(dir)
+  return dir
+}
+
+let dataDir: string
+
+beforeEach(() => {
+  home = mkdtempSync(join(tmpdir(), 'atr-settings-'))
+  // 显式给数据目录：缺省在家目录下（`~/.ai-token-report`），不给就会读写真实身份与连接文件。
+  dataDir = join(home, 'token-report')
+})
+afterEach(() => {
+  rmSync(home, { recursive: true, force: true })
+  for (const dir of extraDirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+})
 const baseUrl = 'http://127.0.0.1:8787'
 const endpoint = 'http://127.0.0.1:8787/api/v1/token-usage'
 
@@ -31,7 +50,7 @@ function request(body: Record<string, unknown>): Request {
 
 /** 当前署名（模拟 broker：直接读身份文件，与宿主 `runtime.identity()` 同源）。 */
 function signed(): { name: string; group?: string } | null {
-  const identity = readIdentity(resolvePaths(home).identityPath).identity
+  const identity = readIdentity(resolvePaths({ dshHome: home, dataDir }).identityPath).identity
   if (!identity) return null
   // 与宿主同一口径：新文件 `group`、旧文件 `dept`（兼容规则的真源在 shared）
   const group = identity.group ?? identity.dept
@@ -48,13 +67,13 @@ interface HostOptions {
 }
 
 function handler(result: unknown, options: HostOptions = {}) {
-  const config: EffectiveConfig = { ...resolveConfig({ dshHome: home }), ...options.config }
+  const config: EffectiveConfig = { ...resolveConfig({ dshHome: home, dataDir }), ...options.config }
   return createSettingsHandler(
     {
       state: (): SettingsState => ({
         config,
         identity: signed(),
-        saved: readConnection(home),
+        saved: readConnection({ dshHome: home, dataDir }),
         reporting: { enabled: false, endpoint: config.endpoint, reason: '未启用' },
         locked: options.locked ?? false,
       }),
@@ -74,7 +93,7 @@ function handlerWithApply(result: unknown): { run: (request: Request) => Promise
   const run = handler(result, {
     apply: () => {
       calls += 1
-      const saved = readConnection(home)
+      const saved = readConnection({ dshHome: home, dataDir })
       return { enabled: true, endpoint: endpointOf(saved.baseUrl ?? baseUrl) }
     },
   })
@@ -89,15 +108,15 @@ test('保存 appKey 与地址，GET 不回传任何 Key，重启后连接可恢�
   // ★ 校验地址由 baseUrl 推导，用户不需要自己拼 /api/v1/identity/verify
   expect(seen).toEqual(['http://127.0.0.1:8787/api/v1/identity/verify'])
   // ★ token 就是 appKey：本地页与 CLI 读同一份身份文件
-  expect(readIdentity(resolvePaths(home).identityPath).identity).toMatchObject({ name: '服务端姓名', token: 'report-secret', group: '研发' })
+  expect(readIdentity(resolvePaths({ dshHome: home, dataDir }).identityPath).identity).toMatchObject({ name: '服务端姓名', token: 'report-secret', group: '研发' })
   const text = await (await run(new Request('http://localhost/api/tokenReport.settings'))).text()
   expect(text).not.toContain('report-secret')
   const get = JSON.parse(text) as Record<string, unknown>
   expect(get).toMatchObject({ signed: true, name: '服务端姓名', baseUrl })
   // ★「保存后要不要重启」由宿主能力决定：没给 apply 就说实话要重启
   expect(get['restartRequired']).toBe(true)
-  expect(withSavedConnection({ dshHome: home })).toMatchObject({ endpoint, appKey: 'report-secret' })
-  expect(withSavedConnection({ dshHome: home, appKey: 'deployment-key' }).appKey).toBe('report-secret')
+  expect(withSavedConnection({ dshHome: home, dataDir })).toMatchObject({ endpoint, appKey: 'report-secret' })
+  expect(withSavedConnection({ dshHome: home, dataDir, appKey: 'deployment-key' }).appKey).toBe('report-secret')
 })
 
 test('★ 保存成功即生效：四个字段落盘后调 host.apply()，不再要求重启', async () => {
@@ -114,7 +133,7 @@ test('★ 保存成功即生效：四个字段落盘后调 host.apply()，不再
   // 生效结果如实回给页面（面板上要显示「上报中 / 已停止及原因」）
   expect(body['reporting']).toMatchObject({ enabled: true })
   // ★ 落盘的是用户选的偏好，不只是连接
-  expect(readConnection(home)).toEqual({
+  expect(readConnection({ dshHome: home, dataDir })).toEqual({
     baseUrl, appKey: 'report-secret', flushIntervalMillis: 30_000, position: 'both',
   })
   // 同一个 handler 的 GET 必须立刻反映新值（页面保存后不再显示旧间隔）
@@ -123,11 +142,11 @@ test('★ 保存成功即生效：四个字段落盘后调 host.apply()，不再
 })
 
 test('★ 偏好落进生效配置：间隔与位置可以就地生效而不必改部署文件', () => {
-  mkdirSync(join(home, 'token-report'), { recursive: true })
-  writeFileSync(join(home, 'token-report', 'plugin-connection.json'), JSON.stringify(
+  mkdirSync(dataDir, { recursive: true })
+  writeFileSync(join(dataDir, 'plugin-connection.json'), JSON.stringify(
     { baseUrl, appKey: 'k', flushIntervalMillis: 5_000, position: 'header' },
   ))
-  const merged = withSavedConnection({ dshHome: home, batch: { flushIntervalMillis: 10_000 }, ui: { position: 'dock' } })
+  const merged = withSavedConnection({ dshHome: home, dataDir, batch: { flushIntervalMillis: 10_000 }, ui: { position: 'dock' } })
   expect(merged.batch?.flushIntervalMillis).toBe(5_000)
   expect(merged.ui?.position).toBe('header')
   expect(resolveConfig(merged).batch.flushIntervalMillis).toBe(5_000)
@@ -152,7 +171,7 @@ test('★ 非法间隔与位置在本地就拦下（不许静默当成没给）'
   }
   // 一个字节的校验请求都不该发出去
   expect(seen).toEqual([])
-  expect(readConnection(home)).toEqual({})
+  expect(readConnection({ dshHome: home, dataDir })).toEqual({})
 })
 
 test('间隔取值边界：闭区间内合法，且只认整毫秒数', () => {
@@ -168,19 +187,19 @@ test('间隔取值边界：闭区间内合法，且只认整毫秒数', () => {
 })
 
 test('不传偏好时不覆盖已保存的偏好（部分客户端不会把设置清空）', async () => {
-  mkdirSync(join(home, 'token-report'), { recursive: true })
-  writeFileSync(join(home, 'token-report', 'plugin-connection.json'), JSON.stringify(
+  mkdirSync(dataDir, { recursive: true })
+  writeFileSync(join(dataDir, 'plugin-connection.json'), JSON.stringify(
     { baseUrl, appKey: 'old', flushIntervalMillis: 60_000, position: 'both' },
   ))
   await handler({ ok: true, name: '张三' })(request({ baseUrl, appKey: 'new' }))
-  expect(readConnection(home)).toEqual({
+  expect(readConnection({ dshHome: home, dataDir })).toEqual({
     baseUrl, appKey: 'new', flushIntervalMillis: 60_000, position: 'both',
   })
 })
 
 test('★ 已配好凭证时留空 appKey：只更新本机偏好，不重校验也不重写身份', async () => {
   await handler({ ok: true, name: '张三', group: '研发' })(request({ baseUrl, appKey: 'secret' }))
-  const identityBefore = readIdentity(resolvePaths(home).identityPath).identity
+  const identityBefore = readIdentity(resolvePaths({ dshHome: home, dataDir }).identityPath).identity
   const seen: string[] = []
   let applied = 0
   const run = handler({ ok: true, name: '不该被用到' }, {
@@ -197,11 +216,11 @@ test('★ 已配好凭证时留空 appKey：只更新本机偏好，不重校验
   expect(seen).toEqual([])
   // ★ 但「就地生效」照做 —— 改完间隔立刻按新间隔上报
   expect(applied).toBe(1)
-  expect(readConnection(home)).toEqual({
+  expect(readConnection({ dshHome: home, dataDir })).toEqual({
     baseUrl, appKey: 'secret', flushIntervalMillis: 5_000, position: 'both',
   })
   // 身份文件一个字节都没动（没重新校验就不该重写署名）
-  expect(readIdentity(resolvePaths(home).identityPath).identity).toEqual(identityBefore)
+  expect(readIdentity(resolvePaths({ dshHome: home, dataDir }).identityPath).identity).toEqual(identityBefore)
 })
 
 test('★ 留空 appKey 却改了地址 → 拒绝，且旧连接原样保留', async () => {
@@ -214,7 +233,7 @@ test('★ 留空 appKey 却改了地址 → 拒绝，且旧连接原样保留', 
   expect(body['ok']).toBe(false)
   expect(String(body['reason'])).toContain('appKey')
   expect(seen).toEqual([])
-  expect(readConnection(home).baseUrl).toBe(baseUrl)
+  expect(readConnection({ dshHome: home, dataDir }).baseUrl).toBe(baseUrl)
 })
 
 test('★ 从没配过凭证时留空 appKey：拦在本地，也不留下半份偏好', async () => {
@@ -224,22 +243,22 @@ test('★ 从没配过凭证时留空 appKey：拦在本地，也不留下半份
   ).then((r) => r.json() as Promise<Record<string, unknown>>)
   expect(body['ok']).toBe(false)
   expect(seen).toEqual([])
-  expect(readConnection(home)).toEqual({})
+  expect(readConnection({ dshHome: home, dataDir })).toEqual({})
 })
 
 test('缺服务端姓名的成功响应不能退回客户端提交内容', async () => {
   const response = await handler({ ok: true })(request({ baseUrl, appKey: 'secret' }))
   expect(await response.json()).toMatchObject({ ok: false })
-  expect(readIdentity(resolvePaths(home).identityPath).identity).toBeNull()
-  expect(readConnection(home)).toEqual({})
+  expect(readIdentity(resolvePaths({ dshHome: home, dataDir }).identityPath).identity).toBeNull()
+  expect(readConnection({ dshHome: home, dataDir })).toEqual({})
 })
 
 test('验证失败保留原配置，部署锁定时不保存', async () => {
   await handler({ ok: true, name: '原署名' })(request({ baseUrl, appKey: 'old' }))
   const response = await handler({ ok: false, reason: 'Key 无效' })(request({ baseUrl, appKey: 'new' }))
   expect(await response.json()).toMatchObject({ reason: 'Key 无效' })
-  expect(readConnection(home).appKey).toBe('old')
-  expect(readIdentity(resolvePaths(home).identityPath).identity?.name).toBe('原署名')
+  expect(readConnection({ dshHome: home, dataDir }).appKey).toBe('old')
+  expect(readIdentity(resolvePaths({ dshHome: home, dataDir }).identityPath).identity?.name).toBe('原署名')
   const locked = await handler({ ok: true, name: '新姓名' }, { locked: true })(request({ baseUrl, appKey: 'new' }))
   expect(await locked.json()).toMatchObject({ ok: false })
 })
@@ -248,7 +267,7 @@ test('★ 校验响应兼容旧服务端：只回 `dept` 时分组也必须落�
   // 迁移期尚未升级的服务端只返回 `dept`（与 `group` 同值）。
   // 只读 `group` 会让分组被静默丢掉 —— 不报错，只是那个字段空了。
   await handler({ ok: true, name: '张三', dept: '研发' })(request({ baseUrl, appKey: 'secret' }))
-  expect(readIdentity(resolvePaths(home).identityPath).identity)
+  expect(readIdentity(resolvePaths({ dshHome: home, dataDir }).identityPath).identity)
     .toMatchObject({ name: '张三', group: '研发' })
 })
 
@@ -264,9 +283,9 @@ test('不把校验请求重定向到其它地址，网络错误不回显凭证',
   const run = createSettingsHandler(
     {
       state: (): SettingsState => ({
-        config: resolveConfig({ dshHome: home }),
+        config: resolveConfig({ dshHome: home, dataDir }),
         identity: signed(),
-        saved: readConnection(home),
+        saved: readConnection({ dshHome: home, dataDir }),
         reporting: { enabled: false, endpoint, reason: '未启用' },
         locked: false,
       }),
@@ -280,32 +299,80 @@ test('不把校验请求重定向到其它地址，网络错误不回显凭证',
   )
   const result = await run(request({ baseUrl, appKey: 'secret-key' }))
   expect(await result.text()).not.toContain('secret-key')
-  expect(readConnection(home)).toEqual({})
+  expect(readConnection({ dshHome: home, dataDir })).toEqual({})
 })
 
 test('旧版只存 endpoint 的配置仍可读，升级后不必重填', async () => {
-  mkdirSync(join(home, 'token-report'), { recursive: true })
-  writeFileSync(join(home, 'token-report', 'plugin-connection.json'), JSON.stringify({ endpoint, appKey: 'legacy' }))
-  expect(readConnection(home)).toEqual({ baseUrl, appKey: 'legacy' })
+  mkdirSync(dataDir, { recursive: true })
+  writeFileSync(join(dataDir, 'plugin-connection.json'), JSON.stringify({ endpoint, appKey: 'legacy' }))
+  expect(readConnection({ dshHome: home, dataDir })).toEqual({ baseUrl, appKey: 'legacy' })
   // 旧文件只有连接、没有身份：面板应回填地址并如实说「未署名」，而不是地址空着要人重填
   expect(await (await handler({ ok: true, name: '旧配置' })(new Request('http://localhost/api/tokenReport.settings'))).json())
     .toMatchObject({ baseUrl, signed: false, hasAppKey: true })
 })
 
 test('★ 没有 appKey 时偏好也照读：位置与间隔不该被凭证绑住', () => {
-  mkdirSync(join(home, 'token-report'), { recursive: true })
-  writeFileSync(join(home, 'token-report', 'plugin-connection.json'), JSON.stringify(
+  mkdirSync(dataDir, { recursive: true })
+  writeFileSync(join(dataDir, 'plugin-connection.json'), JSON.stringify(
     { flushIntervalMillis: 5_000, position: 'header' },
   ))
   // 凭证不成对 → 不认连接；但偏好是纯本机选择，必须留下
-  expect(readConnection(home)).toEqual({ flushIntervalMillis: 5_000, position: 'header' })
+  expect(readConnection({ dshHome: home, dataDir })).toEqual({ flushIntervalMillis: 5_000, position: 'header' })
 })
 
 test('损坏的连接文件回退到部署配置，且不抛错', () => {
-  mkdirSync(join(home, 'token-report'), { recursive: true })
-  writeFileSync(join(home, 'token-report', 'plugin-connection.json'), '{ 坏 JSON')
-  expect(readConnection(home)).toEqual({})
-  expect(withSavedConnection({ dshHome: home, appKey: 'deployment' }).appKey).toBe('deployment')
+  mkdirSync(dataDir, { recursive: true })
+  writeFileSync(join(dataDir, 'plugin-connection.json'), '{ 坏 JSON')
+  expect(readConnection({ dshHome: home, dataDir })).toEqual({})
+  expect(withSavedConnection({ dshHome: home, dataDir, appKey: 'deployment' }).appKey).toBe('deployment')
+})
+
+/**
+ * ★ DSH Desktop 场景：会话日志读本机 home，身份与连接放在共享数据目录。
+ *
+ * 这是本次两个目录分开的**唯一目的** —— Desktop 的 `DSH_HOME` 与命令行版不同，
+ * 只想共用一份凭证时不能去动 `dshHome`（那会连日志来源一起换掉）。
+ */
+test('★ dataDir 指向共享目录：保存把身份与连接写在那里，本机 home 一个字节都不写', async () => {
+  const desktopHome = tempDir()
+  const sharedData = tempDir()
+  const config = resolveConfig({ dshHome: desktopHome, dataDir: sharedData })
+  let signed: { name: string; group?: string } | null = null
+
+  const run = createSettingsHandler({
+    state: (): SettingsState => ({
+      config,
+      identity: signed,
+      saved: readConnection(config),
+      reporting: { enabled: false, endpoint: config.endpoint, reason: '未启用' },
+      locked: false,
+    }),
+  }, { fetchImpl: async () => Response.json({ ok: true, name: '共享姓名', group: '研发' }) })
+
+  const body = await (await run(request({ baseUrl, appKey: 'shared-secret' }))).json() as Record<string, unknown>
+  expect(body).toMatchObject({ ok: true, name: '共享姓名' })
+  signed = { name: '共享姓名', group: '研发' }
+
+  // 身份与连接都落在**共享数据目录**
+  expect(readIdentity(join(sharedData, 'identity.json')).identity)
+    .toMatchObject({ name: '共享姓名', token: 'shared-secret', group: '研发' })
+  expect(readConnection(config)).toMatchObject({ baseUrl, appKey: 'shared-secret' })
+  // 本机 DSH home 下连 token-report 目录都不该出现（没有那份身份，也不该有孤儿文件）
+  expect(existsSync(join(desktopHome, 'token-report'))).toBe(false)
+  // GET 也按同一份数据回答
+  expect(await (await run(new Request('http://localhost/api/tokenReport.settings'))).json())
+    .toMatchObject({ signed: true, name: '共享姓名', baseUrl })
+})
+
+test('★ 共用凭证：只给 dataDir 的配置能读到，没给 dataDir 的读不到', () => {
+  const desktopHome = tempDir()
+  const sharedData = tempDir()
+  writeFileSync(join(sharedData, 'plugin-connection.json'), JSON.stringify({ baseUrl, appKey: 'shared' }))
+
+  expect(withSavedConnection({ dshHome: desktopHome, dataDir: sharedData }))
+    .toMatchObject({ appKey: 'shared', endpoint })
+  // 没指共享目录时按本机默认位置读 —— 读不到就老实回退部署配置，不许串台
+  expect(withSavedConnection({ dshHome: desktopHome, appKey: 'deployment' }).appKey).toBe('deployment')
 })
 
 test('地址归一：接受完整上报地址与末尾斜杠，拒绝带账号或查询串', () => {

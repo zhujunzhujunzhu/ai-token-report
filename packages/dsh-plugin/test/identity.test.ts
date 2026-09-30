@@ -6,7 +6,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -16,9 +16,13 @@ import { resolveConfig } from '../src/config.js'
 import type { IdentityState } from '../src/identity.js'
 
 let home: string
+let dataDir: string
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'atr-plugin-'))
+  // 显式给数据目录：缺省值在家目录下（`~/.ai-token-report`），
+  // 不给就会读写使用者真实的身份文件 —— 而测试仍然全绿。
+  dataDir = join(home, 'token-report')
 })
 
 afterEach(() => {
@@ -27,9 +31,9 @@ afterEach(() => {
 
 /** 写一份身份文件。 */
 function writeIdentityFile(content: unknown): void {
-  mkdirSync(join(home, 'token-report'), { recursive: true })
+  mkdirSync(dataDir, { recursive: true })
   writeFileSync(
-    join(home, 'token-report', 'identity.json'),
+    join(dataDir, 'identity.json'),
     typeof content === 'string' ? content : JSON.stringify(content),
     'utf8',
   )
@@ -87,7 +91,7 @@ describe('启用判定 —— 未署名绝不启用', () => {
 
 describe('身份解析', () => {
   test('无文件 → missing', () => {
-    const r = new IdentityResolver({ dshHome: home })
+    const r = new IdentityResolver({ dshHome: home, dataDir })
     const s = r.resolve()
     expect(s.ready).toBe(false)
     if (!s.ready) expect(s.reason).toBe('missing')
@@ -103,7 +107,7 @@ describe('身份解析', () => {
       updatedAt: 1,
     })
 
-    const r = new IdentityResolver({ dshHome: home })
+    const r = new IdentityResolver({ dshHome: home, dataDir })
     const s = r.resolve()
     expect(s.ready).toBe(true)
     if (s.ready) {
@@ -117,7 +121,7 @@ describe('身份解析', () => {
 
   test('文件损坏 → corrupt（与 missing 区分开）', () => {
     writeIdentityFile('{ 坏 JSON')
-    const s = new IdentityResolver({ dshHome: home }).resolve()
+    const s = new IdentityResolver({ dshHome: home, dataDir }).resolve()
     expect(s.ready).toBe(false)
     if (!s.ready) expect(s.reason).toBe('corrupt')
   })
@@ -127,6 +131,7 @@ describe('身份解析', () => {
 
     const r = new IdentityResolver({
       dshHome: home,
+      dataDir,
       configIdentity: { name: '配置里的李四', token: 'tok-config' },
     })
     const s = r.resolve()
@@ -139,6 +144,7 @@ describe('身份解析', () => {
 
     const r = new IdentityResolver({
       dshHome: home,
+      dataDir,
       configIdentity: { name: '   ', token: '' },
     })
     const s = r.resolve()
@@ -147,7 +153,7 @@ describe('身份解析', () => {
   })
 
   test('可以写入并读回（与本地页共用同一份文件）', () => {
-    const r = new IdentityResolver({ dshHome: home })
+    const r = new IdentityResolver({ dshHome: home, dataDir })
     const saved = r.save({ name: '张三', token: 'tok-abc', group: '研发一部' })
     expect(saved.ok).toBe(true)
 
@@ -161,18 +167,61 @@ describe('身份解析', () => {
   })
 
   test('清除后回到未署名', () => {
-    const r = new IdentityResolver({ dshHome: home })
+    const r = new IdentityResolver({ dshHome: home, dataDir })
     r.save({ name: '张三', token: 'tok-abc' })
     expect(r.signed).toBe(true)
 
     r.clear()
     expect(r.signed).toBe(false)
   })
+
+  /**
+   * ★ DSH Desktop：会话日志读本机 home，身份读共享数据目录。
+   *
+   * 这条断言错的话，症状是「我在命令行版填过署名了，Desktop 里还是说未署名」——
+   * 而两个目录都「看起来配置正确」。
+   */
+  test('★ dataDir 换掉身份文件所在目录，且不会读到 dshHome 下那一份', () => {
+    const shared = mkdtempSync(join(tmpdir(), 'atr-shared-'))
+    try {
+      // 共享目录里有一份署名；`dshHome/token-report` 下那份完全不存在
+      // （它已经是**旧位置**了：数据目录不再跟随 dshHome）
+      writeFileSync(join(shared, 'identity.json'), JSON.stringify({ name: '共享署名', token: 'tok-shared' }), 'utf8')
+      mkdirSync(dataDir, { recursive: true })
+      writeFileSync(join(dataDir, 'identity.json'), JSON.stringify({ name: '本机署名', token: 'tok-local' }), 'utf8')
+
+      const r = new IdentityResolver({ dshHome: home, dataDir: shared })
+      expect(r.identityFilePath).toBe(join(shared, 'identity.json'))
+      const s = r.resolve()
+      expect(s.ready).toBe(true)
+      if (s.ready) expect(s.identity.name).toBe('共享署名')
+
+      // 没指共享目录时读到的是我自己的那一份，不许串台
+      expect(new IdentityResolver({ dshHome: home, dataDir }).signed).toBe(true)
+    } finally {
+      rmSync(shared, { recursive: true, force: true })
+    }
+  })
+
+  test('save / clear 落在 dataDir 里，写的不是 dshHome', () => {
+    const shared = mkdtempSync(join(tmpdir(), 'atr-shared-'))
+    try {
+      const r = new IdentityResolver({ dshHome: home, dataDir: shared })
+      expect(r.save({ name: '张三', token: 'tok-abc' }).ok).toBe(true)
+
+      expect(existsSync(join(shared, 'identity.json'))).toBe(true)
+      expect(existsSync(join(home, 'token-report'))).toBe(false)
+      expect(r.clear()).toBe(true)
+      expect(existsSync(join(shared, 'identity.json'))).toBe(false)
+    } finally {
+      rmSync(shared, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('提示文案', () => {
   test('★ 未署名提示必须说明「去哪里填」，而不只是「没填」', () => {
-    const r = new IdentityResolver({ dshHome: home })
+    const r = new IdentityResolver({ dshHome: home, dataDir })
     const text = r.describeProblem()
 
     expect(text).toContain('尚未署名')
@@ -184,19 +233,19 @@ describe('提示文案', () => {
 
   test('损坏时的提示包含文件路径与原因', () => {
     writeIdentityFile('{ 坏')
-    const text = new IdentityResolver({ dshHome: home }).describeProblem()
+    const text = new IdentityResolver({ dshHome: home, dataDir }).describeProblem()
     expect(text).toContain('无法解析')
     expect(text).toContain('identity.json')
   })
 
   test('已署名时不产生提示', () => {
-    const r = new IdentityResolver({ dshHome: home })
+    const r = new IdentityResolver({ dshHome: home, dataDir })
     r.save({ name: '张三', token: 'tok-abc' })
     expect(r.describeProblem()).toBe('')
   })
 
   test('warnOnce 只提示一次（避免每次会话都打扰）', () => {
-    const r = new IdentityResolver({ dshHome: home })
+    const r = new IdentityResolver({ dshHome: home, dataDir })
     const lines: string[] = []
     const write = (m: string): void => void lines.push(m)
 
@@ -206,7 +255,7 @@ describe('提示文案', () => {
   })
 
   test('已署名时 warnOnce 不输出', () => {
-    const r = new IdentityResolver({ dshHome: home })
+    const r = new IdentityResolver({ dshHome: home, dataDir })
     r.save({ name: '张三', token: 'tok-abc' })
 
     const lines: string[] = []
@@ -215,7 +264,7 @@ describe('提示文案', () => {
   })
 
   test('未配 endpoint 的提示说明该怎么配', () => {
-    const r = new IdentityResolver({ dshHome: home })
+    const r = new IdentityResolver({ dshHome: home, dataDir })
     const status = evaluateStatus({ ready: false, reason: 'missing' }, FULL_CONFIG)
     // 未署名时优先提示署名
     expect(describeDisabled(status, r)).toContain('尚未署名')

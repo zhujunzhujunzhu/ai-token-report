@@ -35,6 +35,16 @@ import type { SessionTelemetryRecord } from '@deepseek-ai/dsh-session-telemetry'
 
 const HOME = mkdtempSync(join(tmpdir(), 'atr-runtime-'))
 
+/**
+ * 数据目录：显式指定，**不再跟随 dshHome**。
+ *
+ * 缺省值在家目录下（`~/.ai-token-report`），不给就会读写使用者真实的身份与连接文件。
+ * 这里与 writeIdentity / writeConnection 写文件的位置必须一致。
+ */
+function dataDirOf(home: string): string {
+  return join(home, 'token-report')
+}
+
 /** 一份计费事件（形状与真日志一致，折叠后才会有记录）。 */
 function event(seq: number): SessionTelemetryRecord {
   return {
@@ -90,8 +100,8 @@ function harness(home: string): Harness {
   let refs!: BackendRefs
   const runtime = new ReportRuntime<ReportBackendLike>({
     logger: { info: (m) => logs.push(m), warn: (m) => logs.push(m) },
-    raw: { dshHome: home, outbox: { enabled: false } },
-    resolver: new IdentityResolver({ dshHome: home }),
+    raw: { dshHome: home, dataDir: dataDirOf(home), outbox: { enabled: false } },
+    resolver: new IdentityResolver({ dshHome: home, dataDir: dataDirOf(home) }),
     createBackend: (r) => {
       counts.backends += 1
       refs = r
@@ -113,7 +123,7 @@ function harness(home: string): Harness {
         stats: () => ({ ...stats }),
       }
     }) as never,
-  }, resolveConfig({ dshHome: home }))
+  }, resolveConfig({ dshHome: home, dataDir: dataDirOf(home) }))
 
   return {
     runtime,
@@ -131,7 +141,7 @@ test('未署名：不装后端，也不采集 —— 未署名 = 不采集', asy
   const h = harness(home)
   // 配了地址、没配身份：这就是 apply() 在身份文件缺失时看到的状态
   const status = h.runtime.applyState(
-    resolveConfig({ dshHome: home, appKey: 'k' }),
+    resolveConfig({ dshHome: home, dataDir: dataDirOf(home), appKey: 'k' }),
     { ready: false, reason: 'missing' },
   )
   expect(status.enabled).toBe(false)
@@ -150,7 +160,7 @@ test('★ 保存后 refresh 就地生效：不必重启，且只装一次后端'
 
   const h = harness(home)
   // 启动时身份文件还没写（这里刻意用未署名状态起手）→ 不上报
-  h.runtime.applyState(resolveConfig({ dshHome: home }), { ready: false, reason: 'missing' })
+  h.runtime.applyState(resolveConfig({ dshHome: home, dataDir: dataDirOf(home) }), { ready: false, reason: 'missing' })
   expect(h.runtime.attached).toBe(false)
   expect(h.backends).toBe(0)
 

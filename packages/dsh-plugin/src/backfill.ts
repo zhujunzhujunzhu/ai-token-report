@@ -9,7 +9,13 @@ export type { BackfillStats } from './backfill-runner.js'
 export interface HistoryBackfillOptions {
   config: EffectiveConfig
   identity: FoldIdentity
-  sessionsRoot: string
+  /**
+   * ★ 会话日志根 —— **一组**（同一台机器上并存多套 DSH）。
+   *
+   * 补报的目标是「把全部历史都核对完」，所以根集合是**扫描范围**而不是提示：
+   * 少一个根就等于那套 DSH 的历史永远不会被确认。
+   */
+  sessionsRoots: string[]
   onLog?: (level: 'info' | 'warn', message: string) => void
 }
 
@@ -43,7 +49,7 @@ export function createHistoryBackfill(options: HistoryBackfillOptions): HistoryB
     try {
       const filename = import.meta.url.endsWith('.ts') ? './backfill-worker.ts' : './backfill-worker.js'
       const current = new Worker(new URL(filename, import.meta.url), {
-        workerData: { config: options.config, identity: options.identity, sessionsRoot: options.sessionsRoot, stats: snapshot },
+        workerData: { config: options.config, identity: options.identity, sessionsRoots: options.sessionsRoots, stats: snapshot },
       })
       worker = current
       current.on('message', (message: BackfillStats) => {

@@ -13,7 +13,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { zstdCompressSync } from 'node:zlib'
@@ -27,9 +27,12 @@ import type { FoldIdentity } from '../src/fold.js'
 import { Reporter } from '../src/reporter.js'
 
 let home: string
+let dataDir: string
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'atr-apply-'))
+  // 显式给数据目录：缺省在家目录下（`~/.ai-token-report`），不给就会读写真实身份与本地库。
+  dataDir = join(home, 'token-report')
 })
 
 afterEach(() => {
@@ -85,9 +88,9 @@ function fakeCtx(): {
 
 /** 写一份已署名的身份文件。 */
 function signIdentity(): void {
-  mkdirSync(join(home, 'token-report'), { recursive: true })
+  mkdirSync(dataDir, { recursive: true })
   writeFileSync(
-    join(home, 'token-report', 'identity.json'),
+    join(dataDir, 'identity.json'),
     JSON.stringify({ name: '张三', token: 'tok-abc', group: '研发一部', createdAt: 1, updatedAt: 1 }),
     'utf8',
   )
@@ -161,7 +164,7 @@ test('启用插件后自动补报未打开的历史会话，诊断可读且停�
     },
   })
   const fake = fakeCtx()
-  const { backend } = apply(fake.ctx, { dshHome: home, appKey: 'tok-abc',
+  const { backend } = apply(fake.ctx, { dshHome: home, dataDir, appKey: 'tok-abc',
     endpoint: `http://127.0.0.1:${server.port}/api/v1/token-usage` })
   try {
     expect(backend).not.toBeNull()
@@ -188,7 +191,7 @@ describe('★ 未署名 / 未配凭证 = 不上报', () => {
 
     const { status, backend } = apply(
       ctx,
-      { appKey: 'atr-key', dshHome: home, outbox: { dir: join(home, 'outbox') } },
+      { appKey: 'atr-key', dshHome: home, dataDir, outbox: { dir: join(home, 'outbox') } },
     )
 
     expect(status.reportingEnabled).toBe(false)
@@ -204,7 +207,7 @@ describe('★ 未署名 / 未配凭证 = 不上报', () => {
     const { ctx, logs } = fakeCtx()
     const net = interceptFetch(() => okResponse())
 
-    const { status, backend } = apply(ctx, { dshHome: home })
+    const { status, backend } = apply(ctx, { dshHome: home, dataDir })
 
     expect(status.reportingEnabled).toBe(false)
     expect(status.identityReady).toBe(true)
@@ -216,7 +219,7 @@ describe('★ 未署名 / 未配凭证 = 不上报', () => {
   test('★ 未上报时也**不注册**统计工具与服务之外的上报组件（只挂脱敏规则）', () => {
     signIdentity()
     const { ctx, listeners } = fakeCtx()
-    apply(ctx, { dshHome: home }, {})
+    apply(ctx, { dshHome: home, dataDir }, {})
 
     // 上报未启用 → 不该有 telemetry 相关的注册动作
     expect(listeners['session/telemetry']).toBeUndefined()
@@ -226,7 +229,7 @@ describe('★ 未署名 / 未配凭证 = 不上报', () => {
     signIdentity()
     const { ctx } = fakeCtx()
     const { status } = ((): { status: ReturnType<typeof evaluateStatus> } => {
-      const r = apply(ctx, { dshHome: home }, {})
+      const r = apply(ctx, { dshHome: home, dataDir }, {})
       return { status: r.status }
     })()
 
@@ -251,6 +254,7 @@ describe('★ 配齐之后：上报 + 工具 + 服务', () => {
     const { status, backend } = apply(fake.ctx, {
       appKey: 'atr-key',
       dshHome: home,
+      dataDir,
       outbox: { dir: join(home, 'outbox') },
     })
 
@@ -273,7 +277,7 @@ describe('★ 配齐之后：上报 + 工具 + 服务', () => {
 
     const { backend } = apply(
       ctx,
-      { appKey: 'atr-key', dshHome: home, outbox: { dir: join(home, 'outbox') } },
+      { appKey: 'atr-key', dshHome: home, dataDir, outbox: { dir: join(home, 'outbox') } },
     )
 
     backend!.emit(event(1))
@@ -289,7 +293,7 @@ describe('★ 配齐之后：上报 + 工具 + 服务', () => {
 
     const { backend } = apply(
       ctx,
-      { appKey: 'atr-key', dshHome: home, outbox: { dir: join(home, 'outbox') } },
+      { appKey: 'atr-key', dshHome: home, dataDir, outbox: { dir: join(home, 'outbox') } },
     )
 
     const toolCall = event(1)
@@ -317,6 +321,7 @@ describe('★ 配齐之后：上报 + 工具 + 服务', () => {
     const { backend } = apply(ctx, {
       appKey: 'atr-key',
       dshHome: home,
+      dataDir,
       outbox: { dir: join(home, 'outbox') },
     })
 
@@ -334,7 +339,7 @@ describe('★ 配齐之后：上报 + 工具 + 服务', () => {
     const { ctx, logs } = fakeCtx()
     const net = interceptFetch(() => okResponse())
 
-    apply(ctx, { appKey: 'atr-super-secret', dshHome: home, outbox: { dir: join(home, 'outbox') } })
+    apply(ctx, { appKey: 'atr-super-secret', dshHome: home, dataDir, outbox: { dir: join(home, 'outbox') } })
 
     for (const l of logs) {
       expect(l.message).not.toContain('atr-super-secret')
@@ -349,7 +354,7 @@ describe('★ 脱敏：事件正文不许带出去', () => {
     const { ctx, listeners } = fakeCtx()
     const net = interceptFetch(() => okResponse())
 
-    apply(ctx, { appKey: 'atr-key', dshHome: home, outbox: { dir: join(home, 'outbox') } })
+    apply(ctx, { appKey: 'atr-key', dshHome: home, dataDir, outbox: { dir: join(home, 'outbox') } })
 
     const listener = listeners['session-telemetry/record']![0]!
     // 一条**带对话内容与工具参数**的真实形状记录
@@ -387,7 +392,7 @@ describe('★ 脱敏：事件正文不许带出去', () => {
     signIdentity()
     const { ctx, listeners } = fakeCtx()
     const net = interceptFetch(() => okResponse())
-    apply(ctx, { appKey: 'atr-key', dshHome: home, outbox: { dir: join(home, 'outbox') } })
+    apply(ctx, { appKey: 'atr-key', dshHome: home, dataDir, outbox: { dir: join(home, 'outbox') } })
 
     const listener = listeners['session-telemetry/record']![0]!
     const toolCall: SessionTelemetryRecord = {
@@ -413,7 +418,7 @@ describe('功能开关', () => {
 
     const { status } = apply(
       ctx,
-      { appKey: 'atr-key', dshHome: home, features: { tools: false }, outbox: { dir: join(home, 'outbox') } },
+      { appKey: 'atr-key', dshHome: home, dataDir, features: { tools: false }, outbox: { dir: join(home, 'outbox') } },
     )
     expect(status.toolsRegistered).toBe(false)
     expect(provided['tokenReport']).toBeDefined()
@@ -426,7 +431,7 @@ describe('功能开关', () => {
 
     const { status } = apply(
       ctx,
-      { appKey: 'atr-key', dshHome: home, features: { service: false }, outbox: { dir: join(home, 'outbox') } },
+      { appKey: 'atr-key', dshHome: home, dataDir, features: { service: false }, outbox: { dir: join(home, 'outbox') } },
     )
     expect(status.serviceRegistered).toBe(false)
     expect(provided['tokenReportTools']).toBeDefined()
@@ -442,7 +447,7 @@ describe('服务与工具的形状', () => {
     signIdentity()
     const { ctx, provided } = fakeCtx()
     const net = interceptFetch(() => okResponse())
-    apply(ctx, { appKey: 'atr-key', dshHome: home, outbox: { dir: join(home, 'outbox') } })
+    apply(ctx, { appKey: 'atr-key', dshHome: home, dataDir, outbox: { dir: join(home, 'outbox') } })
 
     const tools = provided['tokenReportTools'] as Record<string, unknown>
     expect(Object.keys(tools).sort()).toEqual([TOOL_NAME, `${TOOL_NAME}_diagnostics`].sort())
@@ -452,7 +457,7 @@ describe('服务与工具的形状', () => {
     signIdentity()
     const { ctx, provided } = fakeCtx()
     const net = interceptFetch(() => okResponse())
-    apply(ctx, { appKey: 'atr-secret', dshHome: home, outbox: { dir: join(home, 'outbox') } })
+    apply(ctx, { appKey: 'atr-secret', dshHome: home, dataDir, outbox: { dir: join(home, 'outbox') } })
 
     const service = provided['tokenReport'] as { config: Record<string, unknown> }
     expect(service.config).not.toHaveProperty('appKey')
@@ -462,13 +467,13 @@ describe('服务与工具的形状', () => {
 
   test('signed() 反映真实的署名状态', () => {
     const { ctx, provided } = fakeCtx()
-    apply(ctx, { dshHome: home }, {})
+    apply(ctx, { dshHome: home, dataDir }, {})
     const service = provided['tokenReport'] as { signed(): boolean }
     expect(service.signed()).toBe(false)
 
     signIdentity()
     const second = fakeCtx()
-    apply(second.ctx, { dshHome: home }, {})
+    apply(second.ctx, { dshHome: home, dataDir }, {})
     const service2 = second.provided['tokenReport'] as { signed(): boolean }
     expect(service2.signed()).toBe(true)
   })
@@ -482,7 +487,7 @@ describe('配置问题只告警，不让 DSH 起不来', () => {
 
     const { status } = apply(
       ctx,
-      { appKey: 'atr-key', endpoint: 'ftp://nope', dshHome: home, outbox: { dir: join(home, 'outbox') } },
+      { appKey: 'atr-key', endpoint: 'ftp://nope', dshHome: home, dataDir, outbox: { dir: join(home, 'outbox') } },
     )
 
     expect(status.reportingEnabled).toBe(true)
@@ -492,7 +497,7 @@ describe('配置问题只告警，不让 DSH 起不来', () => {
   test('打开 localDb 不再错误警告 Bun 专属限制', () => {
     signIdentity()
     const { ctx, logs } = fakeCtx()
-    apply(ctx, { appKey: 'k', dshHome: home, localDb: true }, {})
+    apply(ctx, { appKey: 'k', dshHome: home, dataDir, localDb: true }, {})
     expect(logs.some((l) => l.message.includes('bun:sqlite'))).toBe(false)
   })
 })
@@ -508,6 +513,73 @@ describe('默认导出', () => {
 describe('config 归一化后的默认 endpoint 指向本仓服务端', () => {
   test('未配置时用 shared 契约里的路径', () => {
     expect(resolveConfig({}).endpoint).toContain('/api/v1/token-usage')
+  })
+})
+
+/**
+ * ★ DSH Desktop：`dshHome` 与 `dataDir` 分开装配。
+ *
+ * Desktop 的 `DSH_HOME` 是 `%APPDATA%\dsh-desktop\harness`，命令行版是 `~/.dsh`。
+ * 想「共用一份身份、但各看自己的会话」就必须走 `dataDir`；这里断言装配之后
+ * 身份与 outbox 都落在 `dataDir`，而会话日志根仍指向 `dshHome`。
+ */
+describe('★ DSH Desktop：会话日志根与数据目录分开', () => {
+  test('署名与 outbox 落在 dataDir，本机 dshHome 下不产生 token-report 目录', async () => {
+    const shared = mkdtempSync(join(tmpdir(), 'atr-shared-'))
+    const net = interceptFetch(() => okResponse())
+    try {
+      // 共享目录里已有命令行版填好的署名 —— Desktop 不该再问一次
+      writeFileSync(
+        join(shared, 'identity.json'),
+        JSON.stringify({ name: '共享张三', token: 'tok-shared', createdAt: 1, updatedAt: 1 }),
+        'utf8',
+      )
+
+      const { ctx } = fakeCtx()
+      const { status, backend } = apply(ctx, {
+        dshHome: home,
+        dataDir: shared,
+        appKey: 'tok-shared',
+        endpoint: 'http://127.0.0.1:9/api/v1/token-usage',
+      })
+
+      expect(status.identityReady).toBe(true)
+      expect(status.reportingEnabled).toBe(true)
+      expect(backend).not.toBeNull()
+
+      // ★ 磁盘 outbox 建在共享数据目录下（崩溃不丢数据这件事也共用同一份队列）
+      expect(existsSync(join(shared, 'outbox'))).toBe(true)
+      // 本机 home 一个字节都不写：没有孤儿身份文件，也没有第二份 outbox
+      expect(existsSync(join(home, 'token-report'))).toBe(false)
+
+      await backend!.shutdown()
+    } finally {
+      net.restore()
+      rmSync(shared, { recursive: true, force: true })
+    }
+  })
+
+  test('数据目录里没有署名时仍是「未署名 → 不上报」（共享不改变合规底线）', () => {
+    const shared = mkdtempSync(join(tmpdir(), 'atr-shared-'))
+    try {
+      // 本机 home 下有署名，但数据目录指到了空目录 → 以数据目录为准
+      signIdentity()
+      const { ctx, logs } = fakeCtx()
+      const net = interceptFetch(() => okResponse())
+      try {
+        const { status, backend } = apply(ctx, {
+          dshHome: home, dataDir: shared, appKey: 'tok-shared',
+        })
+        expect(status.identityReady).toBe(false)
+        expect(backend).toBeNull()
+        expect(net.calls).toHaveLength(0)
+        expect(logs.some((l) => l.message.includes('尚未署名'))).toBe(true)
+      } finally {
+        net.restore()
+      }
+    } finally {
+      rmSync(shared, { recursive: true, force: true })
+    }
   })
 })
 

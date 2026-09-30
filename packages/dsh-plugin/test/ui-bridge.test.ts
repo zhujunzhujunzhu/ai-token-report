@@ -416,7 +416,7 @@ describe('配置通道（位置只能这样到页面）', () => {
 })
 
 describe('★ 路由安装：拿不到 connection 必须安静跳过', () => {
-  const stats = { config: {} as never, sessionsRoot: '/tmp/sessions', dbPath: '/tmp/db.sqlite' }
+  const stats = { config: {} as never, sessionsRoots: ['/tmp/sessions'], dbPath: '/tmp/db.sqlite' }
 
   /** 会记录 `register` 调用的假 connection。 */
   function fakeConnection(registered: unknown[]): unknown {

@@ -42,7 +42,6 @@
  * 不装 coordinator、一个字节都不采集**。就地启用同样先过这一关。
  */
 
-import { resolvePaths } from '@ai-token-report/core'
 import { toAssertion, type Identity } from '@ai-token-report/shared'
 import type { SessionTelemetryRecord } from '@deepseek-ai/dsh-session-telemetry'
 
@@ -66,6 +65,7 @@ import {
   type ReporterStats,
 } from './reporter.js'
 import type { OutboxStats } from './outbox.js'
+import { reportPaths } from './paths.js'
 import { ReportLog, type ReportAttempt, type ReportLogOptions } from './report-log.js'
 import { withSavedConnection } from './settings.js'
 import type { UiReportingStatus, UiRouteInstall } from './client/protocol.js'
@@ -222,6 +222,8 @@ export function unitKey(config: EffectiveConfig, identity: Identity): string {
     config.appKey,
     config.name,
     config.dshHome ?? '',
+    // ★ 多根会影响**历史补报的内容**，必须进这个 key，否则「加了 home 却还在按旧范围补报」
+    config.dshHomes ?? [],
     config.batch.maxRecords,
     config.batch.timeoutMillis,
     config.outbox.enabled,
@@ -491,7 +493,7 @@ export class ReportRuntime<B extends ReportBackendLike = ReportBackendLike> {
     const backfill = this.#createBackfill({
       config,
       identity: foldIdentity,
-      sessionsRoot: resolvePaths(config.dshHome).sessionsRoot,
+      sessionsRoots: reportPaths(config).sessionsRoots,
       onLog: log,
     })
     reporter.start()

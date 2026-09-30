@@ -27,7 +27,7 @@ message:{source:{kind:'model',provider:'test',model:'model'}},
 usage:{inputTokens:100,outputTokens:20,cacheReadTokens:300,cacheWriteTokens:40,reasoningTokens:5,totalTokens:460}}});
 const frame = rows => zstdCompressSync(Buffer.from(rows.map(JSON.stringify).join('\\n')+'\\n'));
 writeFileSync(file, frame([{type:'session',version:3,id:'session-1',createdAt:time,cwd:'project'},event(1)]));
-const context = {config:resolveConfig({dshHome:home}),sessionsRoot:join(home,'sessions'),dbPath:join(home,'usage.sqlite')};
+const context = {config:resolveConfig({dshHome:home}),sessionsRoots:[join(home,'sessions')],dbPath:join(home,'usage.sqlite')};
 const query = {period:'today',by:['provider-model','project','session','day','hour'],series:'hour'};
 const sql = await queryUsage(context, query);
 assert.equal(sql.source,'local-db');

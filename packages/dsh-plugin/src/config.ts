@@ -61,7 +61,7 @@ export interface EffectiveConfig {
   outbox: {
     /** 关闭 outbox。默认 `true`（开着）。 */
     enabled: boolean
-    /** 自定义目录。缺省 `$DSH_HOME/token-report/outbox`。 */
+    /** 自定义目录。缺省 `<dataDir>/outbox`。 */
     dir?: string
     /** 未投递文件的总字节上限，超过后丢弃**最旧**的并告警。 */
     maxBytes: number
@@ -106,8 +106,52 @@ export interface EffectiveConfig {
   }
   /** 固定身份（IT 统一部署场景）。留空则读本机身份文件。 */
   user?: { name: string; token: string; group?: string }
-  /** DSH home，一般不需要手动指定。 */
+  /**
+   * DSH home —— **会话日志根**。一般不需要手动指定。
+   *
+   * ⚠️ 改它会连会话日志来源一起换掉（界面统计与历史补报都从 `<dshHome>/sessions` 读）。
+   *   只想让两套 DSH 共用身份与本地库时用 `dataDir`，见下。
+   */
   dshHome?: string
+  /**
+   * ★ DSH home **列表**（同一台机器上并存多套 DSH：命令行版 + Desktop + 第三方客户端）。
+   *
+   * 非空时**覆盖** `dshHome`；两者都不给时由 core 自动发现
+   * （`$DSH_HOME` + `~/.dsh` + `~/.dsh*` + 各平台应用数据目录下的客户端目录，
+   * 只收真正有 `sessions` 的那个）。
+   *
+   * ```yaml
+   * - id: token-report
+   *   config:
+   *     dshHomes:
+   *       - ~/.dsh
+   *       - ~/AppData/Roaming/dsh-desktop/harness
+   * ```
+   *
+   * ⚠️ 多根共用**同一份** `dataDir`（身份 + 本地库 + 补报水位）：库只有一份，
+   *   统计才可能是一份并集。镜像会话靠 `event_id` 主键天然去重，
+   *   所以「并集 < 各根之和」是**正确**结果。
+   */
+  dshHomes?: string[]
+  /**
+   * ★ token-report 自己的数据目录（身份 / 连接偏好 / 本地库 / outbox / 补报水位）。
+   *
+   * 缺省 `~/.ai-token-report`（**与 `dshHome` 无关**，可用 `DSH_TOKEN_REPORT_DATA_DIR` 覆盖）。
+   *
+   * ⚠️ 「DSH Desktop 与命令行版 DSH 共用一份身份与本地库」**不需要配置** ——
+   *   两者默认就指向同一个数据目录，各统计自己的会话。
+   *   只有想**刻意分开**时（例如给 Desktop 单独一份库）才显式给它：
+   *
+   * ```yaml
+   * - id: token-report
+   *   config:
+   *     dataDir: ~/.dsh/token-report   # 只这套 DSH 用它，与 CLI 无关
+   *     # dshHome 不动 —— 会话日志仍读当前 DSH 自己的那一份
+   * ```
+   *
+   * 支持 `~` 展开；空白字符串视为「没配」。
+   */
+  dataDir?: string
 }
 
 /** 默认上报地址 —— 与本仓部门服务端契约一致（`ARCHITECTURE.md` §5.2）。 */
@@ -174,6 +218,8 @@ export const ENV = {
   outboxMaxBytes: 'DSH_TOKEN_REPORT_OUTBOX_MAX_BYTES',
   localDb: 'DSH_TOKEN_REPORT_LOCAL_DB',
   uiPosition: 'DSH_TOKEN_REPORT_UI_POSITION',
+  /** token-report 数据目录（身份 / 本地库 / outbox）。见 `EffectiveConfig.dataDir`。 */
+  dataDir: 'DSH_TOKEN_REPORT_DATA_DIR',
   userName: 'DSH_TOKEN_REPORT_USER_NAME',
   userToken: 'DSH_TOKEN_REPORT_USER_TOKEN',
   // 归属维度现在叫「分组」（原 `DSH_TOKEN_REPORT_DEPT`）。
@@ -208,11 +254,30 @@ export interface RawConfig {
   }
   user?: { name?: string; token?: string; group?: string }
   dshHome?: string
+  /** ★ 多个 DSH home。YAML 给什么都要收下 —— 非法项在归一化时丢弃，不让 DSH 起不来。 */
+  dshHomes?: unknown
+  /** token-report 数据目录。见 `EffectiveConfig.dataDir`。 */
+  dataDir?: string
 }
 
 /** 正数校验：非法值**回退默认**而不是抛错 —— 一个写错的数字不该让整个 DSH 起不来。 */
 function positive(v: number | undefined, fallback: number): number {
   return v !== undefined && Number.isFinite(v) && v > 0 ? v : fallback
+}
+
+/**
+ * 把 YAML 里的「一组路径」收成字符串数组。
+ *
+ * 非法项（不是数组 / 非字符串 / 空白）**丢弃而不是抛错** —— 与 `positive()`
+ * 同一个理由：一个写错的配置项不该让整个 DSH 起不来。
+ * 展开 `~`、绝对化、去重、排序**不在这里做**，那是 core `resolvePaths` 唯一的职责。
+ */
+function toStringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim())
+    .filter((item) => item !== '')
 }
 
 /**
@@ -251,6 +316,9 @@ export function resolveConfig(raw: RawConfig = {}): EffectiveConfig {
         : undefined
 
   const outboxDir = raw.outbox?.dir?.trim() || envString(ENV.outboxDir)
+  const dshHome = raw.dshHome?.trim()
+  const dshHomes = toStringList(raw.dshHomes)
+  const dataDir = raw.dataDir?.trim() || envString(ENV.dataDir)
 
   return {
     name: raw.name?.trim() || envString(ENV.name) || DEFAULT_NAME,
@@ -283,7 +351,11 @@ export function resolveConfig(raw: RawConfig = {}): EffectiveConfig {
       position: parseUiPosition(rawUiPosition(raw)) ?? UI_DEFAULT_POSITION,
     },
     ...(user ? { user } : {}),
-    ...(raw.dshHome ? { dshHome: raw.dshHome } : {}),
+    // 两个目录都**只归一化空白**，展开 `~` 与绝对化留给 core 的路径解析
+    // （`resolvePaths`）—— 那是唯一一处把配置变成路径的地方（见 `paths.ts`）。
+    ...(dshHome ? { dshHome } : {}),
+    ...(dshHomes.length > 0 ? { dshHomes } : {}),
+    ...(dataDir ? { dataDir } : {}),
   }
 }
 

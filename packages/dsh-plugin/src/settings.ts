@@ -38,7 +38,7 @@
 import { mkdirSync, readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { readIdentity, resolvePaths, writeIdentity } from '@ai-token-report/core'
+import { readIdentity, writeIdentity } from '@ai-token-report/core'
 import {
   parseUiPosition,
   UI_POSITIONS,
@@ -46,6 +46,7 @@ import {
   type UiReportingStatus,
 } from './client/protocol.js'
 import type { EffectiveConfig, RawConfig } from './config.js'
+import { reportPaths, type PathInput } from './paths.js'
 
 /** 上报路径（`baseUrl` + 它 = `config.endpoint`）。 */
 export const INGEST_PATH = '/api/v1/token-usage'
@@ -82,8 +83,15 @@ interface SavedConnection {
   position?: UiPosition
 }
 
-function connectionPath(home?: string): string {
-  return join(resolvePaths(home).dshHome, 'token-report', 'plugin-connection.json')
+/**
+ * 本机连接偏好的落盘路径。
+ *
+ * ⚠️ 与身份文件同目录（= token-report **数据目录**，不是 `dshHome`）：
+ *   两者必须一起被共用或一起被隔离，否则会出现「实名来自 A 目录、
+ *   凭证来自 B 目录」这种自相矛盾的署名（见 `paths.ts`）。
+ */
+function connectionPath(target?: PathInput): string {
+  return join(reportPaths(target).dataDir, 'plugin-connection.json')
 }
 
 /**
@@ -140,9 +148,9 @@ export function baseUrlOf(endpoint: string): string {
  * ★ 间隔与位置**独立于凭证**：即使 appKey 还没填（或凭证被删了），
  *   用户选过的偏好也该被记住。凭证本身仍然要求「地址 + 密钥」成对才认。
  */
-export function readConnection(home?: string): Partial<SavedConnection> {
+export function readConnection(target?: PathInput): Partial<SavedConnection> {
   try {
-    const value = JSON.parse(readFileSync(connectionPath(home), 'utf8')) as Record<string, unknown>
+    const value = JSON.parse(readFileSync(connectionPath(target), 'utf8')) as Record<string, unknown>
     const out: Partial<SavedConnection> = {}
     const interval = parseFlushInterval(value['flushIntervalMillis'])
     if (interval !== undefined) out.flushIntervalMillis = interval
@@ -172,7 +180,7 @@ export function readConnection(home?: string): Partial<SavedConnection> {
  * - **固定身份**仍由部署配置管理（`raw.user` 优先级最高，见 `resolveConfig`）。
  */
 export function withSavedConnection(raw: RawConfig): RawConfig {
-  const saved = readConnection(raw.dshHome)
+  const saved = readConnection({ ...(raw.dshHome ? { dshHome: raw.dshHome } : {}), ...(raw.dataDir ? { dataDir: raw.dataDir } : {}) })
   let next = raw
   if (saved.baseUrl && saved.appKey) {
     next = { ...next, endpoint: endpointOf(saved.baseUrl), appKey: saved.appKey }
@@ -264,7 +272,7 @@ export function createSettingsHandler(
 
   return async (request) => {
     const state = host.state()
-    const paths = resolvePaths(state.config.dshHome)
+    const paths = reportPaths(state.config)
 
     if (request.method === 'GET') {
       const identity = state.identity
@@ -292,7 +300,7 @@ export function createSettingsHandler(
     try {
       const raw = await request.json() as Record<string, unknown>
       const appKey = typeof raw['appKey'] === 'string' ? raw['appKey'].trim() : ''
-      const previous = readConnection(state.config.dshHome)
+      const previous = readConnection(state.config)
 
       // ── 地址：新凭证必须自己带地址；只改偏好时地址必须原样不动 ─────────
       let baseUrl: string
@@ -346,7 +354,7 @@ export function createSettingsHandler(
         position = parsed
       }
 
-      const path = connectionPath(state.config.dshHome)
+      const path = connectionPath(state.config)
       /** 这次要落盘的内容：**凭证来自本次输入，或原样沿用已保存的那一份**。 */
       const saved: SavedConnection = {
         baseUrl,

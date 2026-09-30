@@ -10,15 +10,18 @@ import { resolveBackfillDir, runBackfillPass } from '../src/backfill-runner.js'
 import { createHistoryBackfill } from '../src/backfill.js'
 
 let home: string
+/** 数据目录：显式指定，**不再跟随 `dshHome`**（缺省在家目录下，会给真实数据写水位）。 */
+let dataDir: string
 let sessionsRoot: string
 let config: EffectiveConfig
 const identity: FoldIdentity = { clientName: 'history-test', claimedUserId: '已签名成员', userName: '已签名成员' }
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'atr-backfill-'))
+  dataDir = join(home, 'token-report')
   sessionsRoot = join(home, 'sessions')
   mkdirSync(sessionsRoot)
-  config = resolveConfig({ dshHome: home, endpoint: 'https://portal.test/api/v1/token-usage',
+  config = resolveConfig({ dshHome: home, dataDir, endpoint: 'https://portal.test/api/v1/token-usage',
     appKey: 'private-backfill-test-key', batch: { maxRecords: 2 } })
 })
 afterEach(() => rmSync(home, { recursive: true, force: true }))
@@ -65,13 +68,13 @@ describe('磁盘历史全量补报', () => {
     writeSession('closed-a', [{ type: 'session', data: { cwd: '/project/a' } }, usage(1), usage(2)])
     writeSession('closed-b', [usage(4)])
     const target = receiver()
-    const first = await runBackfillPass({ config, identity, sessionsRoot, fetchImpl: target.fetchImpl })
+    const first = await runBackfillPass({ config, identity, sessionsRoots: [sessionsRoot], fetchImpl: target.fetchImpl })
     expect(first).toMatchObject({ status: 'complete', filesTotal: 2, filesProcessed: 2, accepted: 3, confirmed: 3 })
     expect(first.lastCompletedAt).toBeGreaterThan(0)
     expect(target.stored.get('closed-a:1')).toMatchObject({ input_tokens: 10, output_tokens: 2,
       cache_read_tokens: 100, cache_write_tokens: 3, reasoning_tokens: 1, total_tokens: 115, cwd: '/project/a' })
     const calls = target.requests
-    const second = await runBackfillPass({ config, identity, sessionsRoot, fetchImpl: target.fetchImpl })
+    const second = await runBackfillPass({ config, identity, sessionsRoots: [sessionsRoot], fetchImpl: target.fetchImpl })
     expect(second.status).toBe('complete')
     expect(second.confirmed).toBe(0)
     expect(target.requests).toBe(calls)
@@ -81,20 +84,20 @@ describe('磁盘历史全量补报', () => {
     config = { ...config, batch: { ...config.batch, maxRecords: 1 } }
     writeSession('long-history', Array.from({ length: 121 }, (_, i) => usage(i + 1)))
     const target = receiver()
-    const result = await runBackfillPass({ config, identity, sessionsRoot, fetchImpl: target.fetchImpl })
+    const result = await runBackfillPass({ config, identity, sessionsRoots: [sessionsRoot], fetchImpl: target.fetchImpl })
     expect(result.status).toBe('complete')
     expect(target.requests).toBe(121)
     expect(target.stored.size).toBe(121)
-    expect(readdirSync(join(home, 'token-report'))).toEqual(['backfill'])
+    expect(readdirSync(dataDir)).toEqual(['backfill'])
   })
 
   test('同会话后发现的低序号分段不会被过滤，分段继承项目归属', async () => {
     const path = writeSession('split', [{ type: 'session', data: { cwd: '/project/split' } }, usage(100)], 'session.00.jsonl.zstd')
     const target = receiver()
-    await runBackfillPass({ config, identity, sessionsRoot, fetchImpl: target.fetchImpl })
+    await runBackfillPass({ config, identity, sessionsRoots: [sessionsRoot], fetchImpl: target.fetchImpl })
     writeSession('split', [usage(1)], 'session.01.jsonl.zstd')
     appendFileSync(path, frame([usage(101)]))
-    const result = await runBackfillPass({ config, identity, sessionsRoot, fetchImpl: target.fetchImpl })
+    const result = await runBackfillPass({ config, identity, sessionsRoots: [sessionsRoot], fetchImpl: target.fetchImpl })
     expect(result.status).toBe('complete')
     expect([...target.stored.keys()].sort()).toEqual(['split:1', 'split:100', 'split:101'])
     expect(target.stored.get('split:1')?.cwd).toBe('/project/split')
@@ -105,12 +108,12 @@ describe('磁盘历史全量补报', () => {
     writeSession('second', [usage(4)])
     let online = false
     const target = receiver(call => !online && call >= 2 ? new Response('临时离线', { status: 503 }) : undefined)
-    const failed = await runBackfillPass({ config, identity, sessionsRoot, fetchImpl: target.fetchImpl })
+    const failed = await runBackfillPass({ config, identity, sessionsRoots: [sessionsRoot], fetchImpl: target.fetchImpl })
     expect(failed).toMatchObject({ status: 'retrying', filesProcessed: 0, confirmed: 2, lastCompletedAt: 0 })
     expect(target.requests).toBe(2)
-    expect(readdirSync(resolveBackfillDir(config, sessionsRoot))).toEqual([])
+    expect(readdirSync(resolveBackfillDir(config, [sessionsRoot]))).toEqual([])
     online = true
-    const recovered = await runBackfillPass({ config, identity, sessionsRoot, fetchImpl: target.fetchImpl })
+    const recovered = await runBackfillPass({ config, identity, sessionsRoots: [sessionsRoot], fetchImpl: target.fetchImpl })
     expect(recovered).toMatchObject({ status: 'complete', confirmed: 4, accepted: 2, duplicates: 2 })
     expect(target.stored.size).toBe(4)
   })
@@ -119,13 +122,13 @@ describe('磁盘历史全量补报', () => {
     writeSession('missing-ack', [usage(1)])
     for (const response of [new Response('代理页面'), Response.json({ accepted: 0, duplicates: 0, rejected: 0 }),
       new Response(`凭证：${config.appKey.slice(0, 10)}`, { status: 401 })]) {
-      const result = await runBackfillPass({ config, identity, sessionsRoot,
+      const result = await runBackfillPass({ config, identity, sessionsRoots: [sessionsRoot],
         fetchImpl: (async () => response) as unknown as typeof fetch })
       expect(result.status).toBe('retrying')
       expect(result.lastCompletedAt).toBe(0)
       expect(result.lastError).not.toContain('凭证：')
       expect(result.lastError).not.toContain(config.appKey.slice(0, 10))
-      expect(readdirSync(resolveBackfillDir(config, sessionsRoot))).toEqual([])
+      expect(readdirSync(resolveBackfillDir(config, [sessionsRoot]))).toEqual([])
     }
   })
 
@@ -134,12 +137,12 @@ describe('磁盘历史全量补报', () => {
     const tail = frame([usage(2)])
     appendFileSync(path, tail.subarray(0, 8))
     const target = receiver()
-    const first = await runBackfillPass({ config, identity, sessionsRoot, fetchImpl: target.fetchImpl })
+    const first = await runBackfillPass({ config, identity, sessionsRoots: [sessionsRoot], fetchImpl: target.fetchImpl })
     expect(first.status).toBe('retrying')
     expect(first.lastError).toContain('压缩帧')
-    expect(readdirSync(resolveBackfillDir(config, sessionsRoot))).toEqual([])
+    expect(readdirSync(resolveBackfillDir(config, [sessionsRoot]))).toEqual([])
     appendFileSync(path, tail.subarray(8))
-    const second = await runBackfillPass({ config, identity, sessionsRoot, fetchImpl: target.fetchImpl })
+    const second = await runBackfillPass({ config, identity, sessionsRoots: [sessionsRoot], fetchImpl: target.fetchImpl })
     expect(second).toMatchObject({ status: 'complete', accepted: 1, duplicates: 1 })
     expect(target.stored.size).toBe(2)
   })
@@ -149,7 +152,7 @@ describe('磁盘历史全量补报', () => {
     writeSession('b-valid', [usage(2)])
     const target = receiver((_call, records) => records[0]?.event_id === 'a-invalid:1'
       ? new Response('记录格式不合法', { status: 400 }) : undefined)
-    const result = await runBackfillPass({ config, identity, sessionsRoot, fetchImpl: target.fetchImpl })
+    const result = await runBackfillPass({ config, identity, sessionsRoots: [sessionsRoot], fetchImpl: target.fetchImpl })
     expect(result).toMatchObject({ status: 'retrying', filesProcessed: 1, filesTotal: 2, accepted: 1, lastCompletedAt: 0 })
     expect(target.stored.has('b-valid:2')).toBe(true)
   })
@@ -160,34 +163,34 @@ describe('磁盘历史全量补报', () => {
     const corrupt = writeSession('corrupt', [])
     writeFileSync(corrupt, Buffer.from('损坏的压缩文件'))
     const target = receiver()
-    const result = await runBackfillPass({ config, identity, sessionsRoot, fetchImpl: target.fetchImpl })
+    const result = await runBackfillPass({ config, identity, sessionsRoots: [sessionsRoot], fetchImpl: target.fetchImpl })
     expect(result).toMatchObject({ status: 'retrying', filesProcessed: 0, lastCompletedAt: 0 })
-    expect(readdirSync(resolveBackfillDir(config, sessionsRoot))).toEqual([])
+    expect(readdirSync(resolveBackfillDir(config, [sessionsRoot]))).toEqual([])
   })
 
   test('目标地址和凭证分别隔离历史光标，状态文件不保存凭证明文', async () => {
     writeSession('scoped', [usage(1)])
     const target = receiver()
-    await runBackfillPass({ config, identity, sessionsRoot, fetchImpl: target.fetchImpl })
-    const base = resolveBackfillDir(config, sessionsRoot)
+    await runBackfillPass({ config, identity, sessionsRoots: [sessionsRoot], fetchImpl: target.fetchImpl })
+    const base = resolveBackfillDir(config, [sessionsRoot])
     const changed = { ...config, endpoint: 'https://another.test/api/v1/token-usage' }
-    expect(resolveBackfillDir(changed, sessionsRoot)).not.toBe(base)
-    expect(resolveBackfillDir({ ...config, appKey: 'rotated-key' }, sessionsRoot)).not.toBe(base)
+    expect(resolveBackfillDir(changed, [sessionsRoot])).not.toBe(base)
+    expect(resolveBackfillDir({ ...config, appKey: 'rotated-key' }, [sessionsRoot])).not.toBe(base)
     expect(base).not.toContain(config.appKey)
     for (const file of readdirSync(base)) expect(readFileSync(join(base, file), 'utf8')).not.toContain(config.appKey)
-    const replayed = await runBackfillPass({ config: changed, identity, sessionsRoot, fetchImpl: target.fetchImpl })
+    const replayed = await runBackfillPass({ config: changed, identity, sessionsRoots: [sessionsRoot], fetchImpl: target.fetchImpl })
     expect(replayed).toMatchObject({ status: 'complete', confirmed: 1, duplicates: 1 })
   })
 
   test('未签名或禁用上报不扫描、不建光标、不发请求；找不到根目录也不假报完成', async () => {
     const target = receiver()
-    const unsigned = await runBackfillPass({ config, identity: { ...identity, claimedUserId: '' }, sessionsRoot, fetchImpl: target.fetchImpl })
+    const unsigned = await runBackfillPass({ config, identity: { ...identity, claimedUserId: '' }, sessionsRoots: [sessionsRoot], fetchImpl: target.fetchImpl })
     expect(unsigned.status).toBe('retrying')
     const disabled = await runBackfillPass({ config: { ...config, features: { ...config.features, reporting: false } },
-      identity, sessionsRoot, fetchImpl: target.fetchImpl })
+      identity, sessionsRoots: [sessionsRoot], fetchImpl: target.fetchImpl })
     expect(disabled.status).toBe('retrying')
     expect(readdirSync(home)).toEqual(['sessions'])
-    const missing = await runBackfillPass({ config, identity, sessionsRoot: join(home, 'missing'), fetchImpl: target.fetchImpl })
+    const missing = await runBackfillPass({ config, identity, sessionsRoots: [join(home, 'missing')], fetchImpl: target.fetchImpl })
     expect(missing.status).toBe('retrying')
     expect(missing.lastCompletedAt).toBe(0)
     expect(target.requests).toBe(0)
@@ -196,7 +199,7 @@ describe('磁盘历史全量补报', () => {
   test('线程启动异步完成空目录核对，stop确实终止后台工作', async () => {
     let done!: () => void
     const completed = new Promise<void>(resolve => { done = resolve })
-    const controller = createHistoryBackfill({ config, identity, sessionsRoot,
+    const controller = createHistoryBackfill({ config, identity, sessionsRoots: [sessionsRoot],
       onLog: (_level, message) => { if (message.includes('历史补报完成')) done() } })
     controller.start()
     expect(controller.stats().status).toBe('running')

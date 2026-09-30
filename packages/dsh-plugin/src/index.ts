@@ -49,7 +49,6 @@
  *   宁可数据缺失（看板上能看到缺口），也不要未授权采集。
  */
 
-import { resolvePaths } from '@ai-token-report/core'
 import type { Context } from '@deepseek-ai/cordis'
 import { SessionTelemetryBackend, SessionTelemetryCoordinator } from '@deepseek-ai/dsh-session-telemetry'
 
@@ -61,6 +60,7 @@ import {
   type RawConfig,
 } from './config.js'
 import { IdentityResolver, type IdentityState } from './identity.js'
+import { reportPaths } from './paths.js'
 import type { ReporterStats } from './reporter.js'
 import type { BackfillStats } from './backfill-runner.js'
 import {
@@ -456,7 +456,7 @@ export function apply(
         state: () => ({
           config: runtime.config(),
           identity: runtime.identity(),
-          saved: readConnection(runtime.config().dshHome),
+          saved: readConnection(runtime.config()),
           reporting: runtime.status(),
           // 身份由部署配置钉死时不允许在页面上改连接：那会造出
           // 「实名来自配置、凭证来自页面」这种自相矛盾的署名。
@@ -480,10 +480,14 @@ export function apply(
 
 /** 统计上下文：两个路径 + 功能开关。 */
 function buildStatsContext(config: EffectiveConfig): StatsContext {
-  const paths = resolvePaths(config.dshHome)
+  // ⚠️ 会话日志根与数据目录都只经 `reportPaths()` 取（见 `paths.ts`）：
+  //   在这里手抄 `config.dshHome` 会漏掉 `dataDir`，而漏掉不会报错 ——
+  //   只会让「界面上的数」与「上报的数」来自两个不同的目录。
+  const paths = reportPaths(config)
   return {
     config,
-    sessionsRoot: paths.sessionsRoot,
+    // ★ 一组根（多套 DSH 并存）；与 CLI / 本地页吃的是同一个 `openStats`
+    sessionsRoots: paths.sessionsRoots,
     dbPath: paths.dbPath,
     backgroundQueries: true,
   }
@@ -494,11 +498,13 @@ function buildStatsContext(config: EffectiveConfig): StatsContext {
  *
  * 单独一个函数是为了让「生效配置 → 解析器」这层映射只有一处 ——
  * 之前它在 `apply` / `default.apply` / 服务里各写了一遍，
- * 三处只要有一处漏掉 `dshHome`，就会出现「同一个配置、两个不同身份文件」的怪事。
+ * 三处只要有一处漏掉 `dshHome`（今天是 `dataDir`），就会出现
+ * 「同一个配置、两个不同身份文件」的怪事。
  */
 function buildResolver(config: EffectiveConfig): IdentityResolver {
   return new IdentityResolver({
     ...(config.dshHome ? { dshHome: config.dshHome } : {}),
+    ...(config.dataDir ? { dataDir: config.dataDir } : {}),
     ...(config.user ? { configIdentity: config.user } : {}),
   })
 }
@@ -617,6 +623,18 @@ function formatReporterDiagnostics(runtime: ReportRuntime<TokenReportBackend>): 
   lines.push(`  凭证        ${config.appKey ? '已配置（不回显）' : '★ 未配置 —— 上报不会启动'}`)
   lines.push(`  批量        最多 ${config.batch.maxRecords} 条 / 每 ${config.batch.flushIntervalMillis}ms`)
   lines.push(`  outbox      ${config.outbox.enabled ? config.outbox.dir ?? '默认位置' : '已关闭'}`)
+  // ★ 两个目录必须分开报：DSH Desktop 的 home 与命令行版 DSH 不同，
+  //   「我的身份 / 本地库到底落在哪」只能靠这两行回答（见 `paths.ts`）。
+  const paths = reportPaths(config)
+  // ★ 多套 DSH 并存时日志根是**一组**：只报第一个根会让人以为「另一个 home 没被统计」，
+  //   而这恰恰是本插件最需要说清的一件事（界面数字来自哪里）。
+  if (paths.sessionsRoots.length > 1) {
+    lines.push(`  会话日志根  ${paths.sessionsRoots.length} 个 DSH home：`)
+    for (const root of paths.sessionsRoots) lines.push(`              ${root}`)
+  } else {
+    lines.push(`  会话日志根  ${paths.sessionsRoot}`)
+  }
+  lines.push(`  数据目录    ${paths.dataDir}${config.dataDir ? '（dataDir 显式配置）' : ''}`)
   lines.push(`  运行状态    ${status.enabled ? '上报中' : `已停止（${status.reason ?? '原因未知'}）`}`)
 
   if (!status.enabled) {
@@ -751,6 +769,13 @@ export { resolveConfig, DEFAULT_ENDPOINT, ENV } from './config.js'
 export { foldRecord, toWireRecord, toTokenUsage, type BillingRecord, type FoldIdentity } from './fold.js'
 export { Outbox, type OutboxStats } from './outbox.js'
 export { Reporter, resolveOutboxDir, type ReporterStats } from './reporter.js'
+export {
+  reportPaths,
+  reportOutboxDir,
+  reportBackfillDir,
+  type PathConfig,
+  type PathInput,
+} from './paths.js'
 export { queryUsage, formatUsage, TOOL_DIMENSIONS, type UsageQuery, type UsageResult } from './stats.js'
 export {
   installUiRoute,

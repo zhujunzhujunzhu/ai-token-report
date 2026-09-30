@@ -15,7 +15,7 @@ test('会话根目录是联接时，监听真实目录但增量路径保持调�
   const sessionsRoot = join(root, 'alias-sessions')
   mkdirSync(target)
   symlinkSync(target, sessionsRoot, process.platform === 'win32' ? 'junction' : 'dir')
-  const ctx: StatsContext = { config: { localDb: true }, sessionsRoot, dbPath: join(root, 'usage.sqlite'), backgroundQueries: true }
+  const ctx: StatsContext = { config: { localDb: true }, sessionsRoots: [sessionsRoot], dbPath: join(root, 'usage.sqlite'), backgroundQueries: true }
   try {
     expect((await queryUsage(ctx, { summaryOnly: true })).totals.calls).toBe(0)
     const dir = join(target, 'project/session')
@@ -39,7 +39,7 @@ test('会话根目录是联接时，监听真实目录但增量路径保持调�
 
 test('Worker 超时拒绝排队请求，下一次查询可以重建线程', async () => {
   const root = mkdtempSync(join(tmpdir(), 'atr-worker-timeout-'))
-  const ctx: StatsContext = { config: { localDb: true }, sessionsRoot: join(root, 'sessions'),
+  const ctx: StatsContext = { config: { localDb: true }, sessionsRoots: [join(root, 'sessions')],
     dbPath: join(root, 'usage.sqlite'), backgroundQueries: true, queryTimeoutMs: 1 }
   try {
     const pending = await Promise.allSettled([
@@ -63,7 +63,7 @@ test('真实 Worker 支持摘要、精确分页、手动追加刷新及外部写
   const root = mkdtempSync(join(tmpdir(), 'atr-worker-test-'))
   const sessionsRoot = join(root, 'sessions')
   const dbPath = join(root, 'usage.sqlite')
-  const ctx: StatsContext = { config: { localDb: true }, sessionsRoot, dbPath, backgroundQueries: true }
+  const ctx: StatsContext = { config: { localDb: true }, sessionsRoots: [sessionsRoot], dbPath, backgroundQueries: true }
   const time = new Date(2026, 8, 25, 12).getTime()
   const frame = (seq: number) => zstdCompressSync(Buffer.from(JSON.stringify({ type: 'assistant/message', seq, time,
     data: { usage: { inputTokens: 10, outputTokens: 2, cacheReadTokens: 90, cacheWriteTokens: 3 },

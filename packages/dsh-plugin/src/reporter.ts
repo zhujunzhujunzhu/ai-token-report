@@ -21,15 +21,14 @@
  *   **绝不让上报失败影响 agent loop**。
  */
 
-import { join } from 'node:path'
 import { setImmediate as yieldToHost } from 'node:timers/promises'
 
 import { SCHEMA_VERSION, type IngestResponse } from '@ai-token-report/shared'
-import { resolveDshHome } from '@ai-token-report/core'
 
 import type { EffectiveConfig } from './config.js'
 import { toWireRecord, type BillingRecord, type FoldIdentity } from './fold.js'
 import { Outbox, type OutboxStats } from './outbox.js'
+import { reportOutboxDir } from './paths.js'
 import type { ReportAttempt } from './report-log.js'
 
 /** 给一次编码/请求设硬边界；低于服务端 32 MiB 上限，并限制宿主的同步工作片段。 */
@@ -138,10 +137,9 @@ export type ReporterPreview =
   | { ok: true; body: string; records: number; source: 'queue' | 'outbox' }
   | { ok: false; reason: string }
 
-/** outbox 目录：默认与身份文件同级，便于「一键清理这台机器的插件数据」。 */
+/** outbox 目录：默认与身份文件同级（= 数据目录），便于「一键清理这台机器的插件数据」。 */
 export function resolveOutboxDir(config: EffectiveConfig): string {
-  if (config.outbox.dir) return config.outbox.dir
-  return join(resolveDshHome(config.dshHome), 'token-report', 'outbox')
+  return reportOutboxDir(config)
 }
 
 /** 把任意异常转成一句话（**不包含请求头，因此不会泄漏 appKey**）。 */

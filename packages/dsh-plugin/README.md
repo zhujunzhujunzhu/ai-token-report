@@ -58,7 +58,7 @@ dsh plugin --profile web add dsh-plugin-token-report@latest
 dsh --profile web --no-open
 ```
 
-选择工作区后，输入框上方会出现用量条（**0.3.0 起这是默认位置**）。想让面板改到会话标题栏右上角、或两个位置都要，见上方「调整面板位置」。安装后无需单独启动本地统计网页。
+选择工作区后，输入框上方会出现用量条（**0.3.0 起这是默认位置**）。想让面板改到会话标题栏右上角、或两个位置都要，见下方「调整面板位置」。安装后无需单独启动本地统计网页。
 
 > `dsh plugin` 内部调用宿主自己的包管理器。上面的安装命令用于 DSH profile；本仓开发、构建与发布使用 Bun。
 
@@ -70,6 +70,33 @@ dsh --profile web --no-open
    有新采集时按宿主缓存节奏（最多 30 秒）自动更新；切回前台标签页会立刻取一次。
 
 **仅查看本机统计不需要署名。未署名时，插件不采集上报事件，也不上报。** 页面读取的是 DSH 已有的本机会话日志。
+
+### 多套 DSH 并存（DSH Desktop / 命令行 / 第三方客户端）
+
+一台机器上同时装着多套 DSH 时（命令行版 `~/.dsh`、DSH Desktop 的 `%APPDATA%\dsh-desktop\harness`……），
+插件缺省把**它们的会话日志一起统计**。发现是**结构驱动**的 —— 候选目录里只有**真的有 `sessions` 子目录**
+的才算一个根 —— 所以面板上的数字是多套 DSH 的**并集**，接入新的第三方客户端不需要改配置。
+
+两套 DSH 的会话经常互为镜像（同一份日志被两边各记一份）。镜像按 `event_id = <sessionId>:<seq>` 去重、
+**只算一次**，所以「并集**小于**各自相加」是正确结果，不是漏扫。启动日志与 `token_usage_diagnostics`
+会逐一列出这次实际读到的根 —— 「我的数据到底读了哪几处」不会只给一个数字。
+
+**署名、连接配置与本地索引库都在同一个「数据目录」里，缺省 `~/.ai-token-report/`，它与会话日志根无关**，
+所以多套 DSH 缺省就共用同一份身份与配置，Desktop 里不会再出现「尚未署名」，**不需要任何配置**：
+
+```
+<数据目录>/identity.json            ← 署名（token 就是 appKey）
+<数据目录>/plugin-connection.json   ← 面板里填的服务端地址 / appKey / 间隔 / 位置
+<数据目录>/usage.sqlite             ← 本地增量索引库（日志的派生物，可删可重建）
+<数据目录>/outbox/                  ← 磁盘 outbox（崩溃不丢数据）
+```
+
+只有两种情况才需要写配置：想**钉住统计范围**（只看其中几处）用 `dshHomes`，
+想**让某套 DSH 单独用一份身份 / 库**用 `dataDir`（对应环境变量 `DSH_TOKEN_REPORT_DSH_HOMES` /
+`DSH_TOKEN_REPORT_DATA_DIR`）；完整清单与排查见源码仓库 README 的 §1.1。
+
+> 🚨 **不要用日志根去达到「分开身份」的目的**：`dshHome` / `dshHomes` 换掉的是**日志来源**，
+> 那会让面板少算另一套 DSH 的会话，而实时上报照常工作 —— 这个错误**不会**以「完全没数据」的形式暴露。
 
 ### 调整面板位置
 
@@ -86,7 +113,7 @@ dsh --profile web --no-open
 | `两处都显示` | 两处都显示 —— 与 0.2.0 的外观一致 |
 
 这一项与下面「部署配置」写的是同一个东西，只是存在本机
-（`$DSH_HOME/token-report/plugin-connection.json`），并且**优先于部署配置**。
+（`<数据目录>/plugin-connection.json`，缺省即 `~/.ai-token-report/`，见上方「多套 DSH 并存」），并且**优先于部署配置**。
 
 **办法二：在 profile 的 `cordis.patch.yml` 里给插件加一段 `ui`** ——
 适合「IT 统一规定全公司都用某个位置」：
@@ -139,9 +166,9 @@ dsh --profile web --no-open
 > 而宿主只保留**请求体**、不保留请求头 —— appKey 走 `Authorization: Bearer`，天然不在这里。
 > 不要为了「方便排查」把请求头加进去：那会把一个调试页变成凭证泄漏面。
 
-身份与连接保存在 `$DSH_HOME/token-report/` 下；默认 DSH_HOME 为 `~/.dsh`。插件与本地 Web 共用身份文件。部署侧固定了身份时，页面会提示配置由管理员管理。
+身份与连接保存在**数据目录**下（缺省 `~/.ai-token-report/`；DSH Desktop 与命令行版**缺省就共用同一份**、不需要任何配置，见上方「多套 DSH 并存」）。插件与本地 Web 共用身份文件。部署侧固定了身份时，页面会提示配置由管理员管理。
 
-启用上报后，插件会在后台扫描 `$DSH_HOME/sessions` 下的**全部历史会话**，分批补报用量，直到服务器全部确认收到；不需要逐个打开旧会话。实时新用量同时上报，服务端按事件 ID 去重。断网或退出后，下次启动会继续；更换服务端地址或 appKey 后，会向新连接重新全量补报。
+启用上报后，插件会在后台扫描**上面那些会话日志根**（缺省是本机全部 DSH）下的**全部历史会话**，分批补报用量，直到服务器全部确认收到；不需要逐个打开旧会话。实时新用量同时上报，服务端按事件 ID 去重。断网或退出后，下次启动会继续；更换服务端地址或 appKey 后，会向新连接重新全量补报。
 
 历史补报只发送 token 数值、模型和会话归属等统计字段，不发送对话正文。`token_usage_diagnostics` 会显示历史扫描进度、服务器确认数、重试错误和最近完成时间。对照本地与部门看板时，请选择相同时间范围并筛选 appKey 对应人员。
 
@@ -166,6 +193,7 @@ DSH 升级会保留旧格式日志作为备份；同一会话存在多个规范�
 | 界面统计 | 用量条与标题栏入口（挂哪几个由 `ui.position` 决定，默认只挂输入框上方），共用详情面板 |
 | 时间分析 | 预设周期、双月日历、自定义范围、趋势切换 |
 | 明细分析 | 模型 / 服务商 / 项目 / 会话分组，展开与分页 |
+| 多套 DSH 并集 | 缺省统计本机全部 DSH 的会话日志（互为镜像的会话按 event_id 去重，只算一次） |
 | 本地增量查询 | SQLite 增量索引；库不可用时自动回退日志扫描并提示 |
 | 上报连接 | 面板内填服务端地址 + appKey，验证后**立即生效**（无需重启） |
 | 上报偏好 | 面板内选上报间隔与面板位置；只改偏好时不必重填 appKey，保存后即时生效 |
@@ -180,6 +208,46 @@ DSH 升级会保留旧格式日志作为备份；同一会话存在多个规范�
 
 从旧版升级时，重新运行上方带 `@latest` 的安装命令即可安装最新稳定版。若曾源码直挂或手动 `insert`，先执行下方离线修复，再重启 DSH。
 
+> **从 0.5.0（或更早）升到 0.6.0 时，数据目录换了位置，需要手动搬一次家** —— 见下一节。
+> 0.5.0 的下一个公开版本就是 0.6.0，中间没有需要单独安装的版本。
+
+### 🚨 0.6.0 数据目录位置变更：升级必须搬一次家
+
+**这是升级到 0.6.0 唯一需要动手的地方。** 数据目录（署名 / 连接配置 / 本地索引库 / outbox / 补报水位）
+的缺省位置从 `<DSH home>/token-report`（通常是 `~/.dsh/token-report`）改为 `~/.ai-token-report`，
+**旧目录不会被自动迁移，也不会报错**：
+
+| 现象 | 原因 |
+|---|---|
+| 面板回到「尚未署名」、要求重新填 appKey | 署名与连接配置还留在旧目录里 |
+| 面板数字变了（历史少了一块） | 新目录里没有索引库；日志仍在，重扫即可恢复 |
+| 磁盘 outbox 里没发完的批留在了旧目录 | 待投递数据不会自己搬过来 |
+
+先把该 profile 的 DSH 停掉，再搬（**只做移动，不删除任何东西**）：
+
+```powershell
+# Windows PowerShell —— 换过 DSH_HOME 的话，按实际路径替换 $old
+$old = "$env:USERPROFILE\.dsh\token-report"
+$new = "$env:USERPROFILE\.ai-token-report"
+New-Item -ItemType Directory -Force $new | Out-Null
+Get-ChildItem -Force $old | Move-Item -Destination $new -Force
+```
+
+```bash
+# macOS / Linux
+old=~/.dsh/token-report; new=~/.ai-token-report
+mkdir -p "$new" && mv "$old"/* "$new"/
+```
+
+若新目录里已经有同名条目（例如升级后已经跑过一次 DSH、新的空 `outbox/` 已建），
+`Move-Item -Force` 对**已存在的目录**仍会报错 —— 那种情况先把新目录里的空 `outbox` 删掉，
+或者只搬 `identity.json`、`plugin-connection.json`、`state.json`、`backfill` 这几项
+（`usage.sqlite` 可留可删，它是日志的派生物）。
+
+搬完核对：新目录里应当能看到 `identity.json` 与 `plugin-connection.json`；重启 DSH 后面板不再要求重新署名。
+想确认生效位置，打开「配置」→「上报调试」——诊断文本会同时打印**会话日志根**与**数据目录**。
+CLI（`dsh-token-report`）与本插件共用同一个数据目录，所以搬一次两边都恢复。
+
 ### 0.3.0 启动报 duplicate loader entry id: token-report
 
 插件树里重复挂载了相同 ID，Loader 在插件代码执行前就会失败。仅升级 JS 文件不能清理旧 profile。0.3.1 随包提供离线修复工具；先停止该 profile 的 DSH，再在 Windows PowerShell 运行：
@@ -191,7 +259,7 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 
 设置过 `DSH_HOME` 时，把上面的 `USERPROFILE/.dsh` 路径替换成实际 DSH_HOME。第一条只检查，需修复时退出码为 1；第二条先备份，再修改。工具去掉重复 bundle 和旧源码包依赖，把插件 `insert` 转成 ID 配置覆盖；保留其它插件、原配置与 `!!js` 表达式。YAML 注释在原文备份中保留。
 
-终端会打印备份目录（`$DSH_HOME/token-report/plugin-backups/repair-*`）。遇到配置冲突、其它插件占用 ID，或全局 `$DSH_HOME/cordis.patch.yml` 仍重复插入时拒绝写入，需人工合并。不要删除整个 profile、身份文件、数据库或 outbox。修复后重新运行 `dsh web`。
+终端会打印备份目录（`<dataDir>/plugin-backups/repair-*`，缺省 `~/.ai-token-report/plugin-backups/repair-*`）。遇到配置冲突、其它插件占用 ID，或全局 `$DSH_HOME/cordis.patch.yml` 仍重复插入时拒绝写入，需人工合并。不要删除整个 profile、身份文件、数据库或 outbox。修复后重新运行 `dsh web`。
 
 尚未升级时，也可单独复制仓库构建出的 `repair-profile.mjs` 到故障电脑，用同样参数运行，无需启动 DSH。
 
@@ -209,6 +277,7 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 | 首次统计较慢 | 等待首次索引完成；如显示降级，检查 SQLite 权限与宿主 Node 版本 |
 | 团队看板没有数据 | 先看配置页「上报调试」页签：它会直接说「未上报及原因」并列出最近请求与回执；再用 `token_usage_diagnostics` 看补报进度 |
 | 改完配置没生效 | 0.6.0 起保存即生效（页面会回报状态）。若显示「需重启 DSH」，说明宿主没提供热生效入口（旧版本宿主），重启即可 |
+| 升级后面板要求重新署名 / 数字少了一块 | 数据目录换了位置，旧目录要搬一次家 —— 见上方「0.6.0 数据目录位置变更」 |
 
 源码与开发文档见 [GitHub 仓库](https://github.com/zhujunzhujunzhu/ai-token-report/tree/main/packages/dsh-plugin)。
 
@@ -257,7 +326,7 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 
     outbox:
       enabled: true                 # 磁盘 outbox（崩溃不丢）。默认开
-      dir: ~/.dsh/token-report/outbox
+      dir: ~/.ai-token-report/outbox
       maxBytes: 33554432            # 超限丢**最旧**的批并告警
 
     features:
@@ -273,13 +342,32 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 
     localDb: true                   # 默认增量 SQLite，见 §5
 
+    # ── 目录（缺省值都对，一般不用写）────────────────────────────
+    # 会话日志根：缺省**自动发现**本机所有 DSH（$DSH_HOME + ~/.dsh + 各平台客户端目录），
+    # 候选必须是**真的有 sessions 子目录**的目录；多个 home 的用量按**并集**统计
+    # （互为镜像的会话按 event_id 自动去重）。一般不要动，想钉住范围时才显式写：
+    # dshHomes:                     # 数组；给了它就**不再**自动发现
+    #   - ~/.dsh
+    #   - ~/AppData/Roaming/dsh-desktop/harness
+    # 单个根也可以写 dshHome；关掉自动发现（回到「只跟 $DSH_HOME」）：DSH_TOKEN_REPORT_DISCOVER=0
+    #
+    # ★ token-report 自己的数据目录（身份 / 连接偏好 / 本地库 / outbox / 补报水位）。
+    #   缺省 ~/.ai-token-report（**与会话日志根无关**），也可用 DSH_TOKEN_REPORT_DATA_DIR 覆盖。
+    #   因为不跟随各自的 home，DSH Desktop 与命令行版 DSH **缺省就共用同一份身份**，
+    #   不需要写这一项。想「各用一套」时才显式给 —— 改日志根会连会话日志来源一起换掉，见下一节。
+    # dataDir: ~/.dsh/token-report            # 例：只让这套 DSH 用它（不跟随新缺省）
+
     # ── 身份（选填）─────────────────────────────────────────────
-    # 留空则读 $DSH_HOME/token-report/identity.json（员工自己在本地页填的那份）
+    # 留空则读 <数据目录>/identity.json（员工自己在本地页填的那份）
     # user:
     #   name: 张三
     #   token: atr-zhangsan-9f3c
     #   group: 研发一部
 ```
+
+> `dshHome` / `dshHomes` / `dataDir` 都支持 `~` 展开（`~/.dsh` 会展开成真实家目录），
+> 空白字符串一律视为「没配」，`dshHomes` 数组里的非法项（非字符串、空串）会被丢掉而不是让 DSH 起不来。
+> 相对路径按**启动时的工作目录**绝对化。
 
 ### 取值的优先级
 
@@ -302,6 +390,10 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 | `DSH_TOKEN_REPORT_OUTBOX_MAX_BYTES` | `outbox.maxBytes` |
 | `DSH_TOKEN_REPORT_LOCAL_DB` | `localDb` |
 | `DSH_TOKEN_REPORT_UI_POSITION` | `ui.position`（`dock` / `header` / `both`） |
+| `DSH_TOKEN_REPORT_DATA_DIR` | `dataDir`（数据目录；`~` 会展开） |
+| `DSH_TOKEN_REPORT_DSH_HOMES` | `dshHomes`（多个**会话日志根**，按系统路径分隔符分隔：Windows `;` / macOS·Linux `:`） |
+| `DSH_HOME` | `dshHome`（**单个**会话日志根；显式 `dshHomes` 优先） |
+| `DSH_TOKEN_REPORT_DISCOVER` | 自动发现开关（`0`/`false`/`no` 关掉，回到「只跟 `$DSH_HOME`」） |
 | `DSH_TOKEN_REPORT_USER_NAME` | `user.name` |
 | `DSH_TOKEN_REPORT_USER_TOKEN` | `user.token` |
 | `DSH_TOKEN_REPORT_GROUP` | `user.group` |
@@ -330,6 +422,112 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 | `features.*` | 全 `true`（含 `ui`） |
 | `ui.position` | `dock`（输入框上方的用量条） |
 | `localDb` | `true` |
+| `dshHomes` | **自动发现**到的全部 DSH home（数组；显式给出时不再发现）——「会话日志根」 |
+| `dshHome` | `$DSH_HOME`，再缺省 `~/.dsh`（**单个**会话日志根；`dshHomes` 非空时被它盖过） |
+| `dataDir` | `~/.ai-token-report`（**数据目录**；与会话日志根无关，可用 `DSH_TOKEN_REPORT_DATA_DIR` 覆盖） |
+
+---
+
+## 1.1 多套 DSH 并存（DSH Desktop / 自定义 DSH_HOME / 第三方客户端）
+
+一台机器上同时装着多套 DSH 时，它们的 home 不是一个目录：
+
+| | home | 会话日志 |
+|---|---|---|
+| 命令行版 | `~/.dsh`（或 `$DSH_HOME`） | `~/.dsh/sessions` |
+| DSH Desktop | `%APPDATA%\dsh-desktop\harness`（Windows；macOS 为 `~/Library/Application Support/dsh-desktop/harness`） | 同一个 home 下的 `sessions/` |
+| 第三方客户端 | 各自的应用数据目录（如 `%APPDATA%\dsh-desktop`）及其 `harness` 子目录 | 同上 |
+
+**插件缺省把本机所有 DSH 的会话日志一起统计。** 发现是**结构驱动**的，不是硬编码目录清单：
+候选 = `$DSH_HOME` + `~/.dsh` + `~/.dsh*` + 各平台应用数据目录下名字以 `dsh` 开头的目录
+及其 `<目录>/harness`，并且**只有真的有 `sessions` 子目录**才算一个根（名字不像 DSH 客户端、
+但结构像的目录只会被提示，绝不自动采用）。所以面板上的数字是**并集** ——
+桌面端与命令行端的会话都在里面，接入新的第三方客户端也不需要改配置。
+
+两套 DSH 的会话经常互为镜像（同一份日志被两边各记一份）。镜像按
+`event_id = <sessionId>:<seq>` 去重、**只算一次**，因此「并集 **小于** 各自相加」是正确结果，
+不是漏扫。本机实测：两个 home 共 254 个会话（不是 478）。
+
+「到底读了哪几处」是**可见**的，不会只给你一个数字：插件诊断文本列出全部根；
+`dsh-token stats --discover` 逐个候选打印会话数与最新写入；**本地页面**（`dsh-token --web`）
+在指标卡下方显示「数据来源：N 个 DSH 的会话日志，按并集统计」，配了但**不存在**的根
+会在那里显式告警 —— 这正是区分「镜像去重」（正常）与「那个根根本没读到」（bug）的唯一办法。
+
+想**只看其中几处**时显式列出（给了 `dshHomes` 就**不再**自动发现）：
+
+```yaml
+# %APPDATA%\dsh-desktop\harness\profiles\web\cordis.patch.yml
+- id: token-report
+  config:
+    dshHomes:
+      - ~/.dsh
+      - ~/AppData/Roaming/dsh-desktop/harness
+```
+
+也可以走环境变量 `DSH_TOKEN_REPORT_DSH_HOMES`（分隔符见上一节）。
+想**关掉自动发现**、回到「只跟正在跑的这个 DSH 的 `$DSH_HOME`」：`DSH_TOKEN_REPORT_DISCOVER=0`
+（CLI 上的 `--discover` 是**打印**发现结果的诊断命令，不是开关）。
+
+而**身份与本地库的默认位置与日志根无关**：`dataDir` 缺省 **`~/.ai-token-report`**
+（家目录下，见上一节默认值表），于是一个用户下的多套 DSH **天然共用同一份身份、
+`plugin-connection.json` 与本地库**，Desktop 里不会再出现「尚未署名」，**不需要任何配置**。
+
+想**刻意分开**（例：只让 Desktop 用另一份身份）时才显式写 `dataDir`：
+
+```yaml
+# %APPDATA%\dsh-desktop\harness\profiles\web\cordis.patch.yml
+- id: token-report
+  config:
+    dataDir: ~/.dsh/token-report   # 例：只让这套 DSH 用它，不跟随新缺省
+```
+
+等效的环境变量是 `DSH_TOKEN_REPORT_DATA_DIR`（`~` 会展开，见上一节「取值的优先级」）。
+
+### 🚨 不要用会话日志根来达到这个目的
+
+`dshHome` / `dshHomes` 是**会话日志根**，不是数据目录。把日志根指到 `~/.dsh` 会连日志来源一起换掉：
+
+| 现象 | 原因 |
+|---|---|
+| Desktop 面板上的用量「看起来少了」 | 面板改读 `~/.dsh/sessions`，Desktop 自己的会话不再计入 |
+| 历史补报不再覆盖 Desktop 的历史 | 补报同样只扫配置里的日志根 |
+| 实时上报仍然正常 | 它只依赖当前会话的事件，与日志根无关 —— **所以这个错误不会以「完全没数据」的形式暴露** |
+
+一句话：**共用身份 → 缺省已经做好了，什么都不用写；想换一份数据目录 → 才写 `dataDir`（或 `DSH_TOKEN_REPORT_DATA_DIR`）；想换统计范围（多套 DSH 一起算、或只看其中几处）→ 才写 `dshHomes`**。
+
+### 两个目录分别是什么
+
+```
+<会话日志根>/sessions/                   ← 会话日志（只读，统计与历史补报的来源；**不在数据目录里**）
+                                          （通常是好几个根：`~/.dsh`、Desktop 的 harness……按并集统计）
+<dataDir>/identity.json                  ← 署名（token 就是 appKey）
+<dataDir>/plugin-connection.json         ← 面板里填的服务端地址 / appKey / 间隔 / 位置
+<dataDir>/usage.sqlite                   ← 本地增量库（日志的派生物，可删可重建）
+<dataDir>/portal.sqlite                  ← 上报库（只有在这台机器跑部门服务端时才存在；**唯一副本，绝不删**）
+<dataDir>/state.json                     ← CLI 上报水位与 pending
+<dataDir>/outbox/                        ← 磁盘 outbox（崩溃不丢数据）
+<dataDir>/backfill/<scope>/              ← 历史补报水位
+<dataDir>/plugin-backups/repair-*/       ← 修 profile 时的备份（`repair-profile.mjs` 会打印路径）
+```
+
+`dataDir` 也可以在设置页「上报调试」里看到（诊断文本会同时打印**会话日志根**与**数据目录**，
+并在 `dataDir` 是显式配置时标注出来）—— 「我的身份到底被读到哪去了」看这两行。
+
+> 🚨 **从旧版本升级：旧目录要一次性搬家。** 旧缺省是 `<dshHome>/token-report`（通常是
+> `~/.dsh/token-report`），新缺省指向一个**空目录**，而旧目录**不会自动迁移**。
+> 表现**不是报错**，而是「身份不见了」「面板数字变了」—— 数据其实还在旧目录里躺着。
+> 仓内脚本（先干跑；停掉所有 DSH / 服务端进程后再 `--apply`；它不删除任何东西）：
+>
+> ```bash
+> bun run scripts/migrate-data-dir.ts          # 干跑：只列出将要移动的条目
+> bun run scripts/migrate-data-dir.ts --apply  # 真正搬家
+> ```
+
+> ⚠️ 两个 DSH **同时运行**且共用同一个 `dataDir` 时，`usage.sqlite` 与 `outbox/`
+> 会被两个进程轮流写。SQLite 是 WAL，写入会串行化、失败会降级成直扫日志；
+> outbox 的重复投递由服务端 `event_id` 幂等吸收。**不会丢数据，但会有重复请求**。
+> 约定俗成：让其中一个 DSH 常驻时，把 `dataDir` 指到共享目录即可；
+> 只想「别让我再填一次 appKey」时，共用 `dataDir` 也是最省事的做法。
 
 ---
 
@@ -350,8 +548,10 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 ```bash
 bun install
 bun run --filter '@ai-token-report/dsh-plugin' build
-# → packages/dsh-plugin/lib/index.js   宿主半（约 75 KB，Node 侧）
-#    packages/dsh-plugin/lib/client.js  浏览器半（约 26 KB，包在 __ModuleLoader__ 信封里）
+# → packages/dsh-plugin/lib/index.js   宿主半（约 212 KB，Node 侧）
+#    packages/dsh-plugin/lib/client.js  浏览器半（约 331 KB，包在 __ModuleLoader__ 信封里）；
+#                                       体积主要是内联的 Chart.js 与 React DayPicker
+#    lib/stats-worker.js / lib/backfill-worker.js  统计与补报线程（各约 116 / 73 KB）
 #
 # ⚠️ 构建**不能**加 --external '@ai-token-report/*'：
 #   本仓 workspace 包的 main 指向 src/index.ts（Bun 能直接吃，Node 不能），
@@ -461,7 +661,7 @@ dsh --profile web --no-open
 ```
 
 启动成功会打印 `dsh web: http://127.0.0.1:<port>/?token=...`。
-插件启用时还会在 `$DSH_HOME/token-report/` 下**创建 `outbox/` 目录** ——
+插件启用时还会在**数据目录**下**创建 `outbox/` 目录**（缺省 `~/.ai-token-report/outbox`）——
 这是「后端真的构造了」最直接的证据（未启用时不会建）。
 
 装对了的话，**界面上会直接看到用量面板**。挂哪几个由 `ui.position` 决定，
@@ -680,7 +880,7 @@ DSH 的 web 服务器**不做任何鉴权**（`dsh-host-webserver` 的文档明�
 **appKey 留空且地址没变 = 只更新间隔与位置**（不重校验、不重写身份文件）——
 那串密钥往往已经不在用户手边，只改偏好不该逼他再粘一次。
 未填 appKey 时仍可看本机统计，但不采集、不上报；已保存的 appKey 不回显。
-署名与本地 Web 共用 `$DSH_HOME/token-report/identity.json`（`token` 就是这串 appKey），
+署名与本地 Web 共用**数据目录**下的 `identity.json`（缺省 `~/.ai-token-report/identity.json`；`token` 就是这串 appKey），
 连接与偏好保存到同目录的 `plugin-connection.json`（原子写入、0600）。
 用户保存的连接优先于部署默认连接；配置了固定 `user` 时页面只读。
 
@@ -1010,7 +1210,7 @@ bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败
 | 启动日志说「尚未署名」 | 没有身份文件 | 跑 `dsh-token --web` 在页面里填，或配 `config.user` |
 | 启动日志说「未配置上报凭证」 | 没配 `appKey` | 配 `appKey` 或 `DSH_TOKEN_REPORT_APP_KEY` |
 | 看板上没有我的数据 | 凭证过期 / 地址改了 / outbox 满 | 先看配置页「上报调试」页签（状态 + 原因 + 最近请求与回执），再跑 `token_usage_diagnostics` 看 `lastError` 与 `磁盘待投递` |
-| `$DSH_HOME/token-report/outbox` 目录不存在 | 上报后端从未构造（未署名 / 没 appKey / `features.reporting: false`） | 看启动日志给的原因；这是**预期行为**不是故障 |
+| 数据目录下（缺省 `~/.ai-token-report/outbox`）目录不存在 | 上报后端从未构造（未署名 / 没 appKey / `features.reporting: false`） | 看启动日志给的原因；这是**预期行为**不是故障 |
 | 工具报的数比看板少 | 正常 —— 看板是服务端累计，工具只看本机日志 | 用 `period` 对齐时间窗 |
 | 统计很慢（10s+） | 走了直扫路径 | 确认 `localDb` 与宿主运行时；`source` 字段会如实标注 |
 | 界面没有用量面板 | 用的不是 web profile，或 `features.ui: false`，或浏览器半没被加载 | 见 §2.4 的三行对照表；启动日志会说明「数据通道已挂载」还是「宿主不提供 connection」 |
