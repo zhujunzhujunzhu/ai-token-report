@@ -37,11 +37,22 @@ function rng(seed: number): () => number {
   }
 }
 
+/**
+ * 供应商与模型：**按线上实测形态配**（2026-10-01 盘点：7 个供应商 / 19 个模型，
+ * 且两个模型吃掉 94% 的量）。
+ *
+ * 🚨 这份清单直接决定汇总表的行数 —— 汇总表的体积只由**维度基数**决定，
+ *   所以「用两个假模型造数」会把汇总表测小一个数量级。
+ */
 const PROVIDERS = [
-  { provider: 'deepseek-official', models: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-coder'] },
+  // 两个主力模型占 94%（线上实测 deepseek-v4.1-flash 54% + deepseek-flash 40%）
+  { provider: 'deepseek-official', models: ['deepseek-v4.1-flash', 'deepseek-v4.1-flash', 'deepseek-v4.1-flash', 'deepseek-flash', 'deepseek-flash', 'deepseek-v4-pro'] },
   { provider: 'dashscope', models: ['qwen-max', 'qwen-plus', 'qwen-turbo'] },
-  { provider: 'volcengine', models: ['doubao-pro', 'doubao-lite', 'doubao-1.5'] },
-  { provider: 'openai', models: ['gpt-4o', 'gpt-4o-mini', 'o3-mini'] },
+  { provider: 'volcengine', models: ['doubao-pro', 'doubao-lite'] },
+  { provider: 'openai', models: ['gpt-5.6-sol', 'gpt-5.6-mini'] },
+  { provider: 'moonshot', models: ['kimi-k3', 'kimi-k2'] },
+  { provider: 'zhipu', models: ['glm-5', 'glm-4.6'] },
+  { provider: 'baidu', models: ['ernie-5', 'ernie-speed'] },
 ]
 
 export interface SeedOptions {

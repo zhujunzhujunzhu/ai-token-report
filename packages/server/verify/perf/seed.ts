@@ -119,11 +119,28 @@ if (!existsSync(statePath(scale))) {
     const rolesRes = await fetch(`${server.url}/api/v1/admin/roles`, { headers: { Authorization: `Bearer ${adminToken}` } })
     const roles = await rolesRes.json() as { roles: { role_id: string; code: string }[] }
     const memberRole = roles.roles.find((role) => role.code === 'member')!
+    /**
+     * 先建一个分组，再在**建人时**就把 `group_ids` 带上。
+     *
+     * 为什么要造：`by=group` 与「按分组筛选」在**没有任何关联行**时走的是
+     * 子查询返回空集的最快路径 —— 拿空分组去测「分组排行」会得到一个
+     * 与真实负载无关的好数字。
+     * ⚠️ `group_ids` 只在 `admin/members`（创建）与 `admin/members/update`（全量替换）
+     *   上接受，**没有**独立的「加人进组」端点 —— 建完再一个个加会多打 300 次请求。
+     */
+    const groupRes = await fetch(`${server.url}/api/v1/admin/groups`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${adminToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: '性能造数分组' }),
+    })
+    const groupBody = await groupRes.json() as { ok?: boolean; group?: { group_id: string }; reason?: string }
+    const groupId = groupBody.group?.group_id
+    if (!groupId) throw new Error(`建分组失败：${groupBody.reason ?? groupRes.status}`)
     for (let index = 0; index < members; index++) {
       const res = await fetch(`${server.url}/api/v1/admin/members`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${adminToken}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: `${PREFIX}${index}`, role_ids: [memberRole.role_id] }),
+        body: JSON.stringify({ name: `${PREFIX}${index}`, role_ids: [memberRole.role_id], group_ids: [groupId] }),
       })
       const body = await res.json() as { ok: boolean; member?: { member_id: string }; reason?: string }
       if (!body.ok || !body.member) throw new Error(`建人员失败：${body.reason ?? res.status}`)
@@ -135,7 +152,7 @@ if (!existsSync(statePath(scale))) {
       const key = await keyRes.json() as { ok: boolean; token_secret?: string; reason?: string }
       if (!key.ok || !key.token_secret) throw new Error(`签发 appKey 失败：${key.reason ?? keyRes.status}`)
       created.push({ memberId: body.member.member_id, tokenId: '', token: key.token_secret })
-      if ((index + 1) % 50 === 0) console.log(`  身份 ${index + 1}/${members}`)
+      if ((index + 1) % 50 === 0) console.log(`  身份 ${index + 1}/${members}（已挂进 1 个分组）`)
     }
   } finally {
     await server.stop()
