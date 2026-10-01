@@ -232,23 +232,42 @@ test('v5 运行时 SQL 与设计契约逐字一致，v4 基线仍逐字冻结', 
   expect(PORTAL_SQLITE_V4_SQL).toBe(readFileSync(join(repoRoot, 'docs/database-v4/schema.sqlite.sql'), 'utf8'))
   expect(PORTAL_MYSQL_V4_SQL).toBe(readFileSync(join(repoRoot, 'docs/database-v4/schema.mysql.sql'), 'utf8'))
 })
-test('SQLite 新库 v7、FULL、21 表及旧诊断表', async () => {
+test('SQLite 新库 v8、FULL、25 表及旧诊断表', async () => {
   const t = target()
   const info = await preparePortalDatabase(t)
   expect(info.status).toBe('current')
   expect(info.version).toBe(PORTAL_SCHEMA_VERSION)
-  // ★ v7 = v6 的 20 张表 + 模型单价表 model_price（实跑确认，不是照抄文档）。
-  expect(info.tables.length).toBe(21)
+  // ★ v8 = v7 的 21 张表 + 三张汇总表 + 汇总元数据表（实跑确认，不是照抄文档）。
+  expect(info.tables.length).toBe(25)
   expect(info.tables).toContain('member_groups')
   expect(info.tables).toContain('member_group_assignments')
   expect(info.tables).toContain('provider_alias')
   expect(info.tables).toContain('model_price')
+  // ★ v8：汇总表是**性能设施**，四张表必须一起到位（查询层按它们是否存在决定路由）。
+  expect(info.tables).toContain('usage_rollup_day')
+  expect(info.tables).toContain('usage_rollup_hour')
+  expect(info.tables).toContain('usage_rollup_hod')
+  expect(info.tables).toContain('usage_rollup_meta')
   expect(info.tables).not.toContain('departments')
   const store = await openPortalStore(t)
   expect(await store.get<Record<string, unknown>>('PRAGMA synchronous')).toEqual({ synchronous: 2 })
   expect(await store.get<Record<string, unknown>>('SELECT initialized_at_ms FROM portal_identity_state')).toEqual({ initialized_at_ms: null })
   await store.close()
   await verifyWrites(t)
+})
+test('★ v8 汇总表建好即空、且建表不改任何事实表（迁移只增表）', async () => {
+  const t = target()
+  await preparePortalDatabase(t)
+  // 先落两条真实事件：纯追加迁移必须**一条都不改写**。
+  const seed = await openPortalStore(t)
+  try {
+    await insertAttributedRecords(seed, [record('v8:1'), record('v8:2')], { userId: '姓名', userName: '姓名', groupName: '分组快照', ...(await addMember(seed)), receivedAtMs: 1000 })
+    // ★ 迁移建的是**空表**：灌历史归 `syncRollups()`（它要扫全表，不该塞进迁移事务）。
+    for (const table of ['usage_rollup_day', 'usage_rollup_hour', 'usage_rollup_hod', 'usage_rollup_meta']) {
+      const row = await seed.get<{ c: number }>(`SELECT COUNT(*) AS c FROM ${table}`)
+      expect(row?.c, `${table} 迁移后必须是空表`).toBe(0)
+    }
+  } finally { await seed.close() }
 })
 test('SQLite v6 库是可迁移起点：只追加 model_price 与两条权限码，事实表逐位不变', async () => {
   const t = target()

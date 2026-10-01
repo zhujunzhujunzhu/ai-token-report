@@ -23,7 +23,7 @@ import { existsSync, readFileSync, mkdirSync, statSync, writeFileSync } from 'no
 import { dirname, resolve } from 'node:path'
 import type { Database } from './driver.js'
 import { describePortalTarget, openRawPortalStore, type PortalStore, type PortalTarget } from './portal-connection.js'
-import { PORTAL_SCHEMA_VERSION, PORTAL_SQLITE_INGEST_SQL, PORTAL_MYSQL_INGEST_SQL, portalSchemaChecksum, portalSchemaChecksumV6, portalSchemaStatements, portalV6Statements, portalV6TableStatement, portalV7Statements, portalV7TableStatement } from './portal-schema-v5.js'
+import { PORTAL_SCHEMA_VERSION, PORTAL_SQLITE_INGEST_SQL, PORTAL_MYSQL_INGEST_SQL, portalSchemaChecksum, portalSchemaChecksumV6, portalSchemaChecksumV7, portalSchemaStatements, portalV6Statements, portalV6TableStatement, portalV7Statements, portalV7TableStatement, portalV8Statements, portalV8TableStatement, PORTAL_V8_TABLES } from './portal-schema-v5.js'
 import { PORTAL_SQLITE_V4_INGEST_SQL, PORTAL_MYSQL_V4_INGEST_SQL, portalSchemaChecksumV4, portalSchemaStatementsV4 } from './portal-schema-v4.js'
 import { checkExpressions, sameChecks, normalizeTrigger } from './portal-catalog.js'
 
@@ -37,7 +37,7 @@ import { checkExpressions, sameChecks, normalizeTrigger } from './portal-catalog
 const BASELINE_VERSION = 4
 /**
  * v5 的**结构**版本号。它的账本行仍然要能被认出来（那是「基线已就绪」的证据），
- * 而 `PORTAL_SCHEMA_VERSION` 已经是 7。
+ * 而 `PORTAL_SCHEMA_VERSION` 已经是 8。
  */
 const V5_VERSION = 5
 /**
@@ -45,6 +45,13 @@ const V5_VERSION = 5
  * 而 v6 行必须能被认出来 —— 那是「这个库是完整的上一版、可以原地升 v7」的证据。
  */
 const V6_VERSION = 6
+/**
+ * v7 的**结构**版本号（= v5 + provider_alias + model_price）。
+ *
+ * ★ 线上库就是这一版，所以这一行必须存在，否则它会被判成 `unsupported`
+ *   （服务端拒绝启动），而 v8 只是纯追加、一条语句就能升上去。
+ */
+const V7_VERSION = 7
 type SchemaVersion = 4 | 5
 
 export interface PortalInspection {
@@ -110,6 +117,7 @@ async function readPortalState(store: PortalStore): Promise<Omit<PortalInspectio
    */
   const v5Row = await migrationRow(store, tables, V5_VERSION)
   const v6Row = await migrationRow(store, tables, V6_VERSION)
+  const v7Row = await migrationRow(store, tables, V7_VERSION)
   let status: PortalInspection['status'] = 'unsupported'
   if (tables.length === 0 && version === 0) status = 'empty'
   else if (version === 0 && tables.length === 1 && tables[0] === 'portal_schema_migrations' && !current && !baseline) status = 'incomplete'
@@ -128,8 +136,14 @@ async function readPortalState(store: PortalStore): Promise<Omit<PortalInspectio
   //   v6 库会冒充成「结构完好、只差一次追加迁移」，而 v7 是纯追加 ——
   //   它会一路升上去、把手工改动留在库里，且没有任何一步会报错。
   else if (version === V6_VERSION && v6Row?.status === 'completed' && v6Row.checksum === portalSchemaChecksumV6(store.kind) && !current) status = 'legacy'
-  // v5/v6/v7 账本存在但 checksum 不符（程序换了 SQL 或库被改过）会落到 'unsupported'，绝不冒充 current。
-  return { kind: store.kind, label: store.label, version, status, tables, migration: current ?? v6Row ?? v5Row ?? baseline }
+  // ★ v7：结构 = v5 + provider_alias + model_price，但受控 DDL 已经追加了汇总表。
+  //   与 v6 同理，额外比对**冻结的 v7 摘要**：只有「确实是本程序发布出去的那一版 v7」
+  //   才放行。少了它，一个被手工改过结构的 v7 库会冒充成「只差一次追加迁移」，
+  //   而 v8 是纯追加 —— 它会一路升上去、把手工改动留在库里，且没有任何一步会报错。
+  //   ⚠️ 线上库正是 v7，这一条决定它能不能启动。
+  else if (version === V7_VERSION && v7Row?.status === 'completed' && v7Row.checksum === portalSchemaChecksumV7(store.kind) && !current) status = 'legacy'
+  // v5/v6/v7/v8 账本存在但 checksum 不符（程序换了 SQL 或库被改过）会落到 'unsupported'，绝不冒充 current。
+  return { kind: store.kind, label: store.label, version, status, tables, migration: current ?? v7Row ?? v6Row ?? v5Row ?? baseline }
 }
 async function inspectStore(store: PortalStore): Promise<PortalInspection> {
   const state = await readPortalState(store)
@@ -903,6 +917,11 @@ async function upgradeV4ToV5(store: PortalStore, target: PortalTarget, options: 
     // 放在这里是为了让「全部结构追加」集中在重建之前 —— 重建期间
     // `PRAGMA foreign_key_check` 会扫描**所有**表，新表越早到位越好核对。
     await upgradeV6ToV7(store)
+    // v8 建的是三张汇总表 + 元数据表，**不引用任何既有表**（刻意不加外键），
+    // 所以同样放在 v5 重建之前。⚠️ 这里只**建表**，不灌数据 ——
+    // 灌历史要扫全表（300 万行实测 41s），迁移不该把它算进事务里；
+    // 首次补齐由业务启动时的 `syncRollups()` 负责（可中断、可重试、不阻塞迁移）。
+    await upgradeV7ToV8(store)
     if (!v5Ready) {
       if (kind === 'sqlite') await runV5Sqlite(store)
       else await runV5Mysql(store)
@@ -994,6 +1013,37 @@ async function upgradeV6ToV7(store: PortalStore): Promise<void> {
   await verifyTable(store, 'model_price', table)
   for (const sql of portalV7Statements(store.kind)) {
     if (sql.startsWith('INSERT')) await store.exec(sql)
+  }
+}
+
+/**
+ * v7 → v8：**只追加**三张看板汇总表与单行元数据表。
+ *
+ * 与 v5→v6 / v6→v7 完全同构，因此同样安全：
+ * 1. 建四张表（先看目标状态，幂等）；
+ * 2. 建受控索引（v8 里只有 `idx_rollup_day_member` 一条普通索引，无唯一索引）；
+ * 3. 逐表按受控定义核对。
+ *
+ * 🚨 **事实表一个字节都不动**，所以这一步**不需要**备份证明，也不需要重比事件指纹。
+ *
+ * ★ **本步骤刻意不灌数据。** 汇总表可以从 `usage_event` 完整重建，
+ *   而首次全量构建要扫整张事实表（300 万行实测 41 秒）。把它塞进迁移事务会让
+ *   「一次迁移」变成「一次长事务 + 大 undo」，且中途崩了要整体重来。
+ *   所以这里只建空表，由 `syncRollups()` 在业务侧补齐 —— 它可中断、可重试、
+ *   而且**汇总表是空的也不会让看板出错**（查询层会自动退原始表）。
+ */
+async function upgradeV7ToV8(store: PortalStore): Promise<void> {
+  const existing = await tablesOf(store)
+  for (const table of PORTAL_V8_TABLES) {
+    if (existing.includes(table)) continue
+    await store.exec(portalV8TableStatement(store.kind, table))
+  }
+  // 🚨 建索引必须早于 `verifyTable`（同 v5→v6 的注释）：MySQL 分支的 `verifyTable`
+  //   会把受控 DDL 里的 `CREATE INDEX` / `CREATE UNIQUE INDEX` 也算进期望集合，
+  //   先校验后建索引会让这一步在任何真实 MySQL 上直接失败。
+  await ensureControlledIndexes(store, portalV8Statements(store.kind))
+  for (const table of PORTAL_V8_TABLES) {
+    await verifyTable(store, table, portalV8TableStatement(store.kind, table))
   }
 }
 

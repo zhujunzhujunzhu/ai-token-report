@@ -7,6 +7,12 @@ export type { PortalTarget, PortalStore } from './portal-connection.js'
 export { portalDialect } from './dialect.js'
 export type { PortalBackendKind, PortalDialect } from './dialect.js'
 export { PORTAL_SCHEMA_VERSION } from './portal-schema-v5.js'
+// ★ v8 的对外交付面：**表名清单**与**冻结的 v7 摘要**。
+//   它们要能被「迁移/回滚脚本」与「验证脚本」拿到 —— 让调用方自己去
+//   `portal-schema-v8.ts` 里抄一份表名，就等于多了一处会漂移的定义
+//   （漏一张表的表现是「回滚之后库仍被判成 current」，而它不会报错）。
+export { PORTAL_V8_TABLES, ROLLUP_HOUR_RETAIN_DAYS, rollupTimezoneKey } from './portal-schema-v8.js'
+export { portalSchemaChecksumV7 } from './portal-schema-v5.js'
 export { inspectPortalDatabase, migratePortalDatabase, preparePortalDatabase } from './portal-migrations.js'
 export type { PortalInspection, PortalMigrationOptions } from './portal-migrations.js'
 
