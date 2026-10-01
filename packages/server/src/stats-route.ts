@@ -81,6 +81,7 @@ import {
   type Bucket,
   type DiagnosticsResponse,
   type GroupBy,
+  type HourOfDayResponse,
   type OverviewResponse,
   type RecordRow,
   type RecordsResponse,
@@ -388,6 +389,8 @@ export class StatsRoute {
           return await this.#records(session, params)
         case 'diagnostics':
           return { status: 200, body: await buildDiagnostics(session) }
+        case 'hour-of-day':
+          return await this.#hourOfDay(session, params, window)
         default:
           return { status: 404, body: { ok: false, reason: `未找到 /api/v1/stats/${sub}` } }
       }
@@ -515,6 +518,48 @@ export class StatsRoute {
       limit,
       offset,
       rows: page.rows.map(toRecordRow),
+    }
+    return { status: 200, body }
+  }
+
+  /**
+   * `GET /api/v1/stats/hour-of-day?day_kind=all|workday|weekend` —— **工作时段分布**。
+   *
+   * ## 为什么不复用 `breakdown?by=hour`
+   *
+   * `by=hour` 的分组键是 `2026-10-01T14`（哪一天的哪一小时），而本接口要的是
+   * **一天中的第几小时**（`14`）—— 把所有日期的同一时刻折叠。
+   * 那是**另一个分桶键**，不是同一个维度的更细粒度：`by=hour` 在 30 天窗口下会给
+   * 700 多个点，而这里永远只有 24 个。两者的消费方式（热力图 vs 折线）也不同。
+   *
+   * ★ 取数走 `session.hourOfDay()`，它内部按「全历史折叠表 → 保留窗口小时表 →
+   *   原始表」三条路择一，并且由 `rollup.test.ts` 钉住**三条路结果逐位相同**。
+   *
+   * ⚠️ 载荷里**没有 `sessions`**：去重会话数不可加，只能走原始表，
+   *   而本接口刻意走汇总表。要会话数请用 `overview`（见协议注释）。
+   */
+  async #hourOfDay(session: PortalStatsSession, params: URLSearchParams, window: ParsedWindow): Promise<StatsRouteResult> {
+    const raw = params.get('day_kind') ?? 'all'
+    if (raw !== 'all' && raw !== 'workday' && raw !== 'weekend') {
+      // 与 `bucket` / `by` 同一套规矩：未知取值必须 400，不许静默退回 all ——
+      // 那会让「只看工作日」的页面拿到含周末的数字，而图上没有任何迹象。
+      return { status: 400, body: { ok: false, reason: `day_kind 只支持 all / workday / weekend，收到 "${raw}"` } }
+    }
+    const rows = await session.hourOfDay(raw)
+    const body: HourOfDayResponse = {
+      day_kind: raw,
+      points: rows.map((row) => ({
+        hour: row.hour,
+        calls: row.counts.calls,
+        totalTokens: row.counts.total,
+        inputTokens: row.counts.input,
+        outputTokens: row.counts.output,
+        cacheReadTokens: row.counts.cacheRead,
+        cacheWriteTokens: row.counts.cacheWrite,
+        // 口径只经 shared 计算（铁律 1）：这里不写公式。
+        cacheHitRate: cacheHitRate({ input: row.counts.input, cacheRead: row.counts.cacheRead }),
+      })),
+      range: { from: window.sinceMs ?? null, to: window.untilMs ?? null, label: window.label },
     }
     return { status: 200, body }
   }
@@ -850,6 +895,8 @@ const KNOWN_SUBS: readonly string[] = [
   //   不带时间窗、不带筛选，也不含任何用量数字。
   'providers',
   'diagnostics',
+  // ★ 工作时段分布：按「一天中的第几小时」折叠（不是 `by=hour` 那种带日期的分桶）。
+  'hour-of-day',
   // ★ 单价只读快照（`cost:read`）。与管理的 `/api/v1/admin/pricing` 是两件事：
   //   那条是**配置**（读也要求 `pricing:manage`），这条是**看数据时的解释材料** ——
   //   能看金额的人必须能看到这份金额是按哪份单价算出来的，否则他无法核对。

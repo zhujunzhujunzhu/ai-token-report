@@ -71,6 +71,31 @@ export function toHourKey(ms: number): string {
   return `${toDayKey(ms)}T${h}`
 }
 
+/**
+ * 本地时区的「一天中的第几小时」（0~23）。
+ *
+ * ★ 这是**工作时段分布**的分桶键：它**不带日期**，把所有日期的同一时刻折叠在一起。
+ *   `toHourKey()` 是「哪一天的哪一小时」，两者不是一回事 ——
+ *   「选具体某天看趋势」要前者，「看工作时段分布」要后者。
+ *
+ * ⚠️ 与 `toDayKey()` / `toHourKey()` 同源（都用 `Date` 的本地方法），
+ *   所以两条路径在同一进程里必然一致；**绝不要**在 SQL 侧用 `HOUR()` 另算一遍。
+ */
+export function toHourOfDay(ms: number): number {
+  return new Date(ms).getHours()
+}
+
+/**
+ * 本地时区下「这一天算不算周末」：`0` = 工作日（周一~周五），`1` = 周末。
+ *
+ * ★ 只在**汇总表**里用到（`usage_rollup_hod.day_kind`），用于「工作时段」时排除周末。
+ *   它同样是本地时区口径的函数，所以与 `toDayKey()` 一致。
+ */
+export function dayKindOf(ms: number): 0 | 1 {
+  const day = new Date(ms).getDay()   // 0=周日 … 6=周六
+  return day === 0 || day === 6 ? 1 : 0
+}
+
 /** 按维度聚合。 */
 export function aggregate(
   records: UsageRecord[],

@@ -110,8 +110,28 @@ import {
 // ⚠️ `toDayKey()` / `toHourKey()` / `projectName()` 是**内核**的（`aggregate.ts`），
 //   不是 shared 的：它们定义的是「怎么分桶 / 怎么切项目名」。
 //   这里复用同一份实现 —— 与 `groups()` 用同一套键，金额才能按组对上号。
-import { projectName, toDayKey, toHourKey } from '../aggregate.js'
+import { projectName, toDayKey, dayKindOf, toHourKey, toHourOfDay } from '../aggregate.js'
 import { Buffer } from 'node:buffer'
+import { emptyCounts } from '../types.js'
+
+/**
+ * 这组筛选条件是不是**纯时间窗**（只带 `sinceMs` / `untilMs`）。
+ *
+ * ★ 汇总表快路径只接纯时间窗。原因不是懒，而是**汇总表按天存**：
+ * `usage_rollup_day` 的列是 `(day_key, member_id, provider, model)`，
+ * 拿 `WHERE provider LIKE '%dash%'` 去筛它当然可以，但人员 / 分组 /
+ * 归一化后的展示名这些维度都要在 **JS 侧**再折一次 —— 那等于把
+ * 「聚合」从 SQL 搬到 JS，收益消失、还多一条容易分叉的路径。
+ *
+ * 所以带任何维度筛选的请求一律走原始表（它已经正确、也已经有索引）。
+ */
+function isTimeWindowOnly(filter: QueryFilter): boolean {
+  const hasDimension = (filter.providers?.length ?? 0) > 0 || (filter.models?.length ?? 0) > 0
+    || (filter.userIds?.length ?? 0) > 0 || (filter.memberIds?.length ?? 0) > 0
+    || (filter.legacyUserIds?.length ?? 0) > 0 || (filter.groupIds?.length ?? 0) > 0
+    || filter.unattributedOnly === true
+  return !hasDimension
+}
 
 /**
  * 带金额的一档汇总（线上契约 `StatsCostTotals` 的内核形状）。
@@ -309,6 +329,13 @@ export class PortalStatsSession {
    *   或一次页面状态把它带出去。没算过的东西泄不出去。
    */
   readonly #withCost: boolean
+  /**
+   * 汇总表快路径的**一次性判定结果**（每次开一个统计会话只判一次）。
+   *
+   * `undefined` = 还没判过；`false` = 判定为「不可用 / 不适用」；
+   * `true` = 可以走汇总表。见 `#rollupUsable()`。
+   */
+  #rollupState: boolean | undefined
   /** 单价目录（v7）。**惰性读一次**：一次查询里三种金额都要用同一份价。 */
   #prices: PriceIndex | null = null
   #closed = false
@@ -475,6 +502,194 @@ export class PortalStatsSession {
       cacheRead: num(row.cache_read_tokens),
       cacheWrite: num(row.cache_write_tokens),
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // 汇总表快路径（v8）—— 见 `rollup.ts` 的模块注释
+  // ---------------------------------------------------------------------------
+
+  /**
+   * 汇总表现在能不能用。
+   *
+   * ## 🚨 为什么必须比「调用条数」，而不是只看表在不在
+   *
+   * 汇总表**落后于事实表**是正常状态（水位按接收时刻推进，新到的事件还没被折进去）。
+   * 那时若拿它出数，页面就会**静默少算** —— 而「少算」在图上和「这段时间用得少」
+   * 长得一模一样。
+   *
+   * 所以这里用一个**廉价的不变量**：同一窗口下
+   * `SUM(汇总.calls) == COUNT(原始行)`。两者相等才认为汇总是最新的。
+   * 代价是一条走 `idx_usage_event_ts` 的 `COUNT(*)`（实测 300 万行 17ms），
+   * 换掉的是「整窗口聚合 + 把几十万行搬回 Node」（实测 330~490ms）。
+   *
+   * ⚠️ 任何异常（表不存在 / 手工删了 / 权限不足）**一律返回 false 退原始表**：
+   *   汇总表是性能设施，不是正确性依赖，绝不让它把看板打成 5xx。
+   */
+  async #rollupUsable(): Promise<boolean> {
+    if (this.#rollupState !== undefined) return this.#rollupState
+    this.#rollupState = false
+    try {
+      const { sql, params } = buildWhere(this.#filter, undefined)
+      const source = await this.#store.get<{ c: unknown }>(
+        `SELECT COUNT(*) AS c FROM ${EVENT_TABLE}${sql}`, params,
+      )
+      const rolled = await this.#store.get<{ c: unknown }>(
+        `SELECT SUM(calls) AS c FROM usage_rollup_day${sql}`, params,
+      )
+      this.#rollupState = num(source?.c) > 0 && num(rolled?.c) === num(source?.c)
+    } catch {
+      // 表不存在（v8 之前的库）/ 查询失败 → 就当没有汇总表。
+      this.#rollupState = false
+    }
+    return this.#rollupState
+  }
+
+  /**
+   * 从 `usage_rollup_day` / `usage_rollup_hour` 出时间序列。
+   *
+   * ⚠️ **分桶键在 JS 侧算**（`toDayKey` / `toHourKey`），与原始表路径同一份实现。
+   *   汇总是汇总表自己的 `day_key` / `hour_of_day` 两列（落库时已按本地时区算好），
+   *   但**小时点仍必须由 JS 拼**，不能在 SQL 里 `CONCAT` ——
+   *   那是第二个时间键实现，且两个后端的拼接写法还不一样。
+   *
+   * 返回 `null` 表示「这批筛选条件不是纯时间窗」（带了 provider / 人员等），
+   * 此时**不接**这条快路径（`usage_rollup_day` 只按天聚合，没有那些维度的过滤能力）。
+   */
+  async #rollupSeries(granularity: 'day' | 'hour'): Promise<{ bucket: string; counts: TokenCounts }[] | null> {
+    if (!isTimeWindowOnly(this.#filter)) return null
+    const table = granularity === 'day' ? 'usage_rollup_day' : 'usage_rollup_hour'
+    const { sql, params } = buildWhere(this.#filter, undefined)
+    const rows = await this.#store.all<{
+      day_key: unknown; hour_of_day?: unknown
+      input_tokens: unknown; output_tokens: unknown; cache_read_tokens: unknown; cache_write_tokens: unknown
+      reasoning_tokens: unknown; calls: unknown
+    }>(`SELECT * FROM ${table}${sql}`, params)
+    const buckets = new Map<string, TokenCounts>()
+    for (const row of rows) {
+      const day = String(row.day_key ?? '')
+      if (day.length === 0) continue
+      const bucket = granularity === 'day' ? day : `${day}T${String(num(row.hour_of_day)).padStart(2, '0')}`
+      let counts = buckets.get(bucket)
+      if (!counts) {
+        counts = emptyCounts()
+        buckets.set(bucket, counts)
+      }
+      counts.input += num(row.input_tokens)
+      counts.output += num(row.output_tokens)
+      counts.cacheRead += num(row.cache_read_tokens)
+      counts.cacheWrite += num(row.cache_write_tokens)
+      counts.reasoning += num(row.reasoning_tokens)
+      counts.calls += num(row.calls)
+      counts.total = counts.input + counts.output + counts.cacheRead + counts.cacheWrite
+    }
+    return [...buckets.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([bucket, counts]) => ({ bucket, counts }))
+  }
+
+  /**
+   * 「一天中的第几小时」的消耗分布 —— **需求 ②** 的取数口。
+   *
+   * ## 为什么它必须单独有一个入口
+   *
+   * `series('hour')` 给的是「哪一天的哪一小时」（`2026-10-01T14`），
+   * 而「工作时段分布」要的是**把所有日期的同一时刻折叠**（`14`）。
+   * 两者不是粒度差异，是**不同的分桶键**：
+   * 按天的汇总表服务不了它（一天的 24 小时被合并成 1 行），
+   * 按小时带日期的汇总表**也不直接服务它**（要跨日期再折一次）。
+   *
+   * 所以有三条路，按代价从低到高：
+   * 1. `usage_rollup_hod`（全历史折叠，行数上界 `24 × 2 × 人数 × 组合数`）—— 最快；
+   * 2. `usage_rollup_hour`（仅覆盖保留窗口）；
+   * 3. 原始表 —— 永远正确，用于上面两条都不可用时。
+   *
+   * ⚠️ 这三条路都必须给出**逐位相同**的结果（`rollup.test.ts` 钉住了这一点）。
+   *
+   * @param dayKind `'all'` 不筛；`'workday'` 只算周一~周五；`'weekend'` 只算周末。
+   */
+  async hourOfDay(dayKind: 'all' | 'workday' | 'weekend' = 'all'): Promise<{ hour: number; counts: TokenCounts }[]> {
+    const wantKind = dayKind === 'all' ? null : dayKind === 'workday' ? 0 : 1
+    if (await this.#rollupUsable()) {
+      /**
+       * ① / ② 两条汇总表路径。
+       *
+       * 🚨 **折叠一律在 JS 侧做，SQL 只把行取回来。**
+       *   两个理由，都是踩出来的：
+       *
+       *   1. **SQL 里的多列聚合必须有 `GROUP BY`。** 我第一版写成
+       *      `SELECT hour_of_day, SUM(calls) … FROM usage_rollup_hod`（漏了 `GROUP BY`），
+       *      MySQL/SQLite 会把它当成**整表一行**的聚合 —— `hour_of_day` 取到某一行的值
+       *      再配全表 `SUM`。表现是「所有小时被折成一个点」（实测 `[[18, 12]]`
+       *      而正确是 `[[18,4],[19,4],[20,4]]`）**且完全不报错**。
+       *   2. **`day_kind` 的筛选必须在 JS 侧做。** 若写成 `WHERE day_kind = ?`，
+       *      而恰好没有工作日的行，SQL 就会返回 0 行 —— 于是流程「退到 ②」，
+       *      把**周末的行当成结果返回**。那是「筛工作日却拿到周末」，比少算更糟。
+       *
+       *   这两张表都只有几千到几十万行，取回来在 JS 里折的代价可以忽略；
+       *   而口径与 `toHourOfDay()` / `dayKindOf()` 同源，不会再有一条 SQL 侧的实现。
+       */
+      const foldRows = (
+        rows: readonly { hour_of_day: unknown; day_kind?: unknown; calls: unknown; input_tokens: unknown; output_tokens: unknown; cache_read_tokens: unknown; cache_write_tokens: unknown; reasoning_tokens: unknown }[],
+      ): { hour: number; counts: TokenCounts }[] => {
+        const buckets = new Map<number, TokenCounts>()
+        for (const row of rows) {
+          if (wantKind !== null && num(row.day_kind) !== wantKind) continue
+          const hour = num(row.hour_of_day)
+          let counts = buckets.get(hour)
+          if (!counts) { counts = emptyCounts(); buckets.set(hour, counts) }
+          counts.input += num(row.input_tokens)
+          counts.output += num(row.output_tokens)
+          counts.cacheRead += num(row.cache_read_tokens)
+          counts.cacheWrite += num(row.cache_write_tokens)
+          counts.reasoning += num(row.reasoning_tokens)
+          counts.calls += num(row.calls)
+          counts.total = counts.input + counts.output + counts.cacheRead + counts.cacheWrite
+        }
+        return [...buckets.entries()].sort(([a], [b]) => a - b).map(([hour, counts]) => ({ hour, counts }))
+      }
+      if (isTimeWindowOnly(this.#filter)) {
+        // ① 全历史折叠表（不带日期）—— 只在**没有时间窗**时用得到
+        try {
+          const { sql } = buildWhere(this.#filter, undefined)
+          if (!sql) {
+            const rows = await this.#store.all<{ hour_of_day: unknown; day_kind: unknown; calls: unknown; input_tokens: unknown; output_tokens: unknown; cache_read_tokens: unknown; cache_write_tokens: unknown; reasoning_tokens: unknown }>(
+              'SELECT hour_of_day, day_kind, calls, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens FROM usage_rollup_hod',
+            )
+            const folded = foldRows(rows)
+            if (folded.length > 0) return folded
+          }
+        } catch { /* 退 ② / ③ */ }
+        // ② 保留窗口内的小时表（带日期）
+        try {
+          const { sql, params } = buildWhere(this.#filter, undefined)
+          const rows = await this.#store.all<{ hour_of_day: unknown; calls: unknown; input_tokens: unknown; output_tokens: unknown; cache_read_tokens: unknown; cache_write_tokens: unknown; reasoning_tokens: unknown }>(
+            `SELECT hour_of_day, calls, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens FROM usage_rollup_hour${sql}`,
+            params,
+          )
+          const folded = foldRows(rows)
+          if (folded.length > 0) return folded
+        } catch { /* 退 ③ */ }
+      }
+    }
+    // ③ 原始表：永远正确的兜底。分桶在 JS 侧做（`toHourOfDay`），不用 SQL 的 HOUR()。
+    const q = timeBucketRowsQuery({ ...this.#filter, sinceMs: undefined, untilMs: undefined })
+    const rows = await this.#store.all<TimeBucketRow>(q.sql, q.params)
+    const buckets = new Map<number, TokenCounts>()
+    for (const row of rows) {
+      const ts = num(row.ts)
+      if (wantKind !== null && dayKindOf(ts) !== wantKind) continue
+      const hour = toHourOfDay(ts)
+      let counts = buckets.get(hour)
+      if (!counts) { counts = emptyCounts(); buckets.set(hour, counts) }
+      counts.input += num(row.input_tokens)
+      counts.output += num(row.output_tokens)
+      counts.cacheRead += num(row.cache_read_tokens)
+      counts.cacheWrite += num(row.cache_write_tokens)
+      counts.reasoning += num(row.reasoning_tokens)
+      counts.calls += 1
+      counts.total = counts.input + counts.output + counts.cacheRead + counts.cacheWrite
+    }
+    return [...buckets.entries()].sort(([a], [b]) => a - b).map(([hour, counts]) => ({ hour, counts }))
   }
 
   /** 总计（四项独立 + calls）。派生指标请用 `derive()` / `shared/metrics.ts`。 */
@@ -710,6 +925,21 @@ export class PortalStatsSession {
    *   这种差异出现，而且没有任何报错。
    */
   async series(granularity: 'day' | 'hour', fillGaps = true): Promise<PortalSeriesPoint[]> {
+    /**
+     * ★ **汇总表快路径**（v8）。命中则完全不碰 `usage_event`。
+     *
+     * ⚠️ 条件里的两条都是**安全阀，不是可选项**：
+     *   ① `!this.#withCost` —— 金额必须按**每条事件当时的价**算（价按
+     *      `(provider, model)` 定，且带生效区间）。汇总表按
+     *      `(day, member, provider, model)` 求和之后，**同一天里换过价就再也分不开**，
+     *      只能拿一个价乘一份混合用量 —— 那是错的。所以有金额权限时走原始表。
+     *   ② `await this.#rollupUsable()` —— 汇总表空着 / 水位落后 / 时区不匹配时
+     *      必须退原始表，否则会**静默少算**（比慢危险得多）。
+     */
+    if (!this.#withCost && await this.#rollupUsable()) {
+      const rolled = await this.#rollupSeries(granularity)
+      if (rolled) return fillGaps ? renderSeriesGaps(rolled, granularity) : rolled
+    }
     // ⚠️ `withCost` 时连 provider / model 一起取：每个点的金额必须按**该点里
     //   每条事件当时的价**算，而价是按 (provider, model) 定的。
     //   拿「这个点一共多少 token」× 某个价 = 用一个平均单价算账，那是错的。

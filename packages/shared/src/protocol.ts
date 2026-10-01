@@ -508,6 +508,38 @@ export interface StatsProvidersResponse {
   providers: string[]
 }
 
+/**
+ * 「一天中的第几小时」的消耗分布（**工作时段分布**）。
+ *
+ * ★ 与 `SeriesResponse` 的区别是**分桶键不同**，不是粒度不同：
+ *   `series?bucket=hour` 的点是「哪一天的哪一小时」（`2026-10-01T14`），
+ *   而这里的 key 是**一天中的第几小时**（`14`）—— 它把所有日期的同一时刻
+ *   **折叠**在一起，所以只有 24 个点（有数据的小时才出现）。
+ *
+ * ⚠️ 因此它**不能**由 `series` 派生，也不能由「按天汇总」派生：
+ *   按天汇总会把一天里的 24 小时合并成一行，时段信号就永久丢失了。
+ *
+ * ⚠️ **`sessions` 不在载荷里**：去重会话数不可加（跨天会话会被算两次），
+ *   它只能走原始表，而本接口刻意走汇总表。要会话数请用 `overview`。
+ */
+export interface HourOfDayResponse {
+  /** 统计口径：是否只算工作日 / 只算周末。 */
+  day_kind: 'all' | 'workday' | 'weekend'
+  /** 升序；只含**有数据**的小时（不补零 —— 补零会把「没人用」和「缺数据」混起来）。 */
+  points: {
+    /** 0~23，**本地时区**。 */
+    hour: number
+    calls: number
+    totalTokens: number
+    inputTokens: number
+    outputTokens: number
+    cacheReadTokens: number
+    cacheWriteTokens: number
+    cacheHitRate: number
+  }[]
+  range: { from: number | null; to: number | null; label: string }
+}
+
 /** 当前实例的入口队列观测；完成计数包含业务拒绝，不代表成功落库条数。 */
 export interface IngestQueueStatusResponse {
   scope: 'process'
