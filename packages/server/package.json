@@ -17,6 +17,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "bun test",
     "verify:mysql:node": "bun run verify/verify-mysql-node.ts",
+    "verify:mysql:bun-auth": "bun run verify/verify-mysql-bun-auth.ts",
     "verify:ingest": "bun run verify/verify-ingest-performance.ts"
   },
   "dependencies": {

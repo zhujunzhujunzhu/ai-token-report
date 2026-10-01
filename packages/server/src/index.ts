@@ -28,7 +28,7 @@
  */
 
 import { resolvePaths } from '@ai-token-report/core'
-import { backfillRollups, describePortalTarget, openPortalStore, portalDbFileName, resolvePortalTarget, preparePortalDatabase, syncRollups } from '@ai-token-report/core/db'
+import { backfillRollups, describePortalTarget, openPortalStore, planBunMysqlAuth, portalDbFileName, resolvePortalTarget, preparePortalDatabase, syncRollups, type PortalTarget } from '@ai-token-report/core/db'
 import { join } from 'node:path'
 
 import { DatabaseAdminRoute } from './admin-route.js'
@@ -39,11 +39,30 @@ import { IdentityRoute } from './identity-route.js'
 import { IngestRoute } from './ingest-route.js'
 import { IngestQueue, type IngestQueueOptions } from './ingest-queue.js'
 import { CoreStatsProvider, LocalStatsRouter } from './local-api.js'
-import { serveWithPortRetry, type RequestHandler } from './runtime/listen.js'
+import { isBunRuntime, serveWithPortRetry, type RequestHandler } from './runtime/listen.js'
 import { StatsRoute } from './stats-route.js'
 
 export { DEFAULT_PORT, IDLE_TIMEOUT_SECONDS } from './runtime/listen.js'
 export { SERVER_VERSION } from './app.js'
+
+/**
+ * 启动横幅里「上报库」那一行的文本。
+ *
+ * ★ 抽成**纯函数并导出**是为了能单测：核心层会替「长口令 + 非 TLS」的 Bun 连接
+ *   自动启用 TLS（见 `core/src/db/mysql.ts` 的 `planBunMysqlAuth()`），
+ *   而这件事**必须在横幅里说出来** —— 否则运维看到「MySQL xxx @ host:port」
+ *   会以为连接还是明文的，实际上传输方式已经被换掉了。
+ *
+ * 🚨 只能**加后缀**，绝不能改 `describePortalTarget()` 本身的输出：
+ *   它还被迁移的备份证明当成等值键逐字比对（见 `portal-migrations.ts` 的
+ *   `proof.target !== describePortalTarget(target)`）。改了会让历史备份证明对不上。
+ */
+export function portalTargetLabelFor(target: PortalTarget, bunRuntime: boolean): string {
+  const label = describePortalTarget(target)
+  return bunRuntime && target.mysqlUrl && planBunMysqlAuth(target.mysqlUrl).needsTls
+    ? `${label}（Bun 长口令：已自动启用 TLS）`
+    : label
+}
 
 export interface ServerOptions {
   /** 有界上报队列；生产默认 64 个请求（含执行中）、等待最多 5 秒。 */
@@ -343,6 +362,11 @@ export async function createHandlerFor(options: ServerOptions = {}): Promise<Han
     ...(options.requestLog !== undefined ? { requestLog: options.requestLog } : {}),
   })
 
+  const portalTargetLabel = portalTargetLabelFor(
+    resolvePortalTarget({ sqlitePath: dbPath, mysqlUrl }),
+    isBunRuntime(),
+  )
+
   return {
     ingestQueue,
     close: () => {
@@ -359,8 +383,7 @@ export async function createHandlerFor(options: ServerOptions = {}): Promise<Han
     credentialsPath: '',
     identityStore,
     dbPath,
-    // ★ 实际目标的可读描述（MySQL 时是「库名 @ 主机:端口」，**不含密码**）
-    portalTargetLabel: describePortalTarget(resolvePortalTarget({ sqlitePath: dbPath, mysqlUrl })),
+    portalTargetLabel,
     ...(options.staticDir ? { staticDir: options.staticDir } : {}),
   }
 }

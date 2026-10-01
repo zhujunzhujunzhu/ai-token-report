@@ -49,6 +49,14 @@
  *    （`verify:mysql:node` 里有一条 4 字节往返断言钉着这个默认值）。
  * 5. ✅ mysql2 的 `Pool` **不发出 `error` 事件**（源码里一次 `emit()` 都没有），
  *    所以不需要挂监听器；掉线的连接由池内部移除并在下次请求时重建。
+ * 6. 🚨 **Bun 的 `caching_sha2_password` 在非 TLS 连接下对口令 ≥ 20 字节会认证失败**
+ *    （线上实测 `Access denied ... errno 1045`，同一个口令 mysql2 正常；
+ *    oven-sh/bun#26195）。MySQL 在这一步要拿 20 字节的 scramble 去异或口令，
+ *    所以边界正好落在「口令装得下一个 scramble」上 —— **与口令强度无关**。
+ *    ⇒ 本层对那种口令**自动打开 TLS**（见 `planBunMysqlAuth()`）：
+ *    口令走加密信道后不再需要那条有缺陷的 RSA 全量认证分支。
+ *    ⚠️ 不要靠「把口令缩短到 19 字符以内」来绕，也不要把这件事推给部署者
+ *    在 `ATR_MYSQL_URL` 里手写 `?tls=true`。
  *
  * ## Node 端为什么走**可选依赖 `mysql2`**（而不是也内建）
  *
@@ -69,6 +77,8 @@
  *   从 `packages/core` 的源码位置直接跑 Node 是找不到它的。
  *   Bun 侧不受影响（走内建 `Bun.sql`，根本不碰 mysql2）。
  */
+
+import { Buffer } from 'node:buffer'
 
 import type { SqlBindings, SqlValue } from './driver.js'
 
@@ -300,18 +310,100 @@ function makeQueries(
   }
 }
 
+/**
+ * Bun 侧的认证规划：**要不要替使用者把这个连接打开 TLS**。
+ *
+ * ## 为什么需要
+ *
+ * Bun 1.4.2 的 `caching_sha2_password` **全量认证**在非 TLS 连接下，对 UTF-8 长度
+ * ≥ 20 **字节**的口令会失败（线上实测 `errno 1045`，同一个口令 mysql2 正常；
+ * oven-sh/bun#26195）。MySQL 协议这一步要拿刚好 20 字节的 scramble 去异或口令，
+ * 所以边界是「口令装不下一个 scramble」——**与口令强度无关**。
+ * 打开 TLS 后口令走加密信道，不再需要那条有缺陷的分支。
+ *
+ * ## 为什么是「按需」而不是「总是」
+ *
+ * - ★ **只在否则必然失败的那一档上动手**：口令短于 20 字节时 Bun 的非 TLS 路径本来就正常，
+ *   没有必要替使用者改变传输方式。
+ * - ★ **尊重 URL 的显式选择**：`?ssl-mode=DISABLED` / `?tls=false` 是使用者的明确决定，
+ *   不覆盖；URL 自己已经要求 TLS 时也不必重复指定。
+ *
+ * ⚠️ 它是**纯字符串 + 字节**计算：不连库、不探测服务端能力。所以在「服务端其实没开 TLS」
+ *   的机器上它也会给出 `needsTls: true` —— 但那种机器上这个口令本来就连不上，
+ *   它没有把一条**本来能用**的连接弄坏，这是这个取舍成立的前提。
+ */
+export interface BunMysqlAuthPlan {
+  /** 口令是否长到会踩上缺陷（按 UTF-8 **字节**算，不是字符数）。 */
+  longPassword: boolean
+  /** URL 自己已经要求 TLS（此时不需要本层插手）。 */
+  urlRequestsTls: boolean
+  /** URL 显式要求**不要** TLS（尊重使用者，不覆盖）。 */
+  urlDisabledTls: boolean
+  /** 本层是否需要替使用者打开 TLS。 */
+  needsTls: boolean
+}
+
+/** MySQL 官方 `ssl-mode` 里表示「要 TLS」与「不要 TLS」的两组取值。 */
+const TLS_MODE_ON = new Set(['REQUIRED', 'VERIFY_CA', 'VERIFY_IDENTITY'])
+const TLS_MODE_OFF = new Set(['DISABLED'])
+
+export function planBunMysqlAuth(url: string): BunMysqlAuthPlan {
+  const none: BunMysqlAuthPlan = { longPassword: false, urlRequestsTls: false, urlDisabledTls: false, needsTls: false }
+  // URL 语法错误交给驱动保留它自己的错误，这里不抢先报错。
+  let parsed: URL
+  try { parsed = new URL(url) } catch { return none }
+
+  // ⚠️ `URL.password` 给的是**百分号编码**后的原文，必须先解码再量长度：
+  //   否则 `%61`（一个字符 'a'）会被算成 3 个字节，把短口令判成长口令。
+  let password = parsed.password
+  try { password = decodeURIComponent(password) } catch { /* 非法转义：按原文量，宁可少判也不要抛 */ }
+  const longPassword = Buffer.byteLength(password, 'utf8') >= 20
+
+  /**
+   * 三态：`true` 要 / `false` 不要 / `undefined` 认不出来。
+   *
+   * ⚠️ **空值（`?tls=` / `?ssl-mode=`）算「认不出来」**，不算「要」：
+   *   我们宁可让修复默认生效，也不要凭一个语义不明的空参数就放弃它 ——
+   *   猜错的代价是「服务端起不来」，而使用者的本意若是「别开 TLS」，
+   *   他写 `false` / `DISABLED` 才是明确的表达。
+   */
+  const flag = (name: string): boolean | undefined => {
+    const raw = parsed.searchParams.get(name)
+    if (raw === null) return undefined
+    const value = raw.trim().toLowerCase()
+    if (value === 'true' || value === '1' || value === 'required') return true
+    if (value === 'false' || value === '0' || value === 'disabled') return false
+    return undefined
+  }
+  const tls = flag('tls')
+  const ssl = flag('ssl')
+  const mode = parsed.searchParams.get('ssl-mode')?.trim().toUpperCase()
+
+  const urlRequestsTls = tls === true || ssl === true || (mode !== undefined && TLS_MODE_ON.has(mode))
+  const urlDisabledTls = tls === false || ssl === false || (mode !== undefined && TLS_MODE_OFF.has(mode))
+
+  return { longPassword, urlRequestsTls, urlDisabledTls, needsTls: longPassword && !urlRequestsTls && !urlDisabledTls }
+}
+
 /** Bun 侧通道：`unsafe()` 的返回值**同时也是**结果头（`affectedRows` 就在上面）。 */
-interface BunAuthenticationContext { longPassword: boolean; version: string }
+interface BunAuthenticationContext { longPassword: boolean; tlsEnforced: boolean; version: string }
 
 /** 只在服务端实际拒绝认证后补充已实测的上游兼容信息，不改变凭证或驱动选择。 */
 function explainBunAuthenticationError(error: unknown, context?: BunAuthenticationContext): unknown {
   const detail = error as { name?: string; errno?: number; code?: string; sqlState?: string } | null
   if (detail?.name === 'BunMysqlAuthenticationCompatibilityError') return error
   if (!context?.longPassword || detail?.errno !== 1045) return error
+  // ★ 文案必须区分「我们还没试过 TLS」与「TLS 已经开着还是失败」：
+  //   后者说明这**不是**那个上游缺陷（多半就是口令错），照抄旧文案会把人
+  //   引到「换个运行时 / 缩短口令」这条错误的路上。
+  const guidance = context.tlsEnforced
+    ? '本次连接**已经**为这个长口令自动启用了 TLS，所以这条 1045 与那个上游缺陷无关 —— 请按普通认证失败排查（口令 / 账号的 host 范围 / 库权限）。'
+    : '本次连接**没有**启用 TLS，而那正是这个缺陷的触发条件 —— 去掉 URL 里 `?ssl-mode=DISABLED` / `?tls=false` 这类显式选择，本层就会自动启用 TLS。'
   const explained = new Error(
     `MySQL 认证失败（1045），当前为 Bun ${context.version} 原生 MySQL 驱动。` +
-    '本机已验证 Bun 1.4.2 的 caching_sha2_password 在密码超过 19 个字符时可能认证失败（oven-sh/bun#26195），即使相同凭证在其他客户端有效。' +
-    '建议使用真正的 Node + mysql2 复核并运行服务；保留强密码及原认证插件，不要为绕过此问题缩短密码。',
+    'Bun 1.4.2 的 caching_sha2_password 在**非 TLS** 连接下对口令 ≥ 20 字节会认证失败（oven-sh/bun#26195），' +
+    `同一个口令在 Node + mysql2 上正常。${guidance}` +
+    '不要为绕过这个问题缩短口令或改认证插件。',
     { cause: error },
   )
   // 保留调用方已有的错误分类；不把连接串或密码放进诊断文案。
@@ -477,6 +569,7 @@ export async function openMysqlBackend(url: string): Promise<MysqlBackend> {
       SQL: new (url: string, options?: Record<string, unknown>) => BunSql
     }
 
+    const auth = planBunMysqlAuth(url)
     const sql = new SQL(url, {
       // 🚨 必须显式允许取服务端公钥：MySQL 8.4 默认认证插件是
       //   `caching_sha2_password`，非 TLS 连接下驱动需要向服务端要公钥，
@@ -485,12 +578,14 @@ export async function openMysqlBackend(url: string): Promise<MysqlBackend> {
       //   ⚠️ 这是 **Bun.sql 专有**的选项：mysql2 不认它（见文件头差异 1）。
       allowPublicKeyRetrieval: true,
       max: 10,
+      // 🚨 长口令 + 非 TLS 会踩上 Bun 的 caching_sha2_password 缺陷（见 planBunMysqlAuth）。
+      //   替使用者在这里打开 TLS，而不是要求他在 `ATR_MYSQL_URL` 里手写 `?tls=true` ——
+      //   把上游驱动的坑变成「每个部署者都要记住的一件事」，迟早会漏掉，而漏掉的
+      //   表现是服务端起不来。
+      ...(auth.needsTls ? { tls: true } : {}),
     })
 
-    let longPassword = false
-    try { longPassword = decodeURIComponent(new URL(url).password).length > 19 }
-    catch { /* URL 格式错误由驱动保留原错误处理。 */ }
-    return wrapBun(sql, false, false, { longPassword, version: globalThis.Bun.version })
+    return wrapBun(sql, false, false, { longPassword: auth.longPassword, tlsEnforced: auth.needsTls, version: globalThis.Bun.version })
   }
 
   const mysql = await loadMysql2()

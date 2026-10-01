@@ -66,6 +66,12 @@ bun run --filter '@ai-token-report/core' benchmark:multi-home -- --real
 # 本机可用开发 Docker 管理连接；别的机器用 ATR_MYSQL_URL，禁止拿业务库做建删演练
 bun run --filter '@ai-token-report/core' verify:mysql
 
+# ★ Bun 的 MySQL 认证边界（12 项；需要可建临时用户的测试连接，用完自动删用户）
+#   Bun 1.4.2 在**非 TLS** 下对口令 ≥20 字节的 caching_sha2_password 会 errno 1045
+#   （oven-sh/bun#26195）→ openMysqlBackend() 按需自动启用 TLS（planBunMysqlAuth）。
+#   这里在真库上钉住「19 字节明文能连 / 20 字节靠自动 TLS 能连 / 关掉修复必复现 1045」。
+bun run --filter '@ai-token-report/server' verify:mysql:bun-auth
+
 # ★ 双后端逐位对账（62 项；需要本机可连的 MySQL；改上报库 / 看板查询后必跑）
 #   同一批数据起两个服务端（SQLite / MySQL），断言看板每个接口的响应体 JSON 全等
 #   （人员目录 `/api/v1/stats/members` 不能逐位比对 —— 两侧 UUID 各自随机生成 ——
