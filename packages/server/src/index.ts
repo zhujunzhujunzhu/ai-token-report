@@ -28,7 +28,7 @@
  */
 
 import { resolvePaths } from '@ai-token-report/core'
-import { describePortalTarget, portalDbFileName, resolvePortalTarget, preparePortalDatabase } from '@ai-token-report/core/db'
+import { backfillRollups, describePortalTarget, openPortalStore, portalDbFileName, resolvePortalTarget, preparePortalDatabase, syncRollups } from '@ai-token-report/core/db'
 import { join } from 'node:path'
 
 import { DatabaseAdminRoute } from './admin-route.js'
@@ -48,6 +48,13 @@ export { SERVER_VERSION } from './app.js'
 export interface ServerOptions {
   /** 有界上报队列；生产默认 64 个请求（含执行中）、等待最多 5 秒。 */
   ingestQueue?: IngestQueueOptions
+  /**
+   * 看板汇总表（v8）的补齐间隔（毫秒）。
+   *
+   * 汇总表是**性能设施**：构建/补齐失败只记日志，看板会自动退原始表。
+   * 传 `0` 关闭定时补齐（测试与「只跑迁移」的场景用）；缺省 5 分钟。
+   */
+  rollupSyncMs?: number
   /** 后台公开源（HTTPS 反向代理时用于同源校验与 Secure Cookie）。 */
   portalOrigin?: string
   /** 首次部署的后台登录账号；密码只以哈希写入数据库。 */
@@ -218,6 +225,8 @@ export async function createHandlerFor(options: ServerOptions = {}): Promise<Han
   const mysqlUrl = localOnly ? undefined : options.mysqlUrl ?? process.env.ATR_MYSQL_URL
   const target = resolvePortalTarget({ sqlitePath: dbPath, mysqlUrl })
   const identityStore = localOnly ? undefined : new IdentityRepository(target)
+  /** 汇总表补齐的定时器（`close()` 里清掉）。 */
+  let rollupTimer: ReturnType<typeof setInterval> | undefined
   if (identityStore) {
     await preparePortalDatabase(target)
     await identityStore.initialize({
@@ -226,6 +235,58 @@ export async function createHandlerFor(options: ServerOptions = {}): Promise<Han
       adminUsername: options.adminUsername ?? process.env.ATR_ADMIN_USERNAME,
       adminPassword: options.adminPassword ?? process.env.ATR_ADMIN_PASSWORD,
     })
+    /**
+     * ★ 汇总表（v8）的补齐：**尽力而为，绝不阻塞启动、绝不因此启动失败**。
+     *
+     * 它是性能设施而不是正确性依赖 —— 空着 / 落后 / 时区不匹配时，
+     * 查询层会退原始表并给出正确数字（只是慢）。
+     *
+     * ## 🚨 第一次补齐必须是**后台**的（不能 await）
+     *
+     * 实测（1M 行 / 2GB pool）：首次全量重建的一批要 **19.5 秒**，
+     * 之后每批 10~12 秒、共 5 批才追平（≈64 秒）。若在这里 `await`，
+     * **服务端要 20 秒后才开始监听端口** —— 部署脚本的健检、PM2 的就绪探针
+     * 与浏览器首屏都会撞 ECONNRESET / 超时。
+     * 而这段时间里按原始表出数是**完全正确**的（只是慢），没有任何理由让用户等。
+     *
+     * ⚠️ 单次同步有行数上界（`maxRows` = 20 万），所以「积压很多」时分多批推进。
+     *   启动那次用 `backfillRollups()` **一次追平**（1M 行实测 5 批 / ~64 秒，跑在后台）；
+     *   定时器那次只推一批 —— 否则新库要等 5 分钟一轮、约 25 分钟才追平。
+     */
+    let syncing = false
+    /**
+     * @param catchUp `true` = 反复推批直到没有新数据（启动那次用）。
+     */
+    const syncOnce = async (label: string, catchUp = false, forceRebuild = false): Promise<void> => {
+      // 单飞：首次补齐与定时器可能叠加触发，而 upsert 是**加法**语义，
+      // 两批并发跑同一段会让计数翻倍。
+      if (syncing) return
+      syncing = true
+      try {
+        const store = await openPortalStore(target)
+        try {
+          if (catchUp) {
+            const result = await backfillRollups(store, { forceRebuild })
+            console.log(`[rollup] ${label}：${result.rounds} 批，日格 ${result.dayCells} / 小时格 ${result.hourCells} / 时段格 ${result.hodCells}${result.caughtUp ? '（已追平）' : '；⚠️ 达到轮数上界仍未追平，余下交给定时补齐'}`)
+          } else {
+            const result = await syncRollups(store, { forceRebuild })
+            if (result.mode !== 'skipped') {
+              console.log(`[rollup] ${label}：${result.mode}，日格 ${result.dayCells} / 小时格 ${result.hourCells} / 时段格 ${result.hodCells}${result.unattributedWindow > 0 ? `；⚠️ ${result.unattributedWindow} 条历史行没有接收时刻，永远进不了汇总（查询层会为它们退原始表）` : ''}`)
+            }
+          }
+        } finally { await store.close() }
+      } catch (error) {
+        // 汇总表不可用（表缺失 / 权限不足 / 连接问题）不该影响服务可用性。
+        console.warn(`[rollup] ${label}失败（看板将退原始表）：${error instanceof Error ? error.message : String(error)}`)
+      } finally { syncing = false }
+    }
+    // ⚠️ **刻意不 await**：见上面的 🚨。
+    void syncOnce('启动补齐', true)
+    const intervalMs = options.rollupSyncMs ?? 5 * 60_000
+    if (intervalMs > 0) {
+      rollupTimer = setInterval(() => { void syncOnce('定时补齐') }, intervalMs)
+      rollupTimer.unref?.()
+    }
   }
   // 仅保留旧调用方的类型形状；生产鉴权不读取或填充这份空的适配器。
   const credentials = CredentialStore.empty()
@@ -284,7 +345,13 @@ export async function createHandlerFor(options: ServerOptions = {}): Promise<Han
 
   return {
     ingestQueue,
-    close: () => ingestQueue.close(),
+    close: () => {
+      // ⚠️ 定时器必须清掉：`unref()` 只保证它不阻止进程退出，
+      //   而测试里同一个进程会反复 createServer/close —— 不清会积累定时器，
+      //   之后每次触发都会连一次已经换掉的库。
+      if (rollupTimer) { clearInterval(rollupTimer); rollupTimer = undefined }
+      return ingestQueue.close()
+    },
     // ★ 交给最外层服务器的就是这一个函数：Bun 与 Node 共用它
     //   （`Bun.serve({ fetch })` / `serve-node.ts` 的 node:http 桥接）。
     handler: (req: Request) => app.fetch(req),
