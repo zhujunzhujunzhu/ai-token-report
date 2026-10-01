@@ -10,10 +10,17 @@
  * ★ 默认零副作用：不带参数只做本地构建 + 打包 + 打印计划，**不连服务器**。
  *   真上传是 `--preflight`（只上传校验，不切换），真部署是 `--apply`。
  *
- * ★ 只覆盖 packages/server/dist 与 packages/web-portal/dist，绝不碰：
+ * ★ 覆盖三样东西，绝不碰其余：
+ *   - packages/server/dist 与 packages/web-portal/dist（构建产物）；
+ *   - `deploy/atr-server-start.sh`（PM2 启动包装，**仓库里那一份是真源**；
+ *     安装前备份进 .deploy-backup-*，健康检查失败连它一起回滚）。
+ *   绝不碰：
  *   - node_modules：产物 external 了 `mysql2/promise`，靠 packages/server/node_modules 解析；
- *   - deploy/atr-server-start.sh：服务器的 PM2 启动包装，仓库里没有这个文件；
- *   - /root/.atr/portal.env：凭证与监听配置。
+ *   - /root/.atr/portal.env：凭证与监听配置（只读它的 ATR_PORT 做健检）。
+ *
+ * ★ `--runtime bun|node`（缺省 bun）决定线上进程 exec 哪一个二进制。
+ *   改运行时不是「换个参数」那么轻 —— 产物里若还没有 Bun 长口令的 TLS 修复，
+ *   切过去会直接 errno 1045，所以 {@link assertBundleSupportsRuntime} 在**上传之前**判死。
  *
  * ⚠️ 子路径部署必须带 DSH_PORTAL_BASE（本站为 `/ai-token/`）。
  *   忘了带会构建出绝对路径产物，页面**立即变白且服务端零报错** —— 所以本地构建后
@@ -26,10 +33,14 @@ import { homedir, tmpdir } from 'node:os'
 import { delimiter, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import {
+  START_SCRIPT_REPO_PATH, assertBundleSupportsRuntime, renderRemoteScript, renderStartScript, resolveRuntime,
+} from './deploy-plan.mjs'
+
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
 // ---------- 参数解析：拼错参数不能退回成真实部署 ----------
-const DEFAULTS = { portalBase: '/ai-token/', remoteRoot: '/data/ai-token-report', pm2Name: 'ai-token-server' }
+const DEFAULTS = { portalBase: '/ai-token/', remoteRoot: '/data/ai-token-report', pm2Name: 'ai-token-server', runtime: 'bun' }
 
 /**
  * 读取仓库根 `.env` 的 `host` / `password`（服务器凭据的既有存放处）。
@@ -54,6 +65,7 @@ function parseArgs(argv) {
     password: process.env['ATR_DEPLOY_PASSWORD'] ?? dotenv['password'] ?? '', hostkey: process.env['ATR_DEPLOY_HOSTKEY'] ?? '',
     portalBase: process.env['ATR_DEPLOY_PORTAL_BASE'] ?? DEFAULTS.portalBase,
     remoteRoot: DEFAULTS.remoteRoot, pm2Name: DEFAULTS.pm2Name,
+    runtime: process.env['ATR_DEPLOY_RUNTIME'] ?? DEFAULTS.runtime,
   }
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
@@ -68,10 +80,19 @@ function parseArgs(argv) {
     else if (arg === '--hostkey') options.hostkey = argv[++i] ?? ''
     else if (arg === '--portal-base') options.portalBase = argv[++i] ?? ''
     else if (arg === '--remote-root') options.remoteRoot = argv[++i] ?? ''
+    else if (arg === '--runtime') {
+      const value = argv[++i] ?? ''
+      // ⚠️ `--runtime --apply` 这类漏值必须当场报错：把下一个参数当成运行时名，
+      //   会让「模式」静默退回 dry-run，或者反过来 —— 两种都很难看出来。
+      if (!value || value.startsWith('--')) throw new Error('--runtime 缺少值（bun | node）')
+      options.runtime = value
+    }
     else throw new Error(`未知参数：${arg}`)
   }
   if (!options.portalBase.endsWith('/')) throw new Error(`--portal-base 必须以 / 结尾：${options.portalBase}`)
   if (options.skipVerify && options.fullVerify) throw new Error('--skip-verify 与 --full-verify 不能同时使用')
+  // 提前校验运行时名：拼错成 `--runtime bunn` 不能等到上传之后才炸。
+  resolveRuntime(options.runtime)
   return options
 }
 
@@ -83,6 +104,7 @@ mkdirSync(output, { recursive: true })
 const report = {
   status: 'running', mode: options.mode, startedAt: new Date().toISOString(),
   portalBase: options.portalBase, remoteRoot: options.remoteRoot, host: options.host || '(待解析)',
+  runtime: options.runtime,
   steps: [], local: {}, artifacts: [], remote: {}, rollback: '未触发',
 }
 const reportPath = join(output, 'report.json')
@@ -203,116 +225,11 @@ function sha256(file) {
 }
 
 // ---------- 远程脚本（在目标机上执行）----------
-/**
- * ⚠️ 本模板里的 shell 变量一律写 `$VAR`，**不要写 `${VAR}`** ——
- * 脚本用 JS 模板字符串拼装，`${` 会被 JS 抢先求值，是最容易埋进去的一类 bug。
- */
-function renderRemoteScript({ mode, stamp, portalBase, remoteRoot, pm2Name, keepOldAssets }) {
-  const stage = `/tmp/atr-deploy-${stamp}`
-  const assetPrefix = `${portalBase}assets/`
-  return `#!/bin/bash
-# 由 scripts/deploy-server.mjs 生成并在目标服务器执行（模式：${mode}）。
-# 只看两件事：产物是否完整、切换后服务是否真的活着；失败必须能回到原状。
-set -uo pipefail
-
-ROOT=${remoteRoot}
-PM2_NAME=${pm2Name}
-WORK=${stage}
-STAGE=$WORK/stage
-BACKUP=$ROOT/.deploy-backup-${stamp}
-KEEP_OLD_ASSETS=${keepOldAssets ? 1 : 0}
-SERVER_DIST=$ROOT/packages/server/dist
-PORTAL_DIST=$ROOT/packages/web-portal/dist
-
-log() { echo "[remote] $*"; }
-fail() { log "ERROR: $*"; echo "ATR_DEPLOY_RESULT=failed"; exit 1; }
-
-mkdir -p "$STAGE/server-dist" "$STAGE/portal-dist"
-tar -xzf ${stage}-server.tgz -C "$STAGE/server-dist" || fail "server tgz 解包失败"
-tar -xzf ${stage}-portal.tgz -C "$STAGE/portal-dist" || fail "portal tgz 解包失败"
-
-# 产物完整性：缺 main.mjs 直接起不来，宁可拒绝部署也不要把服务挂在半路
-[ -f "$STAGE/server-dist/main.mjs" ] || fail "staging 缺 main.mjs"
-[ -f "$STAGE/server-dist/migrate-db.mjs" ] || fail "staging 缺 migrate-db.mjs"
-[ -f "$STAGE/server-dist/import-credentials.mjs" ] || fail "staging 缺 import-credentials.mjs"
-[ -f "$STAGE/portal-dist/index.html" ] || fail "staging 缺 index.html"
-grep -q "${assetPrefix}" "$STAGE/portal-dist/index.html" || fail "index.html 未带子路径前缀 ${assetPrefix}，部署后必然白屏"
-
-log "server 产物：$(du -sh "$STAGE/server-dist" | cut -f1) / $(ls "$STAGE/server-dist" | wc -l) 个文件"
-log "portal 产物：$(du -sh "$STAGE/portal-dist" | cut -f1) / assets $(ls "$STAGE/portal-dist/assets" | wc -l) 个文件"
-
-if [ "${mode}" = "preflight" ]; then
-  log "preflight 完成：产物已上传并通过校验，未触碰现网文件、未重启服务"
-  rm -rf "$WORK"; rm -f "$WORK"-server.tgz "$WORK"-portal.tgz
-  echo "ATR_DEPLOY_RESULT=preflight-ok"
-  exit 0
-fi
-
-# ---- 切换：先备份，再就位 ----
-mkdir -p "$BACKUP" || fail "创建备份目录失败"
-cp -a "$SERVER_DIST" "$BACKUP/server-dist" || fail "备份 server dist 失败"
-cp -a "$PORTAL_DIST" "$BACKUP/portal-dist" || fail "备份 portal dist 失败"
-log "已备份到 $BACKUP"
-
-rm -rf "$SERVER_DIST" && mkdir -p "$SERVER_DIST" || fail "重建 server dist 目录失败"
-cp -a "$STAGE/server-dist/." "$SERVER_DIST/" || fail "写入 server 产物失败"
-
-# portal：新 assets 是内容哈希命名，先就位再换 index.html，最后才清旧文件，避免切换瞬间 404
-mkdir -p "$PORTAL_DIST/assets"
-cp -a "$STAGE/portal-dist/assets/." "$PORTAL_DIST/assets/" || fail "写入 portal assets 失败"
-cp -f "$STAGE/portal-dist/index.html" "$PORTAL_DIST/index.html" || fail "写入 index.html 失败"
-[ -f "$STAGE/portal-dist/favicon.svg" ] && cp -f "$STAGE/portal-dist/favicon.svg" "$PORTAL_DIST/favicon.svg"
-if [ "$KEEP_OLD_ASSETS" != "1" ]; then
-  ls "$STAGE/portal-dist/assets" > /tmp/atr-keep-assets.txt
-  removed=0
-  for f in "$PORTAL_DIST"/assets/*; do
-    [ -e "$f" ] || continue
-    if ! grep -qxF "$(basename "$f")" /tmp/atr-keep-assets.txt; then rm -f "$f"; removed=$((removed + 1)); fi
-  done
-  rm -f /tmp/atr-keep-assets.txt
-  log "清理历史 assets：$removed 个"
-fi
-
-# ---- 重启 + 健康检查 ----
-export PATH=/usr/local/bin:$PATH
-set -a; . /root/.atr/portal.env; set +a
-OLD_PID=$(pm2 pid "$PM2_NAME" 2>/dev/null | tr -d '[:space:]')
-log "重启 $PM2_NAME（旧 pid $OLD_PID）"
-pm2 restart "$PM2_NAME" >/dev/null 2>&1 || true
-
-health=""
-for i in $(seq 1 30); do
-  sleep 1
-  if health=$(curl -sf -m 3 "http://127.0.0.1:$ATR_PORT/api/health" 2>/dev/null); then break; fi
-  health=""
-done
-
-if [ -z "$health" ]; then
-  log "健康检查 30 秒未通过，开始回滚"
-  rm -rf "$SERVER_DIST" && cp -a "$BACKUP/server-dist" "$SERVER_DIST"
-  rm -rf "$PORTAL_DIST" && cp -a "$BACKUP/portal-dist" "$PORTAL_DIST"
-  pm2 restart "$PM2_NAME" >/dev/null 2>&1 || true
-  for i in $(seq 1 20); do
-    sleep 1
-    curl -sf -m 3 "http://127.0.0.1:$ATR_PORT/api/health" >/dev/null 2>&1 && break
-  done
-  log "回滚后状态：$(curl -sf -m 3 "http://127.0.0.1:$ATR_PORT/api/health" 2>/dev/null || echo '仍不可用')"
-  log "最近日志："
-  pm2 logs "$PM2_NAME" --lines 15 --nostream --no-color 2>&1 | tail -20
-  echo "ATR_DEPLOY_RESULT=rolled-back"
-  exit 2
-fi
-
-NEW_PID=$(pm2 pid "$PM2_NAME" 2>/dev/null | tr -d '[:space:]')
-log "服务已就绪：$health"
-rm -rf "$WORK"; rm -f "$WORK"-server.tgz "$WORK"-portal.tgz
-echo "ATR_DEPLOY_HEALTH=$health"
-echo "ATR_DEPLOY_OLD_PID=$OLD_PID"
-echo "ATR_DEPLOY_NEW_PID=$NEW_PID"
-echo "ATR_DEPLOY_BACKUP=$BACKUP"
-echo "ATR_DEPLOY_RESULT=ok"
-`
-}
+// ★ 生成逻辑住在 `scripts/deploy-plan.mjs` 的 `renderRemoteScript()`。
+//   理由与 `scripts/release-plan.ts` 相同：它是整个部署里**最危险**的一段
+//   （覆盖现网产物、覆盖启动包装、失败回滚），抽成纯模块才能被
+//   `packages/server/test/deploy-plan.test.ts` 结构性地钉住 ——
+//   而本文件因为 import 即执行，没法被测试直接引用。
 
 // ---------- 公网校验：这是唯一能抓住「白屏」的环节 ----------
 /**
@@ -405,7 +322,19 @@ try {
   }
   report.local.serverDist = { files: readFileSync(join(serverDist, 'main.mjs')).length }
   report.local.portalIndexHtml = { bytes: Buffer.byteLength(indexHtml) }
+
+  // ★ 运行时与启动包装：产物配不配得上这个运行时，在**上传之前**就判死。
+  //   顺序错了（先切 Bun、产物里还没有长口令 TLS 修复）会以 errno 1045 的形式
+  //   出现在目标机的 MySQL 连接上，而不是在这里 —— 那是最难查的一类失败。
+  const runtime = resolveRuntime(options.runtime)
+  const startTemplate = readFileSync(join(root, START_SCRIPT_REPO_PATH), 'utf8')
+  const startScriptBody = renderStartScript(startTemplate, options.runtime)
+  assertBundleSupportsRuntime(readFileSync(join(serverDist, 'main.mjs'), 'utf8'), options.runtime)
+  const startScriptFile = join(output, `atr-deploy-${stamp}-start.sh`)
+  writeFileSync(startScriptFile, startScriptBody)
+  report.runtime = { name: runtime.name, label: runtime.label, bin: runtime.bin }
   console.log(`\n产物自检通过：main.mjs ${(report.local.serverDist.files / 1024).toFixed(0)} KB，index.html 带前缀 ${options.portalBase}`)
+  console.log(`运行时：${runtime.label}（${{ bun: 'Bun 长口令 TLS 修复已确认在产物里', node: '无额外前置要求' }[runtime.name]}）→ ${runtime.bin}`)
 
   // 打包：一次一个 tar，传的与解的就是同一份字节
   // ★ 文件名自带 stamp：pscp 不能重命名，本地就按远端期望的名字产出，省掉一次远程 mv
@@ -422,7 +351,8 @@ try {
     report.remote = { note: 'dry-run 未连接服务器；确认无误后跑 --preflight 或 --apply' }
     save()
     console.log(`\n[计划] 目标 ${options.host || '(未指定，需 --server 或 .env 的 host)'} → ${options.remoteRoot}`)
-    console.log('[计划] 上传 server/portal 产物到 /tmp staging，校验后备份切换并重启 PM2，失败自动回滚')
+    console.log(`[计划] 运行时 ${runtime.label}（${runtime.bin}）`)
+    console.log('[计划] 上传 server/portal 产物 + 启动包装到 /tmp staging，校验后备份切换并重启 PM2，失败自动回滚')
     console.log(`\n✅ dry-run 完成（未上传、未重启）。报告：${reportPath}`)
     process.exit(0)
   }
@@ -439,9 +369,12 @@ try {
   writeFileSync(remoteScript, renderRemoteScript({
     mode: options.mode, stamp, portalBase: options.portalBase, remoteRoot: options.remoteRoot,
     pm2Name: options.pm2Name, keepOldAssets: options.keepOldAssets,
+    runtimeName: runtime.name, runtimeBin: runtime.bin,
+    // ★ 远端路径必须与本地文件名逐字相同：pscp 不能重命名（见上面 tarball 那条注释）
+    startScriptUpload: `/tmp/atr-deploy-${stamp}-start.sh`,
   }))
-  // 只传两个 tarball：远程脚本走 plink -m / ssh bash -s 的**文件通道**，不需要上传
-  remoteUpload(transport, options, [serverTarball, portalTarball], '/tmp/')
+  // 只传这两份 tarball + 启动包装：远程脚本走 plink -m / ssh bash -s 的**文件通道**，不需要上传
+  remoteUpload(transport, options, [serverTarball, portalTarball, startScriptFile], '/tmp/')
   report.steps.push({ label: '上传 staging', code: 0 })
   save()
 
@@ -454,6 +387,13 @@ try {
   report.remote.oldPid = remoteOutput.match(/ATR_DEPLOY_OLD_PID=(\S+)/)?.[1]
   report.remote.newPid = remoteOutput.match(/ATR_DEPLOY_NEW_PID=(\S+)/)?.[1]
   report.remote.backup = remoteOutput.match(/ATR_DEPLOY_BACKUP=(\S+)/)?.[1]
+  // ★ 实际运行时是**探测出来的事实**，不是我们传进去的期望值 —— 两个都记进报告，
+  //   否则「部署成功、但进程跑的是另一个二进制」在报告里完全看不出来。
+  const runtimeExpected = remoteOutput.match(/ATR_DEPLOY_RUNTIME_EXPECTED=(\S*)/)?.[1]
+  const runtimeActual = remoteOutput.match(/ATR_DEPLOY_RUNTIME_ACTUAL=(\S*)/)?.[1]
+  if (runtimeExpected || runtimeActual) {
+    report.remote.runtime = { expected: runtimeExpected ?? '', actual: runtimeActual ?? '' }
+  }
   save()
   console.log(remoteOutput.trim())
 
@@ -461,10 +401,22 @@ try {
     if (outcome !== 'preflight-ok') throw new Error(`preflight 未通过（${outcome}）`)
     report.status = 'preflight-ok'
     save()
-    console.log(`\n✅ preflight 通过：产物已上传到 ${options.host}:/tmp 并通过完整性校验，现网未改动。报告：${reportPath}`)
+    console.log(`\n✅ preflight 通过：产物与启动包装已上传到 ${options.host}:/tmp 并通过完整性校验，现网未改动。报告：${reportPath}`)
     process.exit(0)
   }
 
+  // 运行时对不上是一种**独立**的失败：服务是活的，但进程跑错了二进制。
+  // 远端已经回滚并回报了原因，不能把它并进下面那条「部署未成功」的泛化信息里 ——
+  // 两者的排查方向完全不同。
+  if (outcome === 'runtime-mismatch') {
+    report.rollback = '已回滚（运行时断言未通过）'
+    report.status = 'runtime-mismatch'
+    save()
+    throw new Error(
+      `服务健康但进程跑的不是 ${runtime.bin}（实际 ${runtimeActual || '未知'}）；远端已回滚。`
+      + `多半是启动包装没装上、或 pm2 复用了旧进程 —— 见 ${join(output, 'remote.log')}`,
+    )
+  }
   if (outcome === 'rolled-back') { report.rollback = '已回滚到部署前产物'; report.status = 'rolled-back' }
   if (outcome !== 'ok') throw new Error(`部署未成功（${outcome}），服务器状态见 ${join(output, 'remote.log')}`)
 
