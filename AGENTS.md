@@ -113,9 +113,11 @@ bun run publish:plugin:quick / publish:cli:quick       # 快速通道：只验�
 bun run deploy:server            # dry-run：只本地构建 + 打包，不连服务器
 bun run deploy:server:preflight  # 上传到服务器 /tmp 并校验，不切换不重启
 bun run deploy:server:apply      # 真部署：备份 → 切换 → 重启 → 健检，失败自动回滚
-# ⚠️ 该脚本**只管 dist，不管运行时**。线上运行时现状见 docs/服务器部署.md §11 / §12：
-#    2026-10-01 起是 **Bun 1.4.2**（启动包装 deploy/atr-server-start.sh，回滚备份 .node22.bak）。
-#    换运行时是一次独立改动，别指望「回滚部署」把它带回去。
+# ⚠️ 运行时也在部署脚本内：`--runtime bun|node`（缺省 bun）会渲染并安装仓库里的
+#    deploy/atr-server-start.sh（先备份、失败连它一起回滚），重启后断言进程真的 exec 在
+#    那个二进制上。`--runtime bun` 还要求产物含 planBunMysqlAuth（长口令 TLS 修复），
+#    否则**上传之前**就拒绝 —— 线上 atr_user 口令 32 字符，切错会 errno 1045。
+#    规则在 scripts/deploy-plan.mjs，由 packages/server/test/deploy-plan.test.ts（10 项）钉住。
 
 # DSH 插件：构建 + 五层验证（从内到外逐层接近真实，改插件后全跑）
 bun run --filter '@ai-token-report/dsh-plugin' build
