@@ -22,7 +22,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 
-import { closeAllMysqlBackends, openPortalStats } from '@ai-token-report/core/db'
+import { closeAllMysqlBackends, openPortalStats, sharedMysqlBackend } from '@ai-token-report/core/db'
 
 const STATE_DIR = resolve('.artifacts/perf')
 const RESULT_DIR = join(STATE_DIR, 'results')
@@ -48,6 +48,28 @@ function percentile(values: readonly number[], q: number): number {
 
 const sinceMs = Date.now() - 30 * 86_400_000
 const filter = { sinceMs, identityView: 'member' as const }
+
+/**
+ * 先把 `innodb_buffer_pool_size` 调到 `--pool` MB（跑完恢复）。
+ *
+ * 🚨 不设这一项量出来的东西会误导：本机实例默认 128MB，而 1M / 3M 行的表分别是
+ *   1.5GB / 3.5GB —— 那种配置下每条取数 SQL 都要读整张表，实测慢 30~100 倍，
+ *   于是「哪个操作慢」的排序完全被磁盘 I/O 决定，看不出应用层的问题。
+ */
+const poolMb = Number(arg('pool', '0'))!
+let originalPool = 0
+if (poolMb > 0) {
+  const admin = await sharedMysqlBackend(state.url)
+  originalPool = Number((await admin.get<{ v: number }>('SELECT @@innodb_buffer_pool_size AS v'))?.v ?? 0)
+  await admin.exec(`SET GLOBAL innodb_buffer_pool_size = ${poolMb * 1024 * 1024}`)
+  for (let attempt = 0; attempt < 120; attempt++) {
+    const size = await admin.get<{ v: number }>('SELECT @@innodb_buffer_pool_size AS v')
+    if (Number(size?.v) === poolMb * 1024 * 1024) break
+    await new Promise((done) => setTimeout(done, 1_000))
+  }
+  await new Promise((done) => setTimeout(done, 3_000))
+  console.log(`buffer pool：${(originalPool / 1024 / 1024).toFixed(0)}MB → ${poolMb}MB（跑完恢复）`)
+}
 
 const ops: { name: string; run: (session: Awaited<ReturnType<typeof openPortalStats>>) => Promise<unknown> }[] = [
   { name: 'openPortalStats（含 schema 闸门）', run: async () => { /* 由外面测 */ } },
@@ -104,6 +126,11 @@ for (const op of ops.slice(1)) {
 
 mkdirSync(RESULT_DIR, { recursive: true })
 const file = join(RESULT_DIR, `${scale}-ops.json`)
-writeFileSync(file, JSON.stringify({ scale, repeats, window: 'last30d', report, generatedAt: new Date().toISOString() }, null, 2))
+writeFileSync(file, JSON.stringify({ scale, repeats, window: 'last30d', poolMb, report, generatedAt: new Date().toISOString() }, null, 2))
 console.log(`\n结果已写：${file}`)
+if (originalPool > 0) {
+  const admin = await sharedMysqlBackend(state.url)
+  await admin.exec(`SET GLOBAL innodb_buffer_pool_size = ${originalPool}`)
+  console.log(`buffer pool 已恢复为 ${(originalPool / 1024 / 1024).toFixed(0)}MB`)
+}
 await closeAllMysqlBackends()

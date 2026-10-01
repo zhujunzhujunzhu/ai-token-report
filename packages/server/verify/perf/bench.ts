@@ -33,6 +33,7 @@ import { join, resolve } from 'node:path'
 
 import { closeAllMysqlBackends, openPortalStore, sharedMysqlBackend } from '@ai-token-report/core/db'
 import { createServer } from '../../src/index.js'
+import { setTimeout as delay } from 'node:timers/promises'
 
 const STATE_DIR = resolve('.artifacts/perf')
 const RESULT_DIR = resolve('.artifacts/perf/results')
@@ -58,6 +59,15 @@ const ingestBatches = Number(arg('ingest-batches', '20'))!
 const recordsPerBatch = Number(arg('records', '200'))!
 const repeats = Number(arg('repeats', '5'))!
 const cold = process.argv.includes('--cold')
+/**
+ * 先把 `innodb_buffer_pool_size` 调到 `--pool` MB 再测，跑完恢复原值。
+ *
+ * 🚨 **必须显式给**，不要依赖实例默认值：本机开发容器默认只有 **128MB**，
+ *   而 1M 行的表是 1.5GB —— 那个配置下所有取数查询都会退化成「读整张表」，
+ *   实测慢 30~100 倍（`totals` 4.4s vs 128ms）。不把这一项钉住，
+ *   量出来的就不是应用性能，而是 buffer pool 配小了。
+ */
+const poolMb = Number(arg('pool', '0'))!
 
 function statePath(name: string): string {
   return join(STATE_DIR, `${name}.json`)
@@ -133,6 +143,28 @@ async function flushTables(): Promise<void> {
 
 const home = join(STATE_DIR, `bench-home-${scale}`)
 mkdirSync(home, { recursive: true })
+
+/** buffer pool：仅在显式给 `--pool` 时调整（并记住原值以便恢复）。 */
+let originalPool = 0
+if (poolMb > 0) {
+  const admin = await sharedMysqlBackend(state.url)
+  originalPool = Number((await admin.get<{ v: number }>('SELECT @@innodb_buffer_pool_size AS v'))?.v ?? 0)
+  await admin.exec(`SET GLOBAL innodb_buffer_pool_size = ${poolMb * 1024 * 1024}`)
+  // ★ resize 是**后台**任务：`SET GLOBAL` 立刻改的是目标值，页迁移要花几秒。
+  //   不等它稳定就开始量，前几个用例会遇到「池正在换页」——实测表现为
+  //   首两个端点的 p95 冲到 10~17 秒（而 p50 正常），把结论带偏。
+  for (let attempt = 0; attempt < 120; attempt++) {
+    const size = await admin.get<{ v: number }>('SELECT @@innodb_buffer_pool_size AS v')
+    if (Number(size?.v) === poolMb * 1024 * 1024) break
+    await delay(1_000)
+  }
+  await delay(3_000)
+  // 再确认一次：拿不到目标值就是没生效，宁可在启动时炸掉也不要量出一份假数据。
+  const settled = Number((await admin.get<{ v: number }>('SELECT @@innodb_buffer_pool_size AS v'))?.v ?? 0)
+  console.log(`buffer pool：${(originalPool / 1024 / 1024).toFixed(0)}MB → ${(settled / 1024 / 1024).toFixed(0)}MB（跑完恢复）`)
+  if (settled !== poolMb * 1024 * 1024) throw new Error(`buffer pool 没调到 ${poolMb}MB（当前 ${settled}），拒绝在未知配置下压测`)
+}
+
 const server = await createServer({
   host: '127.0.0.1', port: 0, dshHome: home, dataDir: join(home, 'data'),
   dbPath: join(home, 'portal.sqlite'),
@@ -227,9 +259,12 @@ async function measureIngestSql(): Promise<void> {
   // 与生产的 `attributedInsertSql(200)` 逐字同形：20 列 × 200 行多值 INSERT。
   // ⚠️ 只有 `event_id` 写成字面量（每次尝试必须唯一），其余 19 列走位置绑定 ——
   //   绑定值的数量与生产完全一致，所以量到的就是真实的解析 + 绑定开销。
+  // ⚠️ 只把 `event_id` 写成字面量（每次尝试必须唯一），其余 19 列走位置绑定 ——
+  //   绑定值的数量与生产完全一致，所以量到的就是真实的解析 + 绑定开销。
+  const runTag = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   const insertSql = (attempt: number): string => {
     const rowValues = (index: number): string =>
-      `(${literal(`sqlprobe-${attempt}-${index}`)}, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `(${literal(`sqlprobe-${runTag}-${attempt}-${index}`)}, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     return `INSERT INTO usage_event (event_id,session_id,seq,ts,provider,model,cwd,user_id,user_name,group_name,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,turn,step,member_id,report_token_id,received_at_ms) VALUES ${Array.from({ length: 200 }, (_, index) => rowValues(index)).join(',')}`
   }
   const base = [`sqlprobe-session-${Date.now()}`, 1, Date.now(), 'deepseek-official', 'deepseek-chat', 'D:\\perf',
@@ -264,10 +299,15 @@ const ENDPOINTS: { name: string; path: string; note: string }[] = [
   { name: 'providers', path: '/api/v1/stats/providers', note: '供应商候选' },
   { name: 'breakdown:user(legacy)', path: '/api/v1/stats/breakdown?by=user&period=last30d', note: '旧视图人员排行（服务端默认值）' },
   { name: 'overview(legacy)', path: '/api/v1/stats/overview?period=last30d', note: '旧视图总览' },
+  { name: 'pricing', path: '/api/v1/stats/pricing', note: '单价只读快照（需 cost:read）' },
 ]
 
 async function measureQueries(): Promise<QueryReport[]> {
   console.log(`\n【统计】每个端点 ${repeats} 次${cold ? '（每次前 FLUSH TABLES）' : '（连续，热态）'}`)
+  // ★ 先热身：把每个端点各打一遍（不计入统计）。
+  //   少了这一步，「第一次查询」的代价会落在第一个用例的 p95 上 ——
+  //   实测表现为首个端点 p95 十几秒，而那与它自身毫无关系。
+  if (!cold) for (const endpoint of ENDPOINTS) await hit(endpoint.path)
   const reports: QueryReport[] = []
   for (const endpoint of ENDPOINTS) {
     const timings: number[] = []
@@ -323,6 +363,11 @@ const queries = await measureQueries()
 await measureQuerySql()
 
 await server.stop()
+if (originalPool > 0) {
+  const admin = await sharedMysqlBackend(state.url)
+  await admin.exec(`SET GLOBAL innodb_buffer_pool_size = ${originalPool}`)
+  console.log(`buffer pool 已恢复为 ${(originalPool / 1024 / 1024).toFixed(0)}MB`)
+}
 await closeAllMysqlBackends()
 
 const result = {

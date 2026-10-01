@@ -122,6 +122,30 @@ async function patchBackend(): Promise<void> {
 await patchBackend()
 
 const { createHandlerFor: create } = await import('../../src/index.js') as { createHandlerFor: typeof createHandlerFor }
+
+/**
+ * 可选：先把 buffer pool 调到 `--pool` MB 再测。
+ *
+ * ⚠️ 必须调：脚本量的是「闸门 vs 取数」的相对占比，而本机实例默认只有 128MB ——
+ *   那种配置下取数慢 30~100 倍，闸门的占比会被压到看不懂（实测 3%）。
+ *   跑完恢复原值。
+ */
+const poolMb = Number(arg('pool', '0'))!
+let originalPool = 0
+if (poolMb > 0) {
+  const { sharedMysqlBackend: shared } = await import('@ai-token-report/core/db')
+  const admin = await shared(state.url)
+  originalPool = Number((await admin.get<{ v: number }>('SELECT @@innodb_buffer_pool_size AS v'))?.v ?? 0)
+  await admin.exec(`SET GLOBAL innodb_buffer_pool_size = ${poolMb * 1024 * 1024}`)
+  for (let attempt = 0; attempt < 90; attempt++) {
+    const size = await admin.get<{ v: number }>('SELECT @@innodb_buffer_pool_size AS v')
+    if (Number(size?.v) === poolMb * 1024 * 1024) break
+    await new Promise((done) => setTimeout(done, 1_000))
+  }
+  await new Promise((done) => setTimeout(done, 3_000))
+  console.log(`buffer pool 已设为 ${poolMb}MB（原值 ${(originalPool / 1024 / 1024).toFixed(0)}MB，跑完恢复）`)
+}
+
 const bundle = await create({
   dshHome: home, dataDir: join(home, 'data'), dbPath: join(home, 'portal.sqlite'), mysqlUrl: state.url,
   adminToken: state.adminToken, adminName: '性能夹具管理员',
@@ -178,6 +202,12 @@ try {
   }
 } finally {
   await bundle.close()
+  if (originalPool > 0) {
+    const { sharedMysqlBackend: shared } = await import('@ai-token-report/core/db')
+    const admin = await shared(state.url)
+    await admin.exec(`SET GLOBAL innodb_buffer_pool_size = ${originalPool}`)
+    console.log(`buffer pool 已恢复为 ${(originalPool / 1024 / 1024).toFixed(0)}MB`)
+  }
   await closeAllMysqlBackends()
 }
 
