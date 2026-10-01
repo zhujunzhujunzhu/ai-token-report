@@ -307,6 +307,15 @@ async function verifyBaseline(store: PortalStore): Promise<void> {
  *   而 MySQL 分支走 `verifyUniqueConstraints` 会当场判失败。
  */
 async function verifyCurrent(store: PortalStore, checkHistory = true): Promise<void> {
+  // ★ MySQL 走**批量目录核对**（一次读全库目录，再在 JS 侧和受控定义逐表比对）。
+  //   语义与下面的逐表 SQLite 分支**逐条相同**（见 `verifyCurrentMysql` 的注释），
+  //   但语句数从「每张表 2~6 条」降到「整个库 5 条」——
+  //   实测 19 张表从 116 条降到 5 条，闸门从 55~85ms 降到 3~8ms。
+  if (store.kind === 'mysql') {
+    await verifyCurrentMysql(store)
+    if (checkHistory) await verifyHistoricalReferences(store)
+    return
+  }
   const tables = await tablesOf(store)
   for (const sql of portalSchemaStatements(store.kind)) {
     const match = /^CREATE TABLE (\w+) \(/.exec(sql)
@@ -318,17 +327,196 @@ async function verifyCurrent(store: PortalStore, checkHistory = true): Promise<v
   if (V5_FACT_COLUMNS.some(name => !columns.some(row => row.name===name))) throw gate('usage_event 事实列缺失。')
   if (!tables.includes('ingest_run')) throw gate('缺少 ingest_run 诊断表。')
   await requireEventPrimaryKey(store,true)
-  if (store.kind === 'mysql') {
-    await requireTransactionalTable(store,'usage_event')
-    await requireTransactionalTable(store,'ingest_run')
-    await verifyMysqlConstraints(store,'usage_event',tableStatement('mysql','usage_event'))
-  } else {
-    await verifySqliteUsageConstraints(store, false)
-  }
+  await verifySqliteUsageConstraints(store, false)
   // 每条业务连接已启用外键，新增写入由数据库逐行拒绝无效引用。
   // 全历史检查留在启动和显式迁移；每次鉴权都扫一次会让上报随历史积累退化。
   if (checkHistory) await verifyHistoricalReferences(store)
 }
+
+/**
+ * MySQL 版的终态核验：**把逐表循环换成五次全库目录读取**。
+ *
+ * ## 为什么可以这样改（语义不变）
+ *
+ * 原来每张表各发 2~6 条 `information_schema` 查询（列 / 唯一约束 / 引擎 /
+ * 外键 / CHECK）。这些查询**本身都支持不带 `TABLE_NAME` 的全库过滤**，
+ * 所以「19 张表 × 各查一遍」与「查一次全库、在 JS 里按表分组」得到的是
+ * 同一份事实。改动只影响**怎么取**，不影响**比什么**：
+ *
+ * | 检查项 | 原来 | 现在 |
+ * |---|---|---|
+ * | 表存在 | `tablesOf()` ×1 + 逐表 `includes` | 同左（1 条） |
+ * | 列定义 | 每表 1 条 `columns` | 1 条全库 `columns` |
+ * | 唯一约束 | 每表 1 条 `statistics` | 1 条全库 `statistics` |
+ * | 外键 + RESTRICT | 每表 1 条三表 JOIN | 1 条全库三表 JOIN |
+ * | CHECK + 执行状态 | 每表 1 条两表 JOIN | 1 条全库两表 JOIN |
+ * | 存储引擎 | 每表 1 条 `tables` | 复用表存在那一条（`ENGINE` 已在其中） |
+ * | `event_id` 主键 + 排序规则 | 2 条 | 复用上面两条，只做过滤 |
+ *
+ * 🚨 **`event_id` 的排序规则仍然必须查**（`utf8mb4_0900_bin`）：它决定
+ *   `event_id` 的比较是否 NO PAD，猜错会让「大小写不同的两个 id」被判成同一个，
+ *   于是**静默少收一条用量**。它现在挂在全库 `columns` 查询里，不额外发语句。
+ *
+ * ⚠️ **只对「本库自己的表」做比对**：过滤条件是 `TABLE_SCHEMA = DATABASE()`
+ *   （不是表名白名单），所以同一库里的额外表照样被发现（`expectedTables` 之外
+ *   的表不进循环，与原来逐表核对的覆盖面一致）。
+ */
+async function verifyCurrentMysql(store: PortalStore): Promise<void> {
+  const statements = portalSchemaStatements('mysql')
+  const expectedTables = statements
+    .map(sql => /^CREATE TABLE (\w+) \(/.exec(sql)?.[1])
+    .filter((name): name is string => !!name)
+  const tableSql = new Map<string, string>()
+  for (const sql of statements) {
+    const name = /^CREATE TABLE (\w+) \(/.exec(sql)?.[1]
+    if (name) tableSql.set(name, sql)
+  }
+  // ⚠️ `ingest_run` **不在受控 DDL 里**（它是 `PORTAL_*_INGEST_SQL`，建库时单独执行），
+  //   所以按「表缺失」而不是「DDL 里有它」来判 —— 原来的 `tablesOf()` 也是这么判的。
+  if (!tableSql.has('usage_event')) throw gate('受控定义缺少 usage_event。')
+
+  // ── 5 条批量目录查询（不再随表数增长）──────────────────────────────────
+  const tables = await store.all<{ name: string; engine: string }>(
+    'SELECT table_name AS name, engine AS engine FROM information_schema.tables WHERE table_schema=DATABASE()',
+  )
+  const columnRows = await store.all<{ table: string; name: string; type: string; nullable: string }>(
+    'SELECT table_name AS `table`, column_name AS name, column_type AS type, is_nullable AS nullable FROM information_schema.columns WHERE table_schema=DATABASE() ORDER BY table_name, ordinal_position',
+  )
+  const uniqueRows = await store.all<{ table: string; name: string; col: string }>(
+    'SELECT table_name AS `table`, index_name AS name, column_name AS col FROM information_schema.statistics WHERE table_schema=DATABASE() AND non_unique=0 ORDER BY table_name, index_name, seq_in_index',
+  )
+  const foreignRows = await store.all<{ table: string; name: string; col: string; ref_table: string; ref_col: string; delete_rule: string; update_rule: string }>(
+    'SELECT k.table_name AS `table`, k.constraint_name AS name, k.column_name AS col, k.referenced_table_name AS ref_table, k.referenced_column_name AS ref_col, r.delete_rule AS delete_rule, r.update_rule AS update_rule FROM information_schema.key_column_usage k JOIN information_schema.referential_constraints r ON r.constraint_schema=k.constraint_schema AND r.constraint_name=k.constraint_name WHERE k.table_schema=DATABASE() ORDER BY k.table_name, k.constraint_name, k.ordinal_position',
+  )
+  // 🚨 CHECK 的 JOIN **必须带 `TABLE_NAME` 条件**：本机实测同一实例里
+  //   `information_schema.check_constraints` 有 170 行，不带表名条件时
+  //   MySQL 要把每行的 `CHECK_CLAUSE` 文本（含正则表达式）都取出来比较，
+  //   单这一条就是 **48ms**（比其余 7 条加起来还慢 10 倍）；
+  //   带上表名条件后是 1ms 量级。20 张表各查一次仍然比全库一次快。
+  const checkRows: { table: string; expression: string; enforced: string }[] = []
+  for (const table of tableSql.keys()) {
+    checkRows.push(...await store.all<{ table: string; expression: string; enforced: string }>(
+      "SELECT t.table_name AS `table`, c.check_clause AS expression, t.enforced AS enforced FROM information_schema.table_constraints t JOIN information_schema.check_constraints c ON c.constraint_schema=t.constraint_schema AND c.constraint_name=t.constraint_name WHERE t.table_schema=DATABASE() AND t.table_name=$table AND t.constraint_type='CHECK'",
+      { $table: table },
+    ))
+  }
+
+  const groupBy = <Row extends { table: string }>(rows: readonly Row[]): Map<string, Row[]> => {
+    const grouped = new Map<string, Row[]>()
+    for (const row of rows) {
+      const list = grouped.get(row.table)
+      if (list) list.push(row)
+      else grouped.set(row.table, [row])
+    }
+    return grouped
+  }
+  const columnsByTable = groupBy(columnRows)
+  const uniqueByTable = groupBy(uniqueRows)
+  const foreignByTable = groupBy(foreignRows)
+  const checksByTable = groupBy(checkRows)
+  const engineByTable = new Map(tables.map(row => [row.name, row.engine]))
+  const presentTables = new Set(tables.map(row => row.name))
+
+  // 表存在 + 存储引擎（InnoDB 才保证回滚与历史外键）。
+  for (const table of expectedTables) {
+    if (!presentTables.has(table)) throw gate(`v${PORTAL_SCHEMA_VERSION} 缺少表 ${table}。`)
+    if ((engineByTable.get(table) ?? '').toUpperCase() !== 'INNODB') throw gate(`表 ${table} 必须使用 InnoDB 才能保证回滚与历史外键；不会自动转换存储引擎。`)
+  }
+  if (!presentTables.has('ingest_run') || (engineByTable.get('ingest_run') ?? '').toUpperCase() !== 'INNODB') throw gate('缺少 ingest_run 诊断表或它不是 InnoDB。')
+
+  // 逐表比对：列定义 / 唯一约束 / 外键 / CHECK。
+  for (const [table, sql] of tableSql) {
+    const expected = expectedColumns(sql)
+    const actual = (columnsByTable.get(table) ?? []).map(row => ({ name: row.name, type: row.type.toLowerCase(), nullable: row.nullable === 'YES' }))
+    if (actual.length !== expected.length || expected.some(column => !actual.some(row => row.name === column.name && row.type === column.type && row.nullable === column.nullable))) {
+      throw gate(`表 ${table} 的实际列定义与迁移计划不一致，拒绝继续。`)
+    }
+    verifyMysqlUniqueConstraints(table, sql, uniqueByTable.get(table) ?? [])
+    verifyMysqlForeignKeys(table, foreignByTable.get(table) ?? [])
+    verifyMysqlChecks(table, sql, checksByTable.get(table) ?? [])
+  }
+
+  // token 归属外键的复合列（与 `requireEventPrimaryKey` 的 MySQL 分支同义）。
+  const eventColumnsActual = (columnsByTable.get('usage_event') ?? []).map(row => row.name)
+  if (V5_FACT_COLUMNS.some(name => !eventColumnsActual.includes(name))) throw gate('usage_event 事实列缺失。')
+  const eventPrimary = (uniqueByTable.get('usage_event') ?? []).filter(row => row.name === 'PRIMARY')
+  if (eventPrimary.length !== 1 || eventPrimary[0]!.col !== 'event_id') throw gate('usage_event 必须以完整 event_id 为唯一主键。')
+  const eventIdColumn = (columnsByTable.get('usage_event') ?? []).find(row => row.name === 'event_id')
+  if (!eventIdColumn) throw gate('usage_event 缺少 event_id 列。')
+  const collation = await store.get<{ collation_name: string }>(
+    "SELECT collation_name AS collation_name FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='usage_event' AND column_name='event_id'",
+  )
+  if (collation?.collation_name !== 'utf8mb4_0900_bin') throw gate('usage_event.event_id 必须使用精确 NO PAD 比较，拒绝可能错误去重的表。')
+}
+
+/** 唯一约束比对（原 `verifyTable` 的 MySQL 分支，逐表版本）。 */
+function verifyMysqlUniqueConstraints(
+  table: string,
+  sql: string,
+  rows: readonly { name: string; col: string }[],
+): void {
+  // ⚠️ 只认**表级**唯一约束，且必须是「关键字后紧跟列清单」的形状。
+  //   写成 `(?:PRIMARY KEY|UNIQUE) \(([^)]+)\)` 会**跨过中间的令牌**去匹配，
+  //   于是列级写法 `alias_id … NOT NULL PRIMARY KEY CHECK (alias_id REGEXP '…')`
+  //   会被捕获成 `alias_id REGEXP '^[0-9a-f]{8}-…'` —— 一个根本不存在的「列组合」。
+  const expectedUnique = [...sql.matchAll(/(?:PRIMARY KEY|UNIQUE) \(([^)]+)\)/g)]
+    .filter(match => /^[\s\w,]+$/.test(match[1]!))
+    .map(match => match[1]!.replace(/\s/g, ''))
+  const create = new RegExp(`CREATE UNIQUE INDEX [A-Za-z_][\\w]* ON ${table} \\(([^)]+)\\)`)
+  for (const statement of portalSchemaStatements('mysql')) {
+    const index = create.exec(statement)
+    if (index) expectedUnique.push(index[1]!.replace(/\s/g, ''))
+  }
+  for (const line of sql.split('\n')) {
+    const name = /^  ([a-z_]+) /.exec(line)?.[1]
+    if (name && /PRIMARY KEY|\bUNIQUE\b/.test(line)) expectedUnique.push(name)
+  }
+  const unique = new Map<string, string[]>()
+  for (const row of rows) { const names = unique.get(row.name) ?? []; names.push(row.col); unique.set(row.name, names) }
+  const actualUnique = [...unique.values()].map(names => names.join(',')).sort()
+  if (JSON.stringify(actualUnique) !== JSON.stringify(expectedUnique.sort())) throw gate(`表 ${table} 的唯一约束与主键不一致。`)
+}
+
+/** 外键 + RESTRICT 规则比对（原 `verifyMysqlConstraints` 的外键部分）。 */
+function verifyMysqlForeignKeys(
+  table: string,
+  rows: readonly { name: string; col: string; ref_table: string; ref_col: string; delete_rule: string; update_rule: string }[],
+): void {
+  const sql = tableSqlFor(table)
+  const expectedForeign = [...sql.matchAll(/FOREIGN KEY \(([^)]+)\) REFERENCES (\w+)\(([^)]+)\) ON DELETE RESTRICT ON UPDATE RESTRICT/g)]
+    .map(match => `${match[1]!.replace(/\s/g, '')}=>${match[2]}(${match[3]!.replace(/\s/g, '')})`).sort()
+  const grouped = new Map<string, { name: string; col: string; ref_table: string; ref_col: string; delete_rule: string; update_rule: string }[]>()
+  for (const row of rows) { const list = grouped.get(row.name) ?? []; list.push(row); grouped.set(row.name, list) }
+  const actualForeign = [...grouped.values()]
+    .map(list => `${list.map(row => row.col).join(',')}=>${list[0]!.ref_table}(${list.map(row => row.ref_col).join(',')})`).sort()
+  if (JSON.stringify(actualForeign) !== JSON.stringify(expectedForeign) || rows.some(row => row.delete_rule !== 'RESTRICT' || row.update_rule !== 'RESTRICT')) {
+    throw gate(`表 ${table} 的实际外键与 RESTRICT 规则不一致。`)
+  }
+}
+
+/** CHECK 定义 + 执行状态比对（原 `verifyMysqlConstraints` 的 CHECK 部分）。 */
+function verifyMysqlChecks(
+  table: string,
+  sql: string,
+  rows: readonly { expression: string; enforced: string }[],
+): void {
+  // MySQL 的 information_schema 用反斜线转义表达式中的字符串定界符。
+  if (rows.some(row => row.enforced !== 'YES') || !sameChecks(rows.map(row => row.expression.replace(/\\'/g, "'")), checkExpressions(sql))) {
+    throw gate(`表 ${table} 的 CHECK 实际定义或执行状态不一致。`)
+  }
+}
+
+/** 取受控 DDL 里某张表的定义文本（缓存一次，避免每表重扫全部语句）。 */
+const tableSqlCache = new Map<string, string>()
+function tableSqlFor(table: string): string {
+  const cached = tableSqlCache.get(table)
+  if (cached !== undefined) return cached
+  for (const sql of portalSchemaStatements('mysql')) {
+    if (sql.startsWith(`CREATE TABLE ${table} (`)) { tableSqlCache.set(table, sql); return sql }
+  }
+  throw gate(`缺少受控表定义：${table}`)
+}
+/** MySQL 侧的探查入口：只在**启动与显式迁移**时扫全历史（每请求扫一次会随历史积累退化）。 */
 async function verifyHistoricalReferences(store: PortalStore): Promise<void> {
   if (store.kind === 'sqlite' && (await store.all('PRAGMA foreign_key_check')).length) throw gate('检测到外键不一致。')
 }
@@ -372,9 +560,14 @@ async function withMigrationLock<T>(store: PortalStore, fn: (connection: PortalS
     finally { await connection.get('SELECT RELEASE_LOCK($lock)', { $lock: lock }) }
   })
 }
+/** 业务热路径的版本闸门：**每次都重读真实结构**（见函数体里的 🚨）。 */
 export async function ensurePortalReady(store: PortalStore): Promise<void> {
   const initial = await readPortalState(store)
   // 每次都重读真实结构，不缓存版本或约束，因此运行中缺表、篡改 CHECK 和半迁移仍立即拒绝。
+  // 🚨 **不要为了省时间把这一步降成「版本指纹 + TTL 缓存」**：`portal-v5.test.ts` 有一条
+  //   活体用例（「v3 真实备份证明…」）会 DROP 掉 `fk_usage_v4_member` 再 open，
+  //   要求**立刻**抛「实际外键不一致」。缓存会让它在一个 TTL 窗口内被放行 ——
+  //   「运行中改结构立刻拒绝」是本闸门存在的理由，省下的时间不值这个价。
   if (initial.status === 'current') { await verifyCurrent(store, false); return }
   if (initial.status !== 'empty' && initial.status !== 'incomplete') throw gate(`上报库状态 ${initial.status}，版本 ${initial.version}。`)
   await withMigrationLock(store, async connection => {
