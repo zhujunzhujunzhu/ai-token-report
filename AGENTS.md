@@ -81,6 +81,18 @@ bun run packages/server/verify/verify-mysql-portal.ts
 # ★ 断言 zod 没进前端产物（S12.5；shared 根入口一旦 re-export schemas 就会变大且不报错）
 bun run --filter '@ai-token-report/shared' verify:bundles
 
+# ★ 运行时 A/B（Node 22 vs Bun）：在**目标服务器上**跑，要 root 与线上库克隆权限
+#   结果与结论见 docs/性能：Node22 与 Bun 对比实测.md；夹具说明见 runtime-ab/README.md
+#   ⚠️ 会在目标机建一个 atr_http_v5_* 隔离库与一个隔离 MySQL 用户，跑完务必 dispose
+node packages/server/verify/perf/runtime-ab/ssh-exec.mjs --out packages/server/dist/main.mjs \
+  /data/ai-token-report/packages/server/runtime-ab/main.mjs
+node packages/server/verify/perf/runtime-ab/ssh-exec.mjs \
+  /data/ai-token-report/packages/server/runtime-ab/fixture.sh setup
+node packages/server/verify/perf/runtime-ab/ssh-exec.mjs \
+  /data/ai-token-report/packages/server/runtime-ab/run.sh
+node packages/server/verify/perf/runtime-ab/ssh-exec.mjs \
+  /data/ai-token-report/packages/server/runtime-ab/fixture.sh dispose
+
 # npm 发布产物（独立包 dsh-token-report）：构建 + 双运行时端到端验证
 bun run --filter '@ai-token-report/cli' build:npm     # 产物落在 packages/cli/dist
 bun run --filter '@ai-token-report/cli' verify:npm    # ★ 发布前必跑
@@ -101,6 +113,9 @@ bun run publish:plugin:quick / publish:cli:quick       # 快速通道：只验�
 bun run deploy:server            # dry-run：只本地构建 + 打包，不连服务器
 bun run deploy:server:preflight  # 上传到服务器 /tmp 并校验，不切换不重启
 bun run deploy:server:apply      # 真部署：备份 → 切换 → 重启 → 健检，失败自动回滚
+# ⚠️ 该脚本**只管 dist，不管运行时**。线上运行时现状见 docs/服务器部署.md §11 / §12：
+#    2026-10-01 起是 **Bun 1.4.2**（启动包装 deploy/atr-server-start.sh，回滚备份 .node22.bak）。
+#    换运行时是一次独立改动，别指望「回滚部署」把它带回去。
 
 # DSH 插件：构建 + 五层验证（从内到外逐层接近真实，改插件后全跑）
 bun run --filter '@ai-token-report/dsh-plugin' build
