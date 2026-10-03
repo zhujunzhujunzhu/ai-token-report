@@ -34,7 +34,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { Delete, Plus, Refresh, Search } from '@element-plus/icons-vue'
 import {
   ElAlert, ElButton, ElCard, ElDialog, ElForm, ElFormItem, ElInput,
-  ElMessage, ElMessageBox, ElOption, ElRadioButton, ElRadioGroup,
+  ElMessage, ElMessageBox, ElOption, ElRadioButton, ElRadioGroup, ElSelect,
   ElSkeleton, ElTable, ElTableColumn, ElTag,
 } from 'element-plus'
 import type { FormInstance, FormRules } from 'element-plus'
