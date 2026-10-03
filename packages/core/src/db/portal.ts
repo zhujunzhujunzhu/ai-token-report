@@ -298,7 +298,15 @@ export interface PortalRecordRow {
   provider: string
   /** 上报当时的供应商原值。明细要能核对规则，所以两个都留着。 */
   providerRaw: string
+  /** ★ 展示用的模型名（已按规则归一化；未配规则时等于 `modelRaw`）。 */
   model: string
+  /**
+   * 上报当时的模型原值。
+   *
+   * 🚨 它同时是**计价用的那一份**：`model_price` 是按原值 `(provider, model)`
+   *   匹配的，金额必须用原值算 —— 见 `recordProjection()` 的注释。
+   */
+  modelRaw: string
   cwd: string | null
   /**
    * ★ v9：这条用量是哪个客户端写的（`dsh` / `codex` / `claude-code` / …）。
@@ -334,9 +342,12 @@ interface PortalRecordSqlRow {
   ts: unknown
   user_id: string | null
   provider: string
-  /** 归一化表达式的结果；没配规则时该列与 `provider` 同值。 */
+  /** 供应商归一化表达式的结果；没配规则时该列与 `provider` 同值。 */
   provider_norm?: unknown
+  /** **原值**模型名。计价用的就是它（`model_price` 按上报原值匹配）。 */
   model: string
+  /** 模型归一化表达式的结果；没配规则时该列与 `model` 同值。 */
+  model_norm?: unknown
   cwd: string | null
   /** v9：这条用量是哪个客户端写的（受控枚举原值，查询期不做任何归一化）。 */
   source: string
@@ -1343,8 +1354,7 @@ export class PortalStatsSession {
             groupIds: (r.member_id ? groups.get(r.member_id) ?? [] : []).map((group) => group.groupId),
             groupNameSnapshot: r.group_name, attributionStatus: r.member_id ? 'member' as const : r.user_id !== null ? 'legacy' as const : 'unattributed' as const,
           } : {}),
-          ...mapRecordProvider(r),
-          model: r.model,
+          ...mapRecordNames(r),
           cwd: r.cwd,
           // ★ v9 来源：明细也要带它 —— 「这条用量是谁写的」在逐条核对时同样要能看见
           //   （例如「看板上筛了 Codex，但这一行其实是 DSH 的」这种问题只在这里看得出来）。

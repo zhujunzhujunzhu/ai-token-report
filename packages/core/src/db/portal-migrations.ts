@@ -23,7 +23,7 @@ import { existsSync, readFileSync, mkdirSync, statSync, writeFileSync } from 'no
 import { dirname, resolve } from 'node:path'
 import type { Database } from './driver.js'
 import { describePortalTarget, openRawPortalStore, type PortalStore, type PortalTarget } from './portal-connection.js'
-import { PORTAL_SCHEMA_VERSION, PORTAL_SQLITE_INGEST_SQL, PORTAL_MYSQL_INGEST_SQL, portalSchemaChecksum, portalSchemaChecksumV6, portalSchemaChecksumV7, portalSchemaChecksumV8, portalSchemaChecksumV9, portalSchemaChecksumV10, portalSchemaStatements, portalV6Statements, portalV6TableStatement, portalV7Statements, portalV7TableStatement, portalV8Statements, portalV8TableStatement, PORTAL_V8_TABLES, PORTAL_SOURCE_COLUMN, portalV10AddColumnStatements, PORTAL_OFFPEAK_SCHEDULE_COLUMN, portalV11Statements, portalV11TableStatement, PROJECT_ALIAS_TABLE, portalV9AddColumnStatement } from './portal-schema-v5.js'
+import { PORTAL_SCHEMA_VERSION, PORTAL_SQLITE_INGEST_SQL, PORTAL_MYSQL_INGEST_SQL, portalSchemaChecksum, portalSchemaChecksumV6, portalSchemaChecksumV7, portalSchemaChecksumV8, portalSchemaChecksumV9, portalSchemaChecksumV10, portalSchemaChecksumV11, portalSchemaStatements, portalV6Statements, portalV6TableStatement, portalV7Statements, portalV7TableStatement, portalV8Statements, portalV8TableStatement, PORTAL_V8_TABLES, PORTAL_SOURCE_COLUMN, portalV9AddColumnStatement, portalV10AddColumnStatements, PORTAL_OFFPEAK_SCHEDULE_COLUMN, portalV11Statements, portalV11TableStatement, PROJECT_ALIAS_TABLE, portalV12AddColumnStatement, portalV12ReplaceProviderAliasIndex, portalProviderAliasTemporaryIndex, portalProviderAliasUniqueIndex, PORTAL_MODEL_COLUMN, PORTAL_PROVIDER_ALIAS_TEMP_INDEX, PORTAL_PROVIDER_ALIAS_UNIQUE_COLUMNS, PORTAL_PROVIDER_ALIAS_UNIQUE_INDEX } from './portal-schema-v5.js'
 import { PORTAL_SQLITE_V4_INGEST_SQL, PORTAL_MYSQL_V4_INGEST_SQL, portalSchemaChecksumV4, portalSchemaStatementsV4 } from './portal-schema-v4.js'
 import { checkExpressions, sameChecks, normalizeTrigger } from './portal-catalog.js'
 
@@ -81,6 +81,15 @@ const V9_VERSION = 9
  *   一条语句就能升上去。
  */
 const V10_VERSION = 10
+/**
+ * v11 的**结构**版本号（= v10 + `project_alias`）。
+ *
+ * ★ 与 v7~v10 同理：v12 的账本行是当前版本，而 v11 行必须能被认出来 ——
+ *   那是「这个库是完整的上一版、可以原地升 v12」的证据。
+ *   少了这一行，已经迁到 v11 的库会变成 `unsupported`（服务端拒绝启动），
+ *   而 v12 只是给 `provider_alias` 加一列 + 换一次唯一索引就能升上去。
+ */
+const V11_VERSION = 11
 type SchemaVersion = 4 | 5
 
 export interface PortalInspection {
@@ -150,6 +159,7 @@ async function readPortalState(store: PortalStore): Promise<Omit<PortalInspectio
   const v8Row = await migrationRow(store, tables, V8_VERSION)
   const v9Row = await migrationRow(store, tables, V9_VERSION)
   const v10Row = await migrationRow(store, tables, V10_VERSION)
+  const v11Row = await migrationRow(store, tables, V11_VERSION)
   let status: PortalInspection['status'] = 'unsupported'
   if (tables.length === 0 && version === 0) status = 'empty'
   else if (version === 0 && tables.length === 1 && tables[0] === 'portal_schema_migrations' && !current && !baseline) status = 'incomplete'
@@ -191,8 +201,14 @@ async function readPortalState(store: PortalStore): Promise<Omit<PortalInspectio
   //   v10 库会冒充成「只差一次追加迁移」，而 v11 是纯追加 ——
   //   手工改动会被一路带上去，且没有任何一步报错。
   else if (version === V10_VERSION && v10Row?.status === 'completed' && v10Row.checksum === portalSchemaChecksumV10(store.kind) && !current) status = 'legacy'
-  // v5/v6/v7/v8/v9/v10 账本存在但 checksum 不符（程序换了 SQL 或库被改过）会落到 'unsupported'，绝不冒充 current。
-  return { kind: store.kind, label: store.label, version, status, tables, migration: current ?? v10Row ?? v9Row ?? v8Row ?? v7Row ?? v6Row ?? v5Row ?? baseline }
+  // ★ v11：结构 = v10 + `project_alias`，但受控 DDL 已经给 `provider_alias`
+  //   补了 `model` 列**并换掉了它的唯一索引**。与 v6~v10 同理，额外比对
+  //   **冻结的 v11 摘要**：只有「确实是本程序发布出去的那一版 v11」才放行。
+  //   少了它，一个被手工改过结构的 v11 库会冒充成「只差一次追加迁移」，
+  //   而 v12 会给它加列换索引 —— 手工改动会被一路带上去，且没有任何一步报错。
+  else if (version === V11_VERSION && v11Row?.status === 'completed' && v11Row.checksum === portalSchemaChecksumV11(store.kind) && !current) status = 'legacy'
+  // v5/v6/v7/v8/v9/v10/v11 账本存在但 checksum 不符（程序换了 SQL 或库被改过）会落到 'unsupported'，绝不冒充 current。
+  return { kind: store.kind, label: store.label, version, status, tables, migration: current ?? v11Row ?? v10Row ?? v9Row ?? v8Row ?? v7Row ?? v6Row ?? v5Row ?? baseline }
 }
 async function inspectStore(store: PortalStore): Promise<PortalInspection> {
   const state = await readPortalState(store)
@@ -955,6 +971,18 @@ async function upgradeV4ToV5(store: PortalStore, target: PortalTarget, options: 
   }
 
   try {
+    // 🚨 v12 的「给 `provider_alias` 加列 + 换唯一索引」**必须排在最前面**
+    //   （早于 v5→v6），而不能按版本号顺序放在链尾：
+    //   `upgradeV5ToV6()` 用**当前受控定义**建表并核对，它内部的
+    //   `ensureControlledIndexes()` 在索引已存在时会**逐列核对** —— 一个 v11 库的
+    //   `idx_provider_alias_member` 还是旧的 `(member_id, provider)`，先跑 v5→v6
+    //   就会当场报「索引 idx_provider_alias_member 目录定义不匹配」，
+    //   而真正的原因（索引该先被 v12 换掉）在报错里完全看不出来。
+    //   反过来先跑 v12 是安全的：它内部逐项幂等（表不存在 / 列已在 / 索引已对都跳过），
+    //   对 v3/v4 老库是空操作，随后 v5→v6 才把表按含 `model` 的受控定义建出来。
+    //   它还必须在 v5 的事实表重建之前：`provider_alias` 引用 `members`，
+    //   重建 `members` 时这张表必须已经存在（理由见下面 v6 的注释）。
+    await upgradeV11ToV12(store)
     // 🚨 **v6 的追加必须早于 v5 的表重建**：`provider_alias.member_id` 有外键
     //   指向 `members`，而 SQLite 在重建 `members`（RENAME → 新建 → 拷贝 → 删旧）
     //   的过程中会重新解析全部引用它的表 —— 那一刻 `provider_alias` 还不存在时，
@@ -1032,7 +1060,23 @@ async function upgradeV4ToV5(store: PortalStore, target: PortalTarget, options: 
  *   v5 步骤已经比对过，而这里根本没有会改数据的语句。
  */
 async function upgradeV5ToV6(store: PortalStore): Promise<void> {
-  const table = portalV6TableStatement(store.kind, 'provider_alias')
+  /**
+   * ★ 建表与核对都用**当前受控定义**（= v6 的表 + v12 的 `model` 列 +
+   *   换成三列的唯一索引），而不是 `portalV6TableStatement()` 那段冻结的 v6 文本。
+   *
+   * 理由与 `upgradeV6ToV7()` 完全相同：一个「结构已经是当前版本、但账本被回滚到
+   *   v6」的库本来就带着那一列（迁移用例正是这么造旧版库的），拿 v6 文本去
+   *   逐列核对会当场判「provider_alias 的列定义与迁移计划不一致」，
+   *   而它实际完全正确 —— 紧随其后的 `upgradeV9ToV10` / `upgradeV11ToV12`
+   *   本来就是幂等的（列已在就跳过）。
+   *
+   * ⚠️ 索引那一份也必须用**替换后**的清单：`ensureIndex()` 在索引已存在时
+   *   会逐列核对，拿旧的 `(member_id, provider)` 去核对一个已经是
+   *   `(member_id, provider, model)` 的索引会直接判「索引目录定义不匹配」——
+   *   而 `upgradeV11ToV12` 已经把它换对了。
+   */
+  const controlStatements = portalV12ReplaceProviderAliasIndex(portalV6Statements(store.kind))
+  const table = tableStatement(store.kind, 'provider_alias')
   if (!(await tablesOf(store)).includes('provider_alias')) await store.exec(table)
   // ⚠️ 必须用 `ensureControlledIndexes()`（它认 `CREATE UNIQUE INDEX`）。
   //   早先这里写的是 `sql.startsWith('CREATE INDEX')`，于是
@@ -1044,7 +1088,7 @@ async function upgradeV5ToV6(store: PortalStore): Promise<void> {
   //   「表 provider_alias 的唯一约束与主键不一致」，整个迁移一步都走不动；
   //   而 SQLite 分支只比 `sqlite_master.sql` 全文、根本不看索引，
   //   所以这个顺序错误在本地 SQLite 测试里永远看不见。
-  await ensureControlledIndexes(store, portalV6Statements(store.kind))
+  await ensureControlledIndexes(store, controlStatements)
   await verifyTable(store, 'provider_alias', table)
   for (const sql of portalV6Statements(store.kind)) {
     if (sql.startsWith('INSERT')) await store.exec(sql)
@@ -1246,6 +1290,96 @@ async function upgradeV10ToV11(store: PortalStore): Promise<void> {
   for (const sql of portalV11Statements(store.kind)) {
     if (sql.startsWith('INSERT')) await store.exec(sql)
   }
+}
+
+/**
+ * v11 → v12：给 `provider_alias` 补一列 `model`，**并把唯一索引换成三列**。
+ *
+ * ## 为什么这一版既加列又换索引
+ *
+ * 加列让规则从「只折叠供应商」扩展到「模型也能折叠」（`model IS NULL` = 供应商规则，
+ * 非 NULL = 模型规则）。而不换索引的话，「`dashscope` 这条供应商规则」与
+ * 「`dashscope` + `qwen-max` 这条模型规则」在 `(member_id, provider)` 下是同一个键 ——
+ * 第二条根本写不进去，而这两条规则正是使用者会同时配置的。详见
+ * `portal-schema-v12.ts` 的文件头。
+ *
+ * ## 为什么不需要备份证明
+ *
+ * `model` 列**可空、无默认值**：两种后端的 `ADD COLUMN` 都不重写既有行，于是
+ * 历史规则读出来就是「供应商规则」，与它们当年被写入时的语义**逐字一致**。
+ * 换索引只改索引结构，一个字节的规则数据都不动 ——
+ * 与 v6 / v7 / v8 / v9 / v10 / v11 同一档。`usage_event` 更是完全不碰。
+ *
+ * ## 幂等（硬要求：两条升级路径会在不同时刻把这一列带进来）
+ *
+ * 1. **全新库 / v5 之前的老库**：`portalSchemaStatements()` 里的 `provider_alias`
+ *    已经是**拼接过 `model` 列**、且唯一索引已是三列的受控定义，建出来就对；
+ * 2. **已经是 v11 的库**：表里没有这一列、索引还是两列，靠下面这两步补。
+ * 不查就 ALTER 会在第 1 条路径上撞 `duplicate column name`（根因与迁移无关），
+ * 不查就换索引会在第 1 条路径上撞 `index already exists`。
+ *
+ * ⚠️ 表不存在时**直接返回**（v3/v4 老库走的就是这条路）：随后 `upgradeV5ToV6`
+ *   会按含 `model` 的受控定义把表建出来，一步到位。
+ *
+ * 🚨 MySQL 侧换索引**不能先 DROP**：`member_id` 上有指向 `members` 的外键，
+ *   而 InnoDB 要求外键列上存在以它为最左前缀的索引 —— 当前唯一覆盖它的恰恰是
+ *   待删的那个索引，先删会被 errno 1553 挡住（`Cannot drop index …: needed in a
+ *   foreign key constraint`）。所以必须「以临时名建新 → 删旧 → 临时名改回」三步。
+ *   SQLite 没有这条联动，直接 DROP + CREATE 即可。
+ */
+async function upgradeV11ToV12(store: PortalStore): Promise<void> {
+  if (!(await tablesOf(store)).includes('provider_alias')) return
+  // ── 一列：`model`（可空、无默认值）────────────────────────────────
+  const columns = new Set((await tableColumns(store, 'provider_alias')).map(name => name.toLowerCase()))
+  if (!columns.has(PORTAL_MODEL_COLUMN)) await store.exec(portalV12AddColumnStatement(store.kind))
+  // ── 唯一索引：`(member_id, provider)` → `(member_id, provider, model)` ──
+  await replaceProviderAliasUniqueIndex(store)
+  await verifyTable(store, 'provider_alias', tableStatement(store.kind, 'provider_alias'))
+}
+
+/**
+ * 把 `provider_alias` 的唯一索引换成 `(member_id, provider, model)`。
+ *
+ * ⚠️ 需要**临时名**，理由见 `upgradeV11ToV12()` 的注释（MySQL 的 errno 1553）。
+ *   两端的终态都是受控索引名 + 受控列组合，所以 `verifyTable()` 之后的
+ *   `expectedUnique` 核对在两个后端上看到的是同一份事实。
+ *
+ * 三步都各自先查状态：MySQL 的 DDL 会隐式提交，中途崩过之后 resume
+ * 必须能从任意中间态接着跑（半状态正是「临时索引在、旧索引也在」）。
+ */
+async function replaceProviderAliasUniqueIndex(store: PortalStore): Promise<void> {
+  const actual = await uniqueIndexColumns(store, 'provider_alias', PORTAL_PROVIDER_ALIAS_UNIQUE_INDEX)
+  if (actual === PORTAL_PROVIDER_ALIAS_UNIQUE_COLUMNS) return
+  if (store.kind === 'sqlite') {
+    // SQLite 可以随时删索引（外键不会因此失去索引），一步到位。
+    if (actual !== null) await store.exec(`DROP INDEX ${PORTAL_PROVIDER_ALIAS_UNIQUE_INDEX}`)
+    await store.exec(portalProviderAliasUniqueIndex())
+    return
+  }
+  const temporary = await uniqueIndexColumns(store, 'provider_alias', PORTAL_PROVIDER_ALIAS_TEMP_INDEX)
+  if (temporary !== PORTAL_PROVIDER_ALIAS_UNIQUE_COLUMNS) {
+    // 上一次跑崩在「临时索引建了一半」：先清掉再建，否则撞 duplicate key name。
+    if (temporary !== null) await store.exec(`DROP INDEX ${PORTAL_PROVIDER_ALIAS_TEMP_INDEX} ON provider_alias`)
+    await store.exec(portalProviderAliasTemporaryIndex())
+  }
+  // 到这里外键已经有覆盖 `member_id` 最左前缀的索引可用，删旧索引不会再被 1553 挡住。
+  if (actual !== null) await store.exec(`DROP INDEX ${PORTAL_PROVIDER_ALIAS_UNIQUE_INDEX} ON provider_alias`)
+  await store.exec(`ALTER TABLE provider_alias RENAME INDEX ${PORTAL_PROVIDER_ALIAS_TEMP_INDEX} TO ${PORTAL_PROVIDER_ALIAS_UNIQUE_INDEX}`)
+}
+
+/**
+ * 某个索引当前的列组合（**用逗号 + 空格连接**，与受控常量同形）；索引不存在返回 `null`。
+ *
+ * ⚠️ `PRAGMA index_info` 在索引不存在时返回**空结果集**而不是报错，
+ *   所以「不存在」只能靠 `length === 0` 判，不能靠异常。
+ *   列名在两种后端上大小写可能不同，统一小写后再比。
+ */
+async function uniqueIndexColumns(store: PortalStore, table: string, name: string): Promise<string | null> {
+  const rows = store.kind === 'sqlite'
+    ? await store.all<{ name: string | null }>(`PRAGMA index_info(${name})`)
+    : await store.all<{ name: string | null }>('SELECT column_name AS name FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name=$table AND index_name=$name ORDER BY seq_in_index', { $table: table, $name: name })
+  const columns = rows.map(row => String(row.name ?? '').toLowerCase()).filter(Boolean)
+  return columns.length ? columns.join(', ') : null
 }
 
 /**

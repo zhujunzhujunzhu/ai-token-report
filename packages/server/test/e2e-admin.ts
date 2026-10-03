@@ -277,7 +277,8 @@ try {
   // ★ 这就是使用者要的效果：`dashscope` 与 `fixture` 都折进各自配好的名字里。
   assert(collapsedKeys.includes('bailian-tpp') && collapsedKeys.includes('验收供应商')); checks++
   equal(collapsedKeys.includes('dashscope') || collapsedKeys.includes('fixture'), false, '配过规则的原始名不再作为分组出现')
-  // `provider-model` 组合维度只换 provider 那一段 —— 模型名必须原样保留。
+  // `provider-model` 组合维度：此刻只有**供应商**规则，所以只换 provider 那一段 ——
+  // 模型名原样保留（模型规则一配，那一段也会折叠，见下面 v12 那一段）。
   const modelKeys = (await request(a, 'stats/breakdown?identity_view=member&by=provider-model')).data.rows.map((entry: any) => entry.key)
   assert(modelKeys.includes('验收供应商/fixture')); checks++
   assert(modelKeys.includes('bailian-tpp/fixture')); checks++
@@ -336,6 +337,133 @@ try {
   // 🚨 事实表一个字节都没被改写：归一化只是查询侧的表达式。
   const rawProviders = (await request(a, 'stats/records?identity_view=member')).data.rows.map((row: any) => row.providerRaw ?? row.provider)
   assert(rawProviders.includes('fixture') && rawProviders.includes('dashscope')); checks++
+
+  // ── ★ v12 模型归一化：与供应商同一套机制，折叠的是 `model` ──
+  // 这一段的重点是「**一条规则只折叠一个维度**」与「两类规则可以落在同一个原始值上」：
+  //   `coexist-demo` 既是供应商名也被配成模型规则的限定供应商，两条规则必须能并存 ——
+  //   v12 把唯一索引换成 `(member_id, provider, model)` 正是为了这一步。
+  // 先补一条**另一个模型名**的用量：归一化的意义就是把它折进同一个口径。
+  equal((await request(b, 'token-usage', aliasSecret, { schemaVersion: 1, client: {}, generatedAt: new Date().toISOString(), records: [{ ...event('v12:model:1'), model: 'fixture-v2' }] })).data.accepted, 1, '补一条另一个模型名的用量')
+  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: '*', model: 'fixture', alias: '统一模型' })).status, 200, '★ 任意供应商的模型规则可配置（provider = *）')
+  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: '*', model: 'fixture-v2', alias: '统一模型' })).status, 200, '另一个原始模型名可以折进同一个口径')
+  // ⚠️ 跨字段约束由服务端判定：`model` 为空时 `provider` 不能是 `*` ——
+  //   那是一条折叠「任意供应商的供应商名」的规则，永远匹配不到任何用量。
+  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: '*', alias: 'x' })).status, 400, '★ 供应商规则不能「任意供应商」（那是一条永远不命中的规则）')
+  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: 'fixture', model: 'fixture ', alias: 'ok' })).status, 400, '模型名首尾空格是 400（它会静默不命中）')
+  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: 'fixture', model: 'fixture', alias: 'a/b' })).status, 400, '模型规则的归一化名同样不能带 /（拼接歧义）')
+
+  // 按模型维度：两个原始模型名折成一行 —— 而且**只有**这一行。
+  const byModel = (await request(a, 'stats/breakdown?identity_view=member&by=model')).data.rows.map((entry: any) => entry.key)
+  equal(byModel, ['统一模型'], '★ 两个原始模型名折成同一个分组（库里只有这两个模型名）')
+  // 组合维度：**两段都折叠**。`v6:alias:2` 的供应商被供应商规则折成 `bailian-tpp`，
+  // 模型被模型规则折成 `统一模型` —— 只折一半的表现是「看起来像规则没生效」。
+  const comboKeys = (await request(a, 'stats/breakdown?identity_view=member&by=provider-model')).data.rows.map((entry: any) => entry.key)
+  assert(comboKeys.includes('bailian-tpp/统一模型')); checks++
+  equal(comboKeys.includes('bailian-tpp/fixture'), false, '组合维度里模型那一段也被折叠')
+  // ★ 明细同时给出模型的原值：它既是核对规则的地方，**也是计价用的键**。
+  const modelRows = (await request(a, 'stats/records?identity_view=member')).data.rows
+  equal(modelRows.find((row: any) => row.eventId === 'v6:alias:2').model, '统一模型', '明细里 model 是归一化名')
+  equal(modelRows.find((row: any) => row.eventId === 'v6:alias:2').modelRaw, 'fixture', '明细同时给出模型原值')
+  equal(modelRows.find((row: any) => row.eventId === 'v12:model:1').modelRaw, 'fixture-v2', '另一个原始模型名的原值同样保留')
+  // 🚨 事实表里的 model 同样是原值，归一化不改写一个字节。
+  const rawModels = (await request(a, 'stats/records?identity_view=member')).data.rows.map((row: any) => row.modelRaw ?? row.model)
+  assert(rawModels.includes('fixture') && rawModels.includes('fixture-v2')); checks++
+
+  // ★ 同一原始名上的供应商规则与模型规则**并存**（用库里没有用量的名字，
+  //   免得把上面的口径断言搅乱）：旧的两列唯一索引会把第二条挡在门外。
+  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: 'coexist-demo', alias: '并存的供应商规则' })).status, 200, '配一条供应商规则')
+  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: 'coexist-demo', model: 'm1', alias: '并存的模型规则' })).status, 200, '★ 同一原始名的模型规则也能配上（旧索引会把它挡在门外）')
+  equal((await request(a, 'admin/provider-aliases')).data.aliases.filter((entry: any) => entry.provider === 'coexist-demo').length, 2, '★ 两条规则并存，各占一行')
+
+  // ★ 限定供应商的模型规则**优先于**通配规则（`CASE` 分支顺序即语义）：
+  //   给 `dashscope` 单独配一条，那条用量的模型名就该变，而别家的仍走通配。
+  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: 'dashscope', model: 'fixture', alias: '百炼专属模型' })).status, 200, '限定供应商的模型规则可配置')
+  const scopedModelRows = (await request(a, 'stats/records?identity_view=member')).data.rows
+  equal(scopedModelRows.find((row: any) => row.eventId === 'v6:alias:2').model, '百炼专属模型', '★ 限定供应商的规则优先于通配')
+  equal(scopedModelRows.find((row: any) => row.eventId === 'v6:alias:1').model, '统一模型', '别家的同名模型仍走通配规则')
+
+  // ⚠️ 空串模型名会被折成「供应商规则」，而不是写出一条「模型名是空串」的幽灵规则。
+  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: 'openai', model: '', alias: '空串规则' })).data.alias.model, null, '★ 空串模型名按「供应商规则」落库（不会是空串模型名）')
+
+  // 清理这一段的规则：后面的用例断言的是供应商与项目口径，别让模型名与上面这些
+  // 临时名字影响它们。
+  for (const entry of (await request(a, 'admin/provider-aliases')).data.aliases.filter((item: any) => item.model !== null || ['coexist-demo', 'openai'].includes(item.provider))) {
+    equal((await request(a, 'admin/provider-aliases/delete', adminToken, { alias_id: entry.alias_id })).status, 200, '清理本段的归一化规则')
+  }
+
+  // ── ★ v11 项目归一化：把散开的 cwd 折成一个项目口径 ──
+  // 这一段的重点是**前缀语义**与供应商那套刻意不同之处：
+  //   `D:\proj` 这条规则命中 `D:\proj` 与 `D:\proj\packages\core`（前缀按目录边界），
+  //   但**不**命中 `D:\proj-other`；多条命中时最长前缀优先。
+  // 与供应商归一化同样是**查询期**的：`usage_event.cwd` 永远是原值。
+  const withCwd = (id: string, cwd: string) => ({ ...event(id), cwd })
+  // ⚠️ 上报与查询都用 **appKey**（`keyA`）：普通上报 Token 只有
+  //   `identity:read` + `usage:write`，**没有 `stats:read`**，拿它查看板会 403。
+  equal((await request(b, 'token-usage', keyA, { schemaVersion: 1, client: {}, generatedAt: new Date().toISOString(), records: [withCwd('v11:proj:1', 'D:\\proj'), withCwd('v11:proj:2', 'D:\\proj'), withCwd('v11:proj:sub', 'D:\\proj\\packages\\core'), withCwd('v11:proj:other', 'D:\\proj-other')] })).data.accepted, 4, '同一批里可以有多个不同 cwd')
+  // 另一个人名下的目录：用来验「目录候选跟着数据范围收窄」。
+  // ⚠️ 同时给他一条**与甲同目录**的事件 —— 「两个人看到不同项目名」这条断言
+  //   只有在两人**各自都有**那个目录的用量时才成立（非管理员只看得到自己）。
+  equal((await request(b, 'token-usage', keyB, { schemaVersion: 1, client: {}, generatedAt: new Date().toISOString(), records: [withCwd('v11:B:only', 'D:\\b-only'), withCwd('v11:B:core', 'D:\\proj\\packages\\core')] })).data.accepted, 2, '另一个人名下的目录')
+
+  const projectRows = async (token: any): Promise<any[]> =>
+    (await request(a, 'stats/breakdown?identity_view=member&by=project', token)).data.rows
+  const projectKeys = async (token: any): Promise<string[]> => (await projectRows(token)).map((entry: any) => entry.key)
+  // 未配规则时是旧口径：目录最后一段 → `proj` / `core` / `proj-other` 各占一行。
+  const beforeKeys = await projectKeys(keyA)
+  assert(beforeKeys.includes('proj') && beforeKeys.includes('core') && beforeKeys.includes('proj-other')); checks++
+  equal(beforeKeys.includes('验收项目'), false, '还没配规则，不许出现归一化名')
+
+  equal((await request(a, 'admin/project-aliases', null)).status, 401, '未认证不能读项目归一化规则')
+  equal((await request(a, 'admin/project-aliases', aliasSecret)).status, 403, '普通上报凭证读不到项目规则目录')
+  equal((await request(a, 'admin/project-aliases', aliasSecret, { scope: 'global', prefix: 'D:\\x', alias: 'y' })).status, 403, '普通上报凭证改不了项目归一化规则')
+  equal((await request(a, 'admin/project-aliases', adminToken, { scope: 'global', prefix: ' D:\\proj', alias: 'ok' })).status, 400, '首尾空格的前缀是 400（它会静默不命中）')
+  equal((await request(a, 'admin/project-aliases', adminToken, { scope: 'global', prefix: '/', alias: 'ok' })).status, 400, '文件系统根是 400（它会把所有路径折成一个项目）')
+
+  equal((await request(a, 'admin/project-aliases', adminToken, { scope: 'global', prefix: 'D:\\proj', alias: '验收项目' })).status, 200, '管理员可以配置全局项目规则')
+  const folded = await projectKeys(keyA)
+  // ★ 根目录与子目录折成同一行（3 条调用），而**边界**保住了邻居。
+  const foldedRow = (await projectRows(keyA)).find((entry: any) => entry.key === '验收项目')
+  equal(foldedRow?.calls, 3, '★ 前缀命中根目录与子目录（2 + 1 条调用折成一行）')
+  equal(folded.includes('proj') || folded.includes('core'), false, '折进去的原始项目名不再作为分组出现')
+  assert(folded.includes('proj-other')); checks++
+  equal((await request(a, 'admin/project-aliases', adminToken, { scope: 'global', prefix: 'D:\\proj\\packages\\core', alias: '核心包' })).status, 200, '更具体的前缀可以单独成项目')
+  const longest = await projectKeys(keyA)
+  assert(longest.includes('核心包') && longest.includes('验收项目')); checks++
+  equal((await projectRows(keyA)).find((entry: any) => entry.key === '核心包')?.calls, 1, '★ 最长前缀优先：子目录单独成项目')
+
+  // 🚨 目录候选回的是**原始 cwd**（配置页要配的就是这个），而且**跟着数据范围收窄**。
+  const myCwds = (await request(a, 'stats/projects', keyA)).data.projects
+  assert(myCwds.includes('D:\\proj\\packages\\core')); checks++
+  equal(myCwds.includes('D:\\b-only'), false, '★ 非管理员拿不到别人名下的目录（路径会带出使用者信息）')
+  const allCwds = (await request(a, 'stats/projects', adminToken)).data.projects
+  assert(allCwds.includes('D:\\b-only')); checks++
+  equal((await request(a, 'stats/projects', null)).status, 401, '未认证不能读目录候选')
+  equal(JSON.stringify({ projects: allCwds }).includes('tokens'), false, '目录候选里一个用量数字都没有')
+
+  // ── 按人覆盖：同一条目录，不同的人看到不同的项目名 ──
+  equal((await request(a, 'admin/project-aliases', adminToken, { scope: 'member', member_id: viewerA, prefix: 'D:\\proj\\packages\\core', alias: '我的核心包' })).status, 200, '可以给某个人单独配项目规则')
+  const mineKeys = await projectKeys(keyA)
+  const theirsKeys = await projectKeys(keyB)
+  assert(mineKeys.includes('我的核心包') && !mineKeys.includes('核心包')); checks++
+  equal(mineKeys.includes('验收项目'), true, '人员规则没提的目录仍回落全局（逐条覆盖）')
+  assert(theirsKeys.includes('核心包') && !theirsKeys.includes('我的核心包')); checks++
+
+  // ── 改 / 停用 / 删除 ──
+  equal((await request(a, 'admin/project-aliases', adminToken, { scope: 'global', prefix: 'D:\\proj', alias: '改名后' })).status, 200, '同一前缀再配一次是覆盖')
+  assert((await projectKeys(keyA)).includes('改名后')); checks++
+  const projectRules = (await request(a, 'admin/project-aliases')).data.aliases
+  equal(projectRules.length, 3, '列表里是全局两条 + 人员一条（upsert 没有多出行）')
+  const projectRuleId = projectRules.find((entry: any) => entry.scope === 'global' && entry.prefix === 'D:\\proj').alias_id
+  equal((await request(a, 'admin/project-aliases/status', adminToken, { alias_id: projectRuleId, enabled: false })).status, 200, '停用项目规则')
+  const afterDisable = await projectKeys(keyA)
+  assert(afterDisable.includes('proj') && !afterDisable.includes('改名后')); checks++
+  equal((await request(a, 'admin/project-aliases/status', adminToken, { alias_id: projectRuleId, enabled: true })).status, 200, '重新启用项目规则')
+  equal((await request(a, 'admin/project-aliases/delete', adminToken, { alias_id: projectRuleId })).status, 200, '删除项目规则')
+  equal((await request(a, 'admin/project-aliases/delete', adminToken, { alias_id: projectRuleId })).status, 404, '再删一次是 404，不静默成功')
+  equal((await request(a, 'admin/project-aliases', adminToken, { scope: 'member', member_id: '00000000-0000-4000-8000-00000000dead', prefix: 'D:\\z', alias: 'x' })).status, 404, '给不存在的人配规则是 404')
+  // 🚨 事实表一个字节都没被改写：归一化只作用在分组上。
+  const rawCwds = (await request(a, 'stats/records?identity_view=member', keyA)).data.rows.map((row: any) => row.cwd)
+  assert(rawCwds.includes('D:\\proj\\packages\\core')); checks++
 
   // ── ★ v7 模型单价：费用统计的计价来源（真 HTTP，含权限与 409） ──
   // 这一段的重点是**单价是配置、不是数据**：写它不会动 `usage_event` 一根毫毛，

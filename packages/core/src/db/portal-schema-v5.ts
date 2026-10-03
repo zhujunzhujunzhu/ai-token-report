@@ -13,10 +13,11 @@
  * | v9 | 结构追加步骤 | `usage_event` 加一列 `source`（这条用量是哪个客户端写的） |
  * | v10 | 结构追加步骤 | `model_price` 加五列：闲时（低谷）时段表 + 四类闲时单价 |
  * | v11 | 结构追加步骤 | 追加 `project_alias` 表与权限码 `projects:*`（项目归一化） |
+ * | v12 | ★ **当前终态** | `provider_alias` 加一列 `model`，唯一索引换成 `(member_id, provider, model)`（模型归一化） |
  *
  * ⚠️ **本文件的 SQL 常量代表 v7 终态**（v5 的 `usage_event` 那一列除外，见下），
  *   v5 / v6 / v7 的结构变化都是它的一部分：
- *   `PORTAL_SCHEMA_VERSION = 11` + 末尾的 {@link PORTAL_SQLITE_V6_ADDITIONS}
+ *   `PORTAL_SCHEMA_VERSION = 12` + 末尾的 {@link PORTAL_SQLITE_V6_ADDITIONS}
  *   + {@link PORTAL_SQLITE_V7_ADDITIONS} + `portal-schema-v8.ts` 的三张汇总表
  *   + `portal-schema-v9.ts` 的 `source` 列 + `portal-schema-v10.ts` 的闲时五列
  *   + `portal-schema-v11.ts` 的 `project_alias` + `portal-schema-v12.ts` 的
@@ -77,6 +78,11 @@ import {
   portalV11ChecksumInput,
   portalV11Statements,
 } from './portal-schema-v11.js'
+import {
+  portalV12ChecksumInput,
+  portalV12ProviderAliasStatement,
+  portalV12ReplaceProviderAliasIndex,
+} from './portal-schema-v12.js'
 
 // 交付面：调用方（迁移器 / 汇总构建 / 测试）一律从本模块取，
 // 不必知道 v8 / v9 / v10 的实现住在独立文件里 —— 与 v6 / v7 的导出方式保持一致。
@@ -98,7 +104,21 @@ export {
   PROJECT_ALIAS_MAX_LENGTH,
   PORTAL_V11_PERMISSION_SQL,
 } from './portal-schema-v11.js'
-export const PORTAL_SCHEMA_VERSION = 11
+export {
+  portalProviderAliasUniqueIndex,
+  portalProviderAliasTemporaryIndex,
+  portalV12AddColumnStatement,
+  portalV12ChecksumInput,
+  portalV12ProviderAliasStatement,
+  portalV12ReplaceProviderAliasIndex,
+  PORTAL_ANY_PROVIDER,
+  PORTAL_MODEL_COLUMN,
+  PORTAL_MODEL_MAX_LENGTH,
+  PORTAL_PROVIDER_ALIAS_TEMP_INDEX,
+  PORTAL_PROVIDER_ALIAS_UNIQUE_COLUMNS,
+  PORTAL_PROVIDER_ALIAS_UNIQUE_INDEX,
+} from './portal-schema-v12.js'
+export const PORTAL_SCHEMA_VERSION = 12
 export const PORTAL_SQLITE_V5_SQL = `-- 数据库 v5：分组（多对多）+ 权限码 groups:*。
 -- 不执行 ALTER/DROP，不修改本地 usage.sqlite 的 schema v3。
 -- 部署前必须另行实现带备份、版本闸门与恢复点的生产迁移。
@@ -1014,7 +1034,15 @@ export function portalSchemaStatements(kind: PortalBackendKind): string[] {
   const withOffpeak = all.map(statement => statement.startsWith('CREATE TABLE model_price (')
     ? portalV10ModelPriceStatement(kind, statement)
     : statement)
-    return withOffpeak
+  // ★ v12：`provider_alias` 多一列 `model`，**并且唯一索引换成含 model 的三列**。
+  //   同理必须在合并之后再改：provider_alias 来自 v6 的追加常量（已冻结）。
+  //   🔗 两处必须同生共死：只加列不换索引 ⇒ 「同一 provider 的供应商规则与模型规则」
+  //   撞唯一键（MySQL 直接报错、SQLite 侧被应用层查重挡住，而两条规则本来就是
+  //   使用者会同时配的东西）。理由见 `portal-schema-v12.ts` 的文件头。
+  const withModel = withOffpeak.map(statement => statement.startsWith('CREATE TABLE provider_alias (')
+    ? portalV12ProviderAliasStatement(kind, statement)
+    : statement)
+  return portalV12ReplaceProviderAliasIndex(withModel)
 }
 /**
  * 受控定义的文本摘要 —— 迁移账本据此识别「这个库的结构是不是当前版本」。
@@ -1029,6 +1057,26 @@ export function portalSchemaStatements(kind: PortalBackendKind): string[] {
  *   把它算进摘要会让「手工补了一条角色权限」把库判成「结构不符」。
  */
 export function portalSchemaChecksum(kind: PortalBackendKind): string {
+  const source = kind === 'mysql' ? PORTAL_MYSQL_V5_SQL : PORTAL_SQLITE_V5_SQL
+  const additions = kind === 'mysql'
+    ? `${PORTAL_MYSQL_V6_ADDITIONS}\n${PORTAL_MYSQL_V7_ADDITIONS}\n${PORTAL_MYSQL_V8_ADDITIONS}\n${portalV9ChecksumInput(kind)}\n${portalV10ChecksumInput(kind)}\n${portalV11ChecksumInput(kind)}\n${portalV12ChecksumInput(kind)}`
+    : `${PORTAL_SQLITE_V6_ADDITIONS}\n${PORTAL_SQLITE_V7_ADDITIONS}\n${PORTAL_SQLITE_V8_ADDITIONS}\n${portalV9ChecksumInput(kind)}\n${portalV10ChecksumInput(kind)}\n${portalV11ChecksumInput(kind)}\n${portalV12ChecksumInput(kind)}`
+  return createHash('sha256').update(`${source}\n${additions}`).digest('hex')
+}
+/**
+ * ★ **已发布的 v11 摘要，冻结于此**（= v5 文本 + v6 + v7 + v8 + v9 + v10 + v11，
+ * **不含 v12 的 `provider_alias.model` 与被换掉的唯一索引**）。
+ *
+ * 作用与 {@link portalSchemaChecksumV10} 完全一样：让**已经迁到 v11 的库**
+ *   （本机快照库、以及线上库升级后的形态）仍然被判成 `legacy` =
+ *   「结构是上一版、完整、可迁移」。不冻结的后果同样致命：那些库的账本里
+ *   记的是 v11 摘要，而 `portalSchemaChecksum()` 现在返回 v12 摘要 —— 永远对不上，
+ *   于是它从「可迁移的起点」变成 `unsupported`（服务端拒绝启动、迁移脚本也拒绝接手），
+ *   而 v12 只是一列 + 一次索引替换就能升上去。
+ *
+ * ⚠️ v8 / v9 / v10 / v11 的文本一个字都不许再改（本函数按它们的当前全文求摘要）。
+ */
+export function portalSchemaChecksumV11(kind: PortalBackendKind): string {
   const source = kind === 'mysql' ? PORTAL_MYSQL_V5_SQL : PORTAL_SQLITE_V5_SQL
   const additions = kind === 'mysql'
     ? `${PORTAL_MYSQL_V6_ADDITIONS}\n${PORTAL_MYSQL_V7_ADDITIONS}\n${PORTAL_MYSQL_V8_ADDITIONS}\n${portalV9ChecksumInput(kind)}\n${portalV10ChecksumInput(kind)}\n${portalV11ChecksumInput(kind)}`

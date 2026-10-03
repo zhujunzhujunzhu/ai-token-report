@@ -91,6 +91,21 @@ export function nullableIntField(input: MutationInput, key: string): number | nu
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new IdentityError(400, `${key} 需要是非负整数或留空`)
   return value
 }
+/**
+ * 可空字符串（归一化规则的 `model` 用）；`undefined` / `null` 都归成 `null`。
+ *
+ * ⚠️ 「留空」与「给了个空串」在这里是**同一件事**（都归成 `null`）：对
+ *   `provider_alias.model` 来说，`NULL` 的含义是「这是一条供应商规则」，
+ *   而一个 `''` 会变成一条「模型名是空串」的模型规则 —— 它永远不命中，
+ *   表现是「供应商规则全部失效」。所以这里把空串也折成 `null`，
+ *   而不是让它一路写进库（schema 层已经挡了空串，这是第二道）。
+ */
+export function nullableTextField(input: MutationInput, key: string): string | null {
+  const value = input[key]
+  if (value === undefined || value === null || value === '') return null
+  if (typeof value !== 'string') throw new IdentityError(400, `${key} 需要是字符串或留空`)
+  return value
+}
 export function displayName(raw: string, limit = 32): string {
   const value = raw.trim()
   if (!value || value.length > limit || /[\r\n\t]/.test(raw)) throw new IdentityError(400, `名称需要为 1～${limit} 个字符，不能包含换行或制表符`)

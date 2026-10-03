@@ -1136,6 +1136,10 @@ function toRecordRow(row: PortalRecordRow): RecordRow {
     //   多发一个字段只是让每页 JSON 白胖一圈。
     ...(row.providerRaw && row.providerRaw !== row.provider ? { providerRaw: row.providerRaw } : {}),
     model: row.model,
+    // ★ 与 `providerRaw` 同款：只在**与展示名不同**时才发。模型原值同时是
+    //   计价用的键，但既然两者相同就没有信息可丢 —— 而「配了模型规则」的那些行
+    //   一定不同，页面据此就能把原值显示出来供核对。
+    ...(row.modelRaw && row.modelRaw !== row.model ? { modelRaw: row.modelRaw } : {}),
     // ★ v9 来源：原值原样透传（**不做归一化** —— 来源是受控枚举，
     //   `trae` 与 `trae-cn` 是两个来源，归一化会把它们混成一个）。
     //   页面据此显示「这条用量是谁写的」，与看板的来源筛选是同一个值。

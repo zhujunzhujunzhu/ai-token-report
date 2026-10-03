@@ -146,13 +146,13 @@ export interface RawEventRow {
  *   因此「按人筛选」不会出现第二套 SQL —— 两套筛选条件的漂移不会有任何报错，
  *   只会让某个接口的过滤悄悄失效。
  *
- * ## 供应商归一化（`normalize`）
+ * ## 供应商与模型的归一化（`normalize`）
  *
  * 传了 {@link ProviderNormalizer} 时，`provider` 筛选匹配的是**归一化后**的名字：
  * 使用者看到的行是 `bailian-tpp`，他筛 `bailian-tpp` 就必须把
- * `dashscope` / `bailian` 那些原值一起筛出来。
+ * `dashscope` / `bailian` 那些原值一起筛出来。`model` 筛选完全同理。
  * 这与 `dimensionExpression()` 的分组口径**必须一致**，否则会出现
- * 「筛了某个供应商，行里却有别的名字」这种看起来像数据错了的现象。
+ * 「筛了某个供应商（模型），行里却有别的名字」这种看起来像数据错了的现象。
  *
  * ⚠️ 反过来的代价是**不能按原始名搜**（`dashscope` 已经改名为 `bailian-tpp`）。
  *   这是刻意的：页面展示的名字就是可搜的名字，两套名字只会让人怀疑自己筛错了。
@@ -191,7 +191,9 @@ export function buildWhere(
   // ★ 供应商筛选走归一化后的名字（见上方注释）。没有规则时
   //   `providerFilterExpression()` 返回裸 `provider`，SQL 与迁移前逐字相同。
   likeAny(providerFilterExpression(normalize, params), filter.providers, 'prov')
-  likeAny('model', filter.models, 'model')
+  // ★ 模型筛选同理：使用者看到的是折叠后的模型名，他筛这个名字就必须把那几个
+  //   原值一起筛出来 —— 与 `model` 分组维度**同一份表达式**（见 `modelFilterExpression`）。
+  likeAny(modelFilterExpression(normalize, params), filter.models, 'model')
 
   // 来源：精确匹配（受控枚举，不做子串 —— 见 QueryFilter.sources 的注释）。
   if (filter.sources && filter.sources.length > 0) {
@@ -264,6 +266,50 @@ function hasNormalization(normalize?: ProviderNormalizer): normalize is Provider
 }
 
 /**
+ * 有没有**模型**规则。
+ *
+ * ⚠️ 与 {@link hasNormalization} **必须分开判**：只配了供应商规则时
+ *   `modelCaseSql()` 会生成一个空的 `CASE`（在 MySQL 上是语法错误、
+ *   SQLite 上只是恒为 NULL 的静默错误）。所以每个模型相关的表达式都要
+ *   先过这一关，没有模型规则就退回裸列名 —— 与迁移前的 SQL 逐字相同。
+ */
+function hasModelNormalization(normalize?: ProviderNormalizer): normalize is ProviderNormalizer {
+  return !!normalize && normalize.modelRules > 0
+}
+
+/**
+ * 归一化后的 `provider` 表达式（没配供应商规则时就是裸列名）。
+ *
+ * ⚠️ `prefix` **必须在同一次查询里唯一**：绑定参数名是 `$<prefix>k<i>` /
+ *   `$<prefix>v<i>`，两处用同一个前缀会让后一处覆盖前一处的绑定值 ——
+ *   表现是「某些分组名莫名其妙变成了另一个」，没有任何报错。
+ */
+function normalizedProviderExpression(
+  normalize: ProviderNormalizer | undefined,
+  params: Record<string, string | number> | undefined,
+  prefix: string,
+): string {
+  if (!hasNormalization(normalize) || !params) return 'provider'
+  return coalesceOriginal(providerCaseSql('provider', normalize.map, params, prefix), 'provider')
+}
+
+/**
+ * 归一化后的 `model` 表达式（没配模型规则时就是裸列名）。
+ *
+ * ⚠️ 比较用的是**原值** `provider` 列（不是归一化后的那一段）：模型规则是按
+ *   上报原值配的，用折叠后的名字会让「改了供应商展示名」顺带把限定供应商的
+ *   模型规则全部失效 —— 而页面上只表现为「模型没被折叠」。
+ */
+function normalizedModelExpression(
+  normalize: ProviderNormalizer | undefined,
+  params: Record<string, string | number> | undefined,
+  prefix: string,
+): string {
+  if (!hasModelNormalization(normalize) || !params) return 'model'
+  return coalesceOriginal(modelCaseSql('provider', normalize.modelList, params, prefix), 'model')
+}
+
+/**
  * 供应商筛选用的 SQL 表达式（归一化已内联）。
  *
  * ⚠️ 返回的表达式**已经内联了绑定值**，所以调用方必须先调用它、
@@ -273,8 +319,23 @@ function providerFilterExpression(
   normalize: ProviderNormalizer | undefined,
   params: Record<string, string | number>,
 ): string {
-  if (!hasNormalization(normalize)) return 'provider'
-  return coalesceOriginal(providerCaseSql('provider', normalize.map, params, 'pf'), 'provider')
+  return normalizedProviderExpression(normalize, params, 'pf')
+}
+
+/**
+ * 模型筛选用的 SQL 表达式（归一化已内联）。
+ *
+ * ⚠️ 与 `dimensionExpression` 的 `model` 分支**必须是同一份实现**（同一个
+ *   {@link normalizedModelExpression}）：两处不一致会出现「筛了某个模型，
+ *   行里却是别的名字」这种看起来像数据错了的现象。
+ *   与供应商筛选同一个取舍：**页面展示的名字就是可搜的名字**，
+ *   反过来的代价是不能按原始名搜（原值已经被折叠掉了）。
+ */
+function modelFilterExpression(
+  normalize: ProviderNormalizer | undefined,
+  params: Record<string, string | number>,
+): string {
+  return normalizedModelExpression(normalize, params, 'mf')
 }
 
 /**
@@ -290,10 +351,16 @@ function providerFilterExpression(
  *   🚨 直接把 `CASE` 套在拼接结果上（`CASE WHEN provider || '/' || model = 'dashscope'`）
  *   永远不成立：拿一个 `provider/model` 字符串去等于一个 provider 名，
  *   结果是一行都不命中，于是「按 provider-model 分组」静默地全是原值。
+ * @param modelExpression 参与拼接的 model 表达式。理由与 provider 那一段**完全相同**
+ *   （`modelCaseSql` 的 `CASE` 也必须作用在拼接之前）。
  */
-function providerModelExpression(dialect: PortalDialect, providerExpression = 'provider'): string {
+function providerModelExpression(
+  dialect: PortalDialect,
+  providerExpression = 'provider',
+  modelExpression = 'model',
+): string {
   // 分隔符与 aggregate.ts 的 groupKey() 一致（`provider/model`）。
-  return dialect.concat([providerExpression, `'${PROVIDER_MODEL_SEPARATOR_SQL}'`, 'model'])
+  return dialect.concat([providerExpression, `'${PROVIDER_MODEL_SEPARATOR_SQL}'`, modelExpression])
 }
 
 /** SQL 字符串字面量里的分隔符，与 `provider-alias.ts` 的常量必须同值。 */
@@ -335,9 +402,14 @@ const PROVIDER_MODEL_SEPARATOR_SQL = '/'
  *
  * ## 归一化
  *
- * 传了 `normalize` 时，`provider` 维度与 `provider-model` 维度都会把
- * 原值经规则折叠后再分组。**逐条覆盖、未命中保持原值**两条约束的实现在
- * `provider-alias.ts`，这里只负责把表达式接上去。
+ * 传了 `normalize` 时，`provider` / `model` / `provider-model` /
+ * `source-provider-model` 四个维度都会把原值经规则折叠后再分组。
+ * **逐条覆盖、未命中保持原值**两条约束的实现在 `provider-alias.ts`，
+ * 这里只负责把表达式接上去。
+ *
+ * ⚠️ 供应商与模型**各自独立判有没有规则**（`hasNormalization` /
+ *   `hasModelNormalization`）：只配了其中一类时，另一类必须退回裸列名 ——
+ *   否则会生成一个空 `CASE`（MySQL 语法错误 / SQLite 恒为 NULL 的静默错误）。
  */
 function dimensionExpression(
   dim: QueryDimension,
@@ -835,13 +907,16 @@ export interface RecordProjection {
 
 export function recordProjection(normalize?: ProviderNormalizer): RecordProjection {
   const params: Record<string, string | number> = {}
-  const raw = 'provider'
+  const rawProvider = 'provider'
+  const rawModel = 'model'
   // 没有规则时两个表达式都是裸列名 —— SQL 与迁移前逐字相同（多一列同值）。
-  const normalized = hasNormalization(normalize)
-    ? coalesceOriginal(providerCaseSql(raw, normalize.map, params, 'rp'), raw)
-    : raw
+  const normalizedProvider = normalizedProviderExpression(normalize, params, 'rp')
+  const normalizedModel = normalizedModelExpression(normalize, params, 'rm')
   return {
-    columns: `${raw} AS provider, ${normalized} AS provider_norm`,
+    // ⚠️ `model` 这一列**必须原样保留**：明细的金额是按 `(provider, model)`
+    //   读 `model_price` 算的，把归一化名当计价键会让「换个展示名就把价换掉了」。
+    columns: `${rawProvider} AS provider, ${normalizedProvider} AS provider_norm, `
+      + `${rawModel} AS model, ${normalizedModel} AS model_norm`,
     params,
   }
 }
@@ -851,20 +926,40 @@ export function recordProjection(normalize?: ProviderNormalizer): RecordProjecti
  *
  * ★ 与 `portal.ts` 取数用的是同一个 `recordProjection()`：归一化的实现在
  *   查询层只有一份，明细不可能与分组口径漂移。
+ *
+ * ★ 四个字段（供应商与模型各有「原值 + 展示名」）：明细是**唯一**能核对规则
+ *   配得对不对的地方。只给展示名的话，一条把 `qwen-max` 错配成
+ *   `qwen-max-2024` 的规则会表现得完全正常 —— 总量对、名字错。
  */
-export interface NormalizedRecordProvider {
-  /** 上报当时的原值，一个字节都没改过。 */
+export interface NormalizedRecordNames {
+  /** 上报当时的供应商原值，一个字节都没改过。 */
   providerRaw: string
-  /** 看板展示用的名字（未配规则时等于 `providerRaw`）。 */
+  /** 看板展示用的供应商名（未配规则时等于 `providerRaw`）。 */
   provider: string
+  /** 上报当时的模型原值。**它是计价用的那一份**（`model_price` 按原值匹配）。 */
+  modelRaw: string
+  /** 看板展示用的模型名（未配规则时等于 `modelRaw`）。 */
+  model: string
 }
 
-export function mapRecordProvider(row: { provider: unknown; provider_norm?: unknown }): NormalizedRecordProvider {
-  const raw = String(row.provider ?? '')
-  // ⚠️ `provider_norm` 在旧调用方（不带归一化的查询）里没有这一列，
-  //   此时回落原值 —— 而不是回落空串，那会让明细里的供应商列整列消失。
-  const normalized = row.provider_norm === null || row.provider_norm === undefined ? raw : String(row.provider_norm)
-  return { providerRaw: raw, provider: normalized }
+export function mapRecordNames(row: {
+  provider: unknown
+  provider_norm?: unknown
+  model: unknown
+  model_norm?: unknown
+}): NormalizedRecordNames {
+  const rawProvider = String(row.provider ?? '')
+  const rawModel = String(row.model ?? '')
+  // ⚠️ `*_norm` 在旧调用方（不带归一化的查询）里没有这一列，
+  //   此时回落原值 —— 而不是回落空串，那会让明细里的那一列整个消失。
+  const text = (value: unknown, fallback: string): string =>
+    value === null || value === undefined ? fallback : String(value)
+  return {
+    providerRaw: rawProvider,
+    provider: text(row.provider_norm, rawProvider),
+    modelRaw: rawModel,
+    model: text(row.model_norm, rawModel),
+  }
 }
 
 /**
@@ -953,7 +1048,13 @@ export function stackRowsQuery(
   withTarget = false,
 ): SqlQuery {
   const { sql, params } = buildWhere(filter, normalize)
-  const keyCols = dim === 'model' ? 'model AS stack_key' : 'member_id, user_id, user_name'
+  // ★ `model` 维度的堆叠键走**归一化后的模型名**：堆叠图与「按模型」分组排行
+  //   是同一件事的两种画法，一个折叠一个不折叠会让两张图的名字对不上 ——
+  //   而使用者只会以为其中一张图坏了。
+  //   ⚠️ `withTarget` 取的仍是**原值** `model`：那是计价用的键（见 `StackRow`）。
+  const keyCols = dim === 'model'
+    ? `${normalizedModelExpression(normalize, params, 'sk')} AS stack_key`
+    : 'member_id, user_id, user_name'
   return {
     sql: `SELECT ts, ${keyCols}, ${withTarget ? 'provider, model, ' : ''}
                  input_tokens, output_tokens, cache_read_tokens, cache_write_tokens

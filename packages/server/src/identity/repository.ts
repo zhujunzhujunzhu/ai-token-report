@@ -862,18 +862,22 @@ export class IdentityRepository {
     })
   }
   /**
-   * 供应商归一化规则（`provider_alias`）—— 列表。
+   * 归一化规则（`provider_alias`）—— 列表。
    *
    * ★ 权限是 `providers:read`：看板本身不读管理接口（它走 `stats:read` 的
    *   `loadProviderAliases()`），所以「能看数据」与「能看规则目录」是两件事。
    *   `member_name` 顺带 JOIN 出来，免得页面为了显示一个归属人再调一次人员接口。
+   *
+   * ★ v12 起同一张表里既有**供应商规则**（`model IS NULL`）又有**模型规则**：
+   *   排序把 `model` 带上，让同一个原始供应商名下的两类规则有稳定顺序
+   *   （`ORDER BY` 不确定时，页面上每次刷新行序都可能不同）。
    */
   async listProviderAliases(actor: Principal) {
     return this.securedRead(actor, 'providers:read', async (tx) => ({
       aliases: (await tx.all<Row>(
         `SELECT a.*, m.display_name AS member_name
            FROM provider_alias a LEFT JOIN members m ON m.member_id = a.member_id
-          ORDER BY a.scope, m.display_name, a.provider`,
+          ORDER BY a.scope, m.display_name, a.provider, a.model`,
       )).map((row) => this.providerAlias(row)),
     }))
   }
@@ -886,6 +890,10 @@ export class IdentityRepository {
       member_id: row.member_id == null ? null : str(row, 'member_id'),
       member_name: row.member_name == null ? null : str(row, 'member_name'),
       provider: str(row, 'provider'),
+      // ⚠️ `null` 必须原样留住（而不是 `str()` 折成 `''`）：它是「这是一条
+      //   供应商规则」这个事实本身。折成空串会让页面把它显示成一条
+      //   「模型名留空」的模型规则，而这个字段的语义就丢了。
+      model: row.model == null ? null : str(row, 'model'),
       alias: str(row, 'alias'),
       enabled: num(row, 'enabled') === 1,
       created_at_ms: num(row, 'created_at_ms'),
@@ -896,7 +904,7 @@ export class IdentityRepository {
   /**
    * 新建或修改一条归一化规则。
    *
-   * ★ **upsert 语义**：`(scope, member_id, provider)` 就是这条规则的业务主键，
+   * ★ **upsert 语义**：`(scope, member_id, provider, model)` 就是这条规则的业务主键，
    *   页面上「把 dashscope 改成 bailian-tpp」是一次设置，不是一次「查了再改」。
    *   让调用方自己拿 alias_id 来更新，会把「我看到的规则已经被别人删了」
    *   这种事变成一次报错，而对一个展示口径的配置来说，
@@ -904,16 +912,39 @@ export class IdentityRepository {
    *
    * 🚨 **同一原始名 + 同一作用域只能有一条规则**：两个目标会让
    *   `CASE` 的命中结果取决于分支顺序 —— 一个「同样输入、不同结果」的配置。
-   *   MySQL 的 `(member_id, provider)` 唯一索引会挡住它，
+   *   MySQL 的 `(member_id, provider, model)` 唯一索引会挡住它，
    *   SQLite 允许多条 NULL，所以两种后端都在这里显式查重
-   *   （见 `assertAliasFree()`），不能只靠索引。
+   *   （见 `findProviderAlias()`），不能只靠索引。
+   *
+   * ★ v12 起这里同时服务两类规则，靠 `model` 是否有值区分：
+   *   - `model` 为 `null` / 省略 → **供应商规则**（折叠 `provider`）；
+   *   - `model` 有值 → **模型规则**（折叠 `model`），此时 `provider` 可以是
+   *     `'*'`（{@link ANY_PROVIDER}，任意供应商都匹配）或一个真实供应商名
+   *     （只在那家内匹配）。
    */
   async setProviderAlias(actor: Principal, input: MutationInput) {
     const scope = textField(input, 'scope')
     if (scope !== 'global' && scope !== 'member') throw new IdentityError(400, '作用域只支持 global 或 member')
     const provider = textField(input, 'provider')
-    const providerReason = providerNameError(provider)
-    if (providerReason) throw new IdentityError(400, `原始供应商名无效：${providerReason}`)
+    // ★ 先判 `'*'`：`providerNameError()` 刻意不收它（它不是真实供应商名），
+    //   但模型规则需要它来表达「任意供应商」，所以这里单开一条路。
+    const anyProvider = provider === ANY_PROVIDER
+    if (!anyProvider) {
+      const providerReason = providerNameError(provider)
+      if (providerReason) throw new IdentityError(400, `原始供应商名无效：${providerReason}`)
+    }
+    // ★ `model` 有值 = 模型规则。空串在这里被折成 `null`（见 `nullableTextField`），
+    //   否则会写进一条「模型名是空串」的幽灵规则。
+    const model = nullableTextField(input, 'model')
+    if (model !== null) {
+      const modelReason = modelNameError(model)
+      if (modelReason) throw new IdentityError(400, `原始模型名无效：${modelReason}`)
+    } else if (anyProvider) {
+      // 🚨 「不限定供应商」只对模型规则有意义：一条折叠 `provider = '*'` 的
+      //   供应商规则永远匹配不到任何用量（库里没有哪一行的 provider 是 `'*'`），
+      //   而它在列表里看起来完全正常 —— 一条静默失效的规则。
+      throw new IdentityError(400, '不限定供应商只对模型规则有意义：请同时填写模型名，或把供应商改成真实名字')
+    }
     const alias = textField(input, 'alias')
     // ★ 展示名与原始名用**两套**校验：展示名允许中文（`dashscope` → `阿里百炼`
     //   显然比 `bailian-tpp` 更好读），原始名必须与上报值逐字一致，所以只收 ASCII。
@@ -930,7 +961,7 @@ export class IdentityRepository {
         const exists = await tx.get<Row>('SELECT member_id FROM members WHERE member_id = $id', { $id: memberId })
         if (!exists) throw new IdentityError(404, '人员不存在')
       }
-      const existing = await this.findProviderAlias(tx, memberId, provider)
+      const existing = await this.findProviderAlias(tx, memberId, provider, model)
       if (existing) {
         await tx.run('UPDATE provider_alias SET alias = $alias,enabled = $enabled,updated_at_ms = $now WHERE alias_id = $id', {
           $alias: alias, $enabled: inputEnabled ? 1 : 0, $now: this.now(), $id: str(existing, 'alias_id'),
@@ -938,8 +969,8 @@ export class IdentityRepository {
         return { ok: true as const, alias: await this.providerAliasById(tx, str(existing, 'alias_id')) }
       }
       const id = randomUUID()
-      await tx.run('INSERT INTO provider_alias (alias_id,scope,member_id,provider,alias,enabled,created_at_ms,updated_at_ms) VALUES ($id,$scope,$member,$provider,$alias,$enabled,$now,$now)', {
-        $id: id, $scope: scope, $member: memberId, $provider: provider, $alias: alias, $enabled: inputEnabled ? 1 : 0, $now: this.now(),
+      await tx.run('INSERT INTO provider_alias (alias_id,scope,member_id,provider,model,alias,enabled,created_at_ms,updated_at_ms) VALUES ($id,$scope,$member,$provider,$model,$alias,$enabled,$now,$now)', {
+        $id: id, $scope: scope, $member: memberId, $provider: provider, $model: model, $alias: alias, $enabled: inputEnabled ? 1 : 0, $now: this.now(),
       })
       return { ok: true as const, alias: await this.providerAliasById(tx, id) }
     })
@@ -975,19 +1006,26 @@ export class IdentityRepository {
   }
 
   /**
-   * 按 `(member_id, provider)` 查一条规则；全局限定 `member_id IS NULL`。
+   * 按 `(member_id, provider, model)` 查一条规则；全局限定 `member_id IS NULL`。
    *
    * ⚠️ 必须带 `ORDER BY`：唯一索引只对**整行非 NULL** 的组合去重，
-   *   `(NULL, provider)` 在 SQLite 与 MySQL 上都能插进两行（实测见
+   *   `(NULL, provider, NULL)` 在 SQLite 与 MySQL 上都能插进两行（实测见
    *   `verify-database-design.ts`），所以「同一原始名只有一条全局规则」
    *   是**这道应用层查重**在保证，而不是数据库。真出现重复行时，
    *   不带排序的 `get()` 会让每一次「改这条规则」随机命中其中一行 ——
    *   取最早的一条，至少让结果是确定的（`provider-alias.ts` 读取侧同款）。
+   *
+   * 🚨 `model` 那一半的判据必须是 **`IS NULL` 而不是 `= NULL`**：
+   *   后者在两种后端上都恒不成立，于是「改一条供应商规则」会查不到自己、
+   *   每次都当成新增 —— 库里堆出同名的第二条规则，而页面上只是「多了一行」。
+   *   供应商规则与模型规则因此也**不会互相覆盖**：它们的键本来就不一样。
    */
-  private async findProviderAlias(tx: PortalStore, memberId: string | null, provider: string): Promise<Row | null> {
+  private async findProviderAlias(tx: PortalStore, memberId: string | null, provider: string, model: string | null): Promise<Row | null> {
+    const modelClause = model === null ? 'model IS NULL' : 'model = $model'
+    const modelParam = model === null ? {} : { $model: model }
     return memberId
-      ? await tx.get<Row>('SELECT alias_id FROM provider_alias WHERE member_id = $member AND provider = $provider ORDER BY created_at_ms, alias_id LIMIT 1', { $member: memberId, $provider: provider })
-      : await tx.get<Row>('SELECT alias_id FROM provider_alias WHERE member_id IS NULL AND provider = $provider ORDER BY created_at_ms, alias_id LIMIT 1', { $provider: provider })
+      ? await tx.get<Row>(`SELECT alias_id FROM provider_alias WHERE member_id = $member AND provider = $provider AND ${modelClause} ORDER BY created_at_ms, alias_id LIMIT 1`, { $member: memberId, $provider: provider, ...modelParam })
+      : await tx.get<Row>(`SELECT alias_id FROM provider_alias WHERE member_id IS NULL AND provider = $provider AND ${modelClause} ORDER BY created_at_ms, alias_id LIMIT 1`, { $provider: provider, ...modelParam })
   }
 
   private async providerAliasById(tx: PortalStore, id: string): Promise<PortalProviderAlias> {

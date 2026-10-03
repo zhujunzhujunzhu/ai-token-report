@@ -96,12 +96,19 @@ const rowRecord = (row: unknown): RecordRow => row as RecordRow
         {{ row.provider }}<span v-if="row.providerRaw" class="muted">（{{ row.providerRaw }}）</span>
       </template>
     </el-table-column>
-    <el-table-column
-      prop="model"
-      label="模型"
-      min-width="180"
-      show-overflow-tooltip
-    />
+    <!--
+      ★ 模型列与厂商列同款：显示**归一化后**的名字（与模型分布 / 组合分组同一口径），
+      并在配过模型规则时用括号补出上报原值 —— 明细是人用来核对「规则配得对不对」
+      的地方，只显示归一化名的话，把 `qwen-max` 错配成别的名字的规则会表现得很正常。
+
+      ⚠️ 原值只在**与展示名不同**时由服务端下发（`modelRaw`），所以这里同样
+      不需要「有没有配规则」的额外状态：字段在就是不一样。
+    -->
+    <el-table-column label="模型" min-width="180" show-overflow-tooltip>
+      <template #default="{ row }">
+        {{ row.model }}<span v-if="row.modelRaw" class="muted">（{{ row.modelRaw }}）</span>
+      </template>
+    </el-table-column>
     <!--
       ★ 来源（v9）：明细逐条显示「这条用量是哪个客户端写的」。
         它是上报原值（受控枚举），这里只把展示名译出来（`DSH` / `Codex` …）——

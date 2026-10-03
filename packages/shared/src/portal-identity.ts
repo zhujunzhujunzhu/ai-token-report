@@ -346,11 +346,22 @@ export interface PortalLegacyResult extends PortalMutationResult {
 }
 
 /**
- * 一条供应商归一化规则（v6）。
+ * 一条归一化规则（v6 供应商；**v12 起同时承载模型规则**）。
  *
- * ★ 这是**查询期**的展示映射，不是对历史数据的改写：`usage_event.provider`
- *   永远是上报当时的原值，规则只决定「分组与筛选时按哪个名字算」。
+ * ★ 这是**查询期**的展示映射，不是对历史数据的改写：`usage_event.provider` /
+ *   `.model` 永远是上报当时的原值，规则只决定「分组与筛选时按哪个名字算」。
  *   所以新增、修改、停用、删除都是即时生效且可逆的，没有回填这一步。
+ *
+ * ## 一条规则折叠哪个维度，由 {@link model} 是否有值决定
+ *
+ * | `model` | 匹配 | 折叠 |
+ * |---|---|---|
+ * | `null` | `provider` | 供应商名 |
+ * | 有值 | `model` | 模型名 |
+ *
+ * ⚠️ 两者**不叠加**：一条规则只改一个维度。想同时改供应商与模型就配两条规则 ——
+ *   用一列 `target` 表达「这条规则改哪个维度」是另一种写法，但那样必然出现
+ *   「`target='model'` 而 `model IS NULL`」的幽灵规则，而它看起来完全正常。
  */
 export interface PortalProviderAlias {
   alias_id: string
@@ -360,8 +371,21 @@ export interface PortalProviderAlias {
   member_id: string | null
   /** 归属人姓名，仅用于列表展示（`scope='global'` 时为 `null`）。 */
   member_name: string | null
-  /** 上报里出现的**原始** provider（大小写敏感的精确匹配）。 */
+  /**
+   * 匹配的**原始** provider（大小写敏感的精确匹配）。
+   *
+   * ⚠️ 模型规则里它可以是 `'*'`（`shared/price.ts` 的 `ANY_PROVIDER`）= **任意供应商**，
+   *   表示「不管这条用量是哪家报的，这个模型名都折叠成同一个展示名」；
+   *   供应商规则里它一定是真实供应商名（`'*'` 永远不是合法的上报值）。
+   */
   provider: string
+  /**
+   * 匹配的**原始** model（大小写敏感的精确匹配）；`null` = 这是一条**供应商规则**。
+   *
+   * ★ 它与 `usage_event.model` 逐字比较，所以拼错一个字符的后果是
+   *   「规则静默不命中」而不是报错 —— 配置页应当从真实上报值里给出候选项。
+   */
+  model: string | null
   /** 归一化后的展示名。 */
   alias: string
   /** 停用后这一条不参与归一化，但规则行仍在（可以随时启用回来）。 */
@@ -381,13 +405,22 @@ export interface PortalProviderAliasResult extends PortalMutationResult {
 /**
  * 设置一条规则（upsert）。
  *
- * ⚠️ 同一 `(scope, member_id, provider)` 只有一条：再次提交是**改**而不是新增，
- *   否则同一个 provider 会有两条规则、结果取决于读取顺序。
+ * ⚠️ 同一 `(scope, member_id, provider, model)` 只有一条：再次提交是**改**而不是新增，
+ *   否则同一个原始名会有两条规则、结果取决于读取顺序。
+ *
+ * ⚠️ 两条跨字段的联锁由**服务端**判定（`setProviderAlias`），因为它们不是
+ *   「字段格式」而是一句话说不清的业务约束：
+ *   1. `model` 缺省 / `null` = 供应商规则，此时 `provider` 不能再是 `'*'`
+ *      —— 一条「折叠任意供应商的供应商名」的规则对不上任何东西；
+ *   2. `model` 有值 = 模型规则，`provider` 既可以是真实供应商名（只在那家内匹配），
+ *      也可以是 `'*'`（任意供应商都匹配）。
  */
 export interface PortalSetProviderAliasRequest {
   scope: 'global' | 'member'
   member_id?: string
   provider: string
+  /** 匹配的原始 model 名；缺省 / `null` = 这是一条供应商规则。 */
+  model?: string | null
   alias: string
   enabled?: boolean
 }

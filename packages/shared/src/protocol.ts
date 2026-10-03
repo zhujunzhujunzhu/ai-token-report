@@ -434,7 +434,20 @@ export interface RecordRow {
    * 两者相同时前端不必展示它（页面本来就该干净）。
    */
   providerRaw?: string
+  /**
+   * 模型的**展示名**：已经按 `provider_alias` 里的模型规则归一化过。
+   * 没配规则时等于 `modelRaw`。
+   */
   model: string
+  /**
+   * 上报当时的模型**原值**。
+   *
+   * ★ 与 `providerRaw` 同款理由：明细是唯一能核对「模型规则配得对不对」的地方。
+   *   ⚠️ 它**同时是计价用的那一份** —— 明细的金额按 `(providerRaw, modelRaw)`
+   *   读 `model_price` 算，所以这一列不是「仅供参考」，它是金额的锚。
+   *   两者相同时前端不必展示它。
+   */
+  modelRaw?: string
   /**
    * ★ v9：这条用量是**哪个客户端**写的（`dsh` / `codex` / `claude-code` /
    * `trae` / `trae-cn` / `workbuddy`）。
