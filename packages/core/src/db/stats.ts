@@ -48,12 +48,15 @@
  */
 
 import type { Database } from './driver.js'
-import { readLocalRollup, readLocalRollupSummary, type LocalRollupSnapshot } from './local-rollup.js'
+import { readLocalRollup, readLocalRollupSummary, rollupSupportsDimension, type LocalRollupSnapshot } from './local-rollup.js'
 import { existsSync, rmSync } from 'node:fs'
 
 import { aggregate, timeSeries, totalOf, type GroupDimension, type GroupRow } from '../aggregate.js'
 import { resolveRange } from '../range.js'
-import { scanAll, sessionsRootList, type SessionsRootInput } from '../scanner.js'
+import { scanAll, scanAllSources, sessionsRootList, type SessionsRootInput } from '../scanner.js'
+import { registeredSources } from '../sources/registry.js'
+import type { SourceRoot } from '../sources/types.js'
+import { ingestPlainSources } from './ingest-plain.js'
 import type { ScanDiagnostics, TokenCounts, UsageRecord } from '../types.js'
 import { ingest, openDatabaseForIngest, readWatermarks } from './ingest.js'
 import {
@@ -80,6 +83,27 @@ export interface OpenStatsOptions {
   sessionsRoot: SessionsRootInput
   /** 本地库路径。 */
   dbPath: string
+  /**
+   * **带来源**的会话日志根（多客户端）。
+   *
+   * 给了它就按来源分派（DSH 走 zstd 分帧、Codex 走纯文本），
+   * 且**库路径只接 DSH**：本地库的 `source` 列与按来源水位线落地之前，
+   * 「混着来源去 ingest」会让非 DSH 的记录一条也进不了库而**不报错**。
+   * 所以只要这里面出现非 DSH 来源，本次一律改走直扫并给出 `degradedReason`。
+   */
+  sourceRoots?: readonly SourceRoot[]
+  /**
+   * 只统计这些来源（缺省 = 库里的全部来源）。
+   *
+   * ⚠️ 收窄到**部分**来源时会绕过汇总表（`usage_rollup_*` 的键里没有来源），
+   *   见 `openStats` 里的 `scoped`。全选与不传等价。
+   */
+  sources?: readonly string[]
+  /**
+   * 额外要报出来的**缺失**根（`sourceRoots` 只含存在的根，缺失的那部分在
+   * `resolveSourceRoots()` 的 `missing` 里）。不传就只按 `sessionsRoot` 判定。
+   */
+  missingRoots?: readonly string[]
   /** 具名周期（与 CLI `--period` 同义）。缺省 = 全部时间。 */
   period?: string
   /** 显式起始 / 结束（epoch ms），优先于 `period`。 */
@@ -127,9 +151,19 @@ export class StatsSession {
    * 镜像去重，也可能是那个根根本不存在 —— 两者必须能分辨。
    */
   readonly missingRoots: string[]
+  /**
+   * ★ 本次统计读的根，**带来源**（多客户端）。
+   *
+   * 与上面的 `sessionsRoots`（扁平路径）并存而不是替换它：老调用方只认路径数组，
+   * 而「这些根分别属于哪个来源」是新信息，多客户端下页面必须能回答
+   * 「这个数字是谁的」。
+   */
+  readonly sourceRoots: readonly SourceRoot[]
 
   readonly #providers: string[]
   readonly #models: string[]
+  /** 来源筛选（空 = 不过滤，即库里全部来源）。 */
+  readonly #sources: string[]
   /** sql 路径下的库连接。 */
   #db: Database | null = null
   /** scan 路径下的全量记录。 */
@@ -154,6 +188,8 @@ export class StatsSession {
     dbPath?: string
     providers: string[]
     models: string[]
+    /** 来源筛选（可选；缺省 = 不过滤）。 */
+    sources?: readonly string[]
     db: Database | null
     records: UsageRecord[] | null
     sessions: number
@@ -162,6 +198,7 @@ export class StatsSession {
     summaryCounts?: TokenCounts
     sessionsRoots?: string[]
     missingRoots?: string[]
+    sourceRoots?: readonly SourceRoot[]
   }) {
     this.source = init.source
     this.scannedAt = init.scannedAt
@@ -172,8 +209,10 @@ export class StatsSession {
     if (init.dbPath) this.dbPath = init.dbPath
     this.sessionsRoots = init.sessionsRoots ?? []
     this.missingRoots = init.missingRoots ?? []
+    this.sourceRoots = init.sourceRoots ?? []
     this.#providers = init.providers
     this.#models = init.models
+    this.#sources = init.sources === undefined ? [] : [...init.sources]
     this.#db = init.db
     this.#records = init.records
     this.#sessions = init.sessions
@@ -188,12 +227,18 @@ export class StatsSession {
     untilMs?: number
     providers?: string[]
     models?: string[]
+    sources?: string[]
   } {
     return {
       ...(this.sinceMs !== undefined ? { sinceMs: this.sinceMs } : {}),
       ...(this.untilMs !== undefined ? { untilMs: this.untilMs } : {}),
       ...(this.#providers.length > 0 ? { providers: this.#providers } : {}),
       ...(this.#models.length > 0 ? { models: this.#models } : {}),
+      // 🚨 **来源筛选必须在这里也带上**：查询（totals / groups / series / records）
+      //   走的是这个方法，而不是 `openStats` 里那份 filter ——
+      //   只在 openStats 里加 `sources` 的话，会话数那张卡片筛了、其余全不筛，
+      //   表现是「按来源筛选似乎生效了一部分」，比完全无效更难发现。
+      ...(this.#sources.length > 0 ? { sources: this.#sources } : {}),
     }
   }
 
@@ -222,7 +267,9 @@ export class StatsSession {
    * （时间维度升序、其余按用量降序）。
    */
   groups(dim: GroupDimension): GroupRow[] {
-    if (this.#rollup) return this.#rollup.groups(dim)
+    // ⚠️ 来源维度刻意**不**走汇总表：汇总 cell 的键里没有来源，读它只会得到
+    //   一段 undefined 的键（见 `rollupSupportsDimension` 的注释）。
+    if (this.#rollup && rollupSupportsDimension(dim)) return this.#rollup.groups(dim)
     if (this.#db) {
       return queryGroups(this.#db, dim, this.#filter()).map((r) => ({
         key: r.key,
@@ -316,6 +363,11 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
     if (existsSync(root)) presentRoots.push(root)
     else missingRoots.push(root)
   }
+  // 非 DSH 来源的缺失根由调用方带进来（它们不在 `sessionsRoot` 里）——
+  // 「配了但读不到」必须逐项报出，与「本来就没有」是两件事。
+  for (const path of opts.missingRoots ?? []) {
+    if (!missingRoots.includes(path)) missingRoots.push(path)
+  }
 
   const range = resolveRange({
     ...(opts.period ? { period: opts.period } : {}),
@@ -330,13 +382,21 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
 
   // ── 直扫路径（显式强制，或作为降级目标）──────────────────────────
   const scanPath = async (degradedReason?: string): Promise<StatsSession> => {
-    const { records, sessions, diagnostics } = await scanAll(presentRoots, {
-      providers,
-      models,
-      ...(sinceMs !== undefined ? { sinceMs } : {}),
-      ...(untilMs !== undefined ? { untilMs } : {}),
-      ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
-    })
+    const { records, sessions, diagnostics } = opts.sourceRoots !== undefined
+      ? await scanAllSources(opts.sourceRoots, {
+        providers,
+        models,
+        ...(sinceMs !== undefined ? { sinceMs } : {}),
+        ...(untilMs !== undefined ? { untilMs } : {}),
+        ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
+      })
+      : await scanAll(presentRoots, {
+        providers,
+        models,
+        ...(sinceMs !== undefined ? { sinceMs } : {}),
+        ...(untilMs !== undefined ? { untilMs } : {}),
+        ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
+      })
     return new StatsSession({
       source: 'scan',
       ...(degradedReason ? { degradedReason } : {}),
@@ -352,10 +412,19 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
       //   文件数会包含「有文件但这段时间没调用」的会话，让卡片虚高。
       sessions: new Set(records.map((r) => r.sessionId)).size,
       diagnostics,
-      sessionsRoots: presentRoots,
+      sessionsRoots: opts.sourceRoots?.map((root) => root.path) ?? presentRoots,
+      ...(opts.sourceRoots !== undefined ? { sourceRoots: opts.sourceRoots } : {}),
       missingRoots,
     })
   }
+
+  // ★ 来源分流：DSH 走 `ingest()`（zstd 分帧那条成熟路径），其余纯文本来源走
+  //   `ingestPlainSources()`（文件级 L1 + `event_id` 去重）。两条路写进**同一张表**，
+  //   靠 `source` 列区分；库查询因此天然是「全部已选来源的并集」。
+  const dshRoots = opts.sourceRoots === undefined
+    ? presentRoots
+    : opts.sourceRoots.filter((root) => root.source === 'dsh').map((root) => root.path)
+  const plainRoots = opts.sourceRoots?.filter((root) => root.source !== 'dsh') ?? []
 
   if (opts.forceScan) return scanPath()
 
@@ -369,24 +438,45 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
   try {
     if (!opts.readOnly) {
       // ★ ingest 前置：热态约 9 ms，把「库旧于日志」的窗口压到最小
-      await ingest({
-        sessionsRoot: presentRoots,
-        dbPath: opts.dbPath,
-        db,
-        ...(opts.changedFiles ? { changedFiles: opts.changedFiles } : {}),
-        ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
-      })
+      if (dshRoots.length > 0) {
+        await ingest({
+          sessionsRoot: dshRoots,
+          dbPath: opts.dbPath,
+          db,
+          ...(opts.changedFiles ? { changedFiles: opts.changedFiles } : {}),
+          ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
+        })
+      }
+      if (plainRoots.length > 0) {
+        await ingestPlainSources({
+          roots: plainRoots,
+          db,
+          ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
+        })
+      }
     }
+
+    // 来源筛选只在调用方**显式收窄**时加：全选与不加完全等价，
+    // 而生成一个 N 项的 `IN (...)` 只是白费。
+    const allSources = registeredSources().length
+    const narrowSources: string[] | undefined = opts.sources !== undefined && opts.sources.length > 0 && opts.sources.length < allSources
+      ? [...opts.sources]
+      : undefined
 
     const filter = {
       ...(sinceMs !== undefined ? { sinceMs } : {}),
       ...(untilMs !== undefined ? { untilMs } : {}),
       ...(providers.length > 0 ? { providers } : {}),
       ...(models.length > 0 ? { models } : {}),
+      ...(narrowSources !== undefined ? { sources: narrowSources } : {}),
     }
 
-    const summary = opts.rollup === 'summary' ? readLocalRollupSummary(db, filter) : undefined
-    const rollup = opts.rollup === true ? readLocalRollup(db, filter) : undefined
+    // 🚨 汇总表（`usage_rollup_*`）的键里**没有来源**：带着来源筛选去读汇总，
+    //   会静默按「全部来源」出数（筛了 Codex 却拿到 DSH+Codex）。
+    //   所以收窄来源时一律绕过汇总表，走 `usage_event` 上的 SQL 聚合。
+    const scoped = narrowSources !== undefined
+    const summary = !scoped && opts.rollup === 'summary' ? readLocalRollupSummary(db, filter) : undefined
+    const rollup = !scoped && opts.rollup === true ? readLocalRollup(db, filter) : undefined
     return new StatsSession({
       source: 'sql',
       scannedAt: Date.now(),
@@ -396,13 +486,15 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
       dbPath: opts.dbPath,
       providers,
       models,
+      ...(narrowSources !== undefined ? { sources: narrowSources } : {}),
       db,
       records: null,
       sessions: summary?.sessions ?? rollup?.sessions ?? querySessionCount(db, filter),
       ...(summary ? { summaryCounts: summary.counts } : {}),
       ...(rollup ? { rollup } : {}),
       diagnostics: null,
-      sessionsRoots: presentRoots,
+      sessionsRoots: opts.sourceRoots?.map((root) => root.path) ?? presentRoots,
+      ...(opts.sourceRoots !== undefined ? { sourceRoots: opts.sourceRoots } : {}),
       missingRoots,
     })
   } catch (err) {
@@ -452,6 +544,8 @@ export function renderSeriesGaps(
 
   // 占位记录：只有 time，usage 全零 —— 只为让 timeSeries 看到桶的存在
   const placeholders: UsageRecord[] = stamps.map((t, i) => ({
+    // 占位记录永远进不了库、也不参与任何分组；来源取 dsh 只是「不引入新概念」。
+    source: 'dsh',
     eventId: `placeholder:${i}`,
     sessionId: 'placeholder',
     seq: i,

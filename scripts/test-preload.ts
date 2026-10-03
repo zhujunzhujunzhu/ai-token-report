@@ -49,6 +49,28 @@ const dir = mkdtempSync(join(tmpdir(), 'atr-test-data-'))
 
 process.env['DSH_TOKEN_REPORT_DATA_DIR'] = dir
 process.env['DSH_TOKEN_REPORT_DISCOVER'] = '0'
+// ★ 其它来源（Codex 等）同样要钉住：它们的日志根也是**默认按约定目录发现**的
+//   （`$CODEX_HOME` > `~/.codex`）。不关掉的话，任何走到「全部来源」默认值的
+//   测试或脚本都会去读使用者真实的 `~/.codex`（本机实测 1,495 个文件 / 2.8 GB）——
+//   断言随机器漂移、单测从秒变分钟，而且**不会报错**。
+//   需要验证 Codex 行为的测试自己显式给根（`--codex-home` / homes 参数）即可。
+process.env['DSH_TOKEN_REPORT_CODEX'] = '0'
+// ★ Claude Code 同理：它的根也是**默认按约定目录发现**的（`$CLAUDE_CONFIG_DIR` > `~/.claude`）。
+//   本机 `~/.claude/projects` 下已有真实会话（实测 9 个文件 / 21 MB），
+//   不关掉的话「全部来源」的默认路径会把开发者的真实用量扫进单测的断言里 ——
+//   而**不会报错**。需要验证 Claude Code 行为的测试自己显式给根。
+process.env['DSH_TOKEN_REPORT_CLAUDE'] = '0'
+// ★ Trae 同理（**两个发行版各一个开关**）：国际版 `%APPDATA%\Trae\logs` 与
+//   国内版 `%APPDATA%\TraeCN\logs` 都按平台约定目录发现 —— 本机装了 Trae，
+//   不关掉的话「全部来源」的默认路径会把真实用量扫进单测断言，而**不会报错**。
+//   需要验证 Trae 行为的测试自己显式给根（`--trae-home` / homes 参数）即可。
+process.env['DSH_TOKEN_REPORT_TRAE'] = '0'
+process.env['DSH_TOKEN_REPORT_TRAE_CN'] = '0'
+// ★ WorkBuddy 同理：它的根也是**默认按约定目录发现**的（`$WORKBUDDY_CONFIG_DIR` >
+//   `~/.workbuddy`）。本机 `~/.workbuddy/projects` 下已有真实会话（实测 5 个文件），
+//   不关掉的话「全部来源」的默认路径会把真实用量扫进单测断言，而**不会报错**。
+//   需要验证 WorkBuddy 行为的测试自己显式给根（`--workbuddy-home` / homes 参数）即可。
+process.env['DSH_TOKEN_REPORT_WORKBUDDY'] = '0'
 
 process.on('exit', () => {
   try {

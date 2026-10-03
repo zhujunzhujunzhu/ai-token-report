@@ -73,13 +73,29 @@ export function renderTable(columns: Column[], rows: string[][]): string {
   return `${header}\n${sep}\n${body}`
 }
 
-/** 分组结果 → 终端表格。 */
-export function formatGroupTable(rows: GroupRow[], title: string): string {
+/**
+ * 分组结果 → 终端表格。
+ *
+ * `sourceOf` 给出「这一行的来源」时，在「分组」之后插入一列**来源**。
+ *
+ * ★ 为什么来源必须是**一列**而不是靠分组键里带前缀看：多客户端（DSH / Codex / …）之下，
+ *   `provider/model` 完全可能来自两个来源（同一个模型经 DSH 与 Codex 各跑过），
+ *   把它们并成一行之后就没有任何一列能说明「这个数字是谁的」——
+ *   而「这个数字是谁的」正是多来源下第一个要回答的问题。
+ */
+export function formatGroupTable(
+  rows: GroupRow[],
+  title: string,
+  sourceOf?: (row: GroupRow) => string,
+  /** 「分组」列显示什么（缺省用分组键本身）。来源已经是独立一列时，键里的来源前缀就不该再显示一遍。 */
+  labelOf?: (row: GroupRow) => string,
+): string {
   const out: string[] = []
   out.push(`\n=== ${title} ===`)
 
   const body = rows.map((r) => [
-    r.key,
+    ...(sourceOf ? [sourceOf(r)] : []),
+    labelOf ? labelOf(r) : r.key,
     fmtCompact(r.counts.total),
     fmtInt(r.counts.input),
     fmtInt(r.counts.output),
@@ -92,6 +108,7 @@ export function formatGroupTable(rows: GroupRow[], title: string): string {
   out.push(
     renderTable(
       [
+        ...(sourceOf ? [{ title: '来源', align: 'left' as const }] : []),
         { title: '分组', align: 'left' },
         { title: '总量', align: 'right' },
         { title: '未缓存输入', align: 'right' },

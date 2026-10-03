@@ -51,3 +51,12 @@ export * from './range.js'
 export * from './state.js'
 export * from './format.js'
 export * from './types.js'
+// ★ 多客户端扩展点：来源适配器 + 注册表 + 来源根解析。
+//   上游（CLI / 本地服务 / 插件补报）只认这里，新增一个客户端不需要改它们。
+export * from './sources/types.js'
+export * from './sources/registry.js'
+export * from './sources/roots.js'
+export * from './sources/dsh.js'
+export * from './sources/codex.js'
+export * from './sources/claude-code.js'
+export * from './sources/trae.js'

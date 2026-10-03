@@ -11,7 +11,25 @@ import {
   type UsageRecord,
 } from './types.js'
 
-export type GroupDimension = 'provider' | 'model' | 'provider-model' | 'project' | 'session' | 'day' | 'hour'
+/**
+ * 分组维度。
+ *
+ * ★ `source`（来源：`dsh` / `codex` / …）与 `source-provider-model` 是**多客户端**之后
+ *   新加的维度。为什么 `provider-model` 不能自动带上来源：它的分组键是对外契约
+ *   （CSV / JSON / 页面都在用），给它加前缀等于让所有人的脚本换一次口径。
+ *   所以来源是**独立维度**，需要它时显式选（CLI 在多来源时会自动选组合维度，
+ *   见 `cli.ts` 的 `terminalDimensions()`）。
+ */
+export type GroupDimension =
+  | 'source'
+  | 'provider'
+  | 'model'
+  | 'provider-model'
+  | 'source-provider-model'
+  | 'project'
+  | 'session'
+  | 'day'
+  | 'hour'
 
 export interface GroupRow {
   key: string
@@ -30,12 +48,18 @@ export interface GroupRow {
 /** 取分组键。 */
 export function groupKey(rec: UsageRecord, dim: GroupDimension): string {
   switch (dim) {
+    case 'source':
+      return rec.source
     case 'provider':
       return rec.provider
     case 'model':
       return rec.model
     case 'provider-model':
       return `${rec.provider}/${rec.model}`
+    // 组合维度：同一对 (provider, model) 可能同时来自两个来源（同一个模型经 DSH 与
+    // Codex 各跑过）。键里带上来源，行才是「可以单独解释」的。
+    case 'source-provider-model':
+      return `${rec.source}/${rec.provider}/${rec.model}`
     case 'project':
       return projectName(rec.cwd)
     case 'session':

@@ -16,7 +16,12 @@
     "test": "bun test",
     "verify:drivers": "bun run verify/run-driver-parity.ts",
     "verify:multi-home": "bun run verify/verify-multi-home.ts",
+    "verify:codex-format": "bun run verify/verify-codex-format.ts",
+    "verify:claude-code": "bun run verify/verify-claude-code-format.ts",
+    "verify:trae": "bun run verify/verify-trae-format.ts",
+    "verify:workbuddy": "bun run verify/verify-workbuddy-format.ts",
     "benchmark:multi-home": "bun run verify/benchmark-multi-home.ts",
+    "benchmark:sources": "bun run verify/benchmark-sources.ts",
     "verify:mysql": "bun run verify/verify-mysql-dialect.ts"
   },
   "dependencies": {
