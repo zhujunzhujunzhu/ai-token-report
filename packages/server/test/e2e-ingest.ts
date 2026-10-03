@@ -12,9 +12,11 @@
  * 状态码（401/400/405/413）、响应体里的三个计数、以及落库后的归属与分列。
  *
  * 载荷刻意用了**两种客户端的真实形状**：
- *   - CLI（`cli/src/deliver.ts` 的 `toWireRecord`，`client.name = dsh-token-stats`）
- *   - 插件（`dsh-plugin/src/fold.ts` 的 `toWireRecord`，`client.name = dsh-token-report`）
+ *   - CLI（`cli/src/deliver.ts` 的 `toWireRecord`，用 `client.group`）
+ *   - 插件（`dsh-plugin/src/fold.ts` 的 `toWireRecord`，用旧字段名 `client.dept`）
  * 两者字段必须被同一个服务端原样接受 —— 这是「幂等键让多个上报方共存」的前提。
+ * ⚠️ `client.name` 两边现在报**同一个值**（`ai-token-report`）：它只是诊断字段，
+ *   服务端不落库、也不参与归属，所以这里刻意**不**靠它区分两种形状。
  */
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -89,20 +91,20 @@ function cliPayload(records: unknown[]): IngestPayload {
   return {
     schemaVersion: 1,
     // ⚠️ client 里的名字是**客户端自称**，服务端必须忽略它
-    client: { name: 'dsh-token-stats', userId: 'zhangsan', userName: '张三', group: '研发一部' },
+    client: { name: 'ai-token-report', userId: 'zhangsan', userName: '张三', group: '研发一部' },
     generatedAt: new Date().toISOString(),
     records: records as IngestPayload['records'],
   }
 }
 
-/** 插件形状的载荷（`client.name` 不同，字段相同）。 */
+/** 插件形状的载荷（与 CLI 只差分组字段名：`dept` 而非 `group`）。 */
 function pluginPayload(records: unknown[]): IngestPayload {
   return {
     schemaVersion: 1,
     // ⚠️ 这里刻意沿用**旧字段名 `dept`**：已部署的旧插件发的就是它。
     //   服务端按 `client.group ?? client.dept` 落进 `usage_event.group_name`，
     //   丢掉这条兼容不会有任何报错，只会让这些机器的分组快照永久变成 NULL。
-    client: { name: 'dsh-token-report', userId: '张三', userName: '张三', dept: '研发一部' },
+    client: { name: 'ai-token-report', userId: '张三', userName: '张三', dept: '研发一部' },
     generatedAt: new Date().toISOString(),
     records: records as IngestPayload['records'],
   }

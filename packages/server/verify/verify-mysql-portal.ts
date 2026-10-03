@@ -227,7 +227,7 @@ function payload(records: WireRecord[], userName: string): unknown {
     schemaVersion: 1,
     // ⚠️ 客户端自称的名字必须被服务端忽略（归属只信 token）；分组快照同样只是自称，
     //   这里刻意用旧字段名 dept，顺带钉住「旧客户端仍能被接受」。
-    client: { name: 'dsh-token-report', userId: 'someone-else', userName, dept: '研发九部' },
+    client: { name: 'ai-token-report', userId: 'someone-else', userName, dept: '研发九部' },
     generatedAt: new Date().toISOString(),
     records,
   }

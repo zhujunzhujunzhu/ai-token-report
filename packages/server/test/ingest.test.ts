@@ -87,7 +87,7 @@ function payload(
     // ⚠️ `group` 是上报当时客户端的**自称快照**，只落进 `usage_event.group_name`，
     //   不参与归属（归属由 token 决定）。这里刻意与 token 的主人不同分组，
     //   好让「归属不跟着自称走」这件事在断言里看得见。
-    client: { name: 'dsh-token-report', userId: '李四', userName: '李四', group: '研发二部' },
+    client: { name: 'ai-token-report', userId: '李四', userName: '李四', group: '研发二部' },
     generatedAt: '2026-09-25T10:00:00Z',
     records,
     ...over,
@@ -171,7 +171,7 @@ describe('上报接收：正常路径', () => {
     // 已部署的旧插件 / 旧 CLI 发的字段名是 `dept`。丢掉这条兼容，
     // 那些机器此后上报的记录在 group_name 上全是 NULL，而且不会有任何报错。
     const legacy = payload([rec('s:1')], {
-      client: { name: 'dsh-token-report', userId: '张三', userName: '张三', dept: '研发一部' },
+      client: { name: 'ai-token-report', userId: '张三', userName: '张三', dept: '研发一部' },
     })
     const res = await route().submit(legacy, 'Bearer tok-zhang')
 
@@ -199,7 +199,7 @@ describe('上报接收：正常路径', () => {
     //   快照列的语义就是「上报当时客户端自己填的文本」，服务端不替它编一个值。
     const store = CredentialStore.from([{ token: 'tok-x', name: '王五', group: '研发一部' }])
     const noGroup = payload([rec('s:1')], {
-      client: { name: 'dsh-token-report', userId: '王五', userName: '王五' },
+      client: { name: 'ai-token-report', userId: '王五', userName: '王五' },
     })
     await route(store).submit(noGroup, 'Bearer tok-x')
     expect(readRow('s:1')?.group_name).toBeNull()

@@ -19,9 +19,14 @@ import { emptyCounts, mergeCounts, type UsageRecord } from '@ai-token-report/cor
 export interface TokenUsagePayload {
   /** 上报协议版本，便于后台演进。 */
   schemaVersion: 1
-  /** 客户端标识，便于后台区分来源与排查。 */
+  /**
+   * 客户端标识，便于后台区分来源与排查。
+   *
+   * ⚠️ 这个字段**服务端不落库**（`ingest-route.ts` 只取 `client.group` 做文本快照），
+   *   所以改它不会把历史数据切成两截。CLI 与插件现在报**同一个名字**。
+   */
   client: {
-    name: 'dsh-token-stats'
+    name: 'ai-token-report'
     /** 客户端诊断标识；真实归属只由服务端按 token 决定。 */
     userId: string
     userName?: string
@@ -99,7 +104,7 @@ export function createHttpDeliverer(options: HttpDeliverOptions): Deliverer {
     const payload: TokenUsagePayload = {
       schemaVersion: 1,
       client: {
-        name: 'dsh-token-stats',
+        name: 'ai-token-report',
         userId: options.userId ?? 'unknown',
         ...(options.userName ? { userName: options.userName } : {}),
         ...(options.group ? { group: options.group } : {}),
