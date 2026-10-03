@@ -18,6 +18,7 @@ defineEmits<{ (e: 'configure'): void }>()
 
 const {
   loading,
+  busy,
   error,
   summary,
   rows,
@@ -30,6 +31,19 @@ const {
   clearFilters,
   exportCsv,
 } = useUsageStats()
+
+/**
+ * 首屏取数 vs 后续取数。
+ *
+ * - `loading`（首屏，还没有任何数据）：卡片出骨架、明细表出占位行；
+ * - `busy`（有一轮用户发起的取数在飞）：**旧数字留在原地**，只做淡化与文案提示。
+ *
+ * ★ 这两件事必须分开：以前只有 `loading` 一个状态，于是点一下分组维度页签
+ *   （或换时间窗）都会让卡片闪回骨架、明细表塌成一行「正在扫描本机日志…」，
+ *   整页高度跟着一收一放 —— 那就是「点一下闪一下」。
+ */
+const refreshingAll = computed(() => busy.value === 'all')
+const refreshingAny = computed(() => busy.value !== 'idle')
 
 /** 明细表标题用的合计值：当前分组下所有行相加。 */
 function totalOfRows(): number {
@@ -78,7 +92,7 @@ const notice = computed(() => summary.value.notice)
       v-model:time-range="timeRange"
       :time-ranges="timeRanges"
       :dirty="dirty"
-      :loading="loading"
+      :loading="refreshingAny"
       @clear="clearFilters"
       @export="exportCsv"
       @refresh="hardRefresh"
@@ -88,27 +102,34 @@ const notice = computed(() => summary.value.notice)
       {{ error }}
     </p>
 
-    <UsageMetricGrid :metrics="summary.metrics" :loading="loading" />
-
-    <p class="usage-page__sources" :title="sourcePaths">{{ sourceText }}</p>
     <!--
-      费用口径：与「数据来源」同一类信息 —— 它回答「这个金额是按哪份价、有多少没算钱」。
-      本地页读数据目录下的 pricing.json 快照，看板读库里的 model_price，
-      两者会给不同的金额而都「看起来正常」，所以这一行必须与金额同时在场。
+      卡片 + 来源说明 + 趋势图：只有 `all` 那一轮（换时间窗 / 手动刷新）才会换它们，
+      所以也只有那一轮淡化。换分组维度时这一块**一个像素都不动** ——
+      `by` 只进 breakdown 一个接口（见 useUsageStats 的文件头）。
     -->
-    <p v-if="costNote" class="usage-page__sources is-cost">{{ costNote }}</p>
-    <!--
-      降级说明：这一轮没能刷新日志（库被占用 / 只能直扫），数字可能旧一个轮回。
-      没有这一行，使用者没法分辨「日志里就是这些」与「这一轮没刷成」——
-      两者在页面上长得一模一样。
-    -->
-    <p v-if="notice" class="usage-page__notice" role="status">{{ notice }}</p>
+    <div class="usage-page__data" :class="{ 'is-refreshing': refreshingAll }">
+      <UsageMetricGrid :metrics="summary.metrics" :loading="loading" />
 
-    <MetricGroupSection
-      v-for="(group, index) in summary.metricGroups"
-      :key="group.name || `group-${index}`"
-      :group="group"
-    />
+      <p class="usage-page__sources" :title="sourcePaths">{{ sourceText }}</p>
+      <!--
+        费用口径：与「数据来源」同一类信息 —— 它回答「这个金额是按哪份价、有多少没算钱」。
+        本地页读数据目录下的 pricing.json 快照，看板读库里的 model_price，
+        两者会给不同的金额而都「看起来正常」，所以这一行必须与金额同时在场。
+      -->
+      <p v-if="costNote" class="usage-page__sources is-cost">{{ costNote }}</p>
+      <!--
+        降级说明：这一轮没能刷新日志（库被占用 / 只能直扫），数字可能旧一个轮回。
+        没有这一行，使用者没法分辨「日志里就是这些」与「这一轮没刷成」——
+        两者在页面上长得一模一样。
+      -->
+      <p v-if="notice" class="usage-page__notice" role="status">{{ notice }}</p>
+
+      <MetricGroupSection
+        v-for="(group, index) in summary.metricGroups"
+        :key="group.name || `group-${index}`"
+        :group="group"
+      />
+    </div>
 
     <div class="usage-page__tabs" role="tablist">
       <button
@@ -130,6 +151,7 @@ const notice = computed(() => summary.value.notice)
       :group-by="groupBy"
       :total-tokens="totalOfRows()"
       :loading="loading"
+      :busy="refreshingAny"
     />
   </div>
 </template>
@@ -166,6 +188,27 @@ const notice = computed(() => summary.value.notice)
   color: #b42318;
   background-color: #fef3f2;
   border-radius: var(--radius-md);
+}
+
+/*
+  卡片 / 来源说明 / 趋势图这一整块。
+  `gap` 与 `.usage-page` 保持一致，多包一层不改变原来的间距。
+*/
+.usage-page__data {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  transition: opacity 0.15s var(--ease);
+}
+
+/*
+  「换的是这一块」时的淡化（换时间窗 / 手动刷新那一轮）——
+  保留旧数字而不是闪回骨架，同时说明它们正在被替换。
+  ⚠️ 只有 `all` 那一轮才加这个类：换分组维度只换明细表，
+  把卡片与图表一起淡化会让人以为它们也在变（它们不会）。
+*/
+.usage-page__data.is-refreshing {
+  opacity: 0.55;
 }
 
 .usage-page__sources {

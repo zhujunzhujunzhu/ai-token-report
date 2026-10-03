@@ -48,7 +48,7 @@ DSH_LOCAL_API=http://127.0.0.1:8788 bun run dev:local
 | 筛选工具栏 | `UsageFilterBar` | 时间维度、刷新、清除筛选条件、导出 CSV |
 | 指标卡片组 | `UsageMetricGrid` → `UsageMetricCard` | 计费总量 / 缓存命中率 / 调用次数 / 会话数 |
 | 趋势图表 | `MetricGroupSection` → `MetricChartPanel` → `MetricChartCard` | 计费总量（柱状）+ 调用次数（面积） |
-| 分组明细 | `UsageDetailTable` | 按厂商模型 / 厂商 / 模型 / 项目 切换分组 |
+| 分组明细 | `UsageDetailTable` | 按厂商模型 / 厂商 / 模型 / 项目 切换分组。★ 切换维度时**只重取明细表**，旧行留在原地（淡化 + 表头「更新中…」）—— 不闪回骨架、不塌成一行占位 |
 
 ### 配置为什么只有两栏
 
@@ -97,7 +97,7 @@ src/
 │   └── usage/       # 业务组件
 ├── composables/
 │   ├── usage-view-model.ts  # 契约响应 → 视图模型（唯一的格式化/相加处）
-│   ├── useUsageStats.ts     # 数据编排（并发拉取三接口）
+│   ├── useUsageStats.ts     # 数据编排（首屏/换时间窗取三接口；换分组维度只取明细）
 │   └── useIdentity.ts       # 署名状态编排
 ├── types/usage.ts   # 领域类型（对齐 shared 契约）
 ├── utils/format.ts  # 数值格式化
@@ -161,12 +161,18 @@ bun run verify:layout      # 无头 Chrome 量取真实布局（需先起服务�
 - `verify-render.ts` —— 走 Vite SSR 真实渲染组件树。
   ⚠️ SSR 没有本地服务，`fetch` 必然失败，因此外壳部分断言的是**停在 loading 壳时一位金额都不显示**
   （连「费用（估算）」也不该出现）；另有**明细表模板层**的断言
-  （费用列表头 / 金额 / 「未计价」/ 没下发 `cost` 时整列不出现）——
+  （费用列表头 / 金额 / 「未计价」/ 没下发 `cost` 时整列不出现 /
+  ★ 有行时即便在取数也**不塌成占位行**、首屏才用占位行）——
   模板里的列集合是动态的，只跑视图模型断言看不出「逻辑对了但模板还引用旧列」。
   ★ 另有**配置弹框**的断言（`role="dialog"` / 有「服务端地址」与「appKey」两栏 /
   **没有**姓名与分组输入框 / 已署名时把服务端认定值显示成只读文案）：
   SSR 停在 loading 壳时整棵 App 树渲染不到弹框，所以那里是**单独渲染**
   `IdentityGate` 来钉这一版最关键的产品决策。
+- `verify-loading.ts` —— 把真实的 `useUsageStats()` 跑起来（Vite SSR 加载，走 `@/` 别名），
+  用假的 `fetch` 数请求、控时序。★ 守的是**「点一下分组维度页签，整页不许闪一下」**：
+  只发 breakdown 一个请求、`summary`（卡片 / 图表）的对象引用一个都没换、
+  任何一轮都不闪回首屏骨架、在飞时筛选又变了则旧结果丢掉（否则会先画一遍旧维度再换 = 闪两下）。
+  这类回归**不报错**，只让页面抖一下 —— 类型检查、SSR、数据层断言全都看不出来。
 - `verify-layout.ts` —— 走 Chrome `--dump-dom` 读渲染后的 SVG 属性，
   覆盖纯 SSR 断不到的部分。
 
@@ -179,5 +185,13 @@ bun run verify:layout      # 无头 Chrome 量取真实布局（需先起服务�
 - **并发拉取**：overview / series / breakdown 三个请求同时发出，
   服务端把它们合并到同一次日志扫描（见 `server/src/local-api.ts`）。
   串行发只会白等两轮。
+- ★ **换分组维度不重取三个接口**：服务端的筛选条件只有
+  `period` / `provider` / `model`，`by` 只进 breakdown 一个接口。
+  早期实现把三者绑在一起重取，于是点一下维度页签会多跑两趟无关请求，
+  并把卡片与图表整体重建、让卡片闪回骨架、明细表塌成一行占位（整页一收一放）。
+  现在换维度只发 breakdown：卡片与图表**一个字节都不动**，
+  明细行在原地换掉（淡化 + 表头「更新中…」）。
+  与之配套的状态只有两个：`loading`（首屏，还没有任何数据 → 骨架 / 占位）
+  与 `busy`（用户发起的一轮在飞 → 淡化 + 文案；后台每 3 秒轮询刻意不置它）。
 - **时间窗不在前端换算**：`timeRange` 直接就是服务端认识的具名周期
   （`today` / `week` / …），时区口径只在 `core/range.ts` 定义一处。

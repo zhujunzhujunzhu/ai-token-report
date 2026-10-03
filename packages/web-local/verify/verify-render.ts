@@ -122,12 +122,12 @@ try {
     calls: 1,
     cacheHitRate: 0.5,
   }
-  /** 渲染一次明细表（`rows` 决定费用列出不出现）。 */
-  async function renderTable(rows: unknown[]): Promise<string> {
+  /** 渲染一次明细表（`rows` 决定费用列出不出现，`extra` 补 loading / busy 这类状态）。 */
+  async function renderTable(rows: unknown[], extra: Record<string, unknown> = {}): Promise<string> {
     return renderToString(
       createSSRApp({
         render: () =>
-          h(UsageDetailTable, { rows, groupBy: 'model', totalTokens: 110 }),
+          h(UsageDetailTable, { rows, groupBy: 'model', totalTokens: 110, ...extra }),
       }),
     )
   }
@@ -143,6 +143,27 @@ try {
 
   const noCostHtml = await renderTable([{ ...baseRow, key: 'a' }])
   check('服务端没下发 cost 时费用列整列不出现', !noCostHtml.includes('费用（估算）'))
+
+  // —— ★ 换一批行时不许塌陷（模板层；编排那一半见 `verify-loading.ts`） ——
+  //   点分组维度页签 / 换时间窗时旧行仍然有效：表格必须**留在原地**（淡化 + 表头「更新中…」），
+  //   而不是清空成一行「正在扫描本机日志…」—— 那会让表格从 N 行塌成 1 行，
+  //   整页高度跟着一收一放，正是使用者看到的「点一下闪一下」。
+  const busyHtml = await renderTable([{ ...baseRow, key: 'a' }], { loading: false, busy: true })
+  check('★ 有行时即便在取数也不塌成占位行', !busyHtml.includes('正在扫描本机日志') && busyHtml.includes('a</td>'))
+  check('换行期间表头写明「更新中…」', busyHtml.includes('更新中'))
+  check('换行期间表格走淡化而不是清空', busyHtml.includes('is-refreshing'))
+
+  const firstPaintHtml = await renderTable([], { loading: true })
+  check('首屏（一行数据都没有）才用占位行', firstPaintHtml.includes('正在扫描本机日志'))
+
+  const emptyBusyHtml = await renderTable([], { loading: false, busy: true })
+  check(
+    '上一次结果为空、正在换维度时说「正在扫描」而不是「暂无数据」',
+    emptyBusyHtml.includes('正在扫描本机日志') && !emptyBusyHtml.includes('暂无用量数据'),
+  )
+
+  const emptyHtml = await renderTable([], { loading: false, busy: false })
+  check('查完了确实没有用量才说「暂无用量数据」', emptyHtml.includes('暂无用量数据'))
 
   // —— ★ 「配置」弹框：只有服务端地址与 appKey 两栏 ——
   //   为什么单独渲染它：SSR 停在 loading 壳，整棵 App 树渲染不到弹框（见上）。

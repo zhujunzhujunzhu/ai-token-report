@@ -24,7 +24,16 @@ const props = defineProps<{
   groupBy: string
   /** 当前分组维度下合计的计费总量，供标题复用 */
   totalTokens: number
+  /**
+   * 首屏骨架：还没有任何数据可显示（只在第一轮请求结束前为真）。
+   *
+   * ⚠️ 与 `busy` 是两件事：切换分组维度时 `loading` 是假、`busy` 是真 ——
+   * 那时**旧行仍然有效，必须留在原地**，清空重画会让表格从 8 行塌成 1 行占位，
+   * 页面高度跟着一收一放（「点一下就闪」的根源）。
+   */
   loading?: boolean
+  /** 用户发起的一轮在飞（保留旧行 + 淡化 + 表头「更新中…」）。 */
+  busy?: boolean
 }>()
 
 /** 分组维度的中文名，用于标题行。 */
@@ -47,6 +56,21 @@ const firstColumnTitle = computed(() => dimLabel.value)
 const columns = computed(() =>
   showCostColumn(props.rows) ? [...DETAIL_COLUMNS, COST_COLUMN] : DETAIL_COLUMNS,
 )
+
+/**
+ * 表体占位：**这一轮筛选的结果还没到**时用（首屏，或上一次的结果本来就是空的）。
+ *
+ * ★ 判的是 `rows.length === 0` 而不是只看 `loading`：只要表格里已经有行，
+ *   换一批行的过程中就要把它们留住（配合 `busy` 淡化），绝不塌成一行占位。
+ * ★ `busy` 也要算进来：上一维度是空的、刚又点了另一个维度时，说「暂无用量数据」
+ *   是把「还没查完」说成了结论。
+ */
+const showPlaceholder = computed(
+  () => props.rows.length === 0 && (props.loading === true || props.busy === true),
+)
+
+/** 是否在「保留旧行等新行」的状态下（淡化 + 表头提示）。 */
+const isRefreshing = computed(() => props.busy === true && props.rows.length > 0)
 </script>
 
 <template>
@@ -57,10 +81,15 @@ const columns = computed(() =>
         <span class="usage-table__amount tabular">
           合计 {{ totalTokens.toLocaleString('en-US') }} tokens
         </span>
+        <!--
+          换维度 / 换时间窗时，旧行留在原地而合计还是旧的 —— 这一小行说明它们正在被替换。
+          没有它，使用者分不清「已经是新维度的数」与「还在等新数」。
+        -->
+        <span v-if="isRefreshing" class="usage-table__busy" role="status">更新中…</span>
       </h2>
     </header>
 
-    <div class="usage-table__scroll">
+    <div class="usage-table__scroll" :class="{ 'is-refreshing': isRefreshing }">
       <table>
         <thead>
           <tr>
@@ -74,7 +103,7 @@ const columns = computed(() =>
           </tr>
         </thead>
         <tbody>
-          <tr v-if="loading">
+          <tr v-if="showPlaceholder">
             <td class="usage-table__empty" :colspan="columns.length">
               正在扫描本机日志…
             </td>
@@ -131,8 +160,29 @@ const columns = computed(() =>
   color: var(--c-text-secondary);
 }
 
+/*
+  换一批行时的状态提示。刻意做成**表头里的一个词**而不是整表覆盖层 / 骨架：
+  行还留着，页面高度不变，使用者能读到「正在替换」而不会被闪一下。
+*/
+.usage-table__busy {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--c-text-tertiary);
+}
+
 .usage-table__scroll {
   overflow-x: auto;
+  transition: opacity 0.15s var(--ease);
+}
+
+/*
+  淡化而不是清空：旧行在位、可读，颜色略淡表示它正在被替换。
+  与 `.usage-table__busy` 同一个条件（`busy && rows.length > 0`）——
+  首屏那轮不淡化（占位行本来就说明在扫描），后台每 3 秒的轮询也不淡化
+  （否则数字会一直「呼吸」）。
+*/
+.usage-table__scroll.is-refreshing {
+  opacity: 0.55;
 }
 
 table {

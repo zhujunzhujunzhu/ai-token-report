@@ -9,7 +9,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "vue-tsc --noEmit",
-    "verify": "bun run verify/verify-data.ts && bun run verify/verify-render.ts",
+    "verify": "bun run verify/verify-data.ts && bun run verify/verify-render.ts && bun run verify/verify-loading.ts",
     "verify:layout": "bun run verify/verify-layout.ts"
   },
   "dependencies": {
