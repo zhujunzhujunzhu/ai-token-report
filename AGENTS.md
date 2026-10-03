@@ -47,6 +47,17 @@ bun run packages/server/test/e2e-admin.ts            # 签发即刻生效 + 401/
 #   要跑就单独跑（本仓实测 100 pass / 5.34s）。
 bun test packages/server/test/http-contract.test.ts
 
+# ★ 供应商 / 模型归一化（v12）——**不起监听**的 HTTP 断言（改归一化 / 明细 / 筛选 / 规则校验后必跑）
+#   为什么单独一个文件：`e2e-admin.ts` 是「一条脚本跑到底、断言彼此共享演进状态」的形态，
+#   而归一化要钉的东西（折叠哪些维度、`*` 怎么展开、明细给不给原值）与它其它部分无关。
+#   ⚠️ 凭证必须用 `admin/members/appkey`（`usage:write` + `stats:read`）：
+#     `admin/members/tokens` 签的是 `identity:read` + `usage:write`，拿它查看板是 403。
+bun test packages/server/test/model-alias.test.ts
+
+# ★ v12 迁移（`provider_alias` 加 `model` 列 + 唯一索引换成三列）：SQLite 必跑；
+#   带 `ATR_V4_TEST_MYSQL_URL` 时连 MySQL 的「临时索引三步」与「半状态 resume」一起实跑
+bun test packages/core/test/portal-v12.test.ts
+
 # 双轨对照验证（真实日志上跑 SQL vs 直扫，断言两者逐位一致）
 bun run packages/cli/verify/verify-db-parity.ts
 
@@ -218,7 +229,7 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
 | `packages/cli` | **命令入口**：`cli.ts` / `deliver.ts` / `report.ts` / **`cost-view.ts`（`--cost` 三态渲染，零金额算术）** / **`pricing-sync.ts`（`pricing sync`）** |
 | `packages/server` | 上报接收 + 本地直查 + 部门统计（含**分组目录与 `by=group` 分组维度**）+ **数据库身份、账号、会话、人员与分组（多对多）管理** + 静态托管 |
 | `packages/web-local` | 本地页面（`/api/local/*`） |
-| `packages/web-portal` | 部门看板：人员排行 / 趋势 / 分布 / 明细 / 诊断 + **金额（估算）**（概览卡片 / 排行与分布的费用列 / 明细逐条金额 / 趋势费用指标；趋势金额在**多币种或一条价都没配上时禁用并说明原因，不画线**） + **人员管理页（按权限）** + **appKey 管理页（列表按人呈现归属）** + **分组管理页（`/groups`，需 `groups:manage`）** + **供应商归一化页（`/providers`，需 `providers:read`）** + **项目归一化页（`/projects`，需 `projects:read`，按**目录前缀**折叠 `cwd`）** + **模型单价页（`/pricing`，需 `pricing:manage`，按供应商分组、逐模型配四类单价与生效区间）**。后台账号登录。看板数据来自 `/api/v1/stats/*`（含分组候选项 `/api/v1/stats/groups`、人员候选项 `/api/v1/stats/members`、供应商候选 `/api/v1/stats/providers`、来源候选 `/api/v1/stats/sources` 与**项目目录候选 `/api/v1/stats/projects`**）；管理页数据来自 `/api/v1/admin/members*`、`/api/v1/admin/appkeys`、`/api/v1/admin/groups*`、`/api/v1/admin/provider-aliases*`、`/api/v1/admin/project-aliases*` 与 `/api/v1/admin/pricing*`；看板金额的**解释材料**走 `/api/v1/stats/pricing`（`cost:read`，只读单价快照、不含任何用量） |
+| `packages/web-portal` | 部门看板：人员排行 / 趋势 / 分布 / 明细 / 诊断 + **金额（估算）**（概览卡片 / 排行与分布的费用列 / 明细逐条金额 / 趋势费用指标；趋势金额在**多币种或一条价都没配上时禁用并说明原因，不画线**） + **人员管理页（按权限）** + **appKey 管理页（列表按人呈现归属）** + **分组管理页（`/groups`，需 `groups:manage`）** + **供应商模型归一化页（`/providers`，需 `providers:read`；同一张表里配供应商规则与模型规则 —— 模型规则的「限定供应商」留空即 `*`）** + **项目归一化页（`/projects`，需 `projects:read`，按**目录前缀**折叠 `cwd`）** + **模型单价页（`/pricing`，需 `pricing:manage`，按供应商分组、逐模型配四类单价与生效区间）**。后台账号登录。看板数据来自 `/api/v1/stats/*`（含分组候选项 `/api/v1/stats/groups`、人员候选项 `/api/v1/stats/members`、供应商候选 `/api/v1/stats/providers`、来源候选 `/api/v1/stats/sources` 与**项目目录候选 `/api/v1/stats/projects`**）；管理页数据来自 `/api/v1/admin/members*`、`/api/v1/admin/appkeys`、`/api/v1/admin/groups*`、`/api/v1/admin/provider-aliases*`、`/api/v1/admin/project-aliases*` 与 `/api/v1/admin/pricing*`；看板金额的**解释材料**走 `/api/v1/stats/pricing`（`cost:read`，只读单价快照、不含任何用量） |
 | `packages/dsh-plugin` | DSH 插件：实时上报 + `token_usage` 工具 + `ctx.tokenReport` 服务 + **界面用量面板（宿主半 + 浏览器半）**。金额（估算）由宿主算好**格式化成字符串**再透传（浏览器半一个 workspace 包都不 import，只排版）；**面板刻意没有金额曲线**（多币种不相加那条规则的唯一实现在部门看板）。见其 `README.md` |
 
 > 迁移期旧目录（`dsh-token-stats/`、`p0-verify/`）**已删除**。
@@ -243,7 +254,7 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
 | **server 层分层 / 要不要引入第三方库** | `docs/server架构重构方案.md` + `.agents/skills/repo-conventions/SKILL.md` |
 | **部门上报库接 MySQL（方言坑 / 部署 / 备份）** | `docs/mysql上报库.md` |
 | **Portal v9 部署 / v4→v5→v6→v7→v8→v9 显式迁移 / 身份导入** | `docs/数据库部署与迁移.md` + `docs/数据库重设计.md` + `docs/汇总表设计规格.md`（v8） |
-| **供应商归一化（查询期口径 / 按查看者解析）** | `packages/core/src/db/provider-alias.ts` + `docs/数据库重设计.md` §4.3.1 |
+| **供应商 / 模型归一化（查询期口径 / 按查看者解析 / 一条规则只折叠一个维度）** | `packages/core/src/db/provider-alias.ts` + `portal-schema-v12.ts` + `docs/数据库重设计.md` §4.3.1 + `core/test/provider-alias.test.ts` + **`server/test/model-alias.test.ts`**。`provider_alias.model IS NULL` = 供应商规则，非 NULL = 模型规则（**不加 `target` 列** —— 多一列只会多出一个必然漂移的字段）；模型规则的 `provider` 可以是 `'*'`（= `ANY_PROVIDER`，与模型单价的「不限供应商基础价」同一个字面量）。🚨 唯一索引必须是 **`(member_id, provider, model)`**（v12 换的）：不换则「`dashscope` 供应商规则」与「`dashscope`+`qwen-max` 模型规则」是同一个键，第二条写不进去。🚨 MySQL 换索引**不能先 DROP**（`member_id` 上有外键，errno 1553）⇒ 走「临时名建新 → 删旧 → 改名回」 |
 | **项目归一化（目录前缀 / 最长优先 / 未命中回落 `projectName()`）** | `packages/core/src/db/project-alias.ts` + `docs/数据库重设计.md` §4.3.1.1 + `core/test/project-alias.test.ts`。🚨 前缀**必须按路径分隔符边界**判定（裸 `startsWith` 会让一条规则吃掉邻居项目）；`project` 维度的分布表与金额列共用 `PortalStatsSession.#projectOf()`；目录候选 `/api/v1/stats/projects` **跟着数据范围收窄**，且**不能**走 `openPortalStats()`（会撞 `assertLegacyIdentityView()` 的 409） |
 | **分组（多对多）/ 归属展开** | `docs/数据库重设计.md` + `ARCHITECTURE.md` §4.5；归属权威是关联表 `member_group_assignments`，`usage_event.group_name` 只是文本快照 |
 
@@ -645,16 +656,29 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
   差额就是他们 —— 页面必须能说清这一点。看板的分组候选项走 `GET /api/v1/stats/groups`
   （`stats:read`），**不要**让页面去读管理接口 `/api/v1/admin/groups`（那是 `groups:read`）；
   人员候选项同理走 `GET /api/v1/stats/members`（`stats:read`），不是 `/api/v1/admin/members`。
-- **上报库的 schema 变更绝不能自愈**：portal 当前是 **v9**（**v4 是冻结基线**：v3 库先经
-  `portal-schema-v4.ts` 迁到 v4，再依次走 v4→v5、v5→v6、v6→v7、v7→v8、v8→v9；v5 的 `usage_event` 去掉了一列并把 `dept`
+- **上报库的 schema 变更绝不能自愈**：portal 当前是 **12**（**v4 是冻结基线**：v3 库先经
+  `portal-schema-v4.ts` 迁到 v4，再依次走 v4→v5、v5→v6、v6→v7、v7→v8、v8→v9、v9→v10、v10→v11、v11→v12；v5 的 `usage_event` 去掉了一列并把 `dept`
   改名 `group_name`；**v6 只增表** `provider_alias` 与两个权限码；**v7 同样只增表** `model_price`
   与两个权限码（`cost:read` = `...114`、`pricing:manage` = `...115`）；
   **v8 只增表** `usage_rollup_*` 三张看板汇总表（`portal-schema-v8.ts`）；
-  **v9 是唯一一次给既有表加列**：`usage_event.source`（`portal-schema-v9.ts`）），
+  **v9 是第一次给既有表加列**：`usage_event.source`（`portal-schema-v9.ts`）；
+  **v10 也是加列**：`model_price` 的闲时五列（`portal-schema-v10.ts`）；
+  **v11 只增表** `project_alias` 与 `projects:*` 两个权限码（`portal-schema-v11.ts`）；
+  **v12 第一次改既有表的「列 + 索引」**：`provider_alias` 加 `model` 列、唯一索引换成
+  `(member_id, provider, model)`（`portal-schema-v12.ts`）），
   本地 `usage.sqlite` 为 **v4**（同样只多了 `source`，靠 `rebuildSchema()` 重建而不是迁移）。
   - **当前版本的受控 DDL 恒在 `portal-schema-v5.ts`**（v5 结构 + `_V6_ADDITIONS` + `_V7_ADDITIONS`），
     **不要新建 `portal-schema-v7.ts`** —— 分成两个文件会让「哪些表属于当前版本」变成两处各自维护，
-    而它们必然漂移。v8 / v9 各自独立成文件（前者是性能设施，后者动既有表）。
+    而它们必然漂移。v8 / v9 / v10 / v11 / v12 各自独立成文件（v8 是性能设施；v9 / v10 动既有表的列；
+    v11 只追加一张规则表；v12 动既有表的列**与索引**）。
+  - 🚨 **同一个理由适用于所有后续版本**（v9 的拼接是第一个例子，见下一条）：`model_price`
+    闲时五列（v10）、`provider_alias.model` 与三列唯一索引（v12）也全都由**拼接 / 替换**得到
+    （`portalSchemaStatements()` 在**返回的语句清单**上做映射，`upgradeV5ToV6()` 也走同一个
+    `portalV12ReplaceProviderAliasIndex()`）—— 绝不去改那些常量。
+    同理，加一版就要把 `readPortalState()` 的分支、`Vn_VERSION` 常量与 legacy 判定**一起**加上：
+    少了任何一环，那一版的库都会变成 `unsupported`（服务端拒绝启动）。
+    ⚠️ v12 换索引在 SQLite 上只是 `DROP` + `CREATE`，在 MySQL 上必须走「临时名」三步
+    （外键要求 `member_id` 上有最左前缀索引，先删会撞 errno 1553）—— 两步的**终态**必须同形。
   - 🚨 **v9 的那一列不能写进 v5 常量**：`portalSchemaChecksumV6/V7` 按 v5 文本的**当前全文**
     求摘要，改了它会让已经迁到 v6 / v7 的库从「可迁移起点」退化成 `unsupported`（服务端拒绝启动）。
     所以受控定义里的 `usage_event` 由 `portalV9UsageEventStatement()` **拼接**得到，
@@ -901,11 +925,11 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
   旧 `user` 视图保留原姓名键语义，有歧义时报错；禁止将待确认历史当成匿名或自动映射同名人员。
 - **按人筛选是精确匹配，provider/model 才是子串匹配**。人名做子串会把
   「张三」和「张三丰」并成一个人 —— 那是数据错误，不是便利。
-- **🚨 供应商归一化是「查询期的展示口径」，绝不是数据改写**（`provider_alias`，v6）：
-  `usage_event.provider` 永远是上报原值，规则只决定「分组与筛选时按哪个名字算」
-  （`core/src/db/provider-alias.ts` 的 `providerCaseSql()` 产出**没有 ELSE** 的 `CASE`，
+- **🚨 供应商 / 模型归一化是「查询期的展示口径」，绝不是数据改写**（`provider_alias`，v6 供应商 + **v12 模型**）：
+  `usage_event.provider` / `.model` 永远是上报原值，规则只决定「分组与筛选时按哪个名字算」
+  （`core/src/db/provider-alias.ts` 的 `providerCaseSql()` / `modelCaseSql()` 产出**没有 ELSE** 的 `CASE`，
   命中不到就回落原值）。因此改规则即时生效、可逆，**历史数据不需要也没有回填步骤**。
-  四条实测踩出来的：
+  六条实测踩出来的：
   1. **没配规则的供应商保持原始名** —— 归一化是「折叠少数几个」，不是统一改名；
   2. **原始名大小写敏感精确匹配**，写错就静默不命中；映射之后**原始名再也搜不到**它
      （筛选作用在归一化后的表达式上，这是刻意的），所以明细必须同时给出原值；
@@ -913,6 +937,15 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
      否则任何有 `stats:read` 的人都能套用别人的口径，而页面上看不出差别。人员规则逐条覆盖全局；
   4. `provider-model` 维度必须**先归一化 provider 段再拼接**（`dialect.concat`），
      对拼好的字符串做 `CASE` 永远匹配不到 —— 这是一个不会报错、只是不生效的坑。
+     模型那一段同理（`modelCaseSql` 的比较也必须在拼接**之前**的单列上）；
+  5. **一条规则只折叠一个维度**：供应商规则（`model IS NULL`）不动 `model`，模型规则只动 `model`。
+     所以 `provider-model` / `source-provider-model` 是「两段各折叠各的」，不是整串套一个 `CASE`；
+  6. **模型规则的 `provider` 可以是 `'*'`（= `ANY_PROVIDER`）**，表示「任意供应商」。
+     🚨 它**绝不能**被展开成 `provider = '*'`（库里没有哪一行的 provider 是 `'*'`，那是一条静默失效的规则）——
+     正确展开是「**只留 `model` 条件**」。同理 `provider = '*'` 且 `model` 为空的规则由服务端 400 挡住；
+     两档优先级是「限定供应商 > 任意供应商」，**`CASE` 的分支顺序即语义**。
+     ⚠️ 供应商与模型**各自独立判有没有规则**：只配了其中一类时，另一类必须退回裸列名，
+     否则会生成一个空 `CASE`（MySQL 语法错误 / SQLite 恒为 `NULL` 的静默错误）。
 - **`user` 维度只存在于查询层**（`core/db/query.ts` 的 `QueryDimension`），
   **不要并进 `aggregate.ts` 的 `GroupDimension`**：后者是内存聚合（直扫日志）
   的维度集合，而日志里根本没有归属，塞进去只会多一个恒为 `unknown` 的选项。
