@@ -12,6 +12,7 @@
 import { createServer } from 'vite'
 import { createSSRApp, h } from 'vue'
 import { renderToString } from 'vue/server-renderer'
+import { readFile } from 'node:fs/promises'
 
 const server = await createServer({
   root: process.cwd(),
@@ -80,6 +81,22 @@ try {
     typeof METRIC_HINTS.cost === 'string' &&
       METRIC_HINTS.cost.includes('估算') &&
       METRIC_HINTS.cost.includes('未计价'))
+
+  // —— ★ 模板层：「缺失的会话日志根」那一行**刻意不渲染** ——
+  //   为什么读源码而不是渲染：SSR 停在 loading 壳，渲染不到统计页（见文件头）。
+  //   这条守的是「别把它当成漏渲染补回去」：来源缺省是全部已注册来源，
+  //   没装 Trae CN / Codex 这类「本来就没有」的根每次都会命中，页面上只剩噪音。
+  //   ⚠️ 只扫 `<template>` 段 —— 组件脚本里那段「为什么刻意不渲染」的注释
+  //   必然写着这些字，扫全文会把它自己判成失败。
+  const viewSource = await readFile(new URL('../src/views/UsageStatsView.vue', import.meta.url), 'utf8')
+  const viewTemplate = viewSource.slice(
+    viewSource.indexOf('<template>'),
+    viewSource.indexOf('</template>'),
+  )
+  check(
+    '统计页模板里没有「会话日志根不存在」告警（刻意去掉的，不是漏渲染）',
+    viewTemplate.length > 0 && !viewTemplate.includes('不存在') && !viewTemplate.includes('missingRoots'),
+  )
 
   // —— ★ 明细表的费用列（模板层：`verify-data.ts` 只验到视图模型，验不到模板） ——
   //   模板里的列集合是**动态**的（`columns` computed），这类改动最容易出现

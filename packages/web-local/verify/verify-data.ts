@@ -11,7 +11,6 @@
 import {
   buildUsageSummary,
   bucketFor,
-  describeMissingRoots,
   describeSourcePaths,
   describeSources,
   detailCell,
@@ -29,8 +28,10 @@ function check(label: string, condition: boolean, detail = ''): void {
 // ── 构造一份与真实扫描结果同形的样本 ──────────────────────────────────────
 const overview: LocalOverviewResponse = {
   range: { from: null, to: null, label: '今天' },
-  // ★ 来源样本刻意给**两个根 + 一个缺失根**：页面必须能自证「读了哪几处」，
-  //   并对「配了但没读到」的那个显式告警 —— 那种情况与「镜像去重」的数字看起来一样
+  // ★ 来源样本刻意给**两个根 + 一个缺失根**：页面必须能自证「读了哪几处」。
+  //   ⚠️ 缺失的那个**只走到载荷为止** —— 页面刻意不渲染它（见 `UsageStatsView.vue` 里
+  //   那段注释：自动发现的可选来源没装时它是每次必现的假警报），
+  //   但字段必须原样透传，CLI / 诊断仍靠它区分「配了但读不到」与「本来就没有」。
   sources: {
     sessionsRoots: ['/home/u/.dsh/sessions', '/home/u/AppData/Roaming/dsh-desktop/harness/sessions'],
     missingRoots: ['/home/u/.dsh-vscode/sessions'],
@@ -120,7 +121,12 @@ check(
   '空来源有明确文案而不是空白',
   describeSources({ ...summary.sources, sessionsRoots: [] }) === '数据来源：未读到任何会话日志根',
 )
-check('缺失的根逐项列出', describeMissingRoots(summary.sources) === '/home/u/.dsh-vscode/sessions')
+// ★ 缺失的根不再由页面呈现（只在载荷里）—— 断言的是「事实没丢」，不是「页面不显示」。
+//   页面不显示这件事由 `verify-render.ts` 的「模板里不含那句告警」兜住。
+check(
+  '缺失的根仍在载荷里逐项透传（页面不渲染，但不是没有）',
+  summary.sources.missingRoots.length === 1,
+)
 check('悬停能看全部根路径', describeSourcePaths(summary.sources).split('\n').length === 2)
 
 // ★ 金额三态之一：**字段缺席**（旧服务端 / 没有金额来源）

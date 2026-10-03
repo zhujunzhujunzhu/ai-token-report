@@ -681,7 +681,10 @@ export interface LocalStatsQuery {
  * - 「并按集去重」—— 加了一个 home，数字只涨了一点，**这是对的**；
  * - 「那个根根本没读到」—— 数字同样没怎么涨，**这是 bug**。
  *
- * 所以 `missingRoots` 必须逐项报出、绝不静默。
+ * 所以 `missingRoots` 必须逐项报出、绝不静默（**这一条约束落在载荷上**；由谁呈现是
+ * 消费方的选择：CLI 每次统计逐项打印、`--format json` 也带着它，而**本地页面刻意不渲染**
+ * —— 来源缺省是全部已注册来源，没装 Trae CN / Codex 这类「本来就没有」的根每次都会命中，
+ * 页面上只剩噪音，见 `web-local/src/views/UsageStatsView.vue` 里那段注释）。
  */
 export interface LocalStatsSources {
   /** 本次统计读的**会话日志根**（绝对路径）。多个 = 多来源 / 多套 DSH 的并集去重。 */
