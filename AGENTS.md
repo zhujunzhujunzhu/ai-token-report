@@ -39,7 +39,7 @@ bun run packages/cli/verify/verify-report-ingest.ts  # ④整条链 CLI report �
                                                     # 也上报、且 source 落到 usage_event.source —— 真 HTTP + 真库）
 
 # 人员管理与权限端到端（真 HTTP；改 admin 路由 / 数据库身份 / 角色后全跑）
-bun run packages/server/test/e2e-admin.ts            # 签发即刻生效 + 401/403 + 护栏 + appKey 列表 + 分组多对多 + 供应商归一化 + 模型单价 + 数据范围（185 项；`--mysql` 同款）
+bun run packages/server/test/e2e-admin.ts            # 签发即刻生效 + 401/403 + 护栏 + appKey 列表 + 分组多对多 + 供应商归一化 + 项目归一化 + 模型单价 + 数据范围（220 项；`--mysql` 同款）
 
 # 分发面契约（100 项，含 S12.3 的静态托管断言与分组目录 / 供应商归一化 / 模型单价路由族 / 来源目录 / 看板金额门禁 / **看板数据范围** / 旧路径 404；改 app.ts / 路由 / 方法 / 状态码后必跑）
 # ⚠️ 它里面有一条会**冷建本机库**（`GET /api/v1/local/stats/overview`，单条 5 秒超时）：
@@ -218,7 +218,7 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
 | `packages/cli` | **命令入口**：`cli.ts` / `deliver.ts` / `report.ts` / **`cost-view.ts`（`--cost` 三态渲染，零金额算术）** / **`pricing-sync.ts`（`pricing sync`）** |
 | `packages/server` | 上报接收 + 本地直查 + 部门统计（含**分组目录与 `by=group` 分组维度**）+ **数据库身份、账号、会话、人员与分组（多对多）管理** + 静态托管 |
 | `packages/web-local` | 本地页面（`/api/local/*`） |
-| `packages/web-portal` | 部门看板：人员排行 / 趋势 / 分布 / 明细 / 诊断 + **金额（估算）**（概览卡片 / 排行与分布的费用列 / 明细逐条金额 / 趋势费用指标；趋势金额在**多币种或一条价都没配上时禁用并说明原因，不画线**） + **人员管理页（按权限）** + **appKey 管理页（列表按人呈现归属）** + **分组管理页（`/groups`，需 `groups:manage`）** + **供应商归一化页（`/providers`，需 `providers:read`）** + **模型单价页（`/pricing`，需 `pricing:manage`，按供应商分组、逐模型配四类单价与生效区间）**。后台账号登录。看板数据来自 `/api/v1/stats/*`（含分组候选项 `/api/v1/stats/groups` 与人员候选项 `/api/v1/stats/members`）；管理页数据来自 `/api/v1/admin/members*`、`/api/v1/admin/appkeys`、`/api/v1/admin/groups*`、`/api/v1/admin/provider-aliases*` 与 `/api/v1/admin/pricing*`；看板金额的**解释材料**走 `/api/v1/stats/pricing`（`cost:read`，只读单价快照、不含任何用量） |
+| `packages/web-portal` | 部门看板：人员排行 / 趋势 / 分布 / 明细 / 诊断 + **金额（估算）**（概览卡片 / 排行与分布的费用列 / 明细逐条金额 / 趋势费用指标；趋势金额在**多币种或一条价都没配上时禁用并说明原因，不画线**） + **人员管理页（按权限）** + **appKey 管理页（列表按人呈现归属）** + **分组管理页（`/groups`，需 `groups:manage`）** + **供应商归一化页（`/providers`，需 `providers:read`）** + **项目归一化页（`/projects`，需 `projects:read`，按**目录前缀**折叠 `cwd`）** + **模型单价页（`/pricing`，需 `pricing:manage`，按供应商分组、逐模型配四类单价与生效区间）**。后台账号登录。看板数据来自 `/api/v1/stats/*`（含分组候选项 `/api/v1/stats/groups`、人员候选项 `/api/v1/stats/members`、供应商候选 `/api/v1/stats/providers`、来源候选 `/api/v1/stats/sources` 与**项目目录候选 `/api/v1/stats/projects`**）；管理页数据来自 `/api/v1/admin/members*`、`/api/v1/admin/appkeys`、`/api/v1/admin/groups*`、`/api/v1/admin/provider-aliases*`、`/api/v1/admin/project-aliases*` 与 `/api/v1/admin/pricing*`；看板金额的**解释材料**走 `/api/v1/stats/pricing`（`cost:read`，只读单价快照、不含任何用量） |
 | `packages/dsh-plugin` | DSH 插件：实时上报 + `token_usage` 工具 + `ctx.tokenReport` 服务 + **界面用量面板（宿主半 + 浏览器半）**。金额（估算）由宿主算好**格式化成字符串**再透传（浏览器半一个 workspace 包都不 import，只排版）；**面板刻意没有金额曲线**（多币种不相加那条规则的唯一实现在部门看板）。见其 `README.md` |
 
 > 迁移期旧目录（`dsh-token-stats/`、`p0-verify/`）**已删除**。
@@ -244,6 +244,7 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
 | **部门上报库接 MySQL（方言坑 / 部署 / 备份）** | `docs/mysql上报库.md` |
 | **Portal v9 部署 / v4→v5→v6→v7→v8→v9 显式迁移 / 身份导入** | `docs/数据库部署与迁移.md` + `docs/数据库重设计.md` + `docs/汇总表设计规格.md`（v8） |
 | **供应商归一化（查询期口径 / 按查看者解析）** | `packages/core/src/db/provider-alias.ts` + `docs/数据库重设计.md` §4.3.1 |
+| **项目归一化（目录前缀 / 最长优先 / 未命中回落 `projectName()`）** | `packages/core/src/db/project-alias.ts` + `docs/数据库重设计.md` §4.3.1.1 + `core/test/project-alias.test.ts`。🚨 前缀**必须按路径分隔符边界**判定（裸 `startsWith` 会让一条规则吃掉邻居项目）；`project` 维度的分布表与金额列共用 `PortalStatsSession.#projectOf()`；目录候选 `/api/v1/stats/projects` **跟着数据范围收窄**，且**不能**走 `openPortalStats()`（会撞 `assertLegacyIdentityView()` 的 409） |
 | **分组（多对多）/ 归属展开** | `docs/数据库重设计.md` + `ARCHITECTURE.md` §4.5；归属权威是关联表 `member_group_assignments`，`usage_event.group_name` 只是文本快照 |
 
 ---
@@ -421,6 +422,25 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
     `/pricing` 页刻意不进那个拼接串。
   - **单价粒度是 `(provider, model)` 精确匹配**，且匹配的是**上报原值**
     （不是归一化后的展示名 —— 供应商归一化只是查询期口径）；同一供应商下不同模型各配各的价。
+    ★ **v10 起还有一条「不限供应商的基础价」**（`provider = ANY_PROVIDER = '*'`，是保留值，
+    不是供应商名）：`resolvePrice()` 先找专属价、找不到才用它；取数 SQL 因此 **join 两次**
+    （`mp_e` 专属 + 在 `mp_e.price_id IS NULL` 前提下 join 一次 `mp_b` 基础价）——
+    🚨 **绝不能改回 `ON (provider = ? OR provider = '*')`**：那会让一条事件同时命中两行、
+    token 与金额一起翻倍，而页面上只是数字变大。
+  - ★ **v10 起单价分高峰 / 闲时两档**：价行多了 `offpeak_schedule` + 四类闲时单价
+    （`model_price` 的五列，v10 只加列、不重建表），**五个字段同生共死**
+    （`offpeakConfigError()` 兜住，半套配置会让缺的那档按 0 元算）。
+    「哪段时间算高峰」只在 `shared/price.ts` 的 `PRICE_SCHEDULES` 里定义一次
+    （当前 `deepseek-cn`：北京时间周一至周五 09:00–12:00、14:00–18:00 为高峰，
+    其余含**周末与法定节假日全天**为闲时）；**节假日表逐年维护**，
+    `holidaysThrough` 写明覆盖到哪天，过期会把节假日按高峰计。
+    🚨 判定有**两份实现**：JS 侧 `isPeakAt()`、SQL 侧 `query.ts` 的 `slotExpressionSql()`
+    （由同一份时段表**生成**，只用整数算术 —— **绝不用** `strftime(localtime)` /
+    `FROM_UNIXTIME()` / `DAYOFWEEK()`，那些按 OS / 会话时区算），
+    由 `core/test/portal-offpeak.test.ts` 的逐档手算值对上。
+    逐事件路径（趋势 / 明细 / 离线折叠 / 插件宿主）必须走 `priceRatesAt()`，
+    聚合路径按时段取价（SQL 的 `price_slot` → `priceRatesForSlot()`）——
+    漏了这一步就是把闲时用量按高峰价算，费用虚高整整一倍且**看不出区别**。
   - 金额是**整数微元 / 千 token**（1 微 = 1e-6 货币单位）：
     `cost = input×p_in + output×p_out + cacheRead×p_cr + cacheWrite×p_cw`，
     **四类必须分开乘**（`cacheRead` 占总量 94% 以上，合成一个价等于让绝大部分用量算错）。
@@ -460,6 +480,16 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
     且**必须与金额同时展示** —— 离线端与看板读的不是同一份价，
     **同一个时间窗会给出不同的金额**。实测：内置种子价只覆盖 `deepseek-official`，
     真实数据是 `dashscope` 时命中率为 0，`unpricedRate` 必然是 100%。
+  - ★ **本地页的金额多一道配置门禁**：`/api/local/stats/*` 只在**本机已署名**
+    （`<dataDir>/identity.json` 存在 —— 与 `/api/local/identity` 的 `signed`
+    读同一份文件）时才下发 `cost`；没配置上报的机器上那个数只可能是内置种子价，
+    而它会以一个「看起来正常」的金额出现在第一屏。未配置时三个接口**都不带
+    `cost`**（缺席，不是 `0`），服务端**连 `pricing.json` 都不读、连
+    `session.records()` 都不物化**；页面/CSV 靠既有的「字段在不在」判定自动收掉
+    卡片 / 费用列 / 口径行 / CSV 两列，**前端零改动**。判据是**活取值**
+    （每次请求现读）：在页面里配完，下一次刷新就出现。
+    ⚠️ 它**不是权限** —— `/api/local/*` 无鉴权、只监听回环；部门看板的 `cost:read`
+    与 CLI / 插件面板的金额都不受它影响。
   - **折叠公共件是 `packages/core/src/db/cost.ts`**（离线端唯一实现）：
     `loadLocalPricing` / `priceResolver` / `costTotalsOf` / `costByGroupOf` /
     `recordCostOf` / `unpricedTargetsOf`。它**逐条事件按事件时刻取价**
