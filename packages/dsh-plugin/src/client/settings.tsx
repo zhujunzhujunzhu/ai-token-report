@@ -57,6 +57,7 @@ import {
   UI_FLUSH_INTERVALS,
   UI_SETTINGS_PATH,
   readUiRootsView,
+  readUiExtraSources,
   readUiSettings,
   type UiPosition,
   type UiReportingStatus,
@@ -118,6 +119,42 @@ export function rootsSummary(roots: { path: string; exists: boolean }[], source:
 
 type Tab = 'connection' | 'debug'
 
+/**
+ * 把「其它来源」输入框里的文本收成 id 数组（逗号 / 空格 / 换行都能分隔）。
+ *
+ * 只做「切分 + 去空白 + 小写 + 去重」：**认不认识**由宿主判定
+ * （它拿得到已注册来源表，而且拼错必须在保存时当场报错 —— 见
+ * `settings.ts` 的 `parseExtraSources`）。在这里也做一遍校验就等于第二处口径。
+ */
+export function parseExtraSourcesText(text: string): string[] {
+  const out: string[] = []
+  for (const part of text.split(/[\s,，、]+/)) {
+    const id = part.trim().toLowerCase()
+    if (id !== '' && !out.includes(id)) out.push(id)
+  }
+  return out
+}
+
+/**
+ * 「其它来源」那一行：把「现在真的并进了哪些来源」说清楚。
+ *
+ * 返回空串 = **只统计 DSH**（默认）—— 调用方据此说明默认范围，
+ * 而不是显示一个空的列表（「空」与「没配」在界面上必须是一回事，都是 DSH）。
+ */
+export function extraSourcesSummary(effective: readonly string[]): string {
+  if (effective.length === 0) return '当前只统计 DSH（本机其它 AI 客户端的用量不计入面板）。'
+  return `当前统计 DSH + ${effective.map((id) => SOURCE_LABELS[id] ?? id).join(' + ')}。`
+}
+
+/** 来源 id → 展示名（不认识的值原样显示，新来源不改前端也能看出来）。 */
+const SOURCE_LABELS: Record<string, string> = {
+  'claude-code': 'Claude Code',
+  codex: 'Codex',
+  trae: 'Trae',
+  'trae-cn': 'Trae CN',
+  workbuddy: 'WorkBuddy',
+}
+
 export function SettingsPanel(props: { onClose(): void }): ReactNode {
   const [loaded, setLoaded] = useState<UiSettingsPayload | undefined>(undefined)
   const [refreshError, setRefreshError] = useState('')
@@ -132,6 +169,13 @@ export function SettingsPanel(props: { onClose(): void }): ReactNode {
    *   而下方「当前生效」那一行必须始终反映**宿主此刻的事实**。
    */
   const [dshHomesText, setDshHomesText] = useState('')
+  /**
+   * 「其它来源」的输入框（逗号 / 空格 / 换行分隔）。
+   *
+   * ⚠️ 与 `dshHomesText` 同一个道理：输入框里的是**草稿**，下方那行「当前生效」
+   *   必须始终反映宿主此刻的事实。空 = 只统计 DSH（默认）。
+   */
+  const [extraSourcesText, setExtraSourcesText] = useState('')
   const [message, setMessage] = useState('')
   const [busy, setBusy] = useState(false)
   const [tab, setTab] = useState<Tab>('connection')
@@ -149,6 +193,7 @@ export function SettingsPanel(props: { onClose(): void }): ReactNode {
       setInterval(body.flushIntervalMillis > 0 ? body.flushIntervalMillis : UI_DEFAULT_FLUSH_INTERVAL_MILLIS)
       setPosition(body.position)
       setDshHomesText(body.dshHomes.join('\n'))
+      setExtraSourcesText(body.extraSources.join(', '))
       setLive(body.reporting)
     }).catch((err: Error) => { if (!controller.signal.aborted) setRefreshError(err.message) })
     return () => controller.abort()
@@ -179,6 +224,7 @@ export function SettingsPanel(props: { onClose(): void }): ReactNode {
           flushIntervalMillis: interval,
           position,
           dshHomes: parseDshHomesText(dshHomesText),
+          extraSources: parseExtraSourcesText(extraSourcesText),
         }),
       })
       if (!response.ok) throw new Error(`保存失败（HTTP ${response.status}）`)
@@ -193,6 +239,8 @@ export function SettingsPanel(props: { onClose(): void }): ReactNode {
       const roots = readUiRootsView(result)
       setAppKey('')
       setDshHomesText(roots.dshHomes.join('\n'))
+      // 宿主的落盘结果同样是权威：它会把 `dsh` / 重复项剔掉（照它回填，不照我们提交的）
+      setExtraSourcesText(readUiExtraSources(result).join(', '))
       if (reporting) setLive(reporting)
       if (nextPosition) {
         setPosition(nextPosition)
@@ -299,6 +347,22 @@ export function SettingsPanel(props: { onClose(): void }): ReactNode {
         h('span', { className: 'atr-note' },
           '留空 = 不覆盖，跟随部署配置或自动发现本机全部 DSH home。' +
           '填了就只看这几处（本机面板数字与历史补报都按它读日志）。')),
+      // ★ 其它来源（多客户端）：DSH 之外的客户端各有自己的日志目录，面板只统计
+      //   **显式列出来**的那些 —— 默认关，因为并进来意味着面板每次取数都会去
+      //   增量扫那些日志（Codex 在本机是 1,495 个文件 / 2.8 GB）。
+      h('label', { className: 'atr-field' }, '其它来源（本机其它 AI 客户端，逗号分隔）',
+        h('input', {
+          className: 'atr-input', type: 'text', spellCheck: false, disabled,
+          value: extraSourcesText,
+          placeholder: loaded.availableSources.length > 0
+            ? `留空 = 只统计 DSH；可填 ${loaded.availableSources.join(' / ')} 或 all`
+            : '留空 = 只统计 DSH',
+          onChange: (event: { target: { value: string } }) => setExtraSourcesText(event.target.value),
+        }),
+        h('span', { className: 'atr-note' },
+          '留空 = 只统计 DSH（默认）。写 trae 这类来源 id 会把那个客户端的用量一并算进面板；' +
+          'all = 全部已注册来源（冷扫时可能要等一会儿）。')),
+      h('p', { className: 'atr-note' }, extraSourcesSummary(loaded.extraSourcesEffective)),
       // ★「现在真的在读哪几处」必须单独一行显示：只给输入框，用户分不清
       //   「我存的」与「真的生效的」——而这两件事在本插件里最容易不一致。
       rootsLine === ''

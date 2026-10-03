@@ -536,6 +536,29 @@ console.log('\n── 6. 面板改会话日志根：同一进程就地生效（�
     const rejected = await save({ dshHomes: 'not-a-list' })
     check('非法列表被拒（说清原因）', rejected['ok'] === false && typeof rejected['reason'] === 'string')
     check('被拒后盘上的连接文件一个字节没被改写', readFileSync(connectionFile, 'utf8') === textBeforeReject)
+
+    // ⑦ 多客户端白名单（`extraSources`）：**默认关**，且拼错当场报错 ——
+    //   这一项的错法没有下游信号（数字不变，与「那个客户端没用量」一模一样）。
+    check('★ 默认关：面板没设过其它来源',
+      Array.isArray(before['extraSources']) && (before['extraSources'] as unknown[]).length === 0)
+    check('★ 默认关时一个额外来源都不并（只统计 DSH）',
+      Array.isArray(before['extraSourcesEffective']) && (before['extraSourcesEffective'] as unknown[]).length === 0)
+    check('GET 给出可填的来源清单（输入框据此自解释）',
+      Array.isArray(before['availableSources']) && (before['availableSources'] as unknown[]).includes('trae'))
+    const badSource = await save({ extraSources: ['trea'] })
+    check('🚨 拼错的来源名当场被拒，并给出可用值',
+      badSource['ok'] === false && String(badSource['reason']).includes('trae'))
+    const withTrae = await save({ extraSources: ['trae'] })
+    check('写入合法白名单后如实回报「已并入 trae」',
+      withTrae['ok'] === true
+      && JSON.stringify(withTrae['extraSourcesEffective']) === JSON.stringify(['trae']),
+      JSON.stringify(withTrae['extraSourcesEffective']))
+    check('白名单也落盘（plugin-connection.json）',
+      JSON.stringify(savedFile()['extraSources']) === JSON.stringify(['trae']))
+    const clearedSources = await save({ extraSources: [] })
+    check('★ 清空白名单 = 回到「只统计 DSH」',
+      clearedSources['ok'] === true
+      && JSON.stringify(clearedSources['extraSourcesEffective']) === JSON.stringify([]))
   } finally {
     rmSync(home, { recursive: true, force: true })
   }

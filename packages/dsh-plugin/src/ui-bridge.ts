@@ -572,10 +572,21 @@ export function installUiRoute(
     // ★ 与 CLI `dsh-token` / `token_usage` 工具调用的是**同一个函数**，
     //   所以面板上的数与终端、与 Agent 报的数必然一致。
     run: (query) => queryUsage(stats, query),
-    // ★ 缓存跟着**取数范围**走：`StatsContext` 的三个路径都是活取值，
-    //   面板里改完会话日志根之后，下一次取数就该按新根查，
+    // ★ 缓存跟着**取数范围**走：`StatsContext` 的路径都是活取值，
+    //   面板里改完会话日志根 / 其它来源之后，下一次取数就该按新范围查，
     //   而不是继续回 TTL 内的旧结果（那看起来就像「改了没生效」）。
-    scope: () => [stats.dbPath, stats.dataDir, ...stats.sessionsRoots].join('\u0000'),
+    scope: () => [
+      stats.dbPath,
+      stats.dataDir,
+      ...stats.sessionsRoots,
+      // 白名单（`extraSources`）同样在范围指纹里：漏了它就会出现
+      // 「配了 trae 但面板要过 30 秒才变」这种「改了没生效」的经典症状。
+      ...(stats.sourceRoots ?? []).map((root) => `${root.source}:${root.path}`),
+      // ★ 查询期的来源清单也要进指纹：根只反映「哪些来源的目录存在」，
+      //   而白名单是「只算哪些来源」—— 两者可能不同（例如配了一个本机没装的来源，
+      //   根里没有它，账单口径却变了），只按根做指纹会命中过期缓存。
+      ...(stats.sources ?? []),
+    ].join('\u0000'),
     ...(options.ttlMs !== undefined ? { ttlMs: options.ttlMs } : {}),
     ...(options.generation !== undefined ? { generation: options.generation } : {}),
   })

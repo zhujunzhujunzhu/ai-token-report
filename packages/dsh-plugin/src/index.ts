@@ -61,6 +61,7 @@ import {
 } from './config.js'
 import { IdentityResolver, type IdentityState } from './identity.js'
 import { reportPaths } from './paths.js'
+import { resolveStatsSourceRoots, statsSourceIds } from './extra-sources.js'
 import type { ReporterStats } from './reporter.js'
 import type { BackfillStats } from './backfill-runner.js'
 import {
@@ -516,6 +517,17 @@ function buildStatsContext(read: () => EffectiveConfig): StatsContext {
     // 单价快照（`pricing.json`）就在数据目录里：金额是**本机**的估算，
     // 所以「按哪份价算的」这件事必须跟着数据目录一起传下去。
     get dataDir() { return paths().dataDir },
+    // ★ 多客户端白名单（`extraSources`）：**活取值**，配置一改下一次取数就按新来源走。
+    //   缺省（白名单为空）返回 undefined ⇒ 不 ingest 任何额外来源（行为不变）。
+    get sourceRoots() { return resolveStatsSourceRoots(read(), paths().dshHomes)?.roots },
+    // ★ 与 `sourceRoots` 成对：根管「本次 ingest 谁」，这份清单管「本次只算谁」。
+    //   缺了它，库里别的来源的行（CLI 入的）会被当成面板自己的数字 —— 见 `extra-sources.ts`。
+    get sources() { return statsSourceIds(read()) },
+    get missingRoots() {
+      // 配了但不存在的那部分单独报出来：「没装那个客户端」与「路径写错了」必须能分辨。
+      const plan = resolveStatsSourceRoots(read(), paths().dshHomes)
+      return plan?.missing.map((root) => root.path)
+    },
     backgroundQueries: true,
   }
 }

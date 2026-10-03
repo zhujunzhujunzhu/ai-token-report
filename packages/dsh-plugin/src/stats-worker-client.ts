@@ -47,7 +47,23 @@ export function queryInStatsWorker(ctx: StatsContext, query: UsageQuery): Promis
     own.pending.set(id, { resolve, reject, timer })
     own.worker.ref()
     try {
-      own.worker.postMessage({ id, query, ctx: { sessionsRoots: ctx.sessionsRoots, dbPath: ctx.dbPath, dataDir: ctx.dataDir, config: { localDb: ctx.config.localDb } } })
+      own.worker.postMessage({
+        id,
+        query,
+        ctx: {
+          sessionsRoots: ctx.sessionsRoots,
+          dbPath: ctx.dbPath,
+          dataDir: ctx.dataDir,
+          config: { localDb: ctx.config.localDb },
+          // ★ 多客户端白名单要一起过线：只传 DSH 的根会让「配了 extraSources 却只有 DSH」
+          //   变成一个查不出原因的现象（面板走的就是这条线程）。
+          ...(ctx.sourceRoots !== undefined ? { sourceRoots: ctx.sourceRoots } : {}),
+          // ★ 查询期来源清单同样要过线：它在**线程内**决定「只算哪些来源的行」，
+          //   漏传的后果是线程里按「库里的全部来源」出数（与主线程不一致，且不报错）。
+          ...(ctx.sources !== undefined ? { sources: ctx.sources } : {}),
+          ...(ctx.missingRoots !== undefined ? { missingRoots: ctx.missingRoots } : {}),
+        },
+      })
     } catch (error) { own.fail(error instanceof Error ? error : new Error(String(error))) }
   })
 }

@@ -7,7 +7,7 @@ import { zstdCompressSync } from 'node:zlib'
 import { queryUsage, type StatsContext } from '../src/stats.js'
 import { closeStatsWorker } from '../src/stats-worker-client.js'
 import { openDatabaseForIngest, insertRecords } from '@ai-token-report/core/db'
-import { emptyCounts } from '@ai-token-report/core'
+import { emptyCounts, resolveSourceRoots } from '@ai-token-report/core'
 
 test('会话根目录是联接时，监听真实目录但增量路径保持调用方目录', async () => {
   const root = mkdtempSync(join(realpathSync.native(tmpdir()), 'atr-worker-alias-'))
@@ -60,6 +60,55 @@ test('Worker 超时拒绝排队请求，下一次查询可以重建线程', asyn
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('★ 面板默认只统计 DSH：库里别的来源的行（Codex）不许混进来', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'atr-worker-sources-'))
+  const dbPath = join(root, 'usage.sqlite')
+  const ctx: StatsContext = { config: { localDb: true }, sessionsRoots: [join(root, 'sessions')],
+    dbPath, dataDir: join(root, 'data'), backgroundQueries: true }
+  /**
+   * 本地库是 CLI / 本地页 / 插件 / report **共用的一个文件**：CLI 跑过一次缺省运行
+   * （或 `--source all`）之后，库里就躺着别的来源的行。而 `openStats` 的 `sources`
+   * 缺省语义是「库里的全部来源」—— 面板不显式收窄就会把这些行当成自己的数字。
+   *
+   * ⚠️ 这里**不能用 `insertRecords` 造那条 Codex 行**：它对非 `dsh` 来源是硬拒绝的
+   *   （种子数据不许带来源）。所以走真路径：造一份最小的 Codex rollout 日志，
+   *   让 `ingestPlainSources()` 自己把它写进去。
+   */
+  const codexHome = join(root, 'codex-home')
+  const sessionId = '11111111-2222-3333-4444-555555555555'
+  const dayDir = join(codexHome, 'sessions', '2026', '01', '01')
+  mkdirSync(dayDir, { recursive: true })
+  const envelope = (ordinal: number, type: string, payload: unknown, at: string) =>
+    JSON.stringify({ timestamp: at, ordinal, type, payload })
+  writeFileSync(join(dayDir, `rollout-2026-01-01T00-00-00-${sessionId}.jsonl`), [
+    envelope(0, 'session_meta', { session_id: sessionId, timestamp: '2026-01-01T00:00:00.000Z', cwd: '/work/codex', model_provider: 'openai' }, '2026-01-01T00:00:00.000Z'),
+    envelope(1, 'turn_context', { model: 'gpt-5-codex', cwd: '/work/codex' }, '2026-01-01T00:00:00.500Z'),
+    envelope(2, 'event_msg', { type: 'token_count', info: {
+      last_token_usage: { input_tokens: 1000, cached_input_tokens: 800, cache_write_input_tokens: 0, output_tokens: 50, reasoning_output_tokens: 0, total_tokens: 1050 },
+      total_token_usage: { input_tokens: 1000, cached_input_tokens: 800, cache_write_input_tokens: 0, output_tokens: 50, reasoning_output_tokens: 0, total_tokens: 1050 },
+    } }, '2026-01-01T00:00:01.000Z'),
+  ].join('\n') + '\n')
+  const codexRoots = resolveSourceRoots({ sources: ['codex'], homes: { codex: [codexHome] } }).roots
+  try {
+    // ① 白名单里显式配上 Codex：这一轮把 Codex 的用量写进**同一个库**，并如实算出来
+    const withCodex = await queryUsage({ ...ctx, sourceRoots: codexRoots, sources: ['dsh', 'codex'] }, { summaryOnly: true })
+    expect(withCodex.totals.calls).toBe(1)
+    expect(withCodex.totals.total).toBe(1050)
+
+    // ② 关键断言：白名单为空（缺省 = 只统计 DSH）时，库里那条 Codex 行**一位都不许算**
+    const dshOnly = await queryUsage(ctx, { summaryOnly: true })
+    expect(dshOnly.totals.calls).toBe(0)
+    expect(dshOnly.totals.total).toBe(0)
+
+    // ③ 收回白名单之外的那一轮：DSH 的口径没有被「筛选」这件事本身改坏
+    const stillBoth = await queryUsage({ ...ctx, sourceRoots: codexRoots, sources: ['dsh', 'codex'] }, { summaryOnly: true })
+    expect(stillBoth.totals.total).toBe(1050)
+  } finally {
+    await closeStatsWorker(dbPath)
+    rmSync(root, { recursive: true, force: true })
+  }
+}, 20_000)
 
 test('真实 Worker 支持摘要、精确分页、手动追加刷新及外部写入，卸载释放线程', async () => {
   const root = mkdtempSync(join(tmpdir(), 'atr-worker-test-'))
@@ -116,7 +165,7 @@ test('真实 Worker 支持摘要、精确分页、手动追加刷新及外部写
     expect(refreshed.totals.total).toBe(420)
     const db = openDatabaseForIngest(dbPath)
     try {
-      insertRecords(db, [{ eventId: 'external:1', sessionId: 'external', seq: 1, time, provider: 'p', model: 'm',
+      insertRecords(db, [{ source: 'dsh', eventId: 'external:1', sessionId: 'external', seq: 1, time, provider: 'p', model: 'm',
         cwd: null, turn: null, step: null, usage: { ...emptyCounts(), input: 7, total: 7, calls: 1 } }])
     } finally { db.close() }
     const external = await queryUsage(ctx, { summaryOnly: true })

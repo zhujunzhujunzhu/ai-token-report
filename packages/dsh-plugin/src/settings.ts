@@ -59,6 +59,7 @@ import {
   DSH_HOME_ENV,
   DSH_HOMES_ENV,
   readIdentity,
+  registeredSources,
   writeIdentity,
 } from '@ai-token-report/core'
 import {
@@ -69,6 +70,7 @@ import {
 } from './client/protocol.js'
 import type { EffectiveConfig, RawConfig } from './config.js'
 import { reportPaths, type PathInput } from './paths.js'
+import { planExtraSources } from './extra-sources.js'
 
 /** 上报路径（`baseUrl` + 它 = `config.endpoint`）。 */
 export const INGEST_PATH = '/api/v1/token-usage'
@@ -116,6 +118,13 @@ interface SavedConnection {
    * ⚠️ 它换的是**日志来源**（面板数字与历史补报都读它），不是数据目录。
    */
   dshHomes?: string[]
+  /**
+   * ★ **额外并入统计的来源**（面板里填的那一份，多客户端）。
+   *
+   * 空数组 = 没覆盖（面板只统计 DSH）；非空 = 覆盖部署配置的 `extraSources`。
+   * 只影响**本机取数范围**，与连接 / 身份无关，所以和 `dshHomes` 同一类纯本机偏好。
+   */
+  extraSources?: string[]
 }
 
 /**
@@ -157,6 +166,48 @@ export function parseDshHomes(value: unknown): DshHomesParse {
   }
   if (out.length > MAX_DSH_HOMES) {
     return { ok: false, reason: `会话日志根最多 ${MAX_DSH_HOMES} 个（当前 ${out.length} 个）` }
+  }
+  return { ok: true, value: out }
+}
+
+/**
+ * 面板上一次最多接受多少个「其它来源」。
+ *
+ * 与 `MAX_DSH_HOMES` 同一个理由：每一项都是一条日志来源，畸形输入不该被收下。
+ * 实际上已注册来源只有个位数，16 是给将来留的余量。
+ */
+export const MAX_EXTRA_SOURCES = 16
+
+/** 解析面板提交的「其它来源」：合法的收下，非法的**说清原因**（不静默丢弃）。 */
+export type ExtraSourcesParse = { ok: true; value: string[] } | { ok: false; reason: string }
+
+/**
+ * 收下面板提交的「其它来源」数组。
+ *
+ * 与 `parseDshHomes` 的三条口径一致（`undefined` ≠ `[]`、空白项按没写、非字符串报错），
+ * 另加一条**这里独有的**：只接受**已注册的来源 id**（以及 `all`）。
+ *
+ * 🚨 为什么这里比 `dshHomes` 严：路径写错会被「缺失根逐项报出」当场看见，
+ *   而来源名写错**没有任何下游信号** —— 面板数字不变，与「那个客户端本来就没用量」
+ *   完全一样。所以拼错必须在**保存时**就报错（面板会把原因原样显示出来）。
+ */
+export function parseExtraSources(value: unknown): ExtraSourcesParse {
+  if (!Array.isArray(value)) return { ok: false, reason: '其它来源必须是一个列表' }
+  const known: string[] = registeredSources().map((adapter) => adapter.id).filter((id) => id !== 'dsh')
+  const out: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string') return { ok: false, reason: '其它来源里有一项不是字符串' }
+    const id = item.trim().toLowerCase()
+    if (id === '') continue
+    // `dsh` 永远在（面板的主体就是 DSH 用量），写它等于没写 —— 静默忽略而不是报错。
+    if (id === 'dsh') continue
+    if (id !== 'all' && !known.includes(id)) {
+      return { ok: false, reason: `不认识的来源 "${item.trim()}"（可用：all / ${known.join(' / ')}）` }
+    }
+    if (!out.includes(id)) out.push(id)
+  }
+  if (out.length > MAX_EXTRA_SOURCES) {
+    return { ok: false, reason: `其它来源最多 ${MAX_EXTRA_SOURCES} 个（当前 ${out.length} 个）` }
   }
   return { ok: true, value: out }
 }
@@ -287,6 +338,14 @@ export function readConnection(target?: PathInput): Partial<SavedConnection> {
         console.warn(`token-report: 本地配置里的 dshHomes 不可用（${homes.reason}），已忽略该项`)
       }
     }
+    if (value['extraSources'] !== undefined) {
+      const extra = parseExtraSources(value['extraSources'])
+      if (extra.ok) {
+        if (extra.value.length > 0) out.extraSources = extra.value
+      } else {
+        console.warn(`token-report: 本地配置里的 extraSources 不可用（${extra.reason}），已忽略该项`)
+      }
+    }
     return out
   } catch (err) {
     if ((err as { code?: string }).code !== 'ENOENT') console.warn('token-report: 本地连接配置损坏，已回退部署配置')
@@ -320,6 +379,9 @@ export function withSavedConnection(raw: RawConfig): RawConfig {
   }
   if (saved.dshHomes !== undefined && saved.dshHomes.length > 0) {
     next = { ...next, dshHomes: [...saved.dshHomes] }
+  }
+  if (saved.extraSources !== undefined && saved.extraSources.length > 0) {
+    next = { ...next, extraSources: [...saved.extraSources] }
   }
   return next
 }
@@ -423,6 +485,26 @@ export function createSettingsHandler(
     rootsSource: dshHomesSourceOf({ saved: state.saved, effective: state.config }),
   })
 
+  /**
+   * 面板要显示的「其它来源」三件套（多客户端）。
+   *
+   * - `extraSources` —— **面板里存过的那一份**（空 = 没覆盖 ⇒ 只统计 DSH）→ 回填输入框；
+   * - `extraSourcesEffective` —— **此刻真的并进了哪些**（已滤掉未注册 / 重复 / `dsh`）；
+   * - `availableSources` —— 可以填的 id 清单，让输入框自己说清「能填什么」。
+   *
+   * ⚠️ 与 `rootsView` 同一个理由：读取与保存响应**共用这一处**，
+   *   否则保存后回填的与刷新后读到的不一致。
+   */
+  const extraSourcesView = (state: SettingsState): {
+    extraSources: string[]
+    extraSourcesEffective: string[]
+    availableSources: string[]
+  } => ({
+    extraSources: state.saved.extraSources ?? [],
+    extraSourcesEffective: planExtraSources(state.config).sources,
+    availableSources: registeredSources().map((adapter) => adapter.id).filter((id) => id !== 'dsh'),
+  })
+
   return async (request) => {
     const state = host.state()
     const paths = reportPaths(state.config)
@@ -445,6 +527,7 @@ export function createSettingsHandler(
         position: saved.position ?? state.config.ui.position,
         reporting: state.reporting,
         ...rootsView(state),
+        ...extraSourcesView(state),
       })
     }
     if (request.method !== 'POST') return json({ ok: false, reason: '不支持的请求方法' }, 405)
@@ -518,6 +601,15 @@ export function createSettingsHandler(
         dshHomes = parsed.value
       }
 
+      // 其它来源：`undefined` = 这次不动它；`[]` = 把覆盖清掉（回落部署配置）。
+      // 与 dshHomes 的唯一差别是**拼错会当场报错**（那位没有下游信号，见 parseExtraSources）。
+      let extraSources = previous.extraSources
+      if (raw['extraSources'] !== undefined) {
+        const parsed = parseExtraSources(raw['extraSources'])
+        if (!parsed.ok) return json({ ok: false, reason: parsed.reason })
+        extraSources = parsed.value
+      }
+
       const path = connectionPath(state.config)
       /** 这次要落盘的内容：**凭证来自本次输入，或原样沿用已保存的那一份**。 */
       const credential = appKey || previous.appKey
@@ -527,6 +619,7 @@ export function createSettingsHandler(
         ...(interval !== undefined ? { flushIntervalMillis: interval } : {}),
         ...(position !== undefined ? { position } : {}),
         ...(dshHomes !== undefined && dshHomes.length > 0 ? { dshHomes } : {}),
+        ...(extraSources !== undefined && extraSources.length > 0 ? { extraSources } : {}),
       }
 
       /**
@@ -561,6 +654,7 @@ export function createSettingsHandler(
           position: saved.position ?? after.config.ui.position,
           flushIntervalMillis: saved.flushIntervalMillis ?? after.config.batch.flushIntervalMillis,
           ...rootsView(after),
+          ...extraSourcesView(after),
           reporting,
           applied,
           restartRequired: !applied,

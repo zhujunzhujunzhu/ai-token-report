@@ -48,6 +48,8 @@ import {
   aggregate,
   resolveRange,
   type GroupDimension,
+  type SessionSource,
+  type SourceRoot,
   type TokenCounts,
 } from '@ai-token-report/core'
 import {
@@ -197,6 +199,32 @@ export interface StatsContext {
    * 不要在各处重新拼路径。
    */
   dataDir: string
+  /**
+   * ★ **带来源的根**（多客户端）—— 只有配置了 `extraSources` 才有值。
+   *
+   * 不传（`undefined`）时 `openStats()` 只按 `sessionsRoots` 取数，也就是
+   * 「面板只统计 DSH」的既有行为**逐字不变**。给了它之后，DSH 走 zstd 分帧、
+   * 其余来源走纯文本通路，两条路写进**同一张** `usage_event`，靠 `source` 列区分，
+   * 于是面板上的数字天然是「全部已选来源的并集」。
+   *
+   * ⚠️ 代价是**取数时会增量 ingest 这些来源的日志**（面板每 30 秒探一次），
+   *   所以白名单默认空、而且由使用者显式列出来（见 `extra-sources.ts` 文件头）。
+   */
+  sourceRoots?: readonly SourceRoot[]
+  /**
+   * ★ **查询期来源清单**（缺省 = `['dsh']`）——与 `sourceRoots` 是一对，
+   *   缺了它就只有「本次 ingest 谁」，没有「本次只算谁」。
+   *
+   * 🚨 为什么必须有：本地库是 CLI / 本地页 / 插件 / report **共用的一个文件**，
+   *   库里天然躺着别的来源的行（CLI 跑过一次缺省运行就会有）。而
+   *   `openStats()` 的 `sources` 缺省语义是「**库里的全部来源**」——
+   *   面板配着 `extraSources: []`（默认 = 只统计 DSH）也会把 Codex 的行算进来，
+   *   数字看起来完全正常，只是不属于这个来源。见 `extra-sources.ts` 的
+   *   `statsSourceIds()`。
+   */
+  sources?: readonly SessionSource[]
+  /** 白名单里**配了但不存在**的根：页面/日志要能分辨「没装」与「路径写错」。 */
+  missingRoots?: readonly string[]
   /** DSH 宿主启用独立线程，直接调用方仍可使用当前线程。 */
   backgroundQueries?: boolean
   /** 查询等待上限（含排队）；默认两分钟，异常线程不能让宿主无限等待。 */
@@ -261,6 +289,20 @@ export async function executeQuery(ctx: StatsContext, query: UsageQuery, options
   const session = await openStats({
     sessionsRoot: ctx.sessionsRoots,
     dbPath: ctx.dbPath,
+    // ★ 来源清单**任何情况都要给**（缺省 = 只统计 DSH）：`openStats` 的 `sources`
+    //   缺省语义是「库里的全部来源」，而库是几个形态共用的一个文件 ——
+    //   不传就等于把 CLI 曾经入过库的 Codex / workbuddy 行当成面板自己的数字。
+    sources: ctx.sources ?? ['dsh'],
+    // ★ 白名单为空（`undefined`）⇒ 不传 `sourceRoots` ⇒ 只按 DSH 的会话根取数
+    //   （改动前的行为）。给了它才把其它来源并进来，并把它配了但不存在的根一并报出去。
+    ...(ctx.sourceRoots !== undefined && ctx.sourceRoots.length > 0
+      ? {
+        sourceRoots: ctx.sourceRoots,
+        ...(ctx.missingRoots !== undefined && ctx.missingRoots.length > 0
+          ? { missingRoots: ctx.missingRoots }
+          : {}),
+      }
+      : {}),
     forceScan: !ctx.config.localDb,
     rollup: query.summaryOnly ? 'summary' : true,
     readOnly: options.readOnly,
