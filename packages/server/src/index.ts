@@ -349,10 +349,20 @@ export async function createHandlerFor(options: ServerOptions = {}): Promise<Han
         //   `resolvePaths()` 而让来源解析走缺省，会让 `web --dsh-home <临时目录>`
         //   的页面**仍然去读缺省 home** —— 页面数字与同一个进程的 CLI 统计对不上，
         //   而且它看起来像「口径 bug」，其实是「读了别处的日志」。
+        // ⚠️ **两种写法都要认**：CLI 把 `--dsh-home` 收进 `dshHomes`（复数），
+        //   而程序化调用（`createServer({ dshHome })`，e2e 与契约测试都这么用）
+        //   只给单个 `dshHome` —— 只认复数就等于「测试里钉的临时 home 被忽略、
+        //   改去读开发机真实的会话日志」：既让用例随本机日志体量变慢（实测冷建库 >5s，
+        //   把 `http-contract` 那条 5 秒超时的用例打成假失败），
+        //   也让用例悄悄读了不该读的目录。
         new CoreStatsProvider(
           paths.sessionsRoots,
           paths.dbPath,
-          resolveSourceRoots(options.dshHomes ? { homes: { dsh: options.dshHomes } } : {}),
+          resolveSourceRoots(
+            options.dshHomes
+              ? { homes: { dsh: options.dshHomes } }
+              : options.dshHome ? { homes: { dsh: [options.dshHome] } } : {},
+          ),
         ),
         // ★ 只为了让页面能显示「数据目录在哪」（来源可见性），不参与取数
         { dataDir: paths.dataDir },
