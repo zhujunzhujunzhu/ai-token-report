@@ -1001,6 +1001,157 @@ export class IdentityRepository {
   }
 
   /**
+   * 项目归一化规则（`project_alias`，v11）—— 列表。
+   *
+   * ★ 权限是 `projects:read`，与 `providers:read` 同款：看板本身不读管理接口
+   *   （它走 `stats:read` 的 `loadProjectAliases()`），所以「能看数据」与
+   *   「能看规则目录」是两件事。`member_name` 顺带 JOIN 出来，免得页面为了
+   *   显示一个归属人再调一次人员接口。
+   *
+   * ⚠️ 排序按**前缀长度降序**，与查询期的匹配优先级同向：页面上从上往下读
+   *   就是「谁先命中」。按字典序排会让使用者以为 `D:\a` 排在 `D:\a\b` 前面
+   *   却仍被后者压住，而那只在规则真正生效时才看得出来。
+   */
+  async listProjectAliases(actor: Principal) {
+    const result = await this.securedRead(actor, 'projects:read', async (tx) => ({
+      aliases: (await tx.all<Row>(
+        `SELECT a.*, m.display_name AS member_name
+           FROM project_alias a LEFT JOIN members m ON m.member_id = a.member_id
+          ORDER BY a.scope, m.display_name, a.prefix`,
+      )).map((row) => this.projectAlias(row)),
+    }))
+    result.aliases.sort((a, b) => (b.prefix.length - a.prefix.length) || (a.prefix < b.prefix ? -1 : a.prefix > b.prefix ? 1 : 0))
+    return result
+  }
+
+  private projectAlias(row: Row): PortalProjectAlias {
+    const scope = str(row, 'scope') === 'member' ? 'member' as const : 'global' as const
+    return {
+      alias_id: str(row, 'alias_id'),
+      scope,
+      member_id: row.member_id == null ? null : str(row, 'member_id'),
+      member_name: row.member_name == null ? null : str(row, 'member_name'),
+      prefix: str(row, 'prefix'),
+      alias: str(row, 'alias'),
+      enabled: num(row, 'enabled') === 1,
+      created_at_ms: num(row, 'created_at_ms'),
+      updated_at_ms: num(row, 'updated_at_ms'),
+    }
+  }
+
+  /**
+   * 新建或修改一条**项目**归一化规则。
+   *
+   * 与 `setProviderAlias` 逐条同构（upsert / 同作用域查重 / 人员存在性），
+   * 只有两处按「前缀」这个语义改写：
+   *
+   * 1. **落库的前缀先去掉尾部分隔符**（`normalizeProjectPrefix`）：
+   *    `D:\work\proj\` 与 `D:\work\proj` 显然指同一个目录，而匹配时
+   *    cwd 一侧一定会被归一化 —— 只归一化一侧的结果是「这条规则永远不命中」，
+   *    页面上它看起来完全正确。两侧用同一个函数，是这条不变量唯一的保证。
+   * 2. **业务主键是 `(scope, member_id, prefix)`**（不是 provider），
+   *    所以查重也必须按前缀做。
+   *
+   * 🚨 **同一前缀 + 同一作用域只能有一条规则**：两条会让「哪个项目名生效」
+   *   取决于读取顺序。MySQL 的 `(member_id, prefix)` 唯一索引会挡住整行非 NULL
+   *   的组合，SQLite 允许多条 NULL，所以两种后端都在这里显式查重
+   *   （见 `findProjectAlias()`），不能只靠索引。
+   */
+  async setProjectAlias(actor: Principal, input: MutationInput) {
+    const scope = textField(input, 'scope')
+    if (scope !== 'global' && scope !== 'member') throw new IdentityError(400, '作用域只支持 global 或 member')
+    const raw = textField(input, 'prefix')
+    const prefixReason = projectPrefixError(raw)
+    if (prefixReason) throw new IdentityError(400, `目录前缀无效：${prefixReason}`)
+    // ★ 归一化在**校验之后**：校验要判的是使用者填进来的原值（首尾空格之类），
+    //   而归一化只针对「同一目录的两种写法」这一件事。
+    const prefix = normalizeProjectPrefix(raw)
+    const alias = textField(input, 'alias')
+    // ★ 展示名与原始前缀用**两套**校验：展示名允许中文（`AI Token 用量平台`
+    //   显然比 `ai-token-report` 更好读），原始前缀必须与上报值逐字一致。
+    const aliasReason = projectAliasNameError(alias)
+    if (aliasReason) throw new IdentityError(400, `归一化名无效：${aliasReason}`)
+    const memberId = scope === 'member' ? idField(input, 'member_id') : null
+    const inputEnabled = input.enabled === undefined ? true : input.enabled
+    if (typeof inputEnabled !== 'boolean') throw new IdentityError(400, 'enabled 需要是布尔值')
+
+    return this.mutate(actor, 'projects:manage', 'project_alias.set', 'project_alias', null, async (tx) => {
+      if (memberId) {
+        // 人员必须真实存在：外键在两种后端上都会拦，但拦下来的报错是驱动原文，
+        // 使用者看到的应该是「人员不存在」。
+        const exists = await tx.get<Row>('SELECT member_id FROM members WHERE member_id = $id', { $id: memberId })
+        if (!exists) throw new IdentityError(404, '人员不存在')
+      }
+      const existing = await this.findProjectAlias(tx, memberId, prefix)
+      if (existing) {
+        await tx.run('UPDATE project_alias SET alias = $alias,enabled = $enabled,updated_at_ms = $now WHERE alias_id = $id', {
+          $alias: alias, $enabled: inputEnabled ? 1 : 0, $now: this.now(), $id: str(existing, 'alias_id'),
+        })
+        return { ok: true as const, alias: await this.projectAliasById(tx, str(existing, 'alias_id')) }
+      }
+      const id = randomUUID()
+      await tx.run('INSERT INTO project_alias (alias_id,scope,member_id,prefix,alias,enabled,created_at_ms,updated_at_ms) VALUES ($id,$scope,$member,$prefix,$alias,$enabled,$now,$now)', {
+        $id: id, $scope: scope, $member: memberId, $prefix: prefix, $alias: alias, $enabled: inputEnabled ? 1 : 0, $now: this.now(),
+      })
+      return { ok: true as const, alias: await this.projectAliasById(tx, id) }
+    })
+  }
+
+  /** 删除一条规则（按 `alias_id`）。删除后那些 cwd 立刻回到 `projectName()` 的旧口径。 */
+  async deleteProjectAlias(actor: Principal, input: MutationInput) {
+    const id = idField(input, 'alias_id')
+    return this.mutate(actor, 'projects:manage', 'project_alias.delete', 'project_alias', id, async (tx) => {
+      const row = await tx.get<Row>('SELECT alias_id FROM project_alias WHERE alias_id = $id', { $id: id })
+      if (!row) throw new IdentityError(404, '规则不存在')
+      await tx.run('DELETE FROM project_alias WHERE alias_id = $id', { $id: id })
+      return { ok: true as const, deleted: id }
+    })
+  }
+
+  /**
+   * 启用 / 停用一条规则。
+   *
+   * ⚠️ 停用**不等于**「映射到原名」：停用后这些 cwd 回到**未配置**状态，
+   *   也就是 `projectName()` 的旧口径（目录最后一段）。与 `setProviderAliasStatus`
+   *   同一取舍 —— 停用是「不再应用这条口径」，不是改写数据。
+   */
+  async setProjectAliasStatus(actor: Principal, input: MutationInput) {
+    const id = idField(input, 'alias_id'), enabled = input.enabled
+    if (typeof enabled !== 'boolean') throw new IdentityError(400, 'enabled 需要是布尔值')
+    return this.mutate(actor, 'projects:manage', 'project_alias.status', 'project_alias', id, async (tx) => {
+      const row = await tx.get<Row>('SELECT alias_id FROM project_alias WHERE alias_id = $id', { $id: id })
+      if (!row) throw new IdentityError(404, '规则不存在')
+      await tx.run('UPDATE project_alias SET enabled = $enabled,updated_at_ms = $now WHERE alias_id = $id', { $enabled: enabled ? 1 : 0, $now: this.now(), $id: id })
+      return { ok: true as const, alias: await this.projectAliasById(tx, id) }
+    })
+  }
+
+  /**
+   * 按 `(member_id, prefix)` 查一条规则；全局限定 `member_id IS NULL`。
+   *
+   * ⚠️ 必须带 `ORDER BY`：唯一索引只对**整行非 NULL** 的组合去重，
+   *   `(NULL, prefix)` 在 SQLite 与 MySQL 上都能插进两行（实测见
+   *   `verify-database-design.ts`），所以「同一前缀只有一条全局规则」
+   *   是**这道应用层查重**在保证，而不是数据库。真出现重复行时，
+   *   取最早的一条，至少让结果是确定的（`project-alias.ts` 读取侧同款）。
+   */
+  private async findProjectAlias(tx: PortalStore, memberId: string | null, prefix: string): Promise<Row | null> {
+    return memberId
+      ? await tx.get<Row>('SELECT alias_id FROM project_alias WHERE member_id = $member AND prefix = $prefix ORDER BY created_at_ms, alias_id LIMIT 1', { $member: memberId, $prefix: prefix })
+      : await tx.get<Row>('SELECT alias_id FROM project_alias WHERE member_id IS NULL AND prefix = $prefix ORDER BY created_at_ms, alias_id LIMIT 1', { $prefix: prefix })
+  }
+
+  private async projectAliasById(tx: PortalStore, id: string): Promise<PortalProjectAlias> {
+    const row = await tx.get<Row>(
+      `SELECT a.*, m.display_name AS member_name
+         FROM project_alias a LEFT JOIN members m ON m.member_id = a.member_id
+        WHERE a.alias_id = $id`, { $id: id },
+    )
+    if (!row) throw new IdentityError(404, '规则不存在')
+    return this.projectAlias(row)
+  }
+
+  /**
    * 模型单价（`model_price`）—— 列表。
    *
    * ★ 权限是 `pricing:manage`：单价直接决定每一笔费用怎么算，它是**配置**，

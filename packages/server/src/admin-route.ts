@@ -57,6 +57,7 @@ import {
   portalCreateRoleSchema, portalUpdateRoleSchema, portalRoleStatusSchema,
   portalTokenExpirySchema,
   portalSetProviderAliasSchema, portalProviderAliasIdSchema, portalProviderAliasStatusSchema,
+  portalSetProjectAliasSchema, portalProjectAliasIdSchema, portalProjectAliasStatusSchema,
   portalSetModelPriceSchema, portalModelPriceIdSchema, portalSeedModelPricesSchema,
 } from '@ai-token-report/shared/schemas'
 
@@ -261,6 +262,13 @@ export class DatabaseAdminRoute {
       'POST provider-aliases': 'providers:manage',
       'POST provider-aliases/delete': 'providers:manage',
       'POST provider-aliases/status': 'providers:manage',
+      // ★ 项目归一化规则（v11）：与供应商归一化逐条同形（读 / 写分开）。
+      //   看板查询同样**不经过这里** —— 它用 `stats:read` 自己读规则表，
+      //   所以「能看数据」的人不会因为缺 `projects:read` 就看到未归一化的项目名。
+      'GET project-aliases': 'projects:read',
+      'POST project-aliases': 'projects:manage',
+      'POST project-aliases/delete': 'projects:manage',
+      'POST project-aliases/status': 'projects:manage',
       // ★ 模型单价（v7）：读也归 `pricing:manage` —— 单价是**配置**，
       //   不是「看一眼的数字」。能看金额的人（`cost:read`）不必能看/改计价表；
       //   看板要展示金额时走的是 `stats` 侧的只读快照，不经过这里。
@@ -332,6 +340,10 @@ export class DatabaseAdminRoute {
         case 'POST provider-aliases': return mutate(parsePortalBody(portalSetProviderAliasSchema, body), input => r.setProviderAlias(actor, input))
         case 'POST provider-aliases/delete': return mutate(parsePortalBody(portalProviderAliasIdSchema, body), input => r.deleteProviderAlias(actor, input))
         case 'POST provider-aliases/status': return mutate(parsePortalBody(portalProviderAliasStatusSchema, body), input => r.setProviderAliasStatus(actor, input))
+        case 'GET project-aliases': return ok(await r.listProjectAliases(actor))
+        case 'POST project-aliases': return mutate(parsePortalBody(portalSetProjectAliasSchema, body), input => r.setProjectAlias(actor, input))
+        case 'POST project-aliases/delete': return mutate(parsePortalBody(portalProjectAliasIdSchema, body), input => r.deleteProjectAlias(actor, input))
+        case 'POST project-aliases/status': return mutate(parsePortalBody(portalProjectAliasStatusSchema, body), input => r.setProjectAliasStatus(actor, input))
         case 'GET pricing': return ok(await r.listModelPrices(actor))
         case 'POST pricing': return mutate(parsePortalBody(portalSetModelPriceSchema, body), input => r.setModelPrice(actor, input))
         case 'POST pricing/delete': return mutate(parsePortalBody(portalModelPriceIdSchema, body), input => r.deleteModelPrice(actor, input))

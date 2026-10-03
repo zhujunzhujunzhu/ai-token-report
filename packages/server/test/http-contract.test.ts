@@ -424,6 +424,29 @@ describe('现状契约：GET /api/v1/stats/*', () => {
   })
 
   /**
+   * ★ 项目归一化配置页的**原始目录**候选（v11）。
+   *
+   * 与供应商候选同一道门（`stats:read`、不是 `projects:read`），但有**两处关键差别**
+   * ——它们正是这条接口存在的理由，所以在这里钉住：
+   *
+   * 1. 回的是**原始 `cwd`**（配置页要配的就是「哪个目录算哪个项目」），
+   *    不是归一化后的项目名；
+   * 2. 🚨 它**跟着数据范围收窄**：`cwd` 会带出使用者路径（`C:\Users\alice\…`），
+   *    而这是一份没有任何用量的全量路径清单 —— 不收窄就等于给
+   *    「非管理员只看本人」开了一个侧门。
+   */
+  test('★ 项目目录候选是看板接口：缺 Authorization → 401，带 token → 200 且只回原始 cwd', async () => {
+    expect((await call(dept, 'GET', '/api/v1/stats/projects')).status).toBe(401)
+    const r = await call(dept, 'GET', '/api/v1/stats/projects', { headers: MEMBER })
+    expect(r.status).toBe(200)
+    const body = r.body as { projects: string[] }
+    expect(Array.isArray(body.projects)).toBe(true)
+    // 一个用量数字都不许出现：这是名称目录，不是一份统计。
+    expect(JSON.stringify(body)).not.toContain('tokens')
+    expect(JSON.stringify(body)).not.toContain('calls')
+  })
+
+  /**
    * ★ 数据范围的分发面契约：**非内置管理员只能查自己**。
    *
    * 这条与「页面隐藏人员下拉」是两件事 —— 手拼查询串同样拿不到别人的数据，
@@ -723,6 +746,71 @@ describe('现状契约：/api/v1/admin/provider-aliases*（供应商归一化规
 
   test('GET /admin/provider-aliases/delete → 405 且 Allow 恰好是 POST', async () => {
     const r = await call(dept, 'GET', '/api/v1/admin/provider-aliases/delete')
+    expect(r.status).toBe(405)
+    expect(r.allow).toBe('POST')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────
+describe('现状契约：/api/v1/admin/project-aliases*（项目归一化规则，v11）', () => {
+  test('缺 Authorization → 401（读目录与写规则都要身份）', async () => {
+    expect((await call(dept, 'GET', '/api/v1/admin/project-aliases')).status).toBe(401)
+    expect((await call(dept, 'POST', '/api/v1/admin/project-aliases', { headers: JSON_HEADERS, body: '{}' })).status).toBe(401)
+  })
+
+  test('admin 建规则 → 200，列表能读回；重复设置是 upsert 而不是新增', async () => {
+    const body = JSON.stringify({ scope: 'global', prefix: 'D:\\Coding_agent\\ai-token-report', alias: 'AI Token 用量平台' })
+    const created = await call(dept, 'POST', '/api/v1/admin/project-aliases', { headers: { ...JSON_HEADERS, ...ADMIN }, body })
+    expect(created.status).toBe(200)
+    expect((created.body as { alias: { prefix: string; alias: string } }).alias)
+      .toMatchObject({ prefix: 'D:\\Coding_agent\\ai-token-report', alias: 'AI Token 用量平台' })
+
+    const again = await call(dept, 'POST', '/api/v1/admin/project-aliases', { headers: { ...JSON_HEADERS, ...ADMIN }, body: JSON.stringify({ scope: 'global', prefix: 'D:\\Coding_agent\\ai-token-report', alias: '改名后' }) })
+    expect(again.status).toBe(200)
+    const list = await call(dept, 'GET', '/api/v1/admin/project-aliases', { headers: ADMIN })
+    expect(list.status).toBe(200)
+    const aliases = (list.body as { aliases: { prefix: string; alias: string }[] }).aliases
+    expect(aliases.filter((entry) => entry.prefix === 'D:\\Coding_agent\\ai-token-report').length).toBe(1)
+    expect(aliases.find((entry) => entry.prefix === 'D:\\Coding_agent\\ai-token-report')!.alias).toBe('改名后')
+  })
+
+  test('★ 尾部分隔符被归一化后再落库（只归一化一侧等于规则永远不命中）', async () => {
+    const r = await call(dept, 'POST', '/api/v1/admin/project-aliases', { headers: { ...JSON_HEADERS, ...ADMIN }, body: JSON.stringify({ scope: 'global', prefix: 'D:\\work\\proj\\', alias: '带尾斜杠' }) })
+    expect(r.status).toBe(200)
+    // 存进库的必须是去掉尾分隔符的形态：匹配时 cwd 一侧一定会被归一化。
+    expect((r.body as { alias: { prefix: string } }).alias.prefix).toBe('D:\\work\\proj')
+  })
+
+  test('非法形状 400：首尾空格的前缀、文件系统根、只有分隔符、未知作用域、缺字段', async () => {
+    for (const payload of [
+      { scope: 'global', prefix: ' D:\\a', alias: 'ok' },
+      { scope: 'global', prefix: 'D:\\a ', alias: 'ok' },
+      { scope: 'global', prefix: '/', alias: 'ok' },
+      { scope: 'global', prefix: '///', alias: 'ok' },
+      { scope: 'global', prefix: '\\', alias: 'ok' },
+      { scope: 'team', prefix: 'D:\\a', alias: 'ok' },
+      { scope: 'global', prefix: 'D:\\a' },
+    ]) {
+      const r = await call(dept, 'POST', '/api/v1/admin/project-aliases', { headers: { ...JSON_HEADERS, ...ADMIN }, body: JSON.stringify(payload) })
+      expect(r.status, JSON.stringify(payload)).toBe(400)
+    }
+  })
+
+  test('★ 归一化名允许中文与 /（没有任何维度用 / 拼接项目名）', async () => {
+    const r = await call(dept, 'POST', '/api/v1/admin/project-aliases', { headers: { ...JSON_HEADERS, ...ADMIN }, body: JSON.stringify({ scope: 'global', prefix: 'D:\\client', alias: '客户A/前端' }) })
+    expect(r.status).toBe(200)
+    expect((r.body as { alias: { alias: string } }).alias.alias).toBe('客户A/前端')
+  })
+
+  test('普通成员（无 projects:read）读规则目录 → 403', async () => {
+    // ★ 与供应商归一化同一条纪律：看板查询不经过这个接口（它用 stats:read
+    //   自己读规则表），所以「能看数据」与「能改全平台项目口径」是两件事。
+    const r = await call(dept, 'GET', '/api/v1/admin/project-aliases', { headers: MEMBER })
+    expect(r.status).toBe(403)
+  })
+
+  test('GET /admin/project-aliases/delete → 405 且 Allow 恰好是 POST', async () => {
+    const r = await call(dept, 'GET', '/api/v1/admin/project-aliases/delete')
     expect(r.status).toBe(405)
     expect(r.allow).toBe('POST')
   })

@@ -22,6 +22,7 @@ import type {
   StatsGroupsResponse,
   StatsMembersResponse,
   StatsProvidersResponse,
+  StatsProjectsResponse,
   StatsSourcesResponse,
 } from '@ai-token-report/shared'
 
@@ -164,6 +165,29 @@ export function fetchProviderOptions(): Promise<ApiResult<StatsProvidersResponse
  */
 export function fetchSourceOptions(): Promise<ApiResult<StatsSourcesResponse>> {
   return request<StatsSourcesResponse>('/api/v1/stats/sources')
+}
+
+/**
+ * 项目归一化配置页的**原始目录**候选项（`GET /api/v1/stats/projects`，v11）。
+ *
+ * ★ 走**看板接口**（`stats:read`）而不是项目归一化的管理接口
+ *   `/api/v1/admin/project-aliases`（那是 `projects:read`）：配置页里那个
+ *   「选目录」的下拉只是一份名称目录，不该让 `projects:read` 变成它的前置条件
+ *   （与供应商那页读人员名册同一取舍 —— 拿不到就退回手填）。
+ *
+ * ★ 回的是**原始 cwd**（不是归一化后的项目名）：配置页要配的正是
+ *   「哪个目录算哪个项目」，给它归一化名等于让它无据可配。
+ *
+ * 🚨 与其它候选**不同**：它**跟着数据范围收窄**。`cwd` 会带出使用者路径
+ *   （`C:\Users\alice\…`），一份全量路径清单等于给「非管理员只看本人」
+ *   开了一个侧门。所以这个接口失败（含 403）时，配置页只应退回手填，
+ *   绝不能把它当成「库里没有目录」。
+ *
+ * ⚠️ **不带任何参数**：候选必须是完整集合，否则「上个月用过的目录」
+ *   会从下拉里消失，那看起来像数据丢了。
+ */
+export function fetchProjectCwds(): Promise<ApiResult<StatsProjectsResponse>> {
+  return request<StatsProjectsResponse>('/api/v1/stats/projects')
 }
 
 /** 顶部指标卡片。 */

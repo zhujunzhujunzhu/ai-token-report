@@ -401,27 +401,79 @@ const aliasName = z.string().min(1, { error: '归一化名不能为空' }).max(1
  *   真正的联锁在服务端（`setProviderAlias` 按 scope 决定取值），
  *   在这一层做「scope 与 member_id 必须同时出现」会让前端多写一段状态机，
  *   而它并不比服务端那一行更可靠。
+ *
+ * ★ 模型归一化（v12）复用同一条规则的形状：`model` 有值 = 模型规则
+ *   （折叠 `model`），`model` 为 `null` / 省略 = 供应商规则（折叠 `provider`）。
+ *   `provider` 因此要能取 `'*'`（任意供应商的模型规则），用
+ *   {@link starOrProviderName} 而不是 `providerName`。
+ *
+ * ⚠️ 「`model` 为空时 `provider` 不能是 `'*'`」这条**跨字段**约束同样留给服务端：
+ *   它是业务约束（一条折叠「任意供应商的供应商名」的规则对不上任何东西），
+ *   不是字段格式，在这一层用 `superRefine` 表达会让错误信息的措辞与服务端分家。
  */
 export const portalSetProviderAliasSchema = z.strictObject({
   scope: z.enum(['global', 'member']),
   member_id: portalId.optional(),
-  provider: providerName,
+  provider: starOrProviderName,
+  model: modelName.nullable().optional(),
   alias: aliasName,
   enabled: z.boolean().optional(),
 })
 export const portalProviderAliasIdSchema = z.strictObject({ alias_id: portalId })
 export const portalProviderAliasStatusSchema = z.strictObject({ alias_id: portalId, enabled: z.boolean() })
+
 /**
- * 模型标识。
+ * **原始 cwd 前缀**（项目归一化，v11）。
  *
- * ⚠️ 与 `providerName` **分开**，不能沿用它的字符集：模型 ID 里出现 `/` 是常态
- *   （`deepseek/deepseek-chat` 这类网关前缀），而 `providerName` 恰好禁止 `/`。
- *   字符集刻意宽松（只禁不可见字符、要求首尾无空格）—— 模型名由各供应商自己定，
- *   卡死了只会让新模型录不进来，而录入者唯一的办法是改代码。
+ * ★ 与 `providerName` 刻意不同，这里有**三条它没有的规矩**：
+ *
+ * 1. **允许 `\` 与 `:`**：目录路径里它们本来就该出现（`D:\work\proj`）。
+ *    `providerName` 的字符集是给供应商标识用的，套到路径上会让
+ *    Windows 上**没有一条规则能填得进去**。
+ * 2. **首尾不能是空格**：与 `providerName` 同一条理由 —— `'D:\a '` 与
+ *    `'D:\a'` 在 `startsWith` 里是两个前缀，而它们在页面上看不出差别。
+ * 3. **长度到 512**（`providerName` 是 128）：规则写的是目录，而现实里的
+ *    仓库路径可以很长。上限与 `portal-schema-v11.ts` 的 CHECK 是**同一个数**。
+ *
+ * ⚠️ 这里**不做**尾部分隔符归一化：那只发生在服务端（仓储落库前）与
+ *   匹配时（`project-alias.ts` 的 `normalizeProjectPrefix`）。在这一层改写
+ *   使用者的输入，会让「页面上显示的」与「存进库的」不一致而无处对照。
  */
-const modelName = z.string().min(1, { error: '模型名不能为空' }).max(255, { error: '模型名不能超过 255 个字符' })
-  .refine((value) => !invisibleCharacters.test(value), { error: '模型名不能包含空格以外的空白或不可见字符' })
-  .refine((value) => value === value.trim(), { error: '模型名首尾不能是空格' })
+const projectPrefix = z.string().min(1, { error: '目录前缀不能为空' }).max(512, { error: '目录前缀不能超过 512 个字符' })
+  .refine((value) => !invisibleCharacters.test(value), { error: '目录前缀不能包含空格以外的空白或不可见字符' })
+  .refine((value) => !/^ | $/.test(value), { error: '目录前缀首尾不能是空格' })
+  // ★ 文件系统根（`/`、`\`、`///`…）会把**所有**路径折成一个项目，必然是误配。
+  //   ⚠️ 判据与 `project-alias.ts` 的 `projectPrefixError()` 必须等价：
+  //   那边是「归一化（去尾分隔符）之后是不是恰好一个分隔符」，
+  //   而只有「全是分隔符」的字符串才会归一化成那一个字符 —— 所以这条正则是同一件事。
+  //   两处判据分叉的表现是「前端放行、服务端 400」，而使用者只看到一次报错。
+  .refine((value) => !/^[\\/]+$/.test(value), { error: '目录前缀不能是文件系统根目录（它会匹配所有路径）' })
+/**
+ * 项目归一化后的**展示名**。
+ *
+ * ⚠️ 与 `aliasName`（供应商展示名）的差别只有一条：**允许 `/` 与 `\`**。
+ *   `aliasName` 禁 `/` 是因为它是 `provider/model` 拼接键的分隔符；
+ *   而没有任何维度用 `/` 拼接**项目名**，所以 `客户A/前端` 这种写法是合法的。
+ */
+const projectAliasName = z.string().min(1, { error: '归一化名不能为空' }).max(128, { error: '归一化名不能超过 128 个字符' })
+  .refine((value) => !invisibleCharacters.test(value), { error: '归一化名不能包含空格以外的空白或不可见字符' })
+  .refine((value) => !/^ | $/.test(value), { error: '归一化名首尾不能是空格' })
+/**
+ * 设置一条**项目**归一化规则（upsert）。
+ *
+ * ★ 与 `portalSetProviderAliasSchema` 逐字同形（scope / member_id / 原值 / 归一化名 /
+ *   enabled）—— 两个功能的配置面本来就该长得一样，使用者不必学第二套。
+ *   `member_id` 的联锁同样交给服务端（`setProjectAlias` 按 scope 决定取值）。
+ */
+export const portalSetProjectAliasSchema = z.strictObject({
+  scope: z.enum(['global', 'member']),
+  member_id: portalId.optional(),
+  prefix: projectPrefix,
+  alias: projectAliasName,
+  enabled: z.boolean().optional(),
+})
+export const portalProjectAliasIdSchema = z.strictObject({ alias_id: portalId })
+export const portalProjectAliasStatusSchema = z.strictObject({ alias_id: portalId, enabled: z.boolean() })
 /** ISO 4217 三位大写 —— 与库里那条 CHECK（`^[A-Z]{3}$`）逐字一致。 */
 const currencyCode = z.string().regex(/^[A-Z]{3}$/, { error: '币种需要是三位大写字母的 ISO 4217 代码（如 USD、CNY）' })
 /**

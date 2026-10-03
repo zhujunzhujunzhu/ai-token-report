@@ -345,31 +345,29 @@ function dimensionExpression(
   normalize?: ProviderNormalizer,
   params?: Record<string, string | number>,
 ): string | null {
+  /** 归一化后的 `provider` 表达式（没配供应商规则时就是裸列名）。 */
+  const providerExpr = (prefix: string): string => normalizedProviderExpression(normalize, params, prefix)
+  /** 归一化后的 `model` 表达式（没配模型规则时就是裸列名）。 */
+  const modelExpr = (prefix: string): string => normalizedModelExpression(normalize, params, prefix)
   switch (dim) {
     case 'source':
       // 来源是受控枚举（dsh / codex / …），**不做归一化**：它的值由采集端决定，
       // 不是用户可配的显示名（那是 provider 的事）。
       return 'source'
-    case 'provider': {
-      if (!hasNormalization(normalize) || !params) return 'provider'
-      return coalesceOriginal(providerCaseSql('provider', normalize.map, params, 'gp'), 'provider')
-    }
+    case 'provider':
+      return providerExpr('gp')
     case 'model':
-      return 'model'
+      return modelExpr('gd')
     case 'session':
       return 'session_id'
-    case 'provider-model': {
-      if (!hasNormalization(normalize) || !params) return providerModelExpression(dialect)
-      // ★ 先归一化 provider 那一段，再拼接：规则里的 `provider` 只写供应商名，
-      //   所以比较也必须发生在单个 provider 上（见 providerModelExpression 的 🚨）。
-      return providerModelExpression(dialect, coalesceOriginal(providerCaseSql('provider', normalize.map, params, 'gm'), 'provider'))
-    }
+    case 'provider-model':
+      // ★ 先归一化 provider 与 model 两段，再拼接：规则里的键只写单个维度，
+      //   所以比较也必须发生在单个维度上（见 providerModelExpression 的 🚨）。
+      return providerModelExpression(dialect, providerExpr('gm'), modelExpr('gn'))
     case 'source-provider-model': {
       // 组合维度：`<source>/<provider>/<model>`，与 `aggregate.ts` 的 `groupKey()` 逐字同形
       //   （两端不一致会让「库查询 == 直扫」这条对照断言失败 —— 它正是为此存在的）。
-      const inner = !hasNormalization(normalize) || !params
-        ? providerModelExpression(dialect)
-        : providerModelExpression(dialect, coalesceOriginal(providerCaseSql('provider', normalize.map, params, 'gs'), 'provider'))
+      const inner = providerModelExpression(dialect, providerExpr('gs'), modelExpr('gt'))
       return dialect.concat(['source', `'${PROVIDER_MODEL_SEPARATOR_SQL}'`, inner])
     }
     case 'user':
@@ -754,13 +752,21 @@ export function costByDimensionQuery(
  *   把它们显示出来是「未计价」唯一可行动的形态 —— 只给一个比例，
  *   使用者知道有 12% 没算钱，却不知道该去补哪个价。
  */
-export function costTotalsQuery(filter: QueryFilter = {}, normalize?: ProviderNormalizer): SqlQuery {
-  return costQueryFor(null, filter, normalize, {}, true)
+export function costTotalsQuery(
+  filter: QueryFilter = {},
+  normalize?: ProviderNormalizer,
+  dialect: PortalDialect = SQLITE_DIALECT,
+): SqlQuery {
+  return costQueryFor(null, filter, normalize, {}, dialect, true)
 }
 
 /** `project` 维度的金额：先按 `cwd` 取，再在 JS 侧按项目名合并（同分组路径）。 */
-export function costByCwdQuery(filter: QueryFilter = {}, normalize?: ProviderNormalizer): SqlQuery {
-  return costQueryFor('cwd', filter, normalize, {})
+export function costByCwdQuery(
+  filter: QueryFilter = {},
+  normalize?: ProviderNormalizer,
+  dialect: PortalDialect = SQLITE_DIALECT,
+): SqlQuery {
+  return costQueryFor('cwd', filter, normalize, {}, dialect)
 }
 
 /** 金额取数行 → 内核形状（`SUM` 的字符串归一化只此一处，理由同 `mapGroupRows`）。 */
@@ -993,6 +999,32 @@ export function projectGroupsQuery(filter: QueryFilter = {}): SqlQuery {
 export function projectSessionsQuery(filter: QueryFilter = {}): SqlQuery {
   const { sql, params } = buildWhere(filter)
   return { sql: `SELECT DISTINCT cwd, session_id FROM ${EVENT_TABLE}${sql}`, params }
+}
+
+/**
+ * 库里出现过的**原始 cwd** 目录清单（去重、升序）。
+ *
+ * ★ 它存在的唯一理由是**给项目归一化的配置页当候选项**：规则写的是
+ *   目录前缀，而让使用者凭记忆敲一个 `D:\Coding_agent\ai-token-report`
+ *   正是这个功能最容易出错的地方（敲错一个字符 = 规则静默不命中，
+ *   页面上完全看不出来）。所以候选项必须来自**真实上报值**。
+ *
+ * ⚠️ **不带时间窗**（调用方传空 filter）：候选必须是完整集合。
+ *   带窗口会让「上个月用过的项目目录」从下拉里消失，那看起来像数据丢了
+ *   （与 `/api/v1/stats/providers` 同一条取舍）。
+ *
+ * 🚨 **只回原始 cwd，不回任何用量数字**：名称目录不参与排序与聚合，
+ *   也不需要与事件行一起过一遍 `SUM()`。要看某个目录用了多少，
+ *   去看板的「项目」分布表（那里已经是归一化后的口径）。
+ *   ⚠️ `cwd` 可能带出使用者路径（`C:\Users\alice\…`），所以调用方
+ *   **必须**按查看者的数据范围收窄 —— 见 `stats-route.ts` 的 `#projects()`。
+ */
+export function distinctCwdsQuery(filter: QueryFilter = {}): SqlQuery {
+  const { sql, params } = buildWhere(filter)
+  return {
+    sql: `SELECT DISTINCT cwd FROM ${EVENT_TABLE}${sql}${sql ? ' AND' : ' WHERE'} cwd IS NOT NULL ORDER BY cwd`,
+    params,
+  }
 }
 
 /**
@@ -1311,17 +1343,26 @@ export interface ProjectSessionPair {
  * 而不能直接把 projectName 塞进 SQL 的 GROUP BY。
  *
  * ★ 两种后端共用本函数（本地 `queryGroupsByProject` 与部门 `portal.ts`）。
+ *
+ * `projectOf` 是**部门路径专有**的项目名解析器（`project-alias.ts` 的
+ * `ProjectNormalizer.resolve`）：命中 `project_alias` 规则时给出归一化名，
+ * 否则回落 `projectName()`。本机库（`usage.sqlite`）没有那张表，
+ * 调用方也就不传 —— 于是本地页面的项目维度与迁移前**逐字节相同**。
+ *
+ * ⚠️ 默认值必须是 `projectName` 本身，而不是「先算一个再判空」：
+ *   两条路径的口径差异只允许来自「有没有规则」，不允许来自两条分支各写一遍。
  */
 export function groupRowsFromProject(
   rows: readonly ProjectGroupRow[],
   sessionPairs: readonly ProjectSessionPair[],
+  projectOf: (cwd: string | null) => string = projectName,
 ): QueryGroupRow[] {
   const merged = new Map<string, QueryGroupRow>()
   // 各项目下的会话集合，用于合并后的去重计数（直接相加会把同一会话算两次）
   const sessionSets = new Map<string, Set<string>>()
 
   for (const r of rows) {
-    const key = projectName(typeof r.cwd === 'string' ? r.cwd : null)
+    const key = projectOf(typeof r.cwd === 'string' ? r.cwd : null)
     let row = merged.get(key)
     if (!row) {
       row = {
@@ -1353,7 +1394,7 @@ export function groupRowsFromProject(
   //   若同一会话在两者下都出现（迁移过目录），相加会把一个会话算两次。
   for (const p of sessionPairs) {
     sessionSets
-      .get(projectName(typeof p.cwd === 'string' ? p.cwd : null))
+      .get(projectOf(typeof p.cwd === 'string' ? p.cwd : null))
       ?.add(String(p.session_id ?? ''))
   }
   for (const [key, set] of sessionSets) {

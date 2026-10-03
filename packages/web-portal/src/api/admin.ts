@@ -12,6 +12,8 @@ import type {
   PortalLegacyAttribution, PortalConfirmLegacyRequest, PortalLegacyResult,
   PortalProviderAliasListResponse, PortalProviderAliasResult,
   PortalSetProviderAliasRequest, PortalProviderAliasIdRequest, PortalProviderAliasStatusRequest,
+  PortalProjectAliasListResponse, PortalProjectAliasResult,
+  PortalSetProjectAliasRequest, PortalProjectAliasIdRequest, PortalProjectAliasStatusRequest,
   PortalModelPriceListResponse, PortalModelPriceResult,
   PortalSetModelPriceRequest, PortalModelPriceIdRequest, PortalSeedModelPricesRequest,
 } from '@ai-token-report/shared'
@@ -112,17 +114,36 @@ export const createGroup = (name: string) => post<PortalGroupResult>(root + '/gr
 export const updateGroup = (input: PortalGroupVersionRequest & { name: string }) => post<PortalGroupResult>(root + '/groups/update', input)
 export const updateGroupStatus = (input: PortalGroupVersionRequest & { status: 'active' | 'disabled' }) => post<PortalGroupResult>(root + '/groups/status', input)
 /**
- * 供应商归一化规则（v6）。
+ * 供应商 / 模型归一化规则（v6 供应商，v12 追加模型）。
  *
  * ★ 这是**查询期**的展示映射，不是数据改写：配一条规则之后，看板里
- *   「按供应商分组」的分组名立刻变，而明细里的原值列原样保留。
+ *   「按供应商 / 模型分组」的分组名立刻变，而明细里的原值列原样保留。
  *   所以这里没有「应用 / 回填」按钮，也不需要版本号做并发保护 ——
- *   一次设置就是使用者想要的结果（服务端按 `(scope, member_id, provider)` upsert）。
+ *   一次设置就是使用者想要的结果（服务端按 `(scope, member_id, provider, model)` upsert）。
+ *
+ * ★ 一条规则只折叠一个维度：请求里 `model` 为空 = 折叠供应商名，
+ *   有值 = 折叠模型名（此时 `provider` 可以是 `'*'`，表示任意供应商）。
  */
 export const fetchProviderAliases = () => request<PortalProviderAliasListResponse>(root + '/provider-aliases')
 export const setProviderAlias = (input: PortalSetProviderAliasRequest) => post<PortalProviderAliasResult>(root + '/provider-aliases', input)
 export const setProviderAliasStatus = (input: PortalProviderAliasStatusRequest) => post<PortalProviderAliasResult>(root + '/provider-aliases/status', input)
 export const deleteProviderAlias = (input: PortalProviderAliasIdRequest) => post<PortalMutationResult>(root + '/provider-aliases/delete', input)
+/**
+ * 项目归一化规则（v11）。
+ *
+ * ★ 与供应商归一化同类：**查询期**的展示映射，不是数据改写。配一条规则之后
+ *   看板「按项目分组」的分组名立刻变，而 `usage_event.cwd` 原样保留，
+ *   历史不需要任何回填。
+ *
+ * ⚠️ 有一处语义与供应商**刻意不同**，页面的文案必须说清：匹配是**目录前缀**
+ *   （按路径分隔符边界），多条命中时**最长前缀优先**；没配规则的目录回落
+ *   「目录最后一段」的旧口径。所以同一份数据两个人看到的项目分布可以不同
+ *   （人员规则覆盖同前缀的全局规则）。
+ */
+export const fetchProjectAliases = () => request<PortalProjectAliasListResponse>(root + '/project-aliases')
+export const setProjectAlias = (input: PortalSetProjectAliasRequest) => post<PortalProjectAliasResult>(root + '/project-aliases', input)
+export const setProjectAliasStatus = (input: PortalProjectAliasStatusRequest) => post<PortalProjectAliasResult>(root + '/project-aliases/status', input)
+export const deleteProjectAlias = (input: PortalProjectAliasIdRequest) => post<PortalMutationResult>(root + '/project-aliases/delete', input)
 /**
  * 模型单价（v7）—— 费用统计的**唯一**计价来源。
  *

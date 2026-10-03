@@ -402,6 +402,79 @@ export interface PortalProviderAliasStatusRequest {
 }
 
 // ---------------------------------------------------------------------------
+// 项目归一化（v11 `project_alias`）—— 按项目维度统计的口径
+// ---------------------------------------------------------------------------
+
+/**
+ * 一条项目归一化规则（v11）。
+ *
+ * ★ 与 {@link PortalProviderAlias} 是**同一类东西**：查询期的展示映射，
+ *   不是对历史数据的改写。所以增删改停用都是即时生效且可逆的，没有回填这一步。
+ *
+ * ⚠️ 有两处**刻意不同**，页面的文案必须说清，否则使用者会按供应商那套去理解：
+ *
+ * | | 供应商归一化 | 项目归一化 |
+ * |---|---|---|
+ * | 匹配 | 原始名**精确**（一字不差） | 原始 cwd **前缀**（按路径分隔符边界） |
+ * | 多条命中 | 同一原始名只会有一条规则 | **最长前缀优先**；同长时人员规则覆盖全局 |
+ * | 未命中 | 显示原始名 | 回落「目录最后一段」的旧口径 |
+ */
+export interface PortalProjectAlias {
+  alias_id: string
+  /** `global` 对所有人生效；`member` 只对该人员生效。 */
+  scope: 'global' | 'member'
+  /** `scope='member'` 时是那个人；`global` 时为 `null`。 */
+  member_id: string | null
+  /** 归属人姓名，仅用于列表展示（`scope='global'` 时为 `null`）。 */
+  member_name: string | null
+  /**
+   * 匹配的**原始 cwd 前缀**（尾部路径分隔符已由服务端归一化后存库）。
+   *
+   * ⚠️ 匹配**区分大小写**：`D:\a` 与 `d:\a` 是两个前缀。Windows 上它们指向
+   *   同一个目录，但把「大小写不敏感」做进匹配会在区分大小写的文件系统上
+   *   把两个不同目录悄悄并起来 —— 那个方向的错误页面上看不出来。
+   */
+  prefix: string
+  /** 归一化后的项目名。 */
+  alias: string
+  /** 停用后这一条不参与归一化，但规则行仍在（可以随时启用回来）。 */
+  enabled: boolean
+  created_at_ms: number
+  updated_at_ms: number
+}
+
+export interface PortalProjectAliasListResponse {
+  aliases: PortalProjectAlias[]
+}
+
+export interface PortalProjectAliasResult extends PortalMutationResult {
+  alias?: PortalProjectAlias
+}
+
+/**
+ * 设置一条项目归一化规则（upsert）。
+ *
+ * ⚠️ 同一 `(scope, member_id, prefix)` 只有一条：再次提交是**改**而不是新增。
+ *   否则同一个前缀会有两条规则、结果取决于读取顺序。
+ */
+export interface PortalSetProjectAliasRequest {
+  scope: 'global' | 'member'
+  member_id?: string
+  prefix: string
+  alias: string
+  enabled?: boolean
+}
+
+export interface PortalProjectAliasIdRequest {
+  alias_id: string
+}
+
+export interface PortalProjectAliasStatusRequest {
+  alias_id: string
+  enabled: boolean
+}
+
+// ---------------------------------------------------------------------------
 // 模型单价（v7 `model_price`）—— 费用统计的唯一计价来源
 // ---------------------------------------------------------------------------
 

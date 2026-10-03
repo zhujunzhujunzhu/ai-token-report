@@ -33,8 +33,8 @@ export const ROLE_PERMISSION_LABELS: Record<string, string> = {
   //   缺了它不会报错：服务端 seed 的 `description` 就是权限码本身，
   //   于是角色管理页把 `providers:read` 原样显示出来，
   //   而使用者会以为「这个权限是给机器看的」，不知道该不该勾。
-  'providers:read': '查看供应商归一化规则',
-  'providers:manage': '管理供应商归一化规则',
+  'providers:read': '查看供应商与模型归一化规则',
+  'providers:manage': '管理供应商与模型归一化规则',
   'cost:read': '查看用量费用',
   'pricing:manage': '管理模型单价',
 }

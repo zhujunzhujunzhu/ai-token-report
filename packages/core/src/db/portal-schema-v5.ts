@@ -11,11 +11,12 @@
  * | v7 | 结构追加步骤 | 追加 `model_price` 表（模型单价）与权限码 `cost:read` / `pricing:manage` |
  * | v8 | 结构追加步骤 | 追加 `usage_rollup_*` 三张看板汇总表（`portal-schema-v8.ts`） |
  * | v9 | 结构追加步骤 | `usage_event` 加一列 `source`（这条用量是哪个客户端写的） |
- * | v10 | ★ **当前终态** | `model_price` 加五列：闲时（低谷）时段表 + 四类闲时单价 |
+ * | v10 | 结构追加步骤 | `model_price` 加五列：闲时（低谷）时段表 + 四类闲时单价 |
+ * | v11 | 结构追加步骤 | 追加 `project_alias` 表与权限码 `projects:*`（项目归一化） |
  *
  * ⚠️ **本文件的 SQL 常量代表 v7 终态**（v5 的 `usage_event` 那一列除外，见下），
  *   v5 / v6 / v7 的结构变化都是它的一部分：
- *   `PORTAL_SCHEMA_VERSION = 10` + 末尾的 {@link PORTAL_SQLITE_V6_ADDITIONS}
+ *   `PORTAL_SCHEMA_VERSION = 11` + 末尾的 {@link PORTAL_SQLITE_V6_ADDITIONS}
  *   + {@link PORTAL_SQLITE_V7_ADDITIONS} + `portal-schema-v8.ts` 的三张汇总表
  *   + `portal-schema-v9.ts` 的 `source` 列 + `portal-schema-v10.ts` 的闲时五列
  *   + `portal-schema-v11.ts` 的 `project_alias` + `portal-schema-v12.ts` 的
@@ -72,6 +73,10 @@ import {
   PORTAL_OFFPEAK_RATE_COLUMNS,
   PORTAL_OFFPEAK_SCHEDULE_COLUMN,
 } from './portal-schema-v10.js'
+import {
+  portalV11ChecksumInput,
+  portalV11Statements,
+} from './portal-schema-v11.js'
 
 // 交付面：调用方（迁移器 / 汇总构建 / 测试）一律从本模块取，
 // 不必知道 v8 / v9 / v10 的实现住在独立文件里 —— 与 v6 / v7 的导出方式保持一致。
@@ -84,7 +89,16 @@ export {
   PORTAL_OFFPEAK_RATE_COLUMNS,
   PORTAL_OFFPEAK_SCHEDULE_COLUMN,
 } from './portal-schema-v10.js'
-export const PORTAL_SCHEMA_VERSION = 10
+export {
+  portalV11Statements,
+  portalV11TableStatement,
+  portalV11ChecksumInput,
+  PROJECT_ALIAS_TABLE,
+  PROJECT_PREFIX_MAX_LENGTH,
+  PROJECT_ALIAS_MAX_LENGTH,
+  PORTAL_V11_PERMISSION_SQL,
+} from './portal-schema-v11.js'
+export const PORTAL_SCHEMA_VERSION = 11
 export const PORTAL_SQLITE_V5_SQL = `-- 数据库 v5：分组（多对多）+ 权限码 groups:*。
 -- 不执行 ALTER/DROP，不修改本地 usage.sqlite 的 schema v3。
 -- 部署前必须另行实现带备份、版本闸门与恢复点的生产迁移。
@@ -990,7 +1004,7 @@ export function portalSchemaStatements(kind: PortalBackendKind): string[] {
   const statements = base.map(statement => statement.startsWith('CREATE TABLE usage_event (')
     ? portalV9UsageEventStatement(kind, statement)
     : statement)
-  const all = [...statements, ...portalV6Statements(kind), ...portalV7Statements(kind), ...portalV8Statements(kind)]
+  const all = [...statements, ...portalV6Statements(kind), ...portalV7Statements(kind), ...portalV8Statements(kind), ...portalV11Statements(kind)]
   // ★ v10：`model_price` 多五列闲时价。⚠️ 它**必须在合并之后**再拼：
   //   这张表来自 v7 的追加常量（那段文本已冻结、一个字都不许改），
   //   在 `base` 上找 `CREATE TABLE model_price (` 是找不到的 —— 找不到就不会拼，
@@ -1015,6 +1029,26 @@ export function portalSchemaStatements(kind: PortalBackendKind): string[] {
  *   把它算进摘要会让「手工补了一条角色权限」把库判成「结构不符」。
  */
 export function portalSchemaChecksum(kind: PortalBackendKind): string {
+  const source = kind === 'mysql' ? PORTAL_MYSQL_V5_SQL : PORTAL_SQLITE_V5_SQL
+  const additions = kind === 'mysql'
+    ? `${PORTAL_MYSQL_V6_ADDITIONS}\n${PORTAL_MYSQL_V7_ADDITIONS}\n${PORTAL_MYSQL_V8_ADDITIONS}\n${portalV9ChecksumInput(kind)}\n${portalV10ChecksumInput(kind)}\n${portalV11ChecksumInput(kind)}`
+    : `${PORTAL_SQLITE_V6_ADDITIONS}\n${PORTAL_SQLITE_V7_ADDITIONS}\n${PORTAL_SQLITE_V8_ADDITIONS}\n${portalV9ChecksumInput(kind)}\n${portalV10ChecksumInput(kind)}\n${portalV11ChecksumInput(kind)}`
+  return createHash('sha256').update(`${source}\n${additions}`).digest('hex')
+}
+/**
+ * ★ **已发布的 v10 摘要，冻结于此**（= v5 文本 + v6 + v7 + v8 + v9 + v10，
+ * **不含 v11 的 `project_alias`**）。
+ *
+ * 作用与 {@link portalSchemaChecksumV9} 完全一样：让**已经迁到 v10 的库**
+ *   （本机快照库、以及线上库升级后的形态）仍然被判成 `legacy` =
+ *   「结构是上一版、完整、可迁移」。不冻结的后果同样致命：那些库的账本里
+ *   记的是 v10 摘要，而 `portalSchemaChecksum()` 现在返回 v11 摘要 —— 永远对不上，
+ *   于是它从「可迁移的起点」变成 `unsupported`（服务端拒绝启动、迁移脚本也拒绝接手），
+ *   而 v11 只是纯追加一张规则表、一条语句就能升上去。
+ *
+ * ⚠️ v8 / v9 / v10 的文本一个字都不许再改（本函数按它们的当前全文求摘要）。
+ */
+export function portalSchemaChecksumV10(kind: PortalBackendKind): string {
   const source = kind === 'mysql' ? PORTAL_MYSQL_V5_SQL : PORTAL_SQLITE_V5_SQL
   const additions = kind === 'mysql'
     ? `${PORTAL_MYSQL_V6_ADDITIONS}\n${PORTAL_MYSQL_V7_ADDITIONS}\n${PORTAL_MYSQL_V8_ADDITIONS}\n${portalV9ChecksumInput(kind)}\n${portalV10ChecksumInput(kind)}`

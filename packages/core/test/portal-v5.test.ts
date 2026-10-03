@@ -236,17 +236,21 @@ test('v5 运行时 SQL 与设计契约逐字一致，v4 基线仍逐字冻结', 
   expect(PORTAL_SQLITE_V4_SQL).toBe(readFileSync(join(repoRoot, 'docs/database-v4/schema.sqlite.sql'), 'utf8'))
   expect(PORTAL_MYSQL_V4_SQL).toBe(readFileSync(join(repoRoot, 'docs/database-v4/schema.mysql.sql'), 'utf8'))
 })
-test('SQLite 新库 v9、FULL、25 表及旧诊断表', async () => {
+test('SQLite 新库 v11、FULL、26 表及旧诊断表', async () => {
   const t = target()
   const info = await preparePortalDatabase(t)
   expect(info.status).toBe('current')
   expect(info.version).toBe(PORTAL_SCHEMA_VERSION)
-  // ★ v9 = v8 的 25 张表（v9 只给 usage_event 加一列，不建表）。
-  expect(info.tables.length).toBe(25)
+  // ★ v11 = v10 的 25 张表 + `project_alias`（v9 / v10 都只改既有表，不建表）。
+  //   ⚠️ 这个数字是**结构**断言，加表时必须跟着改；它不是版本号，
+  //   所以不适用「断言一律对着 PORTAL_SCHEMA_VERSION」那条规矩。
+  expect(info.tables.length).toBe(26)
   expect(info.tables).toContain('member_groups')
   expect(info.tables).toContain('member_group_assignments')
   expect(info.tables).toContain('provider_alias')
   expect(info.tables).toContain('model_price')
+  // ★ v11：项目归一化规则表（只引用 members，与 provider_alias 同一形状）。
+  expect(info.tables).toContain('project_alias')
   // ★ v8：汇总表是**性能设施**，四张表必须一起到位（查询层按它们是否存在决定路由）。
   expect(info.tables).toContain('usage_rollup_day')
   expect(info.tables).toContain('usage_rollup_hour')

@@ -373,6 +373,15 @@ export class PortalStatsSession {
    */
   readonly #normalize: ProviderNormalizer | undefined
   /**
+   * 项目归一化（可选）。`undefined` = 一条规则都没有 ——
+   * 此时项目维度回落 `projectName()`，与迁移前**逐字节相同**。
+   *
+   * ⚠️ 它只作用于 **`project` 维度**的两条路径（`groups('project')` 与
+   *   `costByGroup('project')`）。两个地方必须同时套用它，否则分布表与
+   *   金额列会按两个不同的项目名分组 —— 页面上表现为「有几行金额是空的」。
+   */
+  readonly #projects: ProjectNormalizer | undefined
+  /**
    * 是否连**金额**一起算。
    *
    * 🚨 由调用方按 `cost:read` 决定，而且这里是**真不查、真不算** ——
@@ -396,7 +405,14 @@ export class PortalStatsSession {
     store: PortalStore
     target: PortalTarget
     filter?: QueryFilter
-    aliases?: ProviderAliasMap
+    aliases?: AliasRules
+    /**
+     * 项目归一化映射（`project_alias`，v11）。
+     *
+     * ⚠️ 与 `aliases` 不同，它**不生成任何 SQL**：项目维度的分组本来就在 JS 侧
+     *   （见 `groupRowsFromProject()`），所以这里只留一个解析器。
+     */
+    projectAliases?: ProjectAliasMap
     withCost?: boolean
   }) {
     this.#store = init.store
@@ -405,10 +421,17 @@ export class PortalStatsSession {
     this.dbPath = init.target.sqlitePath
     this.kind = init.store.kind
     this.#filter = init.filter ?? {}
-    // ⚠️ 空映射必须折成 `undefined`：空 `CASE` 在 MySQL 上是语法错误，
+    // ⚠️ 空规则必须折成 `undefined`：空 `CASE` 在 MySQL 上是语法错误，
     //   而在 SQLite 上只是「恒为 NULL」—— 后者更危险，它不会报错。
-    this.#normalize = init.aliases && init.aliases.size > 0
+    //   ★ 两类规则**任何一个非空**都要留着：只配了模型规则时，供应商那一段
+    //   表达式会退回裸列名（`hasNormalization` 逐类判定），但模型那一段必须生效。
+    this.#normalize = init.aliases && (init.aliases.providers.size > 0 || init.aliases.models.length > 0)
       ? providerNormalizer(init.aliases, this.#dialect)
+      : undefined
+    // ⚠️ 同样折成 `undefined`，理由不同：零条规则时走 `projectName()` 那条路
+    //   与迁移前**逐字节相同**，留着空 normalizer 只是白扫一遍规则表。
+    this.#projects = init.projectAliases && init.projectAliases.size > 0
+      ? projectNormalizer(init.projectAliases)
       : undefined
     this.openedAt = Date.now()
     this.#withCost = init.withCost === true
@@ -599,6 +622,16 @@ export class PortalStatsSession {
       cacheRead: num(row.cache_read_tokens),
       cacheWrite: num(row.cache_write_tokens),
     }
+  }
+
+  /**
+   * 一条 cwd → 项目名的**唯一**入口（`project` 维度的两条路径共用）。
+   *
+   * ★ 没有规则时就是 `projectName()` —— 这正是「未配置的 cwd 保持自身」的实现：
+   *   不是空串、也不是 `other`，而是与迁移前逐字节相同的旧口径。
+   */
+  #projectOf(cwd: string | null): string {
+    return this.#projects ? this.#projects.resolve(cwd) : projectName(cwd)
   }
 
   // ---------------------------------------------------------------------------
@@ -907,7 +940,10 @@ export class PortalStatsSession {
       const pairs = projectSessionsQuery(this.#filter)
       const rows = await this.#store.all<ProjectGroupRow>(groups.sql, groups.params)
       const sessionPairs = await this.#store.all<ProjectSessionPair>(pairs.sql, pairs.params)
-      return groupRowsFromProject(rows, sessionPairs)
+      // ★ 项目归一化（v11）就在这里生效：先按 cwd 聚合、再按项目名合并的
+      //   两段都走 `#projectOf`，所以「同一项目名下的多个 cwd」会正确合并，
+      //   而 sessions 去重也按**合并后的项目名**做（见 groupRowsFromProject 的注释）。
+      return groupRowsFromProject(rows, sessionPairs, cwd => this.#projectOf(cwd))
     }
 
     // day / hour：时间键必须在 JS 侧算（见 `dimensionExpression` 的注释）
@@ -1349,18 +1385,22 @@ export class PortalStatsSession {
  *   两者搞反 = 一次版本升级静默清空全部门历史用量。
  *   两种后端遵守同一条铁律。
  *
- * `aliases` 是**已经按查看者解析完毕**的供应商归一化映射（全局 + 人员逐条覆盖），
- * 由 `stats-route.ts` 从 `provider_alias` 表读出来传进去 —— 查询层不认识那张表，
- * 也不该认识：它只认「原始名 → 展示名」这一件事。
+ * `aliases` 是**已经按查看者解析完毕**的归一化规则（供应商映射 + 模型规则，
+ * 全局 + 人员逐条覆盖），由 `stats-route.ts` 从 `provider_alias` 表读出来传进去 ——
+ * 查询层不认识那张表，也不该认识：它只认「原始名 → 展示名」这一件事。
+ *
+ * `loadProjectAliases`（第 5 个参数，v11）同款：项目归一化规则也按查看者解析，
+ * 只是它**不生成任何 SQL**（项目分组在 JS 侧），所以下游只拿到一个解析器。
  *
  * ⚠️ 传的是**加载函数**而不是现成的映射表：加载要用同一个已打开、且已过版本闸门的
- *   连接（`provider_alias` 表的存在性由闸门保证）。让调用方自己先开一次连接去读规则、
- *   再开一次查数据，等于每次看板请求握两次库句柄，而 SQLite 上的代价是真金白银的。
+ *   连接（`provider_alias` / `project_alias` 表的存在性由闸门保证）。让调用方自己先开
+ *   一次连接去读规则、再开一次查数据，等于每次看板请求握两次库句柄，
+ *   而 SQLite 上的代价是真金白银的。
  */
 export async function openPortalStats(
   target: PortalTarget,
   filter: QueryFilter = {},
-  loadAliases?: (store: PortalStore) => Promise<ProviderAliasMap>,
+  loadAliases?: (store: PortalStore) => Promise<AliasRules>,
   /**
    * 是否连金额一起算。由**路由层按 `cost:read` 决定**，core 不认权限概念。
    *
@@ -1369,13 +1409,25 @@ export async function openPortalStats(
    *   没有金额权限的人白算一遍。
    */
   withCost = false,
+  /**
+   * 项目归一化映射的加载函数（v11）。
+   *
+   * ⚠️ **刻意排在第 5 位**（而不是插在 `withCost` 前面）：它是后来才加的一层口径，
+   *   而 `withCost` 是布尔、位置一变就会让既有的
+   *   `openPortalStats(target, filter, loadAliases, true)` 静默把 `true`
+   *   当成加载函数（typecheck 会拦，但没必要制造这次改动面）。
+   *   追加在末尾让所有既有调用点一个字节都不用改。
+   */
+  loadProjectAliases?: (store: PortalStore) => Promise<ProjectAliasMap>,
 ): Promise<PortalStatsSession> {
   const store = await openPortalStore(target)
   try {
-    const aliases = loadAliases ? await loadAliases(store) : undefined
+    const aliases = loadAliases ? await loadAliases(store) : EMPTY_ALIAS_RULES
+    const projectAliases = loadProjectAliases ? await loadProjectAliases(store) : undefined
     const session = new PortalStatsSession({
       store, target, filter, withCost,
-      ...(aliases && aliases.size > 0 ? { aliases } : {}),
+      ...(aliases.providers.size > 0 || aliases.models.length > 0 ? { aliases } : {}),
+      ...(projectAliases && projectAliases.size > 0 ? { projectAliases } : {}),
     })
     await session.assertLegacyIdentityView()
     return session

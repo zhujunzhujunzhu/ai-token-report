@@ -25,6 +25,11 @@ import {
   Ticket,
   OfficeBuilding,
   Connection,
+  // ★ 项目归一化用 `FolderOpened`（它配的是**目录前缀**），与供应商的
+  //   `Connection` 分开：两页的配置面长得一样，但匹配语义刻意不同
+  //   （精确 vs 前缀），图标相同会让人以为可以照搬供应商那套理解。
+  //   单价的 `Money` 又是另一族 —— 它改的是钱怎么算。
+  FolderOpened,
   // ★ 单价的图标刻意用 `Money`：这一页改的是**钱怎么算**，
   //   而它旁边的「供应商归一化」改的是名字怎么显示 —— 两者不该看起来同族。
   Money,
@@ -58,10 +63,15 @@ const navigation = computed(() => [
   ...(session.can('groups:manage')
     ? [{ path: '/groups', label: '分组管理', icon: OfficeBuilding }]
     : []),
-  // ★ 归一化改的是「按供应商看用量」的口径，与分组管理是两件事，
-  //   所以不共用权限：能管分组的人不一定该改全平台的供应商口径。
+  // ★ 归一化改的是「按供应商 / 模型看用量」的口径，与分组管理是两件事，
+  //   所以不共用权限：能管分组的人不一定该改全平台的供应商与模型口径。
   ...(session.can('providers:read')
-    ? [{ path: '/providers', label: '供应商归一化', icon: Connection }]
+    ? [{ path: '/providers', label: '供应商模型归一化', icon: Connection }]
+    : []),
+  // ★ 项目归一化与供应商归一化是**两件独立的事**，权限也各管各的：
+  //   能改供应商口径的人不一定该改项目口径（反之亦然）。
+  ...(session.can('projects:read')
+    ? [{ path: '/projects', label: '项目归一化', icon: FolderOpened }]
     : []),
   // ★ 单价决定**每一笔费用怎么算**，是配置而不是「看一眼的数字」，
   //   所以读也要求 `pricing:manage`：能看金额的人（`cost:read`）不必能改计价，

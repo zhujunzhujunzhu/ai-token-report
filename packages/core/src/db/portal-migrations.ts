@@ -23,7 +23,7 @@ import { existsSync, readFileSync, mkdirSync, statSync, writeFileSync } from 'no
 import { dirname, resolve } from 'node:path'
 import type { Database } from './driver.js'
 import { describePortalTarget, openRawPortalStore, type PortalStore, type PortalTarget } from './portal-connection.js'
-import { PORTAL_SCHEMA_VERSION, PORTAL_SQLITE_INGEST_SQL, PORTAL_MYSQL_INGEST_SQL, portalSchemaChecksum, portalSchemaChecksumV6, portalSchemaChecksumV7, portalSchemaChecksumV8, portalSchemaChecksumV9, portalSchemaStatements, portalV6Statements, portalV6TableStatement, portalV7Statements, portalV7TableStatement, portalV8Statements, portalV8TableStatement, PORTAL_V8_TABLES, PORTAL_SOURCE_COLUMN, portalV10AddColumnStatements, PORTAL_OFFPEAK_SCHEDULE_COLUMN, portalV9AddColumnStatement } from './portal-schema-v5.js'
+import { PORTAL_SCHEMA_VERSION, PORTAL_SQLITE_INGEST_SQL, PORTAL_MYSQL_INGEST_SQL, portalSchemaChecksum, portalSchemaChecksumV6, portalSchemaChecksumV7, portalSchemaChecksumV8, portalSchemaChecksumV9, portalSchemaChecksumV10, portalSchemaStatements, portalV6Statements, portalV6TableStatement, portalV7Statements, portalV7TableStatement, portalV8Statements, portalV8TableStatement, PORTAL_V8_TABLES, PORTAL_SOURCE_COLUMN, portalV10AddColumnStatements, PORTAL_OFFPEAK_SCHEDULE_COLUMN, portalV11Statements, portalV11TableStatement, PROJECT_ALIAS_TABLE, portalV9AddColumnStatement } from './portal-schema-v5.js'
 import { PORTAL_SQLITE_V4_INGEST_SQL, PORTAL_MYSQL_V4_INGEST_SQL, portalSchemaChecksumV4, portalSchemaStatementsV4 } from './portal-schema-v4.js'
 import { checkExpressions, sameChecks, normalizeTrigger } from './portal-catalog.js'
 
@@ -71,6 +71,16 @@ const V8_VERSION = 8
  *   补五列、五条 ALTER 就能升上去。
  */
 const V9_VERSION = 9
+/**
+ * v10 的**结构**版本号（= v9 + `model_price` 的闲时五列）。
+ *
+ * ★ 与 v7 / v8 / v9 同理：v11 的账本行是当前版本，而 v10 行必须能被认出来 ——
+ *   那是「这个库是完整的上一版、可以原地升 v11」的证据。
+ *   少了这一行，已经迁到 v10 的库（本机快照库就是、线上库升级后也是）
+ *   会变成 `unsupported`（服务端拒绝启动），而 v11 只是纯追加一张规则表、
+ *   一条语句就能升上去。
+ */
+const V10_VERSION = 10
 type SchemaVersion = 4 | 5
 
 export interface PortalInspection {
@@ -139,6 +149,7 @@ async function readPortalState(store: PortalStore): Promise<Omit<PortalInspectio
   const v7Row = await migrationRow(store, tables, V7_VERSION)
   const v8Row = await migrationRow(store, tables, V8_VERSION)
   const v9Row = await migrationRow(store, tables, V9_VERSION)
+  const v10Row = await migrationRow(store, tables, V10_VERSION)
   let status: PortalInspection['status'] = 'unsupported'
   if (tables.length === 0 && version === 0) status = 'empty'
   else if (version === 0 && tables.length === 1 && tables[0] === 'portal_schema_migrations' && !current && !baseline) status = 'incomplete'
@@ -174,8 +185,14 @@ async function readPortalState(store: PortalStore): Promise<Omit<PortalInspectio
   //   v9 库会冒充成「只差一次追加迁移」，而 v10 会给它补五列 ——
   //   手工改动会被一路带上去，且没有任何一步报错。
   else if (version === V9_VERSION && v9Row?.status === 'completed' && v9Row.checksum === portalSchemaChecksumV9(store.kind) && !current) status = 'legacy'
-  // v5/v6/v7/v8/v9 账本存在但 checksum 不符（程序换了 SQL 或库被改过）会落到 'unsupported'，绝不冒充 current。
-  return { kind: store.kind, label: store.label, version, status, tables, migration: current ?? v9Row ?? v8Row ?? v7Row ?? v6Row ?? v5Row ?? baseline }
+  // ★ v10：结构 = v9 + `model_price` 的闲时五列，但受控 DDL 已经追加了
+  //   `project_alias`。与 v6~v9 同理，额外比对**冻结的 v10 摘要**：
+  //   只有「确实是本程序发布出去的那一版 v10」才放行。少了它，一个被手工改过结构的
+  //   v10 库会冒充成「只差一次追加迁移」，而 v11 是纯追加 ——
+  //   手工改动会被一路带上去，且没有任何一步报错。
+  else if (version === V10_VERSION && v10Row?.status === 'completed' && v10Row.checksum === portalSchemaChecksumV10(store.kind) && !current) status = 'legacy'
+  // v5/v6/v7/v8/v9/v10 账本存在但 checksum 不符（程序换了 SQL 或库被改过）会落到 'unsupported'，绝不冒充 current。
+  return { kind: store.kind, label: store.label, version, status, tables, migration: current ?? v10Row ?? v9Row ?? v8Row ?? v7Row ?? v6Row ?? v5Row ?? baseline }
 }
 async function inspectStore(store: PortalStore): Promise<PortalInspection> {
   const state = await readPortalState(store)
@@ -962,6 +979,13 @@ async function upgradeV4ToV5(store: PortalStore, target: PortalTarget, options: 
     //   `verifyCurrentMysql` 会把它当成结构不符。而且 model_price 在 v6→v7 里刚建好，
     //   不引用任何既有表，放这里没有任何副作用。
     await upgradeV9ToV10(store)
+    // v11 追加 `project_alias`（项目归一化规则）。与 v6 / v7 完全同构：
+    //   只建表 + 建索引 + 补权限行，**事实表一个字节都不动**。
+    // ⚠️ 它引用 `members`（`member_id` 外键），所以**必须早于 v5 的事实表重建** ——
+    //   理由与 v6 的注释逐字相同：SQLite 重建 `members`（RENAME → 新建 → 拷贝 → 删旧）
+    //   时会重新解析全部引用它的表，那一刻 `project_alias` 还不存在就会抛
+    //   `no such table: main.project_alias`，而错误信息完全不提「是 v11 的表还没建」。
+    await upgradeV10ToV11(store)
     if (!v5Ready) {
       if (kind === 'sqlite') await runV5Sqlite(store)
       else await runV5Mysql(store)
@@ -1192,6 +1216,37 @@ async function upgradeV9ToV10(store: PortalStore): Promise<void> {
 
 /** 单价表的表名（与 `query.ts` 的 `PRICE_TABLE` 同一个字面量；这里刻意不 import 查询层）。 */
 const PRICE_TABLE = 'model_price'
+
+/**
+ * v10 → v11：**只追加** `project_alias`（项目归一化规则表）与权限码 `projects:*`。
+ *
+ * 与 v5→v6 完全同构，因此同样安全：
+ * 1. 建 `project_alias`（先看目标状态，幂等）；
+ * 2. 建它的索引（含**唯一**索引 `idx_project_alias_member`，走 `ensureControlledIndexes`）；
+ * 3. 逐列按受控定义核对；
+ * 4. 补权限行（`WHERE NOT EXISTS`，幂等）。
+ *
+ * 🚨 **事实表一个字节都不动**，所以这一步**不需要**备份证明，也不需要重比事件指纹。
+ *   项目归一化是查询时应用的：规则写进这张表，`usage_event.cwd` 永远是上报当时的原值
+ *   （这正是「删掉规则就恢复原状」的机制）。
+ *
+ * ⚠️ 与 `upgradeV6ToV7` 用**当前受控定义**（而不是某个冻结的 v11 文本）是同一回事：
+ *   受控定义是唯一真源，而 v11 就是当前版本，两者本来就该相同。
+ */
+async function upgradeV10ToV11(store: PortalStore): Promise<void> {
+  const table = portalV11TableStatement(store.kind, PROJECT_ALIAS_TABLE)
+  if (!(await tablesOf(store)).includes(PROJECT_ALIAS_TABLE)) await store.exec(table)
+  // 🚨 同 v5→v6：**建索引必须早于 `verifyTable`**。`idx_project_alias_member` 是受控 DDL 里的
+  //   独立 `CREATE UNIQUE INDEX`，而 MySQL 分支的 `verifyTable` 会把它算进期望的唯一约束 ——
+  //   先校验后建索引会让这一步在任何真实 MySQL 上必然报「唯一约束与主键不一致」，
+  //   整个迁移一步都走不动；而 SQLite 分支只比 `sqlite_master.sql` 全文、根本不看索引，
+  //   所以这个顺序错误在本地 SQLite 测试里永远看不见。
+  await ensureControlledIndexes(store, portalV11Statements(store.kind))
+  await verifyTable(store, PROJECT_ALIAS_TABLE, table)
+  for (const sql of portalV11Statements(store.kind)) {
+    if (sql.startsWith('INSERT')) await store.exec(sql)
+  }
+}
 
 /**
  * SQLite 的 v5 升级。

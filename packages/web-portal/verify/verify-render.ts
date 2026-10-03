@@ -75,7 +75,12 @@ try {
     { path: '/appkeys', name: 'appkeys', title: 'appKey 管理' },
     { path: '/roles', name: 'roles', title: '角色管理' },
     { path: '/groups', name: 'groups', title: '分组管理' },
-    { path: '/providers', name: 'providers', title: '供应商归一化' },
+    // ⚠️ 标题按**当前源码**写：这一页已从「供应商归一化」改名为「供应商模型归一化」
+    //   （v12 起 `provider_alias` 也承载模型规则），改回旧标题会让这条断言假失败。
+    { path: '/providers', name: 'providers', title: '供应商模型归一化' },
+    // ★ v11 项目归一化：与供应商归一化是**两件独立的事**，权限也各管各的
+    //   （能改供应商口径的人不必能改项目口径）—— 所以这里必须单列一项。
+    { path: '/projects', name: 'projects', title: '项目归一化' },
     { path: '/pricing', name: 'pricing', title: '模型单价' },
   ]
   for (const page of managementPages) {
@@ -100,6 +105,8 @@ try {
     // ★ 归一化改的是「按供应商看用量」的口径，与分组管理**不共用**权限：
     //   能管分组的人不该顺带获得改全平台供应商口径的能力。
     { label: '供应商只读者', permissions: ['providers:read'], allowed: ['providers'] },
+    // ★ 项目归一化同样独立：`projects:read` 不给 `providers:read`，反之亦然。
+    { label: '项目只读者', permissions: ['projects:read'], allowed: ['projects'] },
     // ★ 单价决定**每一笔费用怎么算**，是配置而不是「看一眼的数字」：
     //   读也要求 `pricing:manage`，所以「能看供应商口径」与「能看/改计价」互不附带。
     { label: '单价管理者', permissions: ['pricing:manage'], allowed: ['pricing'] },
@@ -118,7 +125,7 @@ try {
     check(`${entry.label}管理导航遵循各自权限`, !!navigationHtml && managementPages.every((page) =>
       navigationHtml.includes(page.title) === entry.allowed.includes(page.name)))
   }
-  session.identity = { member_id: '00000000-0000-4000-8000-000000000001', name: '测试管理员', username: 'admin', role: 'admin', permissions: ['members:read', 'members:manage', 'groups:read', 'groups:manage', 'roles:read', 'roles:assign', 'tokens:manage', 'providers:read', 'providers:manage', 'cost:read', 'pricing:manage'] }
+  session.identity = { member_id: '00000000-0000-4000-8000-000000000001', name: '测试管理员', username: 'admin', role: 'admin', permissions: ['members:read', 'members:manage', 'groups:read', 'groups:manage', 'roles:read', 'roles:assign', 'tokens:manage', 'providers:read', 'providers:manage', 'projects:read', 'projects:manage', 'cost:read', 'pricing:manage'] }
   session.generation++
   for (const page of managementPages) {
     await router.push(page.path)
@@ -128,13 +135,14 @@ try {
   await router.push('/members')
   const layoutHtml = await render('/src/layouts/PortalLayout.vue')
   const navigationHtml = layoutHtml.match(/<aside\b[\s\S]*?<\/aside>/)?.[0] ?? ''
-  check('管理导航依次为人员、appKey、角色、分组、供应商、单价六个独立入口',
+  check('管理导航依次为人员、appKey、角色、分组、供应商、项目、单价七个独立入口',
     navigationHtml.indexOf('人员管理') >= 0 &&
     navigationHtml.indexOf('人员管理') < navigationHtml.indexOf('appKey 管理') &&
     navigationHtml.indexOf('appKey 管理') < navigationHtml.indexOf('角色管理') &&
     navigationHtml.indexOf('角色管理') < navigationHtml.indexOf('分组管理') &&
-    navigationHtml.indexOf('分组管理') < navigationHtml.indexOf('供应商归一化') &&
-    navigationHtml.indexOf('供应商归一化') < navigationHtml.indexOf('模型单价'))
+    navigationHtml.indexOf('分组管理') < navigationHtml.indexOf('供应商模型归一化') &&
+    navigationHtml.indexOf('供应商模型归一化') < navigationHtml.indexOf('项目归一化') &&
+    navigationHtml.indexOf('项目归一化') < navigationHtml.indexOf('模型单价'))
 
   const dashboard = useDashboardStore(pinia)
   // ⚠️ 留一份**没有 `cost`** 的花生（fixture）：下面验金额时要临时挂上 `cost`
@@ -631,6 +639,20 @@ try {
     providersHtml.includes('没有配规则的供应商保持自己的原始名') &&
     providersHtml.includes('明细里始终同时显示原值'))
   check('供应商归一化不混排人员或分组列表', !providersHtml.includes('人员列表') && !providersHtml.includes('分组列表'))
+  const projectsHtml = await render('/src/views/ProjectsView.vue')
+  check('项目归一化独立展示规则列表、搜索、作用范围与新增入口',
+    ['项目归一化', '规则列表', '搜索目录前缀或项目名', '全部作用范围', '添加规则'].every((label) => projectsHtml.includes(label)))
+  // ★ 与供应商那页**刻意不同**的三件事必须写在页面上，否则使用者会照搬供应商那套理解：
+  //   ① 匹配的是**目录前缀**、而且按路径分隔符边界（`D:\a\proj` 不吃 `D:\a\proj-other`）；
+  //   ② 多条命中时**最长前缀优先**；
+  //   ③ 没配规则的目录回落「目录最后一段」的旧口径。
+  check('项目归一化写明前缀语义、最长优先与「未配置者回落旧口径」',
+    projectsHtml.includes('路径分隔符边界') &&
+    projectsHtml.includes('前缀最长的胜出') &&
+    projectsHtml.includes('没有配规则的目录仍然按「目录最后一段」显示'))
+  check('项目归一化写明大小写敏感与「尾部分隔符会被去掉」',
+    projectsHtml.includes('区分大小写') && projectsHtml.includes('会被自动去掉'))
+  check('项目归一化不混排人员或分组列表', !projectsHtml.includes('人员列表') && !projectsHtml.includes('分组列表'))
   const pricingHtml = await render('/src/views/PricingView.vue')
   check('模型单价独立展示计价目录、新增入口与种子初始化',
     ['模型单价', '计价目录', '新增单价', '用内置种子价初始化'].every((label) => pricingHtml.includes(label)))

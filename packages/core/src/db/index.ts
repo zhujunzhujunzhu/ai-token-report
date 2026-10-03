@@ -39,6 +39,10 @@ export * from './portal.js'
 //   它属于**查询层**（`query.ts` 的 SQL 构造器吃它的表达式），
 //   所以必须与 `query.js` 一起可被 `portal.ts` / `stats-route.ts` 取到。
 export * from './provider-alias.js'
+// ★ 项目归一化：上报库里的 `cwd` 折叠成一个项目口径（按**目录前缀**匹配，
+//   最长前缀优先）。与供应商归一化并列 —— 两者是同一类东西（查询期的展示口径），
+//   差别只在匹配语义，所以必须一起可被 `portal.ts` / `stats-route.ts` 取到。
+export * from './project-alias.js'
 // ★ 方言 / MySQL 驱动 / 上报库门面。三者共同构成「一份 SQL、两种后端」：
 //   方言定义必须可被 `query.ts`（本地 + 部门共用）与 `ingest.ts` 直接取到，
 //   不能只藏在 `portal-db.ts` 里（那会形成 `query.ts → portal-db.ts` 的假依赖）。

@@ -43,12 +43,13 @@ export const RECOVERY_PERMISSIONS = ['members:read', 'members:manage', 'tokens:m
  *
  * ★ v6 新增 `providers:read` / `providers:manage`（供应商归一化规则）。
  * ★ v7 新增 `cost:read` / `pricing:manage`（费用统计与模型单价）。
- *   两批权限码都**不是**只改这个数组就生效的：`portal-schema-v5.ts` 的
- *   `PORTAL_V6_PERMISSION_SQL` / `PORTAL_V7_PERMISSION_SQL` 负责往库里补行（幂等），
- *   对应的迁移步骤（v5→v6、v6→v7）负责让已部署的库也拿到它们。漏了任何一半，
- *   表现都是「管理员登录进去了，但配置页显示没有权限」。
+ * ★ v11 新增 `projects:read` / `projects:manage`（项目归一化规则）。
+ *   三批权限码都**不是**只改这个数组就生效的：`portal-schema-v5.ts` 的
+ *   `PORTAL_V6_PERMISSION_SQL` / `PORTAL_V7_PERMISSION_SQL` / `PORTAL_V11_PERMISSION_SQL`
+ *   负责往库里补行（幂等），对应的迁移步骤（v5→v6、v6→v7、v10→v11）负责让已部署的库也拿到它们。
+ *   漏了任何一半，表现都是「管理员登录进去了，但配置页显示没有权限」。
  */
-export const PERMISSIONS = ['identity:read', 'usage:write', 'stats:read', 'members:read', 'members:manage', 'tokens:manage', 'accounts:manage', 'roles:read', 'roles:assign', 'audit:read', 'groups:read', 'groups:manage', 'providers:read', 'providers:manage', 'cost:read', 'pricing:manage']
+export const PERMISSIONS = ['identity:read', 'usage:write', 'stats:read', 'members:read', 'members:manage', 'tokens:manage', 'accounts:manage', 'roles:read', 'roles:assign', 'audit:read', 'groups:read', 'groups:manage', 'providers:read', 'providers:manage', 'cost:read', 'pricing:manage', 'projects:read', 'projects:manage']
 export const str = (r: Row, k: string): string => String(r[k] ?? '')
 export const num = (r: Row, k: string): number => Number(r[k] ?? 0)
 export function requirePermission(p: Principal, permission: string): void {

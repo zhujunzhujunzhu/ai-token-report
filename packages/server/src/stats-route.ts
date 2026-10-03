@@ -57,6 +57,8 @@
 
 import {
   EVENT_TABLE,
+  distinctCwdsQuery,
+  loadProjectAliases,
   loadProviderAliases,
   openPortalStats,
   openPortalStore,
@@ -95,6 +97,7 @@ import {
   type StatsMembersResponse,
   type StatsPricingResponse,
   type StatsProvidersResponse,
+  type StatsProjectsResponse,
   type StatsSourcesResponse,
 } from '@ai-token-report/shared'
 
@@ -335,6 +338,10 @@ export class StatsRoute {
     // ★ 来源候选（`dsh` / `codex` / …）同样是目录：受控枚举 + 库里出现过的值。
     //   不带时间窗、不带筛选，也不含任何用量数字。
     if (sub === 'sources') return await this.#sources()
+    // ★ 项目归一化配置页用的**原始目录**候选（v11）：`cwd` 是路径，让人凭记忆敲
+    //   一个 `D:\Coding_agent\ai-token-report` 正是这个功能最容易出错的地方
+    //   （敲错一个字符 = 规则静默不命中）。它带数据范围，见 `#projects()`。
+    if (sub === 'projects') return await this.#projects(auth.viewer)
     // ★ 单价只读快照：门是 `cost:read`（不是管理接口那道 `pricing:manage`）。
     //   能看金额的人必须能看到这份金额是按哪份单价算出来的 —— 看不到单价，
     //   他就只能相信这一屏上的数字，而「自建计价 ≠ 财务账单」正是要提醒的。
@@ -374,7 +381,7 @@ export class StatsRoute {
       const viewerId = 'memberId' in auth.viewer ? auth.viewer.memberId : undefined
       // 🚨 权限在这里转成**一个布尔**，core 不认权限概念。
       //   没有 `cost:read` 时金额**根本没被计算过** —— 不是「算完再丢掉」。
-      session = await openPortalStats(this.#target, filter, (store) => loadProviderAliases(store, viewerId), hasCostRead(auth.viewer))
+      session = await openPortalStats(this.#target, filter, (store) => loadProviderAliases(store, viewerId), hasCostRead(auth.viewer), (store) => loadProjectAliases(store, viewerId))
     } catch (err) {
       if (isIdentityViewRequired(err)) return { status: 409, body: { ok: false, code: 'identity_view_required', reason: err.message } }
       if (this.#identityStore) return { status: 503, body: { ok: false, reason: '统计数据库暂时不可用，请稍后重试' } }
@@ -774,9 +781,83 @@ export class StatsRoute {
       for (const row of rows) {
         const raw = String(row.provider ?? '')
         if (!raw) continue
-        names.add(aliases.get(raw) ?? raw)
+        names.add(aliases.providers.get(raw) ?? raw)
       }
       const body: StatsProvidersResponse = { providers: [...names].sort() }
+      return { status: 200, body }
+    } catch (err) {
+      if (this.#identityStore) return { status: 503, body: { ok: false, reason: '统计数据库暂时不可用，请稍后重试' } }
+      return { status: 500, body: { ok: false, reason: `查询失败: ${msg(err)}` } }
+    } finally {
+      await store.close()
+    }
+  }
+
+  /**
+   * `GET /api/v1/stats/projects` —— 项目归一化配置页要用的**原始目录**候选项。
+   *
+   * ## 为什么它必须存在
+   *
+   * 项目规则填的是**目录前缀**，而让人凭记忆敲一个
+   * `D:\Coding_agent\ai-token-report` 正是这个功能最容易出错的地方：
+   * 敲错一个字符 = 规则**静默不命中**，页面上完全看不出来。
+   * 所以候选项来自**真实上报值**，让使用者去选而不是去写。
+   *
+   * ## 🚨 与 `/stats/providers` 的关键差别：它**跟着数据范围收窄**
+   *
+   * 供应商名不属于任何一个人，所以那份候选刻意不收窄。而 `cwd` 会带出
+   * 使用者路径（`C:\Users\alice\…`）—— 一份**没有用量**的全量路径清单
+   * 等于给「非管理员只看本人」开了一个侧门：他看不到别人的 token 数，
+   * 却能看到别人的目录名。所以这里必须走 `applyDataScope()`。
+   *
+   * ## 权限与形状
+   *
+   * - 权限是 `stats:read`（与其它看板接口同一道门），**不是** `projects:read`：
+   *   配置页只有在调用方本来就有 `stats:read` 时才去取它，取不到就退回手填
+   *   （与配置页读人员名册同一取舍）。
+   * - ⚠️ 只回**原始 cwd 字符串**，不回任何用量数字（没有条数、没有 token）：
+   *   这是一个名称目录，不是一份统计。要看某个目录用了多少，
+   *   去看板的「项目」分布表（那里已经是归一化后的口径）。
+   * - ⚠️ 刻意**不带时间窗**：候选必须是完整集合，否则「上个月用过的目录」
+   *   会从下拉里消失，那看起来像数据丢了。
+   */
+  async #projects(viewer: unknown): Promise<StatsRouteResult> {
+    /**
+     * ★ **时间窗为空**、只借 `applyDataScope()` 求数据范围。
+     *
+     * 复用那一个函数而不是在这里手写「非管理员 → memberIds:[自己]」：
+     * 范围口径只能有一份实现，否则「看板收窄了、候选没收窄」这种分叉
+     * 不会有任何测试能发现（它两次请求各自都是「对的」）。
+     * 参数传空 `URLSearchParams` —— 这条接口本来就不接受任何筛选参数。
+     *
+     * ⚠️ 它同样会对「没有稳定人员 ID 的凭证」回 403（`scopeDenied`），
+     *   与看板一致：给不出身份就取不到需要按人收窄的数据。
+     */
+    const scope = applyDataScope(viewer, new URLSearchParams(), { label: '全部时间', filter: {} })
+    if ('result' in scope) return scope.result
+
+    let store: PortalStore
+    try {
+      // ★ 与 `/stats/providers` / `/stats/sources` 同款：**开裸连接跑一条 SELECT**，
+      //   不走 `openPortalStats()`。
+      //   🚨 走统计会话会撞上 `assertLegacyIdentityView()` —— 那一关在「部门视角
+      //   （没有 `identity_view=member`）且库里存在『有 member_id 但没有旧姓名』的事件」
+      //   时回 409。那扇门是给**按人排行**用的（同名 / 改名无法表达时必须拒绝），
+      //   而一份目录候选与归属毫无关系 —— 让配置页因为归属形状打不开是错的方向，
+      //   而它表现成「归一化配置页在正式库上永远取不到候选」。
+      store = await openPortalStore(this.#target)
+    } catch (err) {
+      if (this.#identityStore) return { status: 503, body: { ok: false, reason: '统计数据库暂时不可用，请稍后重试' } }
+      return { status: 500, body: { ok: false, reason: `上报库不可用: ${msg(err)}` } }
+    }
+
+    try {
+      // 取数 SQL 仍然只有一处实现（`distinctCwdsQuery`）—— 这里只负责执行它。
+      const q = distinctCwdsQuery(scope.filter)
+      const rows = await store.all<{ cwd: unknown }>(q.sql, q.params)
+      const body: StatsProjectsResponse = {
+        projects: rows.map(row => String(row.cwd)).filter(value => value.length > 0),
+      }
       return { status: 200, body }
     } catch (err) {
       if (this.#identityStore) return { status: 503, body: { ok: false, reason: '统计数据库暂时不可用，请稍后重试' } }
@@ -951,6 +1032,10 @@ const KNOWN_SUBS: readonly string[] = [
   //   来源是**受控枚举**（由 `registeredSources()` 给出），所以候选项 =
   //   注册表 ∪ 库里出现过的值 —— 后者兜住「更新版客户端上报了一个本进程还不认识的来源」。
   'sources',
+  // ★ 项目归一化配置页的**原始目录**候选（v11）。与供应商候选同类（一份目录、
+  //   不带时间窗与筛选、不含任何用量数字），但回的是**原始 cwd**，
+  //   而且**跟着数据范围收窄**（`cwd` 会带出使用者路径，见 `#projects()`）。
+  'projects',
   'diagnostics',
   // ★ 工作时段分布：按「一天中的第几小时」折叠（不是 `by=hour` 那种带日期的分桶）。
   'hour-of-day',
