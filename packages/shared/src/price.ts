@@ -150,6 +150,16 @@ export interface PricingProvenance {
   pricingSource: PricingSource
   /** 快照同步时刻；`db` / `builtin` 为 `null`。 */
   pricingSyncedAt: number | null
+  /**
+   * 这份单价的人可核对来源。
+   *
+   * - `snapshot`：通常是同步快照时的部门服务端地址；
+   * - `builtin`：内置种子价的官方定价页；
+   * - `db`：`null`（来源就是服务端数据库本身）。
+   *
+   * ★ 这是给展示层回答「这份钱按哪来的价算」用的，不参与任何匹配或计价逻辑。
+   */
+  pricingOrigin?: string | null
 }
 
 // ---------------------------------------------------------------------------

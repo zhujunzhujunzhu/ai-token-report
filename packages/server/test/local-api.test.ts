@@ -637,7 +637,12 @@ describe('本地金额（估算）', () => {
     expect(res.status).toBe(200)
     const cost = (res.body as unknown as CostBody).cost
 
-    expect(cost.pricing).toEqual({ pricingSource: 'builtin', pricingSyncedAt: null })
+    expect(cost.pricing).toEqual({
+      pricingSource: 'builtin',
+      pricingSyncedAt: null,
+      // 价目出处：内置价就是 DeepSeek 官方定价页 —— 它与来源一起下发，人才能去核对这份价。
+      pricingOrigin: 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing',
+    })
     // 内置价只覆盖 deepseek-official 的几个模型，dashscope/m-1 一条都不在表里
     // → 全部用量都是「未计价」，而不是 0 元。
     expect(cost.costs).toEqual([])
@@ -656,6 +661,8 @@ describe('本地金额（估算）', () => {
     expect(cost.pricing).toEqual({
       pricingSource: 'snapshot',
       pricingSyncedAt: 1_700_000_000_000,
+      // 快照的来源地址 = 这份价是从哪拉下来的（同步时写进 `pricing.json` 的 `endpoint`）。
+      pricingOrigin: 'http://portal.example/api/v1/stats/pricing',
     })
     // 400 + 120 + 160 = 680 微元（整数，逐位可对）
     expect(cost.costs).toEqual([{ currency: 'CNY', amountMicro: 680, tokens: 2060 }])

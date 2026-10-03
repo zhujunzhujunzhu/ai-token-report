@@ -78,7 +78,11 @@ const PRICE_USD: ModelPrice = {
   effectiveToMs: null,
 }
 
-const DB = { pricingSource: 'snapshot', pricingSyncedAt: 1_700_000_000_000 } as const
+const DB = {
+  pricingSource: 'snapshot',
+  pricingSyncedAt: 1_700_000_000_000,
+  pricingOrigin: 'http://portal:8787/api/v1/stats/pricing',
+} as const
 
 describe('按事件时刻取价', () => {
   test('同一模型的两段区间各取各的价（不是拿一个价算所有历史）', () => {
@@ -141,7 +145,7 @@ describe('折叠成 CostTotals', () => {
 
   test('金额带上「按哪份单价算的」（换来源会让金额变，必须能分辨）', () => {
     const totals = costTotalsOf(records, priceResolver([PRICE_A, PRICE_A2, PRICE_USD]), DB)
-    expect(totals.pricing).toEqual({ pricingSource: 'snapshot', pricingSyncedAt: 1_700_000_000_000 })
+    expect(totals.pricing).toEqual(DB)
   })
 })
 
@@ -209,7 +213,11 @@ describe('离线单价快照', () => {
 
   test('没有数据目录：退回内置价，并说明是按内置价算的', () => {
     const pricing = loadLocalPricing({})
-    expect(pricing.provenance).toEqual({ pricingSource: 'builtin', pricingSyncedAt: null })
+    expect(pricing.provenance).toEqual({
+      pricingSource: 'builtin',
+      pricingSyncedAt: null,
+      pricingOrigin: 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing',
+    })
     expect(pricing.prices.length).toBeGreaterThan(0)
     expect(pricing.note).toContain('内置种子价')
     expect(pricing.path).toBeNull()
@@ -273,6 +281,7 @@ describe('离线单价快照', () => {
       expect(pricing.provenance).toEqual({
         pricingSource: 'snapshot',
         pricingSyncedAt: 1_700_000_000_000,
+        pricingOrigin: 'http://portal:8787/api/v1/stats/pricing',
       })
       expect(pricing.note).toBeNull()
       expect(pricing.prices.map((p) => `${p.provider}/${p.model}@${p.effectiveFromMs}`)).toEqual([

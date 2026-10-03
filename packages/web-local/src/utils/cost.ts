@@ -42,11 +42,12 @@ export function currencyText(amountMicro: number, currency: string): string {
 /** 单价来源的人话（缺字段时不许渲染成空）。 */
 export function provenanceText(provenance: PricingProvenance | null | undefined): string {
   if (!provenance) return '按本机单价快照估算'
+  const origin = provenance.pricingOrigin ? `（来源：${provenance.pricingOrigin}）` : ''
   switch (provenance.pricingSource) {
     case 'builtin':
-      return '按内置种子价估算'
+      return `按内置种子价估算${origin}`
     case 'snapshot':
-      return `按本机单价快照估算${provenance.pricingSyncedAt ? `（同步于 ${formatSyncTime(provenance.pricingSyncedAt)}）` : ''}`
+      return `按本机单价快照估算${provenance.pricingSyncedAt ? `（同步于 ${formatSyncTime(provenance.pricingSyncedAt)}）` : ''}${origin}`
     default:
       return '按服务端数据库中的单价估算'
   }

@@ -62,6 +62,7 @@ export const MAX_UNPRICED_TARGETS = 20
 
 /** 单价快照的文件名（放在**数据目录**里：它是配置，不进可重建的 `usage.sqlite`）。 */
 export const PRICING_FILE_NAME = 'pricing.json'
+const BUILTIN_PRICING_ORIGIN = 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing'
 
 /**
  * 按「事件发生时刻」取价的函数。
@@ -264,7 +265,11 @@ export function loadLocalPricing(opts: {
   const path = resolvePricingPath(opts)
   const builtin = (note: string): LocalPricing => ({
     prices: BUILTIN_PRICES,
-    provenance: { pricingSource: 'builtin', pricingSyncedAt: null },
+    provenance: {
+      pricingSource: 'builtin',
+      pricingSyncedAt: null,
+      pricingOrigin: BUILTIN_PRICING_ORIGIN,
+    },
     note,
     path,
   })
@@ -298,6 +303,7 @@ export function loadLocalPricing(opts: {
     provenance: {
       pricingSource: 'snapshot',
       pricingSyncedAt: snapshot.syncedAtMs,
+      pricingOrigin: snapshot.endpoint ?? null,
     },
     note: null,
     path,

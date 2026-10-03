@@ -197,8 +197,12 @@ test('--cost：JSON 给出金额、未计价 token 与未配价清单，且未�
     const cost = payload.cost
 
     // 价从哪来：同一次查询在「读快照」与「退回内置价」下会给出两个不同的金额，
-    // 所以来源必须与金额一起下发。
-    expect(cost.pricing).toEqual({ pricingSource: 'snapshot', pricingSyncedAt: SYNCED_MS })
+    // 所以来源必须与金额一起下发；出处（endpoint）也在其中 —— 拿它能直接去核对那份价。
+    expect(cost.pricing).toEqual({
+      pricingSource: 'snapshot',
+      pricingSyncedAt: SYNCED_MS,
+      pricingOrigin: 'http://portal.test/api/v1/stats/pricing',
+    })
 
     expect(cost.totals.costs).toEqual([{ currency: 'CNY', amountMicro: PAID_AMOUNT_MICRO, tokens: PAID_TOKENS }])
     expect(cost.totals.pricedTokens).toBe(PAID_TOKENS)
@@ -315,7 +319,11 @@ test('快照坏掉时整份拒绝并说明原因，绝不半份生效', async ()
     const cost = JSON.parse(stdout).cost
     // 半份单价表会让费用看起来正常却按内置价算，而 pricingSyncedAt 还显示同步成功 ——
     // 那是最难排查的一种，所以解析失败一律整份拒绝。
-    expect(cost.pricing).toEqual({ pricingSource: 'builtin', pricingSyncedAt: null })
+    expect(cost.pricing).toEqual({
+      pricingSource: 'builtin',
+      pricingSyncedAt: null,
+      pricingOrigin: 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing',
+    })
     expect(cost.totals.costs).toEqual([])
     expect(cost.totals.unpricedTokens).toBe(PAID_TOKENS + FREE_TOKENS)
   } finally {
