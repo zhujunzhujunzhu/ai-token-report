@@ -6,7 +6,7 @@
  * | 路径 | 使用者 | 数据源 | 鉴权 |
  * |---|---|---|---|
  * | `/api/local/identity` | 本地页面引导页 | 身份文件 | 无（仅 127.0.0.1） |
- * | `/api/local/stats/*` | 本地页面（`dsh-token --web`） | **本地 SQLite 增量库**（降级直扫日志） | 无（仅 127.0.0.1） |
+ * | `/api/local/stats/*` | 本地页面（`ai-token --web`） | **本地 SQLite 增量库**（降级直扫日志） | 无（仅 127.0.0.1） |
  * | `/api/local/refresh` | 本地页面「刷新」按钮 | 触发下一次增量 ingest | 无（仅 127.0.0.1） |
  * | `/api/v1/identity/verify` | 本地服务代用户校验 | 凭证表 | Bearer |
  * | `/api/v1/token-usage` | 插件 & CLI 上报 | 写入**上报库**（`portal.sqlite`） | Bearer |
@@ -396,9 +396,10 @@ export function createApp(deps: AppDeps): Hono {
     app.post('/api/local/identity', async (c) => {
       const parsed = await readJsonBodyStrict(c)
       if ('error' in parsed) return fail(parsed.error, 400)
-      // 形状校验在 `IdentityRoute.submit` 内部（那里才有完整的业务上下文）
+      // 形状校验在 `IdentityRoute.submit` 内部（那里才有完整的业务上下文）。
+      // ★ 只认 `{ token, baseUrl }`：姓名/分组由服务端按 token 解析，提交什么都不采信。
       const result = await deps.identityRoute.submit(
-        parsed.value as { name: string; token: string; group?: string },
+        parsed.value as { token: string; baseUrl?: string },
       )
       // 同样用 200 表达业务失败：这是「填的 token 不对」，不是 HTTP 错误
       return json(result)

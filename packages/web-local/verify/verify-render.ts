@@ -144,6 +144,37 @@ try {
   const noCostHtml = await renderTable([{ ...baseRow, key: 'a' }])
   check('服务端没下发 cost 时费用列整列不出现', !noCostHtml.includes('费用（估算）'))
 
+  // —— ★ 「配置」弹框：只有服务端地址与 appKey 两栏 ——
+  //   为什么单独渲染它：SSR 停在 loading 壳，整棵 App 树渲染不到弹框（见上）。
+  //   而这一版最容易悄悄退回旧形态（姓名 / Key / 分组三栏、整页替换）——
+  //   所以逐项断言「该有的在、不该有的不在」。
+  const { default: IdentityGate } = await server.ssrLoadModule(
+    '/src/components/identity/IdentityGate.vue',
+  )
+  const gateHtml: string = await renderToString(
+    createSSRApp({
+      render: () =>
+        h(IdentityGate, {
+          settings: true,
+          initialBaseUrl: 'http://127.0.0.1:8787',
+          signedName: '朱俊',
+          signedGroup: '数学建模中心开发',
+        }),
+    }),
+  )
+  check('配置弹框是 dialog（不是整页替换）', gateHtml.includes('role="dialog"') && gateHtml.includes('aria-modal="true"'))
+  check('配置弹框有「服务端地址」栏', gateHtml.includes('服务端地址'))
+  check('配置弹框有「appKey」栏', gateHtml.includes('appKey'))
+  check('地址栏回填生效地址', gateHtml.includes('http://127.0.0.1:8787'))
+  check('★ 不再有「姓名」输入栏（服务端按 appKey 解析）', !gateHtml.includes('姓名<') && !gateHtml.includes('placeholder="例如：张三"'))
+  check('★ 不再有「分组」输入栏（同上）', !gateHtml.includes('分组<') && !gateHtml.includes('placeholder="例如：研发一部"'))
+  check(
+    '★ 已署名时把服务端认定的姓名与分组显示成**只读**文案',
+    gateHtml.includes('当前署名') && gateHtml.includes('朱俊 · 数学建模中心开发'),
+  )
+  check('保留「数据与隐私」三条承诺', gateHtml.includes('数据与隐私') && gateHtml.includes('不采集对话内容'))
+  check('appKey 输入框是密码型（不回显）', gateHtml.includes('type="password"'))
+
   console.log('')
   if (failures.length > 0) {
     console.error(`共 ${failures.length} 项断言失败：`)

@@ -6,9 +6,9 @@
  *
  * 流程：
  *   1. 起「部门服务端」，配置凭证
- *   2. 起「本地服务」，指向部门服务端
- *   3. 模拟页面：GET 未署名 → POST 错误 token → POST 正确 token → GET 已署名
- *   4. 验证身份文件真的落盘，且内容以服务端认定的姓名为准
+ *   2. 起「本地服务」（**不配 `--portal`**：地址由页面提交，与插件同一形态）
+ *   3. 模拟页面：GET 未署名 → POST 错误 appKey → POST 正确 appKey → GET 已署名
+ *   4. 验证身份与连接配置真的落盘（连接那份与插件**共用同一个文件**）
  */
 
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -94,56 +94,65 @@ const badRes = await (
 check('错误 token → ok=false', badRes.ok === false)
 check('错误 token 提示注册状态为 true（用户重试有用）', badRes.registered === true)
 
-// ── 3. 起本地服务，指向部门服务端 ───────────────────────────
-console.log('\n【3】启动本地服务（指向部门服务端）')
+// ── 3. 起本地服务（地址由页面提交，不配 --portal）───────────
+console.log('\n【3】启动本地服务（不配 --portal：地址由页面填）')
+// ★ 刻意**不配 `portalUrl`**：地址由「配置」弹框里的「服务端地址」那一栏提交，
+//   这正是「只需要一个 baseUrl + appKey」的意思。部署参数只是缺省值。
 const local = await createServer({
   port: 18788,
   host: '127.0.0.1',
   dshHome: home,
   dataDir: DATA_DIR,
-  portalUrl: portal.url,
   enableLocalApi: true,
 })
 console.log(`  本地服务: ${local.url}`)
 
-// ── 4. 模拟页面署名流程 ─────────────────────────────────────
-console.log('\n【4】模拟页面署名流程')
+// ── 4. 模拟页面配置流程 ─────────────────────────────────────
+console.log('\n【4】模拟页面配置流程（服务端地址 + appKey）')
 
 const before = await (await fetch(`${local.url}/api/local/identity`)).json()
 check('首次 GET → signed=false', before.signed === false)
 check('首次 GET → 带引导提示', typeof before.hint === 'string' && before.hint.length > 0)
+check('★ 首次 GET → 地址为 null（页面必须让用户填）', before.baseUrl === null)
 
-// 4.1 先填一个错误 token
+// 4.1 先填一个错误 appKey（地址按用户会粘贴的样子：完整上报地址 + 尾斜杠）
 const wrongSubmit = await (
   await fetch(`${local.url}/api/local/identity`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: '张三', token: 'wrong-token' }),
+    body: JSON.stringify({ token: 'wrong-token', baseUrl: `${portal.url}/api/v1/token-usage/` }),
   })
 ).json()
-check('错误 token 提交 → ok=false', wrongSubmit.ok === false)
+check('错误 appKey 提交 → ok=false', wrongSubmit.ok === false)
 check('给出可展示的原因', typeof wrongSubmit.reason === 'string')
 
-// 4.2 关键：此时不应落盘
-let identityFileExists = true
-try {
-  readFileSync(join(DATA_DIR, 'identity.json'), 'utf8')
-} catch {
-  identityFileExists = false
+// 4.2 关键：此时不应落盘（身份与连接都不该留下）
+const readIfExists = (name: string): string | null => {
+  try {
+    return readFileSync(join(DATA_DIR, name), 'utf8')
+  } catch {
+    return null
+  }
 }
-check('★ 校验失败时未落盘', identityFileExists === false)
+check('★ 校验失败时未落盘身份', readIfExists('identity.json') === null)
+check('★ 校验失败时未落盘连接配置', readIfExists('plugin-connection.json') === null)
 
-// 4.3 填正确 token，且故意把姓名写错（验证以服务端为准）
+// 4.3 填正确 appKey；同时故意多塞一个姓名字段（验证以服务端为准）
 const goodSubmit = await (
   await fetch(`${local.url}/api/local/identity`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: '张三三（用户打错）', token: 'atr-zhangsan-9f3c' }),
+    body: JSON.stringify({
+      token: 'atr-zhangsan-9f3c',
+      baseUrl: `${portal.url}/api/v1/token-usage/`,
+      name: '张三三（用户打错）',
+    }),
   })
 ).json()
-check('正确 token 提交 → ok=true', goodSubmit.ok === true)
-check('★ 姓名以服务端认定为准，而非用户输入', goodSubmit.name === '张三', String(goodSubmit.name))
+check('正确 appKey 提交 → ok=true', goodSubmit.ok === true)
+check('★ 姓名以服务端认定为准，而非请求里塞的', goodSubmit.name === '张三', String(goodSubmit.name))
 check('分组来自凭证表', goodSubmit.group === '研发一部')
+check('★ 回显的地址已归一化（剥掉接口后缀与尾斜杠）', goodSubmit.baseUrl === portal.url, String(goodSubmit.baseUrl))
 
 // 4.4 落盘内容验证
 const stored = JSON.parse(readFileSync(join(DATA_DIR, 'identity.json'), 'utf8'))
@@ -152,11 +161,27 @@ check('落盘分组 = 研发一部（只写新字段 group）', stored.group ===
 check('落盘 token', stored.token === 'atr-zhangsan-9f3c')
 check('落盘含 createdAt', typeof stored.createdAt === 'number')
 
-// 4.5 再 GET 应显示已署名
+// ★ 连接配置与插件**共用同一份文件**：在本地页填一次，插件读到的是同一个地址与凭证。
+const connection = JSON.parse(readFileSync(join(DATA_DIR, 'plugin-connection.json'), 'utf8'))
+check('★ 连接配置落盘 baseUrl（与插件同一份文件）', connection.baseUrl === portal.url, JSON.stringify(connection))
+check('★ 连接配置落盘 appKey', connection.appKey === 'atr-zhangsan-9f3c')
+
+// 4.5 再 GET 应显示已署名，并回填地址
 const after = await (await fetch(`${local.url}/api/local/identity`)).json()
 check('署名后 GET → signed=true', after.signed === true)
 check('署名后 GET → name=张三', after.name === '张三')
+check('署名后 GET → 回填服务端地址', after.baseUrl === portal.url)
 check('★ 署名后 GET 响应不含 token', !JSON.stringify(after).includes('atr-zhangsan-9f3c'))
+
+// 4.6 只补 appKey、地址留空 → 复用本机存过的地址（页面不必每次重填）
+const reuseSubmit = await (
+  await fetch(`${local.url}/api/local/identity`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: 'atr-zhangsan-9f3c' }),
+  })
+).json()
+check('★ 地址留空 → 复用已保存的地址，保存成功', reuseSubmit.ok === true && reuseSubmit.baseUrl === portal.url)
 
 // ── 5. 端口占用自动重试 ─────────────────────────────────────
 console.log('\n【5】端口占用自动重试')

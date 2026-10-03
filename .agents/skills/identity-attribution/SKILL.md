@@ -66,34 +66,50 @@ DSH 原生**故意匿名**：`~/.dsh/.anonymous-user-id` 是 `crypto.randomUUID(
 > ⚠️ `docs/插件方案.md` §9 里「以 `unknown` 上报并打 warning」是**已废弃的旧方案**，
 > 不要照它实现。
 
-### 两种填写面（终态：插件只填两栏）
+### 两种填写面（都是两栏）
 
 | 填写面 | 填什么 | 为什么 |
 |---|---|---|
-| **DSH 插件「上报连接」面板** | **服务端地址（baseUrl） + appKey** | 员工手上真正拿到的只有这两样；姓名/分组由服务端按 appKey 解析，上报路径由 baseUrl 推导 |
-| 本地页面（`dsh-token --web`） | 姓名 + Key + 分组（选填） | 本地页面还要兼容「显式提供 token」的 CLI 用法，暂未收敛 |
+| **DSH 插件「连接配置」面板** | **服务端地址（baseUrl） + appKey** | 员工手上真正拿到的只有这两样；姓名/分组由服务端按 appKey 解析，上报路径由 baseUrl 推导 |
+| **本地页面（`dsh-token --web`）的「配置」弹框** | **同上，两栏一模一样** | 收敛后与插件同形态；姓名/分组同样由服务端解析。弹框压在统计页上方，未配置也能看本机用量 |
 
 - 插件面板的 appKey 就是 `identity.json` 里的 `token`（同一份文件、同一个凭证），
   所以「在插件里填一次」对本地页与 CLI 上报同样生效。
+- ★ **两个入口写的是同一份连接配置** `<dataDir>/plugin-connection.json`
+  （`core/src/connection-store.ts`；文件名里的 `plugin-` 是历史 —— 改名会让已配好的机器
+  静默变成「没配过」）。本地页只**合并写** `baseUrl` + `appKey` 两个键，
+  插件偏好（间隔 / 位置 / 日志根 / 其它来源）原样保留。
+- 地址优先级：**页面 / 面板里存过的那份 > 部署参数 `--portal`**。
+  `GET /api/local/identity` 把它回报给页面用于回填（响应里仍然**没有 token**）。
 - 插件提交的是 `{ baseUrl, appKey }`；宿主把它换算成
-  `endpoint = baseUrl + /api/v1/token-usage`，再写回 `plugin-connection.json`
-  （`{ baseUrl, appKey }`，旧版只存 `endpoint` 的文件仍可读）。
+  `endpoint = baseUrl + /api/v1/token-usage`，再写回该文件
+  （旧版只存 `endpoint` 的文件仍可读）。
 - **appKey 由平台「appKey 发放」页按人生成**，权限固定为
   `usage:write` + `stats:read`（上报 + 获取统计），不含管理面。
   正因为不含 `identity:read`，`verifyIdentity` 必须同时接受 `usage:write`
   —— 否则插件填完 appKey 只会看到「Key 无效」。
+- ⚠️ **界面上不许再出现姓名 / 分组输入框**：服务端一律覆盖客户端声明，
+  留着它们就是做不到的承诺（本地页旧版三栏，已收敛成两栏）。
 
-## 身份文件
+## 身份文件与连接配置
 
 ```
-$DSH_HOME/token-report/identity.json
+$DSH_HOME/token-report/identity.json           # 「我是谁」
+<dataDir>/plugin-connection.json               # 「连哪台 + 拿什么凭证」（+ 插件偏好）
 ```
 
-**本地页与插件共用同一份** —— 员工在哪里填一次就够了。
+**本地页与插件共用这两份** —— 员工在哪里填一次就够了。
 
 ```json
 { "name": "张三", "token": "...", "group": "研发一部",
   "createdAt": 1789984019944, "updatedAt": 1789984019944 }
+```
+
+连接配置那一份（`core/src/connection-store.ts`：路径 / 原子写 / 合并写都在那里）：
+
+```json
+{ "baseUrl": "http://portal:8787", "appKey": "...",
+  "flushIntervalMillis": 10000, "position": "dock", "dshHomes": ["~/.dsh"] }
 ```
 
 > ⚠️ 字段曾经叫 `dept`。**读的时候两者都认（`group ?? dept`），写的时候只写 `group`** ——
@@ -105,7 +121,15 @@ $DSH_HOME/token-report/identity.json
 |---|---|
 | **原子写入**（临时文件 + rename） | 写一半被杀死留下截断 JSON，用户看到「我明明填过了」 |
 | **权限 0600** | 文件含 token（凭证） |
-| **解析失败不抛错**，降级为「未署名」 | 抛错会让页面白屏，而用户此时最需要看到引导页 |
+| **解析失败不抛错**，降级为「未署名」 | 抛错会让页面白屏，而用户此时最需要看到配置入口 |
+
+连接配置另有三条（`connection-store.ts` 文件头）：
+
+| 约束 | 不加会怎样 |
+|---|---|
+| **地址与凭证成对才认** | 半份连接让「连哪台」与「我是谁」分叉，两边都不报错 |
+| **合并写**（本地页只动两个键） | 整份覆盖 = 本地页保存一次就把插件的间隔/位置/日志根清空 |
+| **坏文件拒绝覆盖** | 销毁证据比报错糟得多（内容可能还有救） |
 
 Windows 上 `chmod` 是 no-op，靠目录 ACL 保护 —— 这是已知且可接受的差异。
 
@@ -156,8 +180,8 @@ Windows 上 `chmod` 是 no-op，靠目录 ACL 保护 —— 这是已知且可�
 
 | 接口 | 说明 |
 |---|---|
-| `GET /api/local/identity` | 署名状态 —— **响应不含 token** |
-| `POST /api/local/identity` | 提交署名（会向部门服务端校验 token） |
+| `GET /api/local/identity` | 署名状态（★ 响应不含 token；**含生效的 `baseUrl`** 供弹框回填） |
+| `POST /api/local/identity` | 提交配置 `{ baseUrl, token }`（会向该地址校验 appKey，通过才落盘） |
 | `DELETE /api/local/identity` | 清除署名 / 换人 |
 | `POST /api/v1/identity/verify` | 服务端校验（**纯查询，不写库不落日志**） |
 

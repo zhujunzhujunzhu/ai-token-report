@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { identityPath, readIdentity } from '@ai-token-report/core'
+import { connectionPath, identityPath, readIdentity } from '@ai-token-report/core'
 import type { VerifyTokenResponse } from '@ai-token-report/shared'
 
 import { CredentialStore } from '../src/credentials.js'
@@ -187,13 +187,32 @@ describe('resolveIngestIdentity —— 上报归属', () => {
   })
 })
 
-describe('IdentityRoute —— 引导页读写', () => {
-  test('未署名时 GET 返回 signed=false 与提示', () => {
+describe('IdentityRoute —— 配置弹框读写（只有 服务端地址 + appKey 两项）', () => {
+  /** 记录每次校验请求打到哪个地址 —— 断言「用哪个地址去校验」。 */
+  function recordingPortal(response: VerifyTokenResponse, calls: string[]): typeof fetch {
+    return (async (input: string) => {
+      calls.push(String(input))
+      return new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }) as unknown as Response
+    }) as unknown as typeof fetch
+  }
+
+  test('未署名时 GET 返回 signed=false 与提示；没配 --portal 时地址为 null', () => {
     const route = new IdentityRoute({ dshHome: home, dataDir })
     const r = route.get()
     expect(r.signed).toBe(false)
     expect(r.name).toBeNull()
     expect(r.hint).toBeTruthy()
+    // ★ 地址是「用户手上两样东西」之一，派生不出来：两处都没有时必须如实说 null，
+    //   页面据此要求用户填，而不是拿一个空字符串去当默认值。
+    expect(r.baseUrl).toBeNull()
+  })
+
+  test('部署参数 --portal 作为缺省地址回报给页面（并归一化）', () => {
+    const route = new IdentityRoute({ dshHome: home, dataDir, portalUrl: 'http://portal.test/' })
+    expect(route.get().baseUrl).toBe('http://portal.test')
   })
 
   test('★ GET 响应绝不含 token', async () => {
@@ -203,7 +222,7 @@ describe('IdentityRoute —— 引导页读写', () => {
       portalUrl: 'http://portal.test',
       fetchImpl: fakePortal({ ok: true, registered: true, name: '张三' }),
     })
-    await route.submit({ name: '张三', token: 'tok-secret-value' })
+    await route.submit({ token: 'tok-secret-value' })
 
     const r = route.get()
     expect(r.signed).toBe(true)
@@ -217,18 +236,133 @@ describe('IdentityRoute —— 引导页读写', () => {
       dshHome: home,
       dataDir,
       portalUrl: 'http://portal.test',
-      // 用户填「张三三」，服务端认定「张三」
       fetchImpl: fakePortal({ ok: true, registered: true, name: '张三', group: '研发一部' }),
     })
 
-    const r = await route.submit({ name: '张三三', token: 'tok-abc' })
+    const r = await route.submit({ token: 'tok-abc' })
     expect(r.ok).toBe(true)
     expect(r.name).toBe('张三')
+    expect(r.baseUrl).toBe('http://portal.test')
 
     const stored = readIdentity(identityPath(home, dataDir)).identity
     expect(stored?.name).toBe('张三')
     expect(stored?.group).toBe('研发一部')
     expect(stored?.token).toBe('tok-abc')
+  })
+
+  test('★ 客户端多提交的姓名一律不采信（防冒用：以服务端返回的为准）', async () => {
+    const route = new IdentityRoute({
+      dshHome: home,
+      dataDir,
+      portalUrl: 'http://portal.test',
+      fetchImpl: fakePortal({ ok: true, registered: true, name: '张三' }),
+    })
+
+    // 手搓请求里塞一个姓名：接口只认 token（形状之外的东西一律忽略）
+    const r = await route.submit({ token: 'tok-abc', name: '李四' } as unknown as { token: string })
+    expect(r.ok).toBe(true)
+    expect(r.name).toBe('张三')
+    expect(readIdentity(identityPath(home, dataDir)).identity?.name).toBe('张三')
+  })
+
+  test('★ 服务端没返回姓名 = 校验失败，不落盘（绝不退回客户端声明）', async () => {
+    const route = new IdentityRoute({
+      dshHome: home,
+      dataDir,
+      portalUrl: 'http://portal.test',
+      fetchImpl: fakePortal({ ok: true, registered: true }),
+    })
+
+    const r = await route.submit({ token: 'tok-abc', name: '张三' } as unknown as { token: string })
+    expect(r.ok).toBe(false)
+    expect(r.reason).toContain('未返回有效署名')
+    expect(existsSync(identityPath(home, dataDir))).toBe(false)
+  })
+
+  test('★ 页面里填的地址就是校验地址，并落进与插件共用的连接文件', async () => {
+    const calls: string[] = []
+    const route = new IdentityRoute({
+      dshHome: home,
+      dataDir,
+      // 部署参数指向别处：页面里填的那份必须赢（与本机连接配置的优先级一致）
+      portalUrl: 'http://deployment.test',
+      fetchImpl: recordingPortal({ ok: true, registered: true, name: '张三' }, calls),
+    })
+
+    // 用户从文档复制来的完整上报地址（还带尾斜杠），也要能用
+    const r = await route.submit({ token: 'tok-abc', baseUrl: 'http://from-page.test/api/v1/token-usage' })
+    expect(r.ok).toBe(true)
+    expect(r.baseUrl).toBe('http://from-page.test')
+    expect(calls).toEqual(['http://from-page.test/api/v1/identity/verify'])
+
+    // 与插件共用同一份文件（plugin-connection.json），键与插件读的一致
+    const saved = JSON.parse(readFileSync(connectionPath(home, dataDir), 'utf8'))
+    expect(saved).toEqual({ baseUrl: 'http://from-page.test', appKey: 'tok-abc' })
+
+    // 再 GET：页面里存过的那份优先于 --portal
+    expect(route.get().baseUrl).toBe('http://from-page.test')
+  })
+
+  test('★ 连接文件的其它键（插件偏好）原样保留，合并写不整份覆盖', async () => {
+    const conn = connectionPath(home, dataDir)
+    mkdirSync(dataDir, { recursive: true })
+    writeFileSync(conn, JSON.stringify({ position: 'header', dshHomes: ['~/.dsh'] }), 'utf8')
+
+    const route = new IdentityRoute({
+      dshHome: home,
+      dataDir,
+      fetchImpl: fakePortal({ ok: true, registered: true, name: '张三' }),
+    })
+    expect((await route.submit({ token: 'tok-abc', baseUrl: 'http://p.test' })).ok).toBe(true)
+
+    expect(JSON.parse(readFileSync(conn, 'utf8'))).toEqual({
+      position: 'header',
+      dshHomes: ['~/.dsh'],
+      baseUrl: 'http://p.test',
+      appKey: 'tok-abc',
+    })
+  })
+
+  test('★ 本机存过的地址可以留空复用（页面只补 appKey 也能保存）', async () => {
+    const calls: string[] = []
+    const route = new IdentityRoute({
+      dshHome: home,
+      dataDir,
+      portalUrl: 'http://deployment.test',
+      fetchImpl: recordingPortal({ ok: true, registered: true, name: '张三' }, calls),
+    })
+    await route.submit({ token: 'tok-abc', baseUrl: 'http://from-page.test' })
+
+    const again = await route.submit({ token: 'tok-new' })
+    expect(again.ok).toBe(true)
+    expect(calls[1]).toBe('http://from-page.test/api/v1/identity/verify')
+    expect(readIdentity(identityPath(home, dataDir)).identity?.token).toBe('tok-new')
+  })
+
+  test('★ 没给地址且没配 --portal → 明确提示，不落盘', async () => {
+    const route = new IdentityRoute({ dshHome: home, dataDir })
+    const r = await route.submit({ token: 'tok-abc' })
+    expect(r.ok).toBe(false)
+    expect(r.reason).toContain('部门服务端地址')
+    expect(existsSync(identityPath(home, dataDir))).toBe(false)
+  })
+
+  test('★ 地址非法 → 本地就拦下，不发任何请求、不落盘', async () => {
+    const route = new IdentityRoute({
+      dshHome: home,
+      dataDir,
+      fetchImpl: (() => {
+        throw new Error('不该被调用')
+      }) as unknown as typeof fetch,
+    })
+
+    for (const bad of ['portal.example.com', 'http://u:p@host:8787', 'http://host:8787/?a=1']) {
+      const r = await route.submit({ token: 'tok-abc', baseUrl: bad })
+      expect(r.ok).toBe(false)
+      expect(r.reason).toContain('服务端地址无效')
+    }
+    expect(existsSync(identityPath(home, dataDir))).toBe(false)
+    expect(existsSync(connectionPath(home, dataDir))).toBe(false)
   })
 
   test('★ token 无效 → 不落盘', async () => {
@@ -239,10 +373,11 @@ describe('IdentityRoute —— 引导页读写', () => {
       fetchImpl: fakePortal({ ok: false, registered: true, reason: 'token 无效，请向管理员确认' }),
     })
 
-    const r = await route.submit({ name: '张三', token: 'tok-bad' })
+    const r = await route.submit({ token: 'tok-bad' })
     expect(r.ok).toBe(false)
     expect(r.reason).toContain('无效')
     expect(existsSync(identityPath(home, dataDir))).toBe(false)
+    expect(existsSync(connectionPath(home, dataDir))).toBe(false)
   })
 
   test('★ 服务端不可达 → 不落盘', async () => {
@@ -255,21 +390,27 @@ describe('IdentityRoute —— 引导页读写', () => {
       }) as unknown as typeof fetch,
     })
 
-    const r = await route.submit({ name: '张三', token: 'tok-abc' })
+    const r = await route.submit({ token: 'tok-abc' })
     expect(r.ok).toBe(false)
     expect(r.reason).toContain('无法连接')
     expect(existsSync(identityPath(home, dataDir))).toBe(false)
   })
 
-  test('未配置 portalUrl → 明确提示，不落盘', async () => {
-    const route = new IdentityRoute({ dshHome: home, dataDir })
-    const r = await route.submit({ name: '张三', token: 'tok-abc' })
+  test('★ 署名写失败 → 连接配置回滚，不留「连上了但没署名」的半份状态', async () => {
+    // 让身份文件路径变成一个**目录**：writeIdentity 的 rename 必然失败
+    mkdirSync(identityPath(home, dataDir), { recursive: true })
+
+    const route = new IdentityRoute({
+      dshHome: home,
+      dataDir,
+      fetchImpl: fakePortal({ ok: true, registered: true, name: '张三' }),
+    })
+    const r = await route.submit({ token: 'tok-abc', baseUrl: 'http://p.test' })
     expect(r.ok).toBe(false)
-    expect(r.reason).toContain('部门服务端')
-    expect(existsSync(identityPath(home, dataDir))).toBe(false)
+    expect(existsSync(connectionPath(home, dataDir))).toBe(false)
   })
 
-  test('空姓名 / 空 token 在发请求前就被挡住', async () => {
+  test('空 token 在发请求前就被挡住', async () => {
     const route = new IdentityRoute({
       dshHome: home,
       dataDir,
@@ -279,8 +420,8 @@ describe('IdentityRoute —— 引导页读写', () => {
       }) as unknown as typeof fetch,
     })
 
-    expect((await route.submit({ name: '', token: 'tok' })).ok).toBe(false)
-    expect((await route.submit({ name: '张三', token: '' })).ok).toBe(false)
+    expect((await route.submit({ token: '' })).ok).toBe(false)
+    expect((await route.submit({ token: '   ' })).ok).toBe(false)
   })
 
   test('current() 未署名返回 null —— 上报流程据此停止', () => {
@@ -295,7 +436,7 @@ describe('IdentityRoute —— 引导页读写', () => {
       portalUrl: 'http://portal.test',
       fetchImpl: fakePortal({ ok: true, registered: true, name: '张三' }),
     })
-    await route.submit({ name: '张三', token: 'tok-abc' })
+    await route.submit({ token: 'tok-abc' })
     expect(route.current()).not.toBeNull()
 
     route.clear()
@@ -310,7 +451,7 @@ describe('IdentityRoute —— 引导页读写', () => {
       portalUrl: 'http://portal.test',
       fetchImpl: fakePortal({ ok: true, registered: true, name: '张三' }),
     })
-    await route.submit({ name: '张三', token: 'tok-abc' })
+    await route.submit({ token: 'tok-abc' })
 
     const raw = JSON.parse(readFileSync(identityPath(home, dataDir), 'utf8'))
     expect(Object.keys(raw).sort()).toEqual(['createdAt', 'name', 'token', 'updatedAt'])
