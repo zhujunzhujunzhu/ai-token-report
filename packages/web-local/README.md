@@ -2,7 +2,7 @@
 
 我自己的 token 用量页 —— **只看本机**，数据来自本地服务的 `/api/local/*`。
 
-由 `dsh-token --web`（或 `bun run web`）启动：CLI 内嵌一个只监听
+由 `ai-token --web`（或 `bun run web`）启动：CLI 内嵌一个只监听
 `127.0.0.1` 的服务，页面由它托管。数据来自**本地 SQLite 增量库**
 （`~/.ai-token-report/usage.sqlite`，由会话日志增量派生），
 **不上报、不出网、断网可用**。首次启动需全量建库（约 15 秒），之后每次请求约 50ms。
@@ -44,11 +44,27 @@ DSH_LOCAL_API=http://127.0.0.1:8788 bun run dev:local
 
 | 区块 | 组件 | 说明 |
 |---|---|---|
-| 署名提示条 | `App.vue` | 未署名时明确告知「不会采集也不会上报」 |
+| 配置弹框 | `UiModal` → `IdentityGate` | ★ **只有两栏：部门服务端地址 + appKey**（与 DSH 插件的「连接配置」同一形态）。未配置身份时自动弹出，可关掉（统计页照常可看，只是不采集不上报）；点右上角「配置」随时重开 |
 | 筛选工具栏 | `UsageFilterBar` | 时间维度、刷新、清除筛选条件、导出 CSV |
 | 指标卡片组 | `UsageMetricGrid` → `UsageMetricCard` | 计费总量 / 缓存命中率 / 调用次数 / 会话数 |
 | 趋势图表 | `MetricGroupSection` → `MetricChartPanel` → `MetricChartCard` | 计费总量（柱状）+ 调用次数（面积） |
 | 分组明细 | `UsageDetailTable` | 按厂商模型 / 厂商 / 模型 / 项目 切换分组 |
+
+### 配置为什么只有两栏
+
+员工手上真正拿到的只有**部门服务端地址**和**一串 appKey**。
+姓名与分组由服务端按 appKey 解析（见 `.agents/skills/identity-attribution/SKILL.md`），
+所以界面上没有这两栏 —— 填了也不作数。提交时本地服务拿 appKey 向该地址的
+`POST /api/v1/identity/verify` 校验，**通过才落盘**：
+
+```
+<dataDir>/identity.json            # 「我是谁」（服务端认定的姓名 + 分组 + 凭证）
+<dataDir>/plugin-connection.json   # 「连哪台 + 拿什么凭证」（与 DSH 插件共用同一份）
+```
+
+地址优先级：**页面里存过的那份 > 启动参数 `--portal`**。
+连接配置是**合并写**：本地页只动 `baseUrl` / `appKey` 两个键，
+插件的上报间隔 / 面板位置 / 会话日志根一个字节都不碰。
 
 ### 两种图表形态
 
@@ -76,8 +92,8 @@ src/
 │   ├── identity.ts  # 署名读写
 │   └── stats.ts     # /api/local/stats/*
 ├── components/
-│   ├── ui/          # 通用基础组件
-│   ├── identity/    # 署名引导页
+│   ├── ui/          # 通用基础组件（含 UiModal 弹框外壳）
+│   ├── identity/    # 「配置」弹框（服务端地址 + appKey）
 │   └── usage/       # 业务组件
 ├── composables/
 │   ├── usage-view-model.ts  # 契约响应 → 视图模型（唯一的格式化/相加处）
@@ -114,7 +130,7 @@ verify/              # 断言脚本，不参与构建
   `cost = input×p_in + output×p_out + cacheRead×p_cr + cacheWrite×p_cw`，
   四类**分开乘**，按币种分别累加、**绝不换算也绝不相加**，多币种用 ` + ` 连接）。
   前端只做格式化（`14200` 微元 → `¥0.01`），**绝不出现 `amountMicro / 1e6`**。
-- 价来自数据目录下的 **`pricing.json` 快照**（`dsh-token-report pricing sync` 写入），
+- 价来自数据目录下的 **`pricing.json` 快照**（`ai-token-report pricing sync` 写入），
   没有就退回**内置种子价**并在响应里如实标注来源。本地页与部门看板读的不是同一份价，
   所以「按哪份单价算的」这一行必须与金额同时在场。
 - 🚨 **未计价的用量绝不显示成 `¥0.00`**，而是写「未计价」，并在口径那一行给出比例。
@@ -137,6 +153,10 @@ bun run verify:layout      # 无头 Chrome 量取真实布局（需先起服务�
   （连「费用（估算）」也不该出现）；另有**明细表模板层**的断言
   （费用列表头 / 金额 / 「未计价」/ 没下发 `cost` 时整列不出现）——
   模板里的列集合是动态的，只跑视图模型断言看不出「逻辑对了但模板还引用旧列」。
+  ★ 另有**配置弹框**的断言（`role="dialog"` / 有「服务端地址」与「appKey」两栏 /
+  **没有**姓名与分组输入框 / 已署名时把服务端认定值显示成只读文案）：
+  SSR 停在 loading 壳时整棵 App 树渲染不到弹框，所以那里是**单独渲染**
+  `IdentityGate` 来钉这一版最关键的产品决策。
 - `verify-layout.ts` —— 走 Chrome `--dump-dom` 读渲染后的 SVG 属性，
   覆盖纯 SSR 断不到的部分。
 

@@ -14,10 +14,10 @@
 **四种形态，三个数据源，一条主线。**
 
 ```
-① dsh-token --web        → 本地页面：只看这台机器（本地增量库，零依赖）
+① ai-token --web        → 本地页面：只看这台机器（本地增量库，零依赖）
 ② 服务端 portal          → 部门页面：看全部门很多人（读数据库）
 ③ DSH 插件               → 无人值守实时上报（装在 DSH 内）
-④ dsh-token report       → 定时补齐历史 + 离线机器兜底
+④ ai-token report       → 定时补齐历史 + 离线机器兜底
 ```
 
 **核心结构决策**：本地与服务端**彻底解耦** —— 本地用自己的库
@@ -200,9 +200,9 @@ ai-token-report/
 
 | 通路 | 触发 | 数据源 | 覆盖 | 延迟 |
 |---|---|---|---|---|
-| ① 本地页 | `dsh-token --web` | **本地增量库**（日志派生） | 仅本机 | **~50 ms** |
+| ① 本地页 | `ai-token --web` | **本地增量库**（日志派生） | 仅本机 | **~50 ms** |
 | ② 插件 | DSH 运行时自动 | 实时事件 | 装了插件的机器 | 实时 |
-| ③ 终盘 | `dsh-token` | **本地增量库**（日志派生） | 仅本机 | **~50 ms** |
+| ③ 终盘 | `ai-token` | **本地增量库**（日志派生） | 仅本机 | **~50 ms** |
 | ④ 定时上报 | 计划任务 | 本地日志 → HTTP | 装了 CLI 的机器 | 10 分钟 |
 
 ### 3.1 为什么本地端改用 SQLite 增量库
@@ -353,34 +353,36 @@ event_id = `${sessionId}:${seq}`
 |---|---|---|
 | 谁填 | IT / 安装脚本 | **员工本人** |
 | 何时 | 装机时 | **首次打开页面 / 首次启动插件** |
-| 入口 | 配置文件 | **页面引导页** |
+| 入口 | 配置文件 | **本地页「配置」弹框 / 插件的「连接配置」面板** |
 | 合规 | 需另行书面告知 | **员工知情且主动**，更干净 |
 
-**填写内容**：`姓名` + `token`（管理员发放）+ `分组`（选填，可多选）。
+**填写内容：只有两项** —— `服务端地址` + `appKey`（管理员发放）。
+姓名与分组**不由用户填**：它们由服务端按 appKey 解析（见 4.5.2）。
+两个入口（本地页弹框、插件面板）是同一形态、写同一份连接配置，在哪填一次都生效。
 
-### 4.5.2 关键设计：token 是身份凭证，不是普通鉴权
+### 4.5.2 关键设计：appKey 是身份凭证，不是普通鉴权
 
 ```
-用户填「张三」+ token
+用户填「服务端地址 + appKey」
         │
         ▼
-本地服务 POST /api/v1/identity/verify ──► 部门服务端凭证表
+POST <地址>/api/v1/identity/verify ──► 部门服务端凭证表
         │                                      │
         │  ◄── { ok, name: "张三", group } ───┘
         │      （响应同时带兼容别名 dept，同值）
         ▼
-以【服务端返回的姓名】落盘 ← ★ 不采信用户输入
+以【服务端返回的姓名】落盘 ← ★ 不采信客户端声明的任何身份字段
 ```
 
 **为什么必须这样**：如果服务端直接采信客户端声明的姓名，
 任何人改一下本地配置就能以他人名义上报，部门看板的数据立刻失去意义。
 
 由此得到的性质：
-- 客户端「我填了张三」不算数，**服务端以 token 解析出的身份为准**
+- 客户端「我填了张三」不算数，**服务端以 appKey 解析出的身份为准**
 - 即使本地身份文件被篡改，**也无法冒用他人身份**上报
-- 姓名填错时以服务端为准，不会产生重复人员
+- 界面里因此**没有**姓名 / 分组输入框（填了也不作数 = 做不到的承诺）
 
-> 实证：端到端测试里故意提交「张三三（用户打错）」，落盘结果是「张三」。
+> 实证：端到端测试里故意在请求体里塞「张三三（用户打错）」，落盘结果是「张三」。
 
 ### 4.5.3 未署名 = 不采集也不上报
 
@@ -395,31 +397,42 @@ event_id = `${sessionId}:${seq}`
 > 为什么不按 `unknown` 兜底上报？因为那是**未授权的数据采集**。
 > 宁可数据缺失（可在看板上看到「有 N 人未署名」），也不要偷偷采集。
 
-### 4.5.4 身份文件
+### 4.5.4 身份文件与连接配置
 
 ```
-<dataDir>/identity.json          # 缺省 ~/.ai-token-report/identity.json
+<dataDir>/identity.json            # 缺省 ~/.ai-token-report/identity.json
+<dataDir>/plugin-connection.json   # 服务端地址 + appKey（+ 插件的本机偏好）
 ```
 
-**本地页与插件共用同一份** —— 员工在哪里填一次就够了。
+**本地页与插件共用这两份** —— 员工在哪里填一次就够了。
 两套 DSH（Desktop 与命令行版）**缺省就共用同一份**（都落到 `~/.ai-token-report`），不需要任何配置；
 想各用一套时才显式写 `dataDir` 或 `DSH_TOKEN_REPORT_DATA_DIR`。
 
 ```json
+// identity.json —— 「我是谁」（服务端认定的）
 { "name": "张三", "token": "...", "group": "研发一部",
   "createdAt": 1789984019944, "updatedAt": 1789984019944 }
+
+// plugin-connection.json —— 「连哪台、拿什么凭证」（+ 面板偏好）
+{ "baseUrl": "http://portal:8787", "appKey": "...",
+  "flushIntervalMillis": 10000, "position": "dock", "dshHomes": ["~/.dsh"] }
 ```
 
-> 旧文件里这个字段叫 `dept`：读取按 `group ?? dept`，**写出只写 `group`** ——
+> 旧身份文件里 `group` 这个字段叫 `dept`：读取按 `group ?? dept`，**写出只写 `group`** ——
 > 兼容只发生在读取边界，不能让两种写法在新文件里并存。
 
-实现要点（`packages/core/src/identity-store.ts`）：
+实现要点（`packages/core/src/identity-store.ts`、`connection-store.ts`）：
 
 | 约束 | 原因 |
 |---|---|
 | **原子写入**（临时文件 + rename） | 写一半被杀死会留下截断 JSON，用户会看到「我明明填过了」 |
-| **权限 0600** | 文件含 token（凭证） |
-| **解析失败不抛错**，降级为「未署名」 | 抛错会让页面白屏，而用户此时最需要看到引导页 |
+| **权限 0600** | 文件含 token / appKey（凭证） |
+| **解析失败不抛错**，降级为「未署名」 | 抛错会让页面白屏，而用户此时最需要看到配置入口 |
+| **地址与凭证成对才认** | 半份连接会让「连哪台」与「我是谁」分叉，而两边都不报错 |
+| **连接配置合并写**（本地页只动 `baseUrl` / `appKey`） | 整份覆盖 = 在本地页保存一次就把插件的偏好清空，且不报错 |
+| **坏文件拒绝覆盖** | 内容可能还有救，销毁证据比报错糟得多 |
+
+地址的优先级：**页面/面板里存过的那份 > 部署参数 `--portal`（或插件 `endpoint`）**。
 
 ### 4.5.5 数据库初始化与旧凭证导入
 
@@ -557,8 +570,8 @@ HTTPS 反向代理需配置 `ATR_PORTAL_ORIGIN`。密码版本变化、账号/�
 
 | 接口 | 说明 |
 |---|---|
-| `GET /api/local/identity` | **署名状态**（★ 响应不含 token） |
-| `POST /api/local/identity` | **提交署名**（会向部门服务端校验 token） |
+| `GET /api/local/identity` | **署名状态**（★ 响应不含 token；含生效的 `baseUrl`） |
+| `POST /api/local/identity` | **提交配置**（`{ baseUrl, token }`，会向该地址校验 appKey） |
 | `DELETE /api/local/identity` | 清除署名 / 换人 |
 | `GET /api/local/stats/overview?period=today` | 卡片指标（**实时扫描**） |
 | `GET /api/local/stats/series?bucket=day` | 趋势 |
@@ -617,7 +630,7 @@ Content-Type: application/json
 
 {
   "schemaVersion": 1,
-  "client": { "name": "dsh-token-stats", "userId": "zhangsan",
+  "client": { "name": "ai-token-report", "userId": "zhangsan",
               "userName": "张三", "group": "研发一部" },
   "generatedAt": "2026-09-21T10:00:00Z",
   "records": [ { "event_id": "...", "session_id": "...", "seq": 16,
@@ -844,7 +857,7 @@ CLI / 插件 ──POST /api/v1/token-usage──► portal.sqlite ──只读�
 > 与配置面 `/api/v1/admin/pricing*`（`pricing:manage`）是**两条接口两道门**。
 > 多币种各自累加、绝不换算相加；趋势金额在多币种时不画线（画出来像「没花钱」）。
 > **离线端（本地页 / CLI / 插件）的价来自数据目录下的 `pricing.json` 快照**
-> （`dsh-token-report pricing sync` 从只读快照接口拉取），没有该文件时退回**内置种子价**
+> （`ai-token-report pricing sync` 从只读快照接口拉取），没有该文件时退回**内置种子价**
 > 并在响应里如实标注来源 —— 离线端与看板读的不是同一份价，**同一个时间窗会给出不同的金额**，
 > 所以「按哪份单价算的」必须与金额同时出现。金额折叠的公共件在 `core/src/db/cost.ts`。
 > 详见 `docs/费用统计方案.md`。
@@ -907,7 +920,7 @@ CLI / 插件 ──POST /api/v1/token-usage──► portal.sqlite ──只读�
 | **S3** | `server`：ingest 接口 + SQLite 幂等落库 | ④ 能打通 | ✅ 完成 |
 | **S4** | `server`：`/api/local/*` 统计直查 | ① 数据就绪 | ✅ 完成 |
 | **S5** | `web-local`：删 mock，接本地 API | **本地页面可用** | ✅ 完成 |
-| **S6** | `cli --web`：内嵌 server + 开浏览器 | **`dsh-token --web` 兑现** | ✅ 完成 |
+| **S6** | `cli --web`：内嵌 server + 开浏览器 | **`ai-token --web` 兑现** | ✅ 完成 |
 | **S7** | `server`：`/api/v1/stats/*` 查询接口 | 部门数据就绪 | ✅ 完成 |
 | **S8** | `web-portal`：部门看板（人员排行等） | **部门页面可用** | ✅ 完成 |
 | **S9** | `dsh-plugin`：backend + 队列 + outbox + 全局配置 + 工具/服务 | **③ 插件上报** | ✅ 完成 |
@@ -1027,7 +1040,7 @@ CLI / 插件 ──POST /api/v1/token-usage──► portal.sqlite ──只读�
 > **最后一个管理员不可删 / 不可降级**（否则没人能再发 token）。
 
 > **两个交付节点**：
-> - **S6** → `dsh-token --web` 一条命令看到自己的真实统计（本地闭环）
+> - **S6** → `ai-token --web` 一条命令看到自己的真实统计（本地闭环）
 > - **S8** → 部门看板可用（服务端闭环）
 > - **S9** → 插件让上报无需人工干预（✅ 已交付，见 `packages/dsh-plugin/README.md`）
 

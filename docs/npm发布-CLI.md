@@ -1,4 +1,4 @@
-# 公网 npm 发布：CLI（`dsh-token-report`）
+# 公网 npm 发布：CLI（包名 `ai-token-usage`，命令名 `ai-token-report`）
 
 > **当前发布入口见 [发布检查与事故恢复](发布检查与事故恢复.md)。**
 > 根目录 `publish:*` 会强制完整验证并发布同一份已验证 tarball；下文直接发布 dist 的命令为历史记录。
@@ -15,8 +15,8 @@
 
 | 项 | 值 |
 |---|---|
-| 包名 | **`dsh-token-report`**（unscoped，实测未被占用） |
-| bin | `dsh-token-report` + `dsh-token`（短名） |
+| 包名 | **`ai-token-usage`**（unscoped，实测未被占用） |
+| bin | `ai-token-report` + `ai-token`（短名）—— ⚠️ bin 名**刻意与包名不同**，见 §1 |
 | 依赖 | **零运行时依赖**（`shared`/`core`/`server` 全部内联进单文件产物） |
 | 运行时 | Node ≥22.15（`node:sqlite`）与 Bun ≥1.1（`bun:sqlite`） |
 | 页面资源 | `packages/web-local/dist` 内嵌进产物，装完即用 |
@@ -32,20 +32,37 @@
 
 ---
 
-## 1. 包名为什么不是 `dsh-token-stats`
+## 1. 包名为什么是 `ai-token-usage`（而命令名是 `ai-token-report`）
 
-`dsh-token-stats` **已被占用**（实测 HTTP 200）：
+产品名是 **AI Token Report**，但 `ai-token-report` **在 npm 上已被占用**：
+
+| 包名 | 状态 | 拥有者 |
+|---|---|---|
+| `ai-token-report` | ❌ 已占用 `0.1.0`（2026-03-21 发布） | `yunshu_0909`，是个无关项目（TokenGobbler） |
+| `ai-token-usage` | ✅ 可用（实测 404） | —— |
+| `@ai-token-report/cli` | ✅ 可用（实测 404，scoped） | —— |
+
+于是**包名与命令名分开**：包名取 `ai-token-usage` 避开占名，bin 仍叫产品名
+`ai-token-report` + 短名 `ai-token`。bin 名只在**同一个包内**才可能冲突，
+所以这两个命令名不占用任何公网资源，也不需要 npm 上是空的。
+
+### 历史：为什么更早一版叫 `dsh-token-report`
+
+平台当时只统计 DSH 的 token，包名跟着叫 `dsh-*`。`dsh-token-stats` 当时**已被占用**：
 
 | 包名 | 状态 | 拥有者 |
 |---|---|---|
 | `dsh-token-stats` | ❌ 已占用 `0.2.0` | `h1a3x`（是个 DSH 浮动面板插件，非 CLI） |
 | `dsh-token` | ⚠️ 已占用 `0.0.1` | `tudamu`，**只是占名、没有 bin** |
-| `dsh-token-report` | ✅ 可用 | —— |
+| `dsh-token-report` | ✅ 当时可用 | —— |
 
-⚠️ `dsh-*` 命名空间已经很挤：`dsh-usage` / `dsh-token-usage` / `dsh-stats` /
+⚠️ `dsh-*` 命名空间那时已经很挤：`dsh-usage` / `dsh-token-usage` / `dsh-stats` /
 `dsh-metrics` / `dsh-session-stats` / `dsh-cost` 被 **6 个不同的人**占了。
+`dsh-token` 这个 **bin 名**当时可用（对方没声明 bin），所以短命令保留。
 
-`dsh-token` 这个 **bin 名**仍然可用（对方没声明 bin），所以短命令保留。
+> 📌 采集范围早已不止 DSH（Codex / Claude Code / Trae / WorkBuddy 都在内），
+> 产品名因此从 `DSH Token` 改成 `AI Token`。历史包名 `dsh-token-report` 已发布过，
+> **不撤回**；新版本起用 `ai-token-usage`。
 
 ---
 
@@ -140,7 +157,7 @@ npm publish packages/cli/dist --dry-run
 
 # ④ 先发 rc / next，本地真装一次确认无误，再发 latest
 npm publish packages/cli/dist --tag next
-npm i -g dsh-token-report@next && dsh-token-report --period today
+npm i -g ai-token-usage@next && ai-token-report --period today
 
 npm publish packages/cli/dist          # 正式
 ```
@@ -162,7 +179,7 @@ npm publish packages/cli/dist          # 正式
 |---|---|---|
 | 1 | **License** | 产物 manifest 现在写的是 `MIT`，但**仓库里没有任何 LICENSE 文件**。公网包默认「保留所有权利」，写 `MIT` 却无正文属于名不副实。要么加一份 `LICENSE`，要么改成 `UNLICENSED` |
 | 2 | **`repository` / `homepage`** | 现在填的是 `github.com/zhujunzhujunzhu/ai-token-report`。若该仓不对外可见，等于公开内部地址 |
-| 3 | **上报的 client 名** | `packages/cli/src/deliver.ts` 上报时 `name: 'dsh-token-stats'`，而插件用的是 `dsh-token-report` —— 同一个组织在门户上会显示成两个客户端。改它会改变已上报数据的聚合口径，**没动**，等你确认 |
+| 3 | **上报的 client 名** | ✅ **已处理**：CLI 与插件现在都报 `name: 'ai-token-report'`（CLI 早先报的 `dsh-token-stats` 已作废）。实测该字段**服务端不落库**（`ingest-route.ts` 只取 `client.group` 做文本快照），所以这个改动**不会**把历史数据切两截 —— 原先「会改变聚合口径」的顾虑不成立 |
 | 4 | **README 口径** | `packages/cli/README.md` 是**面向公网用户**写的（已就位）。npm 页面显示的就是它 |
 
 ---

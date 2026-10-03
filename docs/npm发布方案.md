@@ -20,14 +20,14 @@
 |---|---|
 | registry | 公网 `registry.npmjs.org` |
 | 插件包名 | `dsh-plugin-token-report`（unscoped） |
-| License | **MIT**（与已发布的 CLI 包 `dsh-token-report` 一致） |
+| License | **MIT**（与已发布的 CLI 包 `ai-token-report` 一致） |
 | 发布形态 | **打包到 `dist/` + 手写发布清单**（§1） |
 
 ### 家族命名（现状）
 
 | 目录 | npm 包名 | 状态 |
 |---|---|---|
-| `packages/cli` | `dsh-token-report` | 已产出（`cli/scripts/build-npm.ts` → `cli/dist`） |
+| `packages/cli` | `ai-token-report` | 已产出（`cli/scripts/build-npm.ts` → `cli/dist`） |
 | `packages/dsh-plugin` | `dsh-plugin-token-report` | ✅ 本次落地（`dsh-plugin/scripts/build-npm.ts` → `dsh-plugin/dist`） |
 
 ---
@@ -156,9 +156,12 @@ packages/dsh-plugin/dist/
      → bun run publish:plugin
 ```
 
-⚠️ **名字先占**：unscoped 包名是**先到先得**，`dsh-plugin-token-report` /
-`dsh-token-report` 这类通用名建议尽早发一版占住，被抢走后只能改名，
+⚠️ **名字先占**：unscoped 包名是**先到先得**，`dsh-plugin-token-report`
+这类通用名建议尽早发一版占住，被抢走后只能改名，
 而改名会连带 `cordis.patch.yml` 的 `name`（= 客户端模块图 id）。
+
+> 📌 CLI 侧已经实测踩到这一条：`ai-token-report` 被一个无关项目占了，
+> 所以 CLI 的发布名退到 `ai-token-usage`（命令名不受影响），见 `docs/npm发布-CLI.md` §1。
 
 ⚠️ **`dsh plugin` 内部转发给 pnpm**（不是 bun）—— 这是 DSH 自己的约定，
 与本仓的 bun 铁律不冲突，但文档要对同事说清楚。

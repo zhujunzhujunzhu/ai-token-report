@@ -1,6 +1,6 @@
 # AGENTS.md
 
-DSH token 用量统计平台。四种形态：**CLI / 本地页面 / 部门看板 / DSH 插件**。
+AI token 用量统计平台。四种形态：**CLI / 本地页面 / 部门看板 / DSH 插件**。
 
 本文件是**指针与约束**，不是文档。架构细节在 `ARCHITECTURE.md`，不要在这里复述。
 
@@ -154,7 +154,7 @@ node packages/server/verify/perf/runtime-ab/ssh-exec.mjs \
 node packages/server/verify/perf/runtime-ab/ssh-exec.mjs \
   /data/ai-token-report/packages/server/runtime-ab/fixture.sh dispose
 
-# npm 发布产物（独立包 dsh-token-report）：构建 + 双运行时端到端验证
+# npm 发布产物（独立包 ai-token-usage，命令名 ai-token-report）：构建 + 双运行时端到端验证
 bun run --filter '@ai-token-report/cli' build:npm     # 产物落在 packages/cli/dist
 bun run --filter '@ai-token-report/cli' verify:npm    # ★ 发布前必跑
 
@@ -336,6 +336,18 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
 - **服务端默认只监听 `127.0.0.1`**。改 `0.0.0.0` 前必须确认凭证已配置。
 - **身份以服务端为准**：校验返回的 `name` 只可能来自数据库人员表，
   绝不回显客户端提交的内容。改动此处等于打开冒用身份的口子。
+- **🚨 两个署名填写面都只填「服务端地址 + appKey」，且写同一份连接配置**：
+  插件面板（`dsh-plugin/src/settings.ts`）与本地页「配置」弹框
+  （`web-local` + `server/src/identity-route.ts`）是同一形态 ——
+  姓名 / 分组由服务端按 appKey 解析，**界面上不许再出现这两栏输入框**
+  （填了也不作数 = 做不到的承诺）。连接配置是
+  `<dataDir>/plugin-connection.json`（`core/src/connection-store.ts`：
+  路径 / 原子写 / **合并写** 的唯一实现；本地页只动 `baseUrl` + `appKey`，
+  插件的间隔 / 位置 / 日志根一个字节都不碰）。地址优先级：
+  **页面 / 面板里存过的那份 > 部署参数 `--portal`**；
+  `GET /api/local/identity` 回报生效地址用于回填，但**绝不回传 token**。
+  地址归一化（`normalizeBaseUrl` / `endpointOf` / `baseUrlOf`）只在
+  `shared/src/portal-url.ts` 一份，插件那侧只 re-export。
 - **🚨 权限来自数据库角色关系；Bearer 权限还须与 Token scopes 取交集**。
   新上报 Token 默认仅 `identity:read` / `usage:write`，不是后台登录凭证。
   **appKey（插件 / CLI 上报用）走独立端点 `POST /api/v1/admin/members/appkey`，
@@ -441,7 +453,7 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
   - **自建计价 ≠ 财务账单**（折扣 / 预付 / 赠送额度不在单价里）；账单金额只允许出现在
     月度对账脚本里，**绝不进页面 / 接口 / CLI 输出**。
   - **离线端（本地页 / CLI / 插件）的价来自数据目录下的 `pricing.json` 快照**
-    （`dsh-token-report pricing sync --portal <根地址> --token <带 cost:read 的凭证>`
+    （`ai-token-report pricing sync --portal <根地址> --token <带 cost:read 的凭证>`
     从 `GET /api/v1/stats/pricing` 拉，写盘前用**读取方同一个解析器**回读校验）；
     没有该文件或解析失败就退回**内置种子价**并把原因写进 `note`。
     所以 `pricingSource` 只有 `'snapshot' | 'builtin'`（离线端不可能有 `'db'`），

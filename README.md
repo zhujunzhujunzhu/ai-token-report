@@ -1,6 +1,6 @@
 # AI Token Report
 
-DSH token 用量统计平台。四种形态：**命令行 / 本地页面 / 部门看板 / DSH 插件**。
+AI token 用量统计平台。四种形态：**命令行 / 本地页面 / 部门看板 / DSH 插件**。
 
 > 📖 **先读 [`ARCHITECTURE.md`](./ARCHITECTURE.md)** —— 整体结构与职责划分。
 > 口径细节见 [`docs/口径实测结论.md`](./docs/口径实测结论.md)，
@@ -93,15 +93,16 @@ node "<安装目录>\resources\app.asar.unpacked\node_modules\@deepseek-ai\dsh\l
 
 ## 身份署名
 
-**首次使用本地页面或插件时会要求填写姓名与 token**（管理员发放）。在此之前：
+**首次使用本地页面或插件时只要求填两样：部门服务端地址 + appKey**（管理员发放）。
+姓名与分组**不由用户填** —— 它们由服务端按 appKey 解析（填了也不作数）。在此之前：
 
 - ❌ 不采集、也不向任何服务端发送数据
 - ✅ 仍可查看本机统计（那是你自己的数据）
 
-填写后保存在**数据目录**下的 `identity.json`（缺省 `~/.ai-token-report/identity.json`，
-可用配置项 `dataDir` 或 `DSH_TOKEN_REPORT_DATA_DIR` 覆盖），
-**本地页与插件共用同一份**，填一次即可。
-`token` 是**身份凭证** —— 姓名以服务端凭证表为准，改本地文件无法冒用他人身份。
+填写后保存在**数据目录**下：`identity.json`（谁）+ `plugin-connection.json`（连哪台、拿什么凭证），
+缺省 `~/.ai-token-report/`，可用配置项 `dataDir` 或 `DSH_TOKEN_REPORT_DATA_DIR` 覆盖；
+**本地页与插件的「配置」是同一形态、写同一份配置**，在哪里填一次都生效。
+`appKey` 是**身份凭证** —— 姓名以服务端凭证表为准，改本地文件无法冒用他人身份。
 DSH Desktop 与命令行版 DSH **缺省就共用这份署名**（数据目录不再跟随各自的 home），
 想各用一套时才在插件配置里指 `dataDir`（**不要**改 `dshHome`），见 `packages/dsh-plugin/README.md` §1.1。
 

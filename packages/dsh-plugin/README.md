@@ -355,7 +355,7 @@ mkdir -p "$new" && mv "$old"/* "$new"/
 
 搬完核对：新目录里应当能看到 `identity.json` 与 `plugin-connection.json`；重启 DSH 后面板不再要求重新署名。
 想确认生效位置，打开「配置」→「上报调试」——诊断文本会同时打印**会话日志根**与**数据目录**。
-CLI（`dsh-token-report`）与本插件共用同一个数据目录，所以搬一次两边都恢复。
+CLI（`ai-token-report`）与本插件共用同一个数据目录，所以搬一次两边都恢复。
 
 ### 0.3.0 启动报 duplicate loader entry id: token-report
 
@@ -410,7 +410,7 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 ④ 界面面板   输入框上方的用量条 + 标题栏徽章          ← 人直接看
 ```
 
-四种形态与 CLI `dsh-token`、本地页面走**同一套聚合与同一套口径**，
+四种形态与 CLI `ai-token`、本地页面走**同一套聚合与同一套口径**，
 所以「工具报的数」「面板上的数」「终端里的数」必然一致。
 
 ---
@@ -425,7 +425,7 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
   # 按正式插件 bundle 已提供的 ID 覆盖配置；不重复 insert，也不覆盖包名。
   config:
     # ── 全局配置 ────────────────────────────────────────────────
-    name: dsh-token-report                      # 插件实例名，同时上报为 client.name
+    name: ai-token-report                      # 插件实例名，同时上报为 client.name
     appKey: !!js `process.env.ATR_APP_KEY`      # ★ 上报凭证，走 Authorization: Bearer
     endpoint: https://portal.example.com/api/v1/token-usage   # 计费上报地址
 
@@ -531,7 +531,7 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 
 | 项 | 默认 |
 |---|---|
-| `name` | `dsh-token-report` |
+| `name` | `ai-token-report` |
 | `endpoint` | `http://127.0.0.1:8787/api/v1/token-usage` |
 | `batch.maxRecords` | `50` |
 | `batch.flushIntervalMillis` | `10000` |
@@ -568,7 +568,7 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 不是漏扫。本机实测：两个 home 共 254 个会话（不是 478）。
 
 「到底读了哪几处」是**可见**的，不会只给你一个数字：插件诊断文本列出全部根；
-`dsh-token stats --discover` 逐个候选打印会话数与最新写入；**本地页面**（`dsh-token --web`）
+`ai-token stats --discover` 逐个候选打印会话数与最新写入；**本地页面**（`ai-token --web`）
 在指标卡下方显示「数据来源：N 个 DSH 的会话日志，按并集统计」，鼠标悬停能看到逐条根路径。
 ⚠️ 本地页面**刻意不显示**「以下会话日志根不存在，已跳过」那一条（曾经有，已去掉）——
 来源缺省是全部已注册来源，没装 Trae CN / Codex 这类「本来就没有」的根每次都会命中，
@@ -860,7 +860,7 @@ Remove-Item "$env:USERPROFILE\.dsh\token-report\outbox" -Recurse -Force
 输出里 **四项 token 分列**，且缓存命中率带口径说明：
 
 ```
-DSH token 用量  |  最近 30 天（自然日）
+AI token 用量  |  最近 30 天（自然日）
 数据来源  直扫会话日志
 耗时      11196ms
 
@@ -881,7 +881,7 @@ outbox 满），看板上少了几个人的数据而没人发现：
 
 ```
 === token 上报链路诊断 ===
-  插件名      dsh-token-report
+  插件名      ai-token-report
   上报地址    https://portal.example.com/api/v1/token-usage
   凭证        已配置（不回显）
   ...
@@ -943,7 +943,7 @@ svc.signed()                                            // → 身份是否就�
               ↓  DSH 的 /api 前缀先做 Host/Origin 栅栏 + 浏览器鉴权
 宿主半    ctx.connection.fetch.register(...)  精确 Fetch 路由
               ↓
-          queryUsage()   ← 与 CLI `dsh-token`、`token_usage` 工具**同一个函数**
+          queryUsage()   ← 与 CLI `ai-token`、`token_usage` 工具**同一个函数**
 
 浏览器半  fetch('/api/tokenReport.stats?period=today&view=detail&by=session&page=1&pageSize=10')
               ↓  打开详情后才查询选定分组、当前页及趋势
@@ -1073,7 +1073,7 @@ Windows 文件监听先解析真实路径，避免 8.3 短路径或目录联接�
 | 机制 | 周期 | 代价 |
 |---|---|---|
 | 代次探针（`?gen=N`） | 3 秒 | 宿主只比一个整数；没变就回 `204`，零载荷、零查询、页面零重渲染 |
-| 兜底全量取数 | 120 秒 | 真查一次，兜住**库外**的变化（别的 DSH 实例、CLI `dsh-token`） |
+| 兜底全量取数 | 120 秒 | 真查一次，兜住**库外**的变化（别的 DSH 实例、CLI `ai-token`） |
 | 用户动作 | 立即 | 切周期 / 改区间 / 点刷新 / **从后台切回前台**；后台标签页完全不取数 |
 
 代次由宿主的上报器计数（本进程每采集到一条计费记录 +1），因此**上报未启用时它恒为 0**，
@@ -1260,7 +1260,7 @@ bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败
 {
   "authorization": "Bearer <appKey>",
   "schemaVersion": 1,
-  "client": { "name": "dsh-token-report", "userId": "张三", "userName": "张三", "group": "研发一部" },
+  "client": { "name": "ai-token-report", "userId": "张三", "userName": "张三", "group": "研发一部" },
   "records": [{
     "event_id": "session-63fe9359-...:17",
     "session_id": "session-63fe9359-...",
@@ -1357,7 +1357,7 @@ bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| 启动日志说「尚未署名」 | 没有身份文件 | 跑 `dsh-token --web` 在页面里填，或配 `config.user` |
+| 启动日志说「尚未署名」 | 没有身份文件 | 跑 `ai-token --web` 在页面里填，或配 `config.user` |
 | 启动日志说「未配置上报凭证」 | 没配 `appKey` | 配 `appKey` 或 `DSH_TOKEN_REPORT_APP_KEY` |
 | 看板上没有我的数据 | 凭证过期 / 地址改了 / outbox 满 | 先看配置页「上报调试」页签（状态 + 原因 + 最近请求与回执），再跑 `token_usage_diagnostics` 看 `lastError` 与 `磁盘待投递` |
 | 数据目录下（缺省 `~/.ai-token-report/outbox`）目录不存在 | 上报后端从未构造（未署名 / 没 appKey / `features.reporting: false`） | 看启动日志给的原因；这是**预期行为**不是故障 |

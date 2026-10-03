@@ -48,7 +48,7 @@ bun run build:npm:cli && bun run verify:npm:cli              双运行时全绿�
 
 | | 本机库 `usage.sqlite` | 部门上报库 |
 |---|---|---|
-| 谁在用 | 员工机器上的 `dsh-token --web` | 集中部署的部门服务端 |
+| 谁在用 | 员工机器上的 `ai-token --web` | 集中部署的部门服务端 |
 | 能不能有外部依赖 | 🚨 **不能** —— 单机自足、断网可用是这套 CLI 的前提 | 能（它本来就跑在服务器上） |
 | 后端 | **恒为 SQLite** | 默认 SQLite，配了 `ATR_MYSQL_URL` 就切 MySQL |
 
