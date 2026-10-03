@@ -35,7 +35,7 @@ import { openPortalStore, inspectPortalDatabase, preparePortalDatabase, migrateP
 import { openRawPortalStore } from '../src/db/portal-connection.js'
 import { insertAttributedRecords, insertAttributedRecordsInTransaction, type IngestRecord } from '../src/db/ingest.js'
 import { PORTAL_MYSQL_V4_SQL, PORTAL_SQLITE_V4_SQL, PORTAL_MYSQL_V4_INGEST_SQL, PORTAL_SQLITE_V4_INGEST_SQL, portalSchemaChecksumV4, portalSchemaStatementsV4 } from '../src/db/portal-schema-v4.js'
-import { PORTAL_MYSQL_V5_SQL, PORTAL_SQLITE_V5_SQL, PORTAL_SCHEMA_VERSION, portalSchemaChecksumV6, portalSchemaStatements } from '../src/db/portal-schema-v5.js'
+import { PORTAL_MYSQL_V5_SQL, PORTAL_SQLITE_V5_SQL, PORTAL_SCHEMA_VERSION, PORTAL_SOURCE_COLUMN, portalSchemaChecksumV6, portalSchemaStatements } from '../src/db/portal-schema-v5.js'
 import { closeAllMysqlBackends, openMysqlBackend } from '../src/db/mysql.js'
 import { canonicalCheck } from '../src/db/portal-catalog.js'
 import { ensurePortalReady } from '../src/db/portal-migrations.js'
@@ -52,10 +52,14 @@ const legacyDDL = `CREATE TABLE usage_event (event_id VARCHAR(255) NOT NULL PRIM
 /**
  * 造一个真 v3 老库（本机库 v3 与 portal v3 的 `usage_event` 同形）。
  *
- * ⚠️ `ensureSchema()` 会设 `PRAGMA user_version=3` —— 这正是迁移入口判定 legacy 的依据。
+ * ⚠️ `user_version=3` 是 **portal** 的版本号（迁移入口判定 legacy 的依据），
+ *   与**本地库**的 `DB_SCHEMA_VERSION`（会随本地库结构变）**没有任何关系**。
+ *   所以这里建完表后**显式**把它设成 3，而不是依赖 `ensureSchema()` 顺手写下的值 ——
+ *   后者一升版本（P2 加 `source` 列时就是），这个夹具就会被判成「不是 legacy」，
+ *   表现是三条迁移用例同时失败，而根因完全在别处。
  */
 async function createLegacy(t: PortalTarget): Promise<void> {
-  if (!t.mysqlUrl) { const db = openDb(t.sqlitePath); ensureSchema(db); db.close() }
+  if (!t.mysqlUrl) { const db = openDb(t.sqlitePath); ensureSchema(db); db.exec('PRAGMA user_version=3'); db.close() }
   const store = await openRawPortalStore(t)
   try {
     if (t.mysqlUrl) await store.exec(legacyDDL)
@@ -232,12 +236,12 @@ test('v5 运行时 SQL 与设计契约逐字一致，v4 基线仍逐字冻结', 
   expect(PORTAL_SQLITE_V4_SQL).toBe(readFileSync(join(repoRoot, 'docs/database-v4/schema.sqlite.sql'), 'utf8'))
   expect(PORTAL_MYSQL_V4_SQL).toBe(readFileSync(join(repoRoot, 'docs/database-v4/schema.mysql.sql'), 'utf8'))
 })
-test('SQLite 新库 v8、FULL、25 表及旧诊断表', async () => {
+test('SQLite 新库 v9、FULL、25 表及旧诊断表', async () => {
   const t = target()
   const info = await preparePortalDatabase(t)
   expect(info.status).toBe('current')
   expect(info.version).toBe(PORTAL_SCHEMA_VERSION)
-  // ★ v8 = v7 的 21 张表 + 三张汇总表 + 汇总元数据表（实跑确认，不是照抄文档）。
+  // ★ v9 = v8 的 25 张表（v9 只给 usage_event 加一列，不建表）。
   expect(info.tables.length).toBe(25)
   expect(info.tables).toContain('member_groups')
   expect(info.tables).toContain('member_group_assignments')
@@ -408,7 +412,11 @@ test('SQLite v4→v5：分组改名、归属搬进关联表、权限码保 ID、
     // d. 单值分组列两处都被删掉，快照列改名 group_name。
     expect((await after.all<{ name: string }>('PRAGMA table_info(members)')).map(row => row.name)).not.toContain('department_id')
     const eventColumns = (await after.all<{ name: string }>('PRAGMA table_info(usage_event)')).map(row => row.name)
-    expect(eventColumns).toHaveLength(20)
+    // v5 的受控定义是 20 列；**v9 又加了 `source`**（这条用量是哪个客户端写的），
+    // 所以 v4→当前版本的迁移终态是 21 列。这个数字是刻意的门槛：
+    // 多一列少一列都要有人回来看一眼（列数对得上但列定义不对由后面的逐列核对拦）。
+    expect(eventColumns).toHaveLength(21)
+    expect(eventColumns).toContain('source')
     expect(eventColumns).not.toContain('department_id')
     expect(eventColumns).not.toContain('dept')
     expect(eventColumns).toContain('group_name')
@@ -739,10 +747,15 @@ describe.skipIf(!process.env.ATR_V4_TEST_MYSQL_URL)('真实隔离 MySQL v5', () 
       const memberColumns = (await store.all<{ name: string }>("SELECT column_name AS name FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='members'")).map(row => row.name)
       expect(memberColumns).not.toContain('department_id')
       const eventColumns = (await store.all<{ name: string }>("SELECT column_name AS name FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='usage_event'")).map(row => row.name)
-      expect(eventColumns).toHaveLength(20)
+      // ★ 21 列 = v5 的 20 列 + v9 的 `source`（迁移链一路走到当前版本）。
+      //   ⚠️ 这条与 SQLite 分支那一条是**两个方言各一份**：只改一处时，
+      //   `bun test`（没有 MySQL 连接时整段 skip）全绿，而真实 MySQL 上必炸
+      //   （2026-10-03 实测：Received length: 21）。
+      expect(eventColumns).toHaveLength(21)
       expect(eventColumns).not.toContain('department_id')
       expect(eventColumns).not.toContain('dept')
       expect(eventColumns).toContain('group_name')
+      expect(eventColumns).toContain(PORTAL_SOURCE_COLUMN)
       expect(await store.all('SELECT event_id,group_name FROM usage_event ORDER BY BINARY event_id')).toEqual([
         { event_id: 'v4:1', group_name: '分组A' },
         { event_id: 'v4:2', group_name: '分组B' },
