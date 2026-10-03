@@ -65,7 +65,7 @@ import {
   ingestMomentQuery,
   mapCostRows,
   mapGroupRows,
-  mapRecordProvider,
+  mapRecordNames,
   projectGroupsQuery,
   projectSessionsQuery,
   recordProjection,
@@ -915,8 +915,7 @@ export class PortalStatsSession {
   }
 
   /** 数据的时间边界。NULL 必须保持 null（见 `numOrNull`）。 */
-  async timeBounds(): Promise<{ earliest: number | null; latest: number | null }> {
-    const q = timeBoundsQuery(this.#filter, this.#normalize)
+  async timeBounds(): Promise<{ earliest: number | null; latest: number | null }> {    const q = timeBoundsQuery(this.#filter, this.#normalize)
     const row = await this.#store.get<{ lo: unknown; hi: unknown }>(q.sql, q.params)
     return { earliest: numOrNull(row?.lo), latest: numOrNull(row?.hi) }
   }
