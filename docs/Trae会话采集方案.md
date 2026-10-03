@@ -253,7 +253,7 @@ bun run stats -- --source trae --source trae-cn --by source-provider-model
 | CLI `--source trae` / `--source all` | ✅ | 库路径与直扫路径同数 |
 | CLI **缺省**（不给 `--source`） | ✅（2026-10-03 起） | 缺省已翻成**全部已注册来源**（想回到旧口径：`--source dsh`）。逐个去掉用 `--no-trae` 或 `DSH_TOKEN_REPORT_TRAE=0` |
 | 本地页面 `/api/local/*`（`bun run web`） | ✅ | 一直按 `resolveSourceRoots()` **全部来源**取数 |
-| **DSH 插件面板** | ✅（要显式开） | 面板**缺省只统计 DSH**；在配置（或面板齿轮里的「其它来源」）写 `extraSources: [trae]` 即并入。默认关是刻意的：并进来意味着面板每次取数都去增量扫那些日志（本机 Codex 有 1,495 个文件 / 2.8 GB） |
+| **DSH 插件面板** | ✅（缺省就算，也一起上报） | 面板、`token_usage` 工具与**历史补报**都按 `resolveSourceRoots()` 的**全部已注册来源**取数，**不需要任何配置**（0.8.0 起；旧的 `extraSources` 白名单已废弃，写了会在启动日志里告警）。代价是首次取数与首轮补报要冷扫那些日志（本机 Codex 有 1,495 个文件 / 2.8 GB），之后按文件字节数增量；要收窄只能用来源自己的环境开关（`DSH_TOKEN_REPORT_TRAE=0`） |
 | 部门看板 | ❌（未接通） | `report` 只按 DSH 的会话根扫描（`runReportCommand(opts, paths.sessionsRoots)`），`--source` 对它无效 —— 多客户端上报还没接（见 §6 Q10） |
 
 ⚠️ `packages/cli/dist/cli.js`（发布产物）与源码**不是同一份东西**：它是构建时刻的快照，
@@ -284,10 +284,11 @@ bun run stats -- --source trae --trae-home <夹具>/Trae --data-dir <夹具>/dat
 （它的 `DB_SCHEMA_VERSION` 是旧的）每次取数都会把库**重建**回旧版本，而新代码下一次又建回来。
 其它来源的行能在重建后从日志重扫回来，**Trae 的行不能** —— 它的日志那时已经不存在了。
 所以：**升级插件后第一件事是重启 DSH**，让它加载新 bundle（`packages/dsh-plugin/lib/*`；
-不重启的表现是「面板里没有新那栏『其它来源』」+ 库在 v3/v4 之间来回抖）。
+不重启的表现是「面板里还是旧口径」+ 库在 v3/v4 之间来回抖）。
 
 **③ 想让 Trae 的用量稳定留下来，只有一条路：在日志还活着的时候 ingest。**
-可行的三种频率（从密到疏）：面板开着（30 秒一轮，`extraSources: [trae]`）→
+可行的三种频率（从密到疏）：插件面板开着（30 秒一轮；0.8.0 起缺省就含全部来源，
+不必再配 `extraSources`）→
 计划任务跑 `bun run stats -- --source trae`（分钟级）→ 每次用完 Trae 手动跑一次。
 **没有**任何「事后补采」的办法：日志没了就是没了（§6 Q4 的现场记录）。
 
