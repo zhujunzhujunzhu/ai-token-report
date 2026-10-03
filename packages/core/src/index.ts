@@ -17,6 +17,7 @@
  * | `types.ts` | 用量与计费记录类型 |
  * | `home.ts` | DSH home / 会话日志根 / token-report **数据目录**的路径解析 |
  * | `identity-store.ts` | 本地身份存储 |
+ * | `connection-store.ts` | 本机连接配置（服务端地址 + appKey，插件与本地页共用） |
  * | `db/` | ★ 本地 SQLite 增量库（**独立入口**，见下） |
  *
  * HTTP 投递（`deliver.ts`）与上报编排（`report.ts`）**不在 core**——
@@ -42,6 +43,8 @@ export const CORE_VERSION = '0.1.0'
 
 export * from './home.js'
 export * from './identity-store.js'
+// 本机连接配置（服务端地址 + appKey + 插件偏好）：插件面板与本地页配置共用一份
+export * from './connection-store.js'
 
 // S1 阶段迁入：先原样搬，不改逻辑
 export * from './decode.js'

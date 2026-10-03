@@ -52,16 +52,19 @@
  * ⚠️ 就地生效失败**不回滚**文件：文件是对的，只是这个进程还没换过来；
  *   下次启动会读到它。响应里的 `restartRequired` 会如实说这一点。
  */
-import { mkdirSync, readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs'
-import { dirname, join } from 'node:path'
-import { randomUUID } from 'node:crypto'
 import {
   DSH_HOME_ENV,
   DSH_HOMES_ENV,
+  connectionCredentialOf,
+  connectionFileIn,
+  readConnectionFile,
+  readConnectionText,
   readIdentity,
   registeredSources,
+  writeConnectionText,
   writeIdentity,
 } from '@ai-token-report/core'
+import { baseUrlOf, endpointOf, normalizeBaseUrl, INGEST_PATH, VERIFY_PATH } from '@ai-token-report/shared'
 import {
   parseUiPosition,
   UI_POSITIONS,
@@ -72,10 +75,14 @@ import type { EffectiveConfig, RawConfig } from './config.js'
 import { reportPaths, type PathInput } from './paths.js'
 import { planExtraSources } from './extra-sources.js'
 
-/** 上报路径（`baseUrl` + 它 = `config.endpoint`）。 */
-export const INGEST_PATH = '/api/v1/token-usage'
-/** 身份校验路径（`baseUrl` + 它）。 */
-export const VERIFY_PATH = '/api/v1/identity/verify'
+/**
+ * 上报路径与身份校验路径（`baseUrl` + 它们 = 完整地址）。
+ *
+ * ★ 定义搬到了 `@ai-token-report/shared`：本地页的「配置」弹框
+ *   （`server/src/identity-route.ts`）用的是**同一个**服务端地址口径。
+ *   这里只做 re-export，保持插件对外的 import 路径不变。
+ */
+export { INGEST_PATH, VERIFY_PATH, baseUrlOf, endpointOf, normalizeBaseUrl }
 
 /**
  * 定时冲刷间隔的允许范围。
@@ -243,58 +250,15 @@ export function dshHomesSourceOf(input: {
 }
 
 /**
- * 本机连接偏好的落盘路径。
+ * 本机连接偏好的落盘路径 —— **与本地页的「配置」弹框共用同一份**
+ * （`core/connection-store.ts` 的 `plugin-connection.json`）。
  *
  * ⚠️ 与身份文件同目录（= token-report **数据目录**，不是 `dshHome`）：
  *   两者必须一起被共用或一起被隔离，否则会出现「实名来自 A 目录、
  *   凭证来自 B 目录」这种自相矛盾的署名（见 `paths.ts`）。
  */
 function connectionPath(target?: PathInput): string {
-  return join(reportPaths(target).dataDir, 'plugin-connection.json')
-}
-
-/**
- * 把用户填的地址归一成**服务端根地址**。
- *
- * 刻意宽容：容错比「格式不对，请重填」有用得多 ——
- * 用户从浏览器地址栏复制的是 `http://host:8787/`，从文档复制的是
- * `http://host:8787/api/v1/token-usage`，两者都该能用。
- * 唯一不能含糊的是**协议与凭证**：非 HTTP(S)、带账号密码、带查询串或片段
- * 一律拒绝（后者会让「上报地址」变成一个可被外部控制的跳转）。
- */
-export function normalizeBaseUrl(raw: string): string {
-  const url = new URL(raw.trim())
-  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
-    throw new Error('服务端地址必须是不含账号、查询参数或片段的 HTTP(S) 地址')
-  }
-  // 贴心的反向做法：用户把完整上报地址粘进来时，替他把接口后缀去掉。
-  // ⚠️ 只剥这几个**已知**后缀；其它路径前缀（反代挂在 /token-report 下）
-  //    必须保留，否则会把合法部署改写成根路径。
-  for (const suffix of [INGEST_PATH, '/api/v1', '/api']) {
-    if (url.pathname === suffix || url.pathname === `${suffix}/`) {
-      url.pathname = '/'
-      break
-    }
-    if (url.pathname.endsWith(suffix)) {
-      url.pathname = url.pathname.slice(0, -suffix.length) || '/'
-      break
-    }
-  }
-  return url.toString().replace(/\/+$/, '')
-}
-
-/** 根地址 → 上报地址（`config.endpoint` 的形状）。 */
-export function endpointOf(baseUrl: string): string {
-  return normalizeBaseUrl(baseUrl) + INGEST_PATH
-}
-
-/** 上报地址 → 根地址（读旧版配置文件用）。坏值原样返回，由面板显示出来让用户改。 */
-export function baseUrlOf(endpoint: string): string {
-  try {
-    return normalizeBaseUrl(endpoint)
-  } catch {
-    return endpoint
-  }
+  return connectionFileIn(reportPaths(target).dataDir)
 }
 
 /**
@@ -308,21 +272,31 @@ export function baseUrlOf(endpoint: string): string {
  *   用户选过的偏好也该被记住。凭证本身仍然要求「地址 + 密钥」成对才认。
  */
 export function readConnection(target?: PathInput): Partial<SavedConnection> {
+  // 文件不存在（没配过）不是问题；坏了 / 读不了必须**说出来** ——
+  // 否则在用户眼里就是「我明明配过，配置自己没了」。
+  const read = readConnectionFile(connectionPath(target))
+  if (read.value === null) {
+    if (read.error !== undefined) {
+      console.warn(`token-report: 本地连接配置不可用（${read.error}），已回退部署配置`)
+    }
+    return {}
+  }
+
+  const value = read.value
   try {
-    const value = JSON.parse(readFileSync(connectionPath(target), 'utf8')) as Record<string, unknown>
     const out: Partial<SavedConnection> = {}
     const interval = parseFlushInterval(value['flushIntervalMillis'])
     if (interval !== undefined) out.flushIntervalMillis = interval
     const position = parseUiPosition(value['position'])
     if (position !== undefined) out.position = position
 
-    if (typeof value['appKey'] === 'string' && value['appKey']) {
-      if (typeof value['baseUrl'] === 'string' && value['baseUrl']) {
-        out.baseUrl = normalizeBaseUrl(value['baseUrl'])
-      } else if (typeof value['endpoint'] === 'string' && value['endpoint']) {
-        out.baseUrl = baseUrlOf(value['endpoint'])
-      }
-      if (out.baseUrl) out.appKey = value['appKey']
+    // ★ 地址与凭证**成对才认**（旧 `{ endpoint, appKey }` 也认，见
+    //   `connectionCredentialOf`）。半份连接会让「连哪台」与「我是谁」分叉。
+    //   ⚠️ 地址非法时 `connectionCredentialOf` 会抛错 —— 整份回退（与改动前一致）。
+    const credential = connectionCredentialOf(value)
+    if (credential) {
+      out.baseUrl = credential.baseUrl
+      out.appKey = credential.appKey
     }
 
     // ★ 会话日志根是**纯本机偏好**：即使凭证还没配（或凭证不成对）也必须留下 ——
@@ -347,10 +321,10 @@ export function readConnection(target?: PathInput): Partial<SavedConnection> {
       }
     }
     return out
-  } catch (err) {
-    if ((err as { code?: string }).code !== 'ENOENT') console.warn('token-report: 本地连接配置损坏，已回退部署配置')
+  } catch {
+    console.warn('token-report: 本地连接配置损坏，已回退部署配置')
+    return {}
   }
-  return {}
 }
 
 /**
@@ -386,15 +360,18 @@ export function withSavedConnection(raw: RawConfig): RawConfig {
   return next
 }
 
+/**
+ * 原子写连接配置（0600）。
+ *
+ * ★ 实现在 `core/connection-store.ts` —— 本地页的「配置」弹框写的是**同一个文件**，
+ *   两处各有一份「怎么写」的实现必然会漂移（权限、临时文件、rename 的原子性），
+ *   而漂移的症状是「用本地页保存过之后，插件读不出来了」。
+ */
 function atomicWrite(path: string, text: string): void {
-  mkdirSync(dirname(path), { recursive: true })
-  const temp = `${path}.${randomUUID()}.tmp`
-  try {
-    writeFileSync(temp, text, { mode: 0o600 })
-    renameSync(temp, path)
-  } finally {
-    rmSync(temp, { force: true })
-  }
+  const written = writeConnectionText(path, text)
+  // 旧调用点没有处理写失败的分支（`writeFileSync` 会抛）。这里保持「失败就抛」，
+  // 让 `createSettingsHandler` 那层既有的 catch 把它变成一句可展示的原因。
+  if (!written.ok) throw new Error(written.reason ?? '本机连接配置写入失败')
 }
 
 /**
@@ -688,9 +665,11 @@ export function createSettingsHandler(
         return json({ ok: false, reason: typeof verified?.reason === 'string' ? verified.reason : '服务端未返回有效署名，未保存配置' })
       }
 
-      let previousText: string | undefined
-      try { previousText = readFileSync(path, 'utf8') } catch (err) {
-        if ((err as { code?: string }).code !== 'ENOENT') throw err
+      // 回滚用的原内容。读不了（权限 / 目录被占）时**拒绝继续**：
+      // 写下去就等于拿一份不知道自己覆盖了什么的东西盖掉用户的配置。
+      const previousRaw = readConnectionText(path)
+      if (previousRaw.error !== undefined) {
+        return json({ ok: false, reason: `本机连接配置读不了（${previousRaw.error}）；请检查该文件后重试` })
       }
       atomicWrite(path, JSON.stringify(saved))
       // ★ 身份文件里的 token 就是 appKey：本地页与 CLI 上报读的是同一份，
@@ -701,8 +680,8 @@ export function createSettingsHandler(
         ...(verifiedGroup(verified) ? { group: verifiedGroup(verified) } : {}),
       })
       if (!result.ok) {
-        if (previousText !== undefined) atomicWrite(path, previousText)
-        else rmSync(path, { force: true })
+        // 本来就没有这份文件时，「回滚」= 删掉它（传 null）
+        writeConnectionText(path, previousRaw.text)
         return json({ ok: false, reason: '署名保存失败，连接设置已回退，请检查目录权限' })
       }
 
