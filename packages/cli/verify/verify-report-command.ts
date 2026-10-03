@@ -12,7 +12,7 @@ import { createServer, type ServerHandle } from '@ai-token-report/server'
 import { preparePortalDatabase } from '@ai-token-report/core/db'
 import { IdentityRepository } from '../../server/src/identity/repository.js'
 import { loadState, writeIdentity } from '@ai-token-report/core'
-import { cleanChildEnv, resolveNodeBin } from '../../core/verify/lib/runtime.js'
+import { pinnedSourceEnv, resolveNodeBin } from '../../core/verify/lib/runtime.js'
 
 const packageMode = process.argv.includes('--package')
 const pkg = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -22,7 +22,15 @@ if (packageMode && !node) throw new Error('发布产物验证需要真实 Node')
 const runtimes = packageMode ? [['Node', node!], ['Bun', process.execPath]] : [['源码 Bun', process.execPath]]
 const fixture = mkdtempSync(join(tmpdir(), 'atr-cli-command-'))
 const token = 'atr-cli-fixture-token'
-const env = cleanChildEnv()
+/**
+ * 子进程环境：**钉住本次读哪些来源**（`pinnedSourceEnv()`）。
+ *
+ * 🚨 不钉的话，`report` 的缺省来源是**全部已注册来源**，子进程会去冷扫开发者
+ *   真实的 `~/.codex` / `~/.claude` / Trae / `~/.workbuddy`（本机实测 1530 个文件、
+ *   59,363 条用量、10.1 秒 > 下面的 5 秒超时）—— 而失败的样子不是报错：
+ *   状态文件从未落盘，9 条断言全错，最后停在 ENOENT 上。
+ */
+const env = pinnedSourceEnv()
 for (const key of Object.keys(env)) {
   if (key.startsWith('DSH_REPORT_') || key.startsWith('ATR_')) delete env[key]
 }
@@ -69,9 +77,16 @@ async function run(bin: string, home: string, args: string[]): Promise<{ code: n
     stdout: 'pipe', stderr: 'pipe', env,
   })
   // 响应头已到但 body 永不结束时也要能失败；上限只用于回归脚本防挂死。
-  const timer = setTimeout(() => proc.kill(), 5000)
+  //
+  // ⚠️ 被杀掉时必须**说出来**：超时的症状是「状态文件没落盘 ⇒ 后面每条断言都错 ⇒
+  //   最后炸在读 state.json 的 ENOENT 上」，与真正的原因（这一轮太慢）看不出关系。
+  //   本机实测过一次这种误归因：真实原因是子进程在冷扫开发者真实的 Codex / Claude /
+  //   Trae / WorkBuddy 日志（见 `pinnedSourceEnv()` 的注释）。
+  let killed = false
+  const timer = setTimeout(() => { killed = true; proc.kill() }, 5000)
   try {
     const [code, out, err] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()])
+    if (killed) process.stderr.write(`⚠ CLI 进程超过 5000ms 未结束，已被脚本杀掉（args: ${args.join(' ')}）\n`)
     return { code, out: out + err }
   } finally { clearTimeout(timer) }
 }

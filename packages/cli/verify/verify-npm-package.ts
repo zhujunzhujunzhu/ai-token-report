@@ -35,8 +35,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { registeredSources } from '@ai-token-report/core'
-import { cleanChildEnv, resolveNodeBin } from '../../core/verify/lib/runtime.js'
+import { cleanChildEnv, pinnedSourceEnv, resolveNodeBin } from '../../core/verify/lib/runtime.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const pkgRoot = resolve(here, '..')
@@ -140,22 +139,12 @@ process.stdout.write(`  fixture: ${fixture}\n`)
  *   `~/.claude` / `~/.codex`，把真实用量**写进 fixture 的库**，
  *   页码与 CLI 对不上（实测差 4 倍），而且**看起来像口径 bug**，其实是隔离失效。
  *   真值仍在 fixture 的日志里，这里只是把「本次要读哪些来源」钉死。
+ *
+ * 实现只有一份（`core/verify/lib/runtime.ts` 的 `pinnedSourceEnv()`），
+ * 与 `verify-report-command.ts` 共用：两份手抄的来源名单必然漂移，
+ * 而漂移的症状正是「某个脚本悄悄读了开发者真实的日志」。
  */
-function pinnedEnv(): Record<string, string> {
-  const env: Record<string, string> = {
-    ...cleanChildEnv(),
-    // DSH 侧同理：会话日志根默认**自动发现**，不钉住就会连带扫真实 home。
-    DSH_TOKEN_REPORT_DISCOVER: '0',
-  }
-  // ★ 关闭开关**由适配器自己声明**（`SessionSourceAdapter.disableEnv`），不在这里手抄名单：
-  //   CLI 的缺省现在是**全部已注册来源**，每加一个来源就要回来补一行 ——
-  //   漏一行的症状正是这个脚本最怕的那种：开发者的真实用量被写进 fixture 的库，
-  //   于是「CLI 与本地页是不是同一个数」的比对差几倍，而看起来像口径 bug。
-  for (const adapter of registeredSources()) {
-    if (adapter.disableEnv !== undefined) env[adapter.disableEnv] = '0'
-  }
-  return env
-}
+function pinnedEnv(): Record<string, string> { return pinnedSourceEnv() }
 
 /** 跑一次 CLI，返回退出码与合并输出。 */
 function runCli(bin: string, args: string[]): { code: number; out: string } {

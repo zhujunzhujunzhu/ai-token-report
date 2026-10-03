@@ -8,6 +8,8 @@
 import { existsSync } from 'node:fs'
 import { join, delimiter } from 'node:path'
 
+import { registeredSources } from '../../src/sources/registry.js'
+
 /** 当前进程是否跑在 Bun 上。 */
 export function isBunRuntime(): boolean {
   return typeof (globalThis as { Bun?: unknown }).Bun !== 'undefined'
@@ -69,6 +71,39 @@ export function cleanChildEnv(): Record<string, string> {
     if (lower === 'node_use_env_proxy') continue
     if (lower === 'http_proxy' || lower === 'https_proxy' || lower === 'all_proxy') continue
     env[key] = value
+  }
+  return env
+}
+
+/**
+ * 子进程环境：**钉住「本次读哪些来源」**，只留下命令上显式给的那些根。
+ *
+ * 🚨 为什么每个 spawn CLI 的验证脚本都必须调用它：CLI 的缺省来源是
+ *   **全部已注册来源**（Codex / Claude Code / Trae 国际版与国内版 / WorkBuddy），
+ *   于是「只给了 `--dsh-home <临时目录>`」的脚本会连带冷扫开发者**真实的**
+ *   `~/.codex` / `~/.claude` / `%APPDATA%\Trae` / `~/.workbuddy`，而失败的样子
+ *   **不是报错**：
+ *   2026-10-04 实测 `verify-report-command.ts` 因此解析了 1530 个真实文件、
+ *   多出 59,363 条真实用量（10.1 秒 > 脚本的 5 秒超时被杀）⇒ 状态文件从未落盘，
+ *   从「共享 identity.json 可直接完成上报」起的 9 条断言**全部**失败，
+ *   最后停在「读不到 state.json」的 ENOENT 上 —— 与真正的原因毫无关系。
+ *   除此之外它还读了**不该读的目录**（与「未署名 = 不采集」是同一条精神）。
+ *
+ * 关闭开关**由适配器自己声明**（`SessionSourceAdapter.disableEnv`），这里只遍历注册表：
+ * 每加一个来源不必回来补一行 —— 漏一行的症状正是上面那两种。
+ * `DSH_TOKEN_REPORT_DISCOVER=0` 是 DSH 侧的对应物（关掉 home 自动发现）；
+ * DSH 自身**没有**关闭开关（它就是被测的那个来源），所以显式跳过它 ——
+ * 将来真给它加一个 `disableEnv` 时，这里不至于把 fixture 自己的日志一起关掉。
+ *
+ * ⚠️ `packages/cli/test/child-env.ts` 的 `pinnedChildEnv()` 是同一条规则的
+ *   **单测侧**实现（单测不 import verify 代码，故两份都保留）。
+ */
+export function pinnedSourceEnv(): Record<string, string> {
+  const env = cleanChildEnv()
+  env['DSH_TOKEN_REPORT_DISCOVER'] = '0'
+  for (const adapter of registeredSources()) {
+    if (adapter.id === 'dsh') continue
+    if (adapter.disableEnv !== undefined) env[adapter.disableEnv] = '0'
   }
   return env
 }
