@@ -17,6 +17,26 @@ const server = await createServer({
   optimizeDeps: { noDiscovery: true },
 })
 const failures: string[] = []
+/**
+ * ★ 收集 Vue 的「组件没解析出来」告警：**漏 import 必须在这里现形**。
+ *
+ * 看板与本地页都**没有** `app.use(ElementPlus)`、也没有 unplugin 自动导入 ——
+ * 每个 SFC 必须显式 import 自己用到的 `ElXxx`。漏一个的症状是运行时
+ * `Failed to resolve component: el-xxx`，Vue 把标签当自定义元素原样画出去
+ * （下拉 / 表格整块失效）。而它**不一定抛错**：只有当那个组件的子组件要求注入时
+ * （例如 `el-option` 找不到 `el-select`）才会炸；`el-tag` 这种没有注入依赖的
+ * 漏掉之后页面看着一切正常，只有那个控件不动 —— 于是一路走到发布流水线。
+ * 2026-10-04 实测：v12 顺手删掉了 `ProvidersView.vue` import 里的 `ElSelect`
+ * （模板里还留着 5 处 `<el-select>`），本该由这条断言拦下。
+ */
+const unresolved = new Set<string>()
+const originalWarn = console.warn
+console.warn = (...args: unknown[]) => {
+  const text = args.filter((arg): arg is string => typeof arg === 'string').join(' ')
+  const match = /Failed to resolve component: ([\w-]+)/.exec(text)
+  if (match) unresolved.add(match[1]!)
+  originalWarn(...args)
+}
 function check(label: string, condition: boolean): void {
   console.log(`${condition ? 'PASS' : 'FAIL'}  ${label}`)
   if (!condition) failures.push(label)
@@ -719,6 +739,12 @@ try {
   session.expire()
   await router.push('/analysis')
   check('退出后无法进入统计路由', router.currentRoute.value.name === 'login')
+  // ★ 漏 import 的组件在这里统一收口（见文件上方 `console.warn` 那段注释）：
+  //   失败时把组件名报出来，否则「哪一页漏了哪个」还得再跑一遍才知道。
+  check(
+    `没有未解析的组件（漏 import 的 el-* 会在这里现形）${unresolved.size ? `：${[...unresolved].sort().join('、')}` : ''}`,
+    unresolved.size === 0,
+  )
   if (failures.length) {
     console.error(failures.join('\n'))
     process.exitCode = 1
