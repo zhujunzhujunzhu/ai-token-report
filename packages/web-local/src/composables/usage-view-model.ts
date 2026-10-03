@@ -320,9 +320,26 @@ export function buildUsageSummary(
     // ★ 费用口径那一行（单价来源 + 未计价比例 + 缺哪个价）；没有金额时为 null。
     //   与 `sources` 同理：这是**服务端的事实**，前端只排版。
     costNote: describeCost(overview.cost),
+    // ★ 降级说明（服务端跳过了刷新 / 换了直扫）：正常时为 null。
+    notice: describeDegraded(overview.degradedReason),
     metricGroups,
     rows,
   }
+}
+
+/**
+ * ★ 降级说明文案：这一轮的数**不是刚算的**。
+ *
+ * 服务端把「为什么没刷成」原样带在 `degradedReason` 里（库被别的写入者占用、
+ * 或库不可用只能直扫），这里只加一句前缀 —— 不解释、不改写，
+ * 因为它描述的是服务端发生的事，前端再加工一遍就是第二个说法。
+ *
+ * 🚨 刻意**不把它显示成错误**：数据仍然是对的，只是可能旧一个轮回。
+ *   显示成报错会让人以为「页面坏了」，而实际要做的是「过一会儿再看一眼」。
+ */
+export function describeDegraded(reason: string | undefined): string | null {
+  if (!reason) return null
+  return `⚠ 这一轮没能刷新日志，数字可能不是最新的：${reason}`
 }
 
 /**

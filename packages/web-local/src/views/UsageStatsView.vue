@@ -58,6 +58,13 @@ const sourcePaths = computed(() => describeSourcePaths(summary.value.sources))
  *   两者会给出不同的金额，而都「看起来正常」，所以这一行必须与金额同时在场。
  */
 const costNote = computed(() => summary.value.costNote)
+/**
+ * ★ 降级说明（服务端这一轮没刷成日志 / 换了直扫）。
+ *
+ * 与「数据来源」同一类信息，但**必须显眼一点**：它说的是「这些数字可能不是最新的」。
+ * 数据本身仍然是对的（读的是上一次入库的结果），所以用提示色而不是报错红。
+ */
+const notice = computed(() => summary.value.notice)
 </script>
 
 <template>
@@ -90,6 +97,12 @@ const costNote = computed(() => summary.value.costNote)
       两者会给不同的金额而都「看起来正常」，所以这一行必须与金额同时在场。
     -->
     <p v-if="costNote" class="usage-page__sources is-cost">{{ costNote }}</p>
+    <!--
+      降级说明：这一轮没能刷新日志（库被占用 / 只能直扫），数字可能旧一个轮回。
+      没有这一行，使用者没法分辨「日志里就是这些」与「这一轮没刷成」——
+      两者在页面上长得一模一样。
+    -->
+    <p v-if="notice" class="usage-page__notice" role="status">{{ notice }}</p>
 
     <MetricGroupSection
       v-for="(group, index) in summary.metricGroups"
@@ -170,6 +183,20 @@ const costNote = computed(() => summary.value.costNote)
 .usage-page__sources.is-cost {
   padding-left: 8px;
   border-left: 2px solid var(--c-divider, #e4e7ec);
+}
+
+/*
+  降级说明：不是报错（数据仍然是对的，只是可能旧一个轮回），所以用提示色。
+  但要与「数据来源」那一行区分开 —— 它说的是「这个数可能不是最新的」。
+*/
+.usage-page__notice {
+  margin: -8px 0 0;
+  padding: 8px 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #b54708;
+  background-color: #fffaeb;
+  border-radius: var(--radius-md);
 }
 
 .usage-page__tabs {

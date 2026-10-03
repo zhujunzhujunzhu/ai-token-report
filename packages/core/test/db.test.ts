@@ -1015,6 +1015,157 @@ describe('db 降级', () => {
     const s = await openStats({ sessionsRoot, dbPath, readOnly: true })
     s.close()
   })
+
+  /**
+   * ★ 回归：**库被别的写入者占用时不许降级直扫**。
+   *
+   * 这是本地页「切一下时间维度就半天刷不出来」的根因：另一连接持写锁时，
+   * 原来 `openStats` 把 `database is locked` 当成「库不可用」，于是改走
+   * **全量直扫**（本机真实数据 2.9 GB / 1760 个文件，实测 20~30 秒）。
+   * 本地页每 3 秒轮询一次、一次发 3 个并发请求 ⇒ 几个这样的直扫同时跑，
+   * 单线程的服务端被占满，页面再也刷不出来（实测：持锁 8 秒 ⇒ 3 个并发请求各 51 秒）。
+   *
+   * 正确行为是「读上一次入库的结果」，并把原因带出去（页面据此提示「可能不是最新的」）。
+   */
+  test('★ 库被别的写入者占用时不降级直扫，而是读库里的旧数据并说明原因', async () => {
+    const file = makeSession('proj-a', 'sess-1', [sessionLine('sess-1', 'D:\\p'), usageLine(1)])
+
+    // 先正常建一次库（此时库里已有 1 条记录）
+    const warm = await openStats({ sessionsRoot, dbPath })
+    expect(warm.source).toBe('sql')
+    expect(warm.totals().calls).toBe(1)
+    warm.close()
+
+    // 日志又长了一条 —— 这一步保证接下来那一轮 ingest **真的需要写库**
+    // （什么都不用写时它本来就不会开写事务，也就碰不到锁）
+    appendFrame(file, [usageLine(2)])
+
+    // 另一个连接持写锁：模拟「另一个进程正在 ingest / 正在冷建库」
+    const holder = new Database(dbPath)
+    holder.exec('PRAGMA journal_mode = WAL')
+    holder.exec('BEGIN IMMEDIATE')
+    holder.query('UPDATE ingest_run SET last_ingest_ms = last_ingest_ms WHERE id = 1').run()
+    try {
+      const s = await openStats({ sessionsRoot, dbPath })
+      try {
+        // 🚨 绝不能是 scan —— 那意味着这一页要等一次全量直扫（本机真实数据 20~30 秒）
+        expect(s.source).toBe('sql')
+        expect(s.degradedReason).toBeTruthy()
+        // 措辞要能让人分清「读的是上一次入库的结果」而不是「库坏了」
+        expect(String(s.degradedReason)).toContain('上一次入库')
+        // 数仍然是库里那一份旧数（新追加的第 2 条这一轮**没**进来），且绝不是 0
+        expect(s.totals().calls).toBe(1)
+        expect(s.totals().input).toBe(100)
+      } finally {
+        s.close()
+      }
+    } finally {
+      holder.exec('ROLLBACK')
+      holder.close()
+    }
+
+    // 锁一放，下一轮立刻补上 —— 被跳过的是**刷新**，不是数据
+    const after = await openStats({ sessionsRoot, dbPath })
+    try {
+      expect(after.source).toBe('sql')
+      expect(after.degradedReason).toBeUndefined()
+      expect(after.totals().calls).toBe(2)
+    } finally {
+      after.close()
+    }
+    // ⚠️ 这一条会**真的等满 `busy_timeout`（5 秒）**才判定「库被占用」——
+    //   显式放宽超时，别让默认的 5 秒把断言半路掐断（那会看起来像断言失败）。
+  }, 20_000)
+
+  /**
+   * ★ 回归：**并发取数只做一份工作**（单飞）。
+   *
+   * 本地页一次取数发 3 个并发请求，而每个请求都会先跑一轮 ingest。
+   * 没有单飞时冷启动那一轮是**三份全量建库**（本机真实数据实测第一轮 40 秒）。
+   * 断言用「进度回调总量 == 一份的量」而不是耗时 —— 后者在 CI 上必然不稳。
+   */
+  test('★ 三个并发请求只建一次库（单飞），不是三份全量扫描', async () => {
+    makeSession('proj-a', 'sess-1', [sessionLine('sess-1', 'D:\\p'), usageLine(1)])
+    makeSession('proj-b', 'sess-2', [sessionLine('sess-2', 'D:\\p2'), usageLine(2)])
+
+    // 基准：一次冷建库会回调几次（每个会话文件一次）—— 单独用一个库路径
+    let baseline = 0
+    const solo = await openStats({
+      sessionsRoot,
+      dbPath: join(home, 'solo', 'usage.sqlite'),
+      onProgress: () => { baseline += 1 },
+    })
+    solo.close()
+    expect(baseline).toBe(2)
+
+    let ticks = 0
+    const sessions = await Promise.all(
+      [1, 2, 3].map(() => openStats({ sessionsRoot, dbPath, onProgress: () => { ticks += 1 } })),
+    )
+    try {
+      // 三份并发请求共享同一轮 ingest ⇒ 回调总量仍是一份
+      expect(ticks).toBe(baseline)
+      for (const s of sessions) {
+        expect(s.source).toBe('sql')
+        expect(s.totals().calls).toBe(2)
+      }
+    } finally {
+      for (const s of sessions) s.close()
+    }
+  })
+
+  test('★ 并发降级直扫也只扫一份（单飞），不会几份 20 秒扫描同时跑', async () => {
+    makeSession('proj-a', 'sess-1', [sessionLine('sess-1', 'D:\\p'), usageLine(1)])
+    makeSession('proj-b', 'sess-2', [sessionLine('sess-2', 'D:\\p2'), usageLine(2)])
+
+    let baseline = 0
+    const solo = await openStats({ sessionsRoot, dbPath, forceScan: true, onProgress: () => { baseline += 1 } })
+    solo.close()
+    expect(baseline).toBe(2)
+
+    let ticks = 0
+    const sessions = await Promise.all(
+      [1, 2, 3].map(() =>
+        openStats({ sessionsRoot, dbPath, forceScan: true, onProgress: () => { ticks += 1 } })),
+    )
+    try {
+      expect(ticks).toBe(baseline)
+      for (const s of sessions) {
+        expect(s.source).toBe('scan')
+        expect(s.totals().calls).toBe(2)
+      }
+    } finally {
+      for (const s of sessions) s.close()
+    }
+  })
+
+  /**
+   * ★ 回归：**版本一致时开库不写库**。
+   *
+   * `PRAGMA user_version = N` 即使值没变也会写库头（一个写事务）。
+   * 本地页每个请求都开一次库 ⇒ 每个只读请求都成了写入者，
+   * 于是三个并发请求互相抢锁，接着触发上面那条降级放大。
+   *
+   * 断言方式：别人持着写锁时，开库 + 关库仍必须成功 ——
+   * 只要 `openDatabaseForIngest` 里还有一句无条件的写，这里就会抛 `database is locked`。
+   */
+  test('★ 版本一致时开库不产生写事务（别人持写锁也能开）', () => {
+    const first = openDatabaseForIngest(dbPath)
+    first.close()
+
+    const holder = new Database(dbPath)
+    holder.exec('PRAGMA journal_mode = WAL')
+    holder.exec('BEGIN IMMEDIATE')
+    holder.query('UPDATE ingest_run SET last_ingest_ms = last_ingest_ms WHERE id = 1').run()
+    try {
+      const db = openDatabaseForIngest(dbPath)
+      expect(db.query<{ c: number }, []>(`SELECT COUNT(*) AS c FROM ${EVENT_TABLE}`).get()?.c).toBe(0)
+      db.close()
+    } finally {
+      holder.exec('ROLLBACK')
+      holder.close()
+    }
+  })
 })
 
 // ── SQL 层不写公式（静态约束）─────────────────────────────────────────

@@ -129,6 +129,23 @@ check(
 )
 check('悬停能看全部根路径', describeSourcePaths(summary.sources).split('\n').length === 2)
 
+// ★ 降级说明：服务端说「这一轮没刷成日志」时必须说出来。
+//   「读的是上一次入库的结果」与「日志里就是这些」在页面上长得一模一样，
+//   而它们的差别正是使用者最需要知道的那一点（库被别的写入者占用时不直扫，见 core）。
+check('正常一轮没有降级说明', summary.notice === null)
+const degraded = buildUsageSummary(
+  { ...overview, degradedReason: '本地库暂时不可写（database is locked），本次显示的是上一次入库的结果' },
+  series,
+  rows,
+  'today',
+)
+check(
+  '降级时把服务端给的原因原样带出来（不吞、不改写）',
+  (degraded.notice ?? '').includes('database is locked') && (degraded.notice ?? '').includes('上一次入库'),
+  degraded.notice ?? '',
+)
+check('降级说明是一句提示而不是报错红', (degraded.notice ?? '').startsWith('⚠'), degraded.notice ?? '')
+
 // ★ 金额三态之一：**字段缺席**（旧服务端 / 没有金额来源）
 //   —— 此时页面必须一位金额都不显示，绝不能用 ¥0.00 顶替（那会让
 //   「拿不到金额」与「这段时间没花钱」长得一模一样）。

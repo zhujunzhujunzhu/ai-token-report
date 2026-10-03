@@ -53,7 +53,7 @@ import { existsSync, rmSync } from 'node:fs'
 
 import { aggregate, timeSeries, totalOf, type GroupDimension, type GroupRow } from '../aggregate.js'
 import { resolveRange } from '../range.js'
-import { scanAll, scanAllSources, sessionsRootList, type SessionsRootInput } from '../scanner.js'
+import { scanAll, scanAllSources, sessionsRootList, type ScanOptions, type SessionsRootInput } from '../scanner.js'
 import { registeredSources } from '../sources/registry.js'
 import type { SourceRoot } from '../sources/types.js'
 import { ingestPlainSources } from './ingest-plain.js'
@@ -351,8 +351,26 @@ export class StatsSession {
  * 打开统计会话。
  *
  * 默认走 SQL：先增量 ingest（保证新鲜），再查库。
- * **任何一步失败都降级为直扫日志**，并把原因带在 `degradedReason` 上
- * —— 静默降级会让人以为「库没生效」，带上原因才能排查。
+ * 库**真的不可用**（打不开 / 损坏 / 版本不符）时降级为直扫日志，
+ * 并把原因带在 `degradedReason` 上 —— 静默降级会让人以为「库没生效」，带上原因才能排查。
+ *
+ * ## 🚨 两条「不要把慢路径放大」的护栏（本地页切时间窗卡死的根因）
+ *
+ * 1. **单飞**：同一份工作（同一组根 + 同一个库）在同一进程里只跑一次，
+ *    后来的并发请求共享它的结果。本地页一次取数就发 3 个并发请求
+ *    （overview / series / breakdown），而每个请求都会先跑一轮 ingest ——
+ *    没有单飞时，冷启动那一轮是**三份全量建库**（本机实测第一轮 40 秒，
+ *    单飞之后只剩一份 20 秒）。降级直扫同理：三份 20~30 秒的扫描会把整个事件循环占满。
+ *
+ * 2. **库被占用**（`database is locked`）**不降级**：那只是「别人正在写」，
+ *    库里的数据仍然可读。原来的实现把它当成「库不可用」，于是**一次瞬时的锁冲突
+ *    变成 20~30 秒的全量直扫**（本机实测：另一个连接持锁 8 秒 ⇒ 3 个并发请求
+ *    各 51 秒；改完是 5.7 秒且不烧 CPU）。现在这种情况下本次直接读库
+ *    （可能比日志旧一个轮回），并把原因带进 `degradedReason`；
+ *    只有「库真的打不开 / 真的坏了」才直扫。
+ *
+ * ⚠️ 单飞的键必须**覆盖全部输入**（根、时间窗、筛选、变更文件），
+ *   否则两次不同的取数会共享同一份结果 —— 那是静默错数，比慢严重得多。
  */
 export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
   // ★ 存在性只在这里判一次，库路径与直扫路径共用同一份结果：
@@ -380,38 +398,61 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
   const providers = opts.providers ?? []
   const models = opts.models ?? []
 
+  // 时间窗参数（两种路径共用同一份形状，避免某一支漏掉一边而另一支带上）
+  const window = {
+    ...(sinceMs !== undefined ? { sinceMs } : {}),
+    ...(untilMs !== undefined ? { untilMs } : {}),
+  }
+
   // ── 直扫路径（显式强制，或作为降级目标）──────────────────────────
   const scanPath = async (degradedReason?: string): Promise<StatsSession> => {
-    const { records, sessions, diagnostics } = opts.sourceRoots !== undefined
-      ? await scanAllSources(opts.sourceRoots, {
-        providers,
-        models,
-        ...(sinceMs !== undefined ? { sinceMs } : {}),
-        ...(untilMs !== undefined ? { untilMs } : {}),
-        ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
-      })
-      : await scanAll(presentRoots, {
-        providers,
-        models,
-        ...(sinceMs !== undefined ? { sinceMs } : {}),
-        ...(untilMs !== undefined ? { untilMs } : {}),
-        ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
-      })
+    const typedRoots = opts.sourceRoots
+    const scanKey = [
+      'scan',
+      typedRoots !== undefined
+        ? typedRoots.map((root) => `${root.source}:${root.path}`).join('|')
+        : presentRoots.join('|'),
+      sinceMs ?? '*',
+      untilMs ?? '*',
+      providers.join('|'),
+      models.join('|'),
+    ].join('\u0000')
+
+    const outcome = await singleFlight(scanFlights, scanKey, async (): Promise<ScanOutcome> => {
+      const scanned = typedRoots !== undefined
+        ? await scanAllSources(typedRoots, {
+          providers,
+          models,
+          ...window,
+          ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
+        })
+        : await scanAll(presentRoots, {
+          providers,
+          models,
+          ...window,
+          ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
+        })
+      return {
+        records: scanned.records,
+        // ★ 与 SQL 路径一致：按过滤后的记录去重，而不是用文件数。
+        //   文件数会包含「有文件但这段时间没调用」的会话，让卡片虚高。
+        sessions: new Set(scanned.records.map((r) => r.sessionId)).size,
+        diagnostics: scanned.diagnostics,
+      }
+    })
+
     return new StatsSession({
       source: 'scan',
       ...(degradedReason ? { degradedReason } : {}),
       scannedAt: Date.now(),
       rangeLabel,
-      ...(sinceMs !== undefined ? { sinceMs } : {}),
-      ...(untilMs !== undefined ? { untilMs } : {}),
+      ...window,
       providers,
       models,
       db: null,
-      records,
-      // ★ 与 SQL 路径一致：按过滤后的记录去重，而不是用文件数。
-      //   文件数会包含「有文件但这段时间没调用」的会话，让卡片虚高。
-      sessions: new Set(records.map((r) => r.sessionId)).size,
-      diagnostics,
+      records: outcome.records,
+      sessions: outcome.sessions,
+      diagnostics: outcome.diagnostics,
       sessionsRoots: opts.sourceRoots?.map((root) => root.path) ?? presentRoots,
       ...(opts.sourceRoots !== undefined ? { sourceRoots: opts.sourceRoots } : {}),
       missingRoots,
@@ -436,23 +477,25 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
   }
 
   try {
-    if (!opts.readOnly) {
-      // ★ ingest 前置：热态约 9 ms，把「库旧于日志」的窗口压到最小
-      if (dshRoots.length > 0) {
-        await ingest({
-          sessionsRoot: dshRoots,
-          dbPath: opts.dbPath,
-          db,
-          ...(opts.changedFiles ? { changedFiles: opts.changedFiles } : {}),
-          ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
-        })
-      }
-      if (plainRoots.length > 0) {
-        await ingestPlainSources({
-          roots: plainRoots,
-          db,
-          ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
-        })
+    // ── ingest 前置：热态约 9 ms，把「库旧于日志」的窗口压到最小 ────────
+    //    ★ 单飞 + 「被占用不降级」，见 `openStats` 的 🚨 注释。
+    let refresh: RefreshOutcome = {}
+    if (!opts.readOnly && (dshRoots.length > 0 || plainRoots.length > 0)) {
+      refresh = await refreshLocalDb({
+        dbPath: opts.dbPath,
+        dshRoots,
+        plainRoots,
+        ...(opts.changedFiles ? { changedFiles: opts.changedFiles } : {}),
+        ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
+      })
+      if (refresh.failure !== undefined) {
+        // 库被占用 ⇒ 读上一次入库的结果（**绝不**为此直扫几 GB 日志）。
+        // 唯一例外：库里一条事件都没有（另一个进程正在冷建库），此时只有直扫才拿得到数。
+        const usable = refresh.locked === true && hasAnyEvent(db)
+        if (!usable) {
+          db.close()
+          return scanPath(`本地库不可用，已降级为直扫日志：${refresh.failure}`)
+        }
       }
     }
 
@@ -464,8 +507,7 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
       : undefined
 
     const filter = {
-      ...(sinceMs !== undefined ? { sinceMs } : {}),
-      ...(untilMs !== undefined ? { untilMs } : {}),
+      ...window,
       ...(providers.length > 0 ? { providers } : {}),
       ...(models.length > 0 ? { models } : {}),
       ...(narrowSources !== undefined ? { sources: narrowSources } : {}),
@@ -481,8 +523,14 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
       source: 'sql',
       scannedAt: Date.now(),
       rangeLabel,
-      ...(sinceMs !== undefined ? { sinceMs } : {}),
-      ...(untilMs !== undefined ? { untilMs } : {}),
+      ...(refresh.failure !== undefined
+        ? {
+          // ★ 这是一条**诚实性**要求：数还是库里的旧数，但必须说清「本次没刷成」。
+          //   静默给出旧数据会让人以为「日志里就是这些」，而差的是最近这一小段。
+          degradedReason: `本地库暂时不可写（${refresh.failure}），本次显示的是上一次入库的结果`,
+        }
+        : {}),
+      ...window,
       dbPath: opts.dbPath,
       providers,
       models,
@@ -507,6 +555,113 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
     }
     return scanPath(`本地库不可用，已降级为直扫日志：${msg(err)}`)
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 进程内单飞 —— 「同一份工作只做一次」
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 一次「刷新本地库」（两路 ingest）的结果。刻意**不抛错**，好让调用方区分占用与损坏。 */
+interface RefreshOutcome {
+  /** 刷新失败的原因（成功时缺席）。 */
+  failure?: string
+  /** true = 库正被别的写入者占用（数据仍可读，只是可能比日志旧一点）。 */
+  locked?: boolean
+}
+
+/** 一次「直扫日志」的结果（并发请求共享，避免多份 20~30 秒的扫描同时跑）。 */
+interface ScanOutcome {
+  records: UsageRecord[]
+  sessions: number
+  diagnostics: ScanDiagnostics
+}
+
+/** 刷新（ingest）的单飞表：键 = 库 + 这轮要读的根 + 变更文件。 */
+const refreshFlights = new Map<string, Promise<RefreshOutcome>>()
+/** 直扫的单飞表：键 = 根 + 时间窗 + 筛选。 */
+const scanFlights = new Map<string, Promise<ScanOutcome>>()
+
+/**
+ * 单飞：键相同的调用共享同一个 Promise，跑完即从表里摘掉（下次重新跑）。
+ *
+ * ⚠️ 只共享**正在跑**的那一份，不做 TTL 缓存 —— 缓存的失效条件（日志又变了）
+ *   正是最难判准的东西，而这里要解决的只是「并发重复劳动」。
+ */
+function singleFlight<T>(table: Map<string, Promise<T>>, key: string, run: () => Promise<T>): Promise<T> {
+  const running = table.get(key)
+  if (running !== undefined) return running
+  const task = run().finally(() => {
+    // 只有还是自己那一份时才删（否则会把后来者的任务摘掉）
+    if (table.get(key) === task) table.delete(key)
+  })
+  table.set(key, task)
+  return task
+}
+
+/**
+ * 跑一轮增量入库（DSH 分帧 + 纯文本两路），并发请求共享同一份。
+ *
+ * 🚨 失败**不抛错**而是返回原因：调用方要靠 `locked` 区分
+ *   「库被占用（可读旧数据）」与「库真的坏了（只能直扫）」。
+ */
+function refreshLocalDb(input: {
+  dbPath: string
+  dshRoots: readonly string[]
+  plainRoots: readonly SourceRoot[]
+  changedFiles?: readonly string[]
+  onProgress?: ScanOptions['onProgress']
+}): Promise<RefreshOutcome> {
+  const key = [
+    'refresh',
+    input.dbPath,
+    [...input.dshRoots].sort().join('|'),
+    input.plainRoots.map((root) => `${root.source}:${root.path}`).sort().join('|'),
+    input.changedFiles === undefined ? '*' : [...input.changedFiles].sort().join('|'),
+  ].join('\u0000')
+
+  return singleFlight(refreshFlights, key, async (): Promise<RefreshOutcome> => {
+    try {
+      if (input.dshRoots.length > 0) {
+        await ingest({
+          sessionsRoot: [...input.dshRoots],
+          dbPath: input.dbPath,
+          ...(input.changedFiles ? { changedFiles: [...input.changedFiles] } : {}),
+          ...(input.onProgress ? { onProgress: input.onProgress } : {}),
+        })
+      }
+      if (input.plainRoots.length > 0) {
+        await ingestPlainSources({
+          roots: input.plainRoots,
+          dbPath: input.dbPath,
+          ...(input.onProgress ? { onProgress: input.onProgress } : {}),
+        })
+      }
+      return {}
+    } catch (err) {
+      return { failure: msg(err), locked: isLockError(err) }
+    }
+  })
+}
+
+/**
+ * 是不是「库被占用」这类**瞬时**失败。
+ *
+ * ⚠️ 认定要**保守**：只有明确的锁 / 忙错误才算。把「库损坏」误判成「被占用」
+ *   会让页面永久显示旧数据（而且看起来一切正常），比降级慢得多的问题严重。
+ *   `bun:sqlite` 给 `code = 'SQLITE_BUSY'|'SQLITE_LOCKED'`，
+ *   `node:sqlite` 给 `errcode = 5|6`，两边都认。
+ */
+function isLockError(err: unknown): boolean {
+  const detail = err as { code?: unknown; errcode?: unknown } | null
+  const code = typeof detail?.code === 'string' ? detail.code : ''
+  if (code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED' || code.startsWith('SQLITE_BUSY_')) return true
+  if (detail?.errcode === 5 || detail?.errcode === 6) return true
+  return /database (?:is|table is) locked|database is busy/i.test(msg(err))
+}
+
+/** 库里有没有任何事件（用于「库被占用但库是空的」这一种情况）。 */
+function hasAnyEvent(db: Database): boolean {
+  return db.query('SELECT 1 AS one FROM usage_event LIMIT 1').get() != null
 }
 
 /**
@@ -618,7 +773,7 @@ export function openStatsDb(dbPath: string): Database {
 }
 
 /**
- * 删除本地库（`dsh-token --reset-db`）。库不存在时静默成功。
+ * 删除本地库（`ai-token --reset-db`）。库不存在时静默成功。
  *
  * ⚠️ **Windows 上 `close()` 之后文件句柄不会立即释放** —— SQLite 的
  *   WAL / 共享内存映射仍挂在进程上，紧接着 `unlink` 会抛

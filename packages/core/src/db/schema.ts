@@ -232,10 +232,32 @@ export function openDb(dbPath: string): Database {
  * 刻意**不**在这里做版本迁移：本项目的数据全部可从日志重扫得到，
  * 迁移逻辑比「发现版本不符就重建」更容易出错且更难测试。
  * 版本判定交给 {@link needsRebuild}。
+ *
+ * ## 🚨 `user_version` 只在**真的不同**时才写
+ *
+ * `PRAGMA user_version = N` **即使值没变也会写库头**（本机实测：一次写产生
+ * 4152 字节 WAL 帧，见 `.tmp/bench-write.ts` 那类探针），也就是**一个写事务**。
+ * 而 `openDatabaseForIngest()` 每次取数都会打开一次库 —— 无条件写这一句等于
+ * 「**每一个只读请求都是一个写入者**」：
+ *
+ * - 本地页一次取数发 3 个并发请求 ⇒ 3 个写入者互相抢锁；
+ * - 任何一个写入者持有锁超过 `busy_timeout`（5 秒）时，其余请求直接拿
+ *   `database is locked`，而它过去会**降级成 20~30 秒的全量直扫**
+ *   （见 `stats.ts` 的 `openStats`）—— 一次瞬时冲突被放大成整页卡死。
+ *
+ * 所以这里先读后写：版本一致时**一句都不写**，只跑幂等的 `CREATE ... IF NOT EXISTS`
+ * （表 / 索引都在时 SQLite 一个字节都不写，实测 WAL 帧数不变）。
  */
 export function ensureSchema(db: Database): void {
   db.exec(SCHEMA_SQL)
-  db.exec(`PRAGMA user_version = ${DB_SCHEMA_VERSION}`)
+  if (schemaVersion(db) !== DB_SCHEMA_VERSION) {
+    db.exec(`PRAGMA user_version = ${DB_SCHEMA_VERSION}`)
+  }
+}
+
+/** 读 `user_version`（缺失 / 空文件为 0）。只读库头，不产生写事务。 */
+export function schemaVersion(db: Database): number {
+  return db.query<{ user_version: number }, []>('PRAGMA user_version').get()?.user_version ?? 0
 }
 
 /**
@@ -244,8 +266,7 @@ export function ensureSchema(db: Database): void {
  * 缺失（=0，全新库或空文件）视为**不需要**重建 —— 直接建表即可。
  */
 export function needsRebuild(db: Database): boolean {
-  const row = db.query<{ user_version: number }, []>('PRAGMA user_version').get()
-  const version = row?.user_version ?? 0
+  const version = schemaVersion(db)
   // 0 = 全新/空文件，建表就好；其他不符才算需要重建
   return version !== 0 && version !== DB_SCHEMA_VERSION
 }

@@ -60,16 +60,38 @@ export function useUsageStats() {
 
   let requestSeq = 0
   let pending = false
+  /** 本轮请求在飞时又来了新的刷新要求 —— 合并成「回来之后再跑一轮」。 */
+  let queued = false
   let refreshTimer: ReturnType<typeof setInterval> | undefined
 
   /**
    * 拉取一轮数据。
    *
-   * 用递增的 `requestSeq` 丢弃过期响应：快速切换筛选时，
+   * ## ★ 同一时刻只允许一轮请求在飞（这是「切时间窗卡死」的一半原因）
+   *
+   * 一次取数是 **3 个并发请求**，而服务端每个请求都要先做一轮增量入库。
+   * 早期实现在切换筛选时**不看有没有在飞**，直接再发 3 个：
+   *
+   * - 切一下 = 6 个请求，快速切几下 = 十几个请求同时压在服务端，
+   *   每个都要 ingest 一次库 —— 于是互相抢库锁；
+   * - 抢锁超过 5 秒的那几个请求过去会**降级成 20~30 秒的全量直扫**，
+   *   把同一个（单线程的）服务端占满，后面的请求全部排队 —— 页面半天刷不出来。
+   *
+   * 现在：在飞时用户再切筛选，只记一个「还欠一轮」，等这一轮回来立刻按**最新**筛选
+   * 再跑一轮。丢掉的只是中间那些过时的筛选值，而它们本来就不该被展示。
+   *
+   * 用递增的 `requestSeq` 丢弃过期响应：定时更新与切换筛选可能交错，
    * 先发的请求可能后到，直接写入会让页面回退到旧的筛选结果。
    */
   async function load(background = false): Promise<void> {
+    // 后台轮询：上一轮没回来就跳过这一次（否则每 3 秒叠一轮，服务端被越堆越多）
     if (background && (pending || document.hidden)) return
+    // 用户切换筛选：不叠加新请求，合并成「这一轮回来后再跑一次最新的」
+    if (pending) {
+      queued = true
+      return
+    }
+
     const seq = ++requestSeq
     pending = true
     // 定时更新保留当前图表和表格，避免频繁闪回加载占位。
@@ -78,38 +100,46 @@ export function useUsageStats() {
       error.value = null
     }
 
-    const filter = { period: timeRange.value }
+    try {
+      const filter = { period: timeRange.value }
 
-    const [overview, series, breakdown] = await Promise.all([
-      fetchOverview(filter),
-      fetchSeries(filter, bucketFor(timeRange.value)),
-      fetchBreakdown(filter, groupBy.value),
-    ])
+      const [overview, series, breakdown] = await Promise.all([
+        fetchOverview(filter),
+        fetchSeries(filter, bucketFor(timeRange.value)),
+        fetchBreakdown(filter, groupBy.value),
+      ])
 
-    // 已经有更新的请求发出去了，这轮结果作废
-    if (seq !== requestSeq) return
-    pending = false
+      // 已经有更新的请求发出去了，这轮结果作废
+      if (seq !== requestSeq) return
 
-    // 三个请求任一失败都提示 —— 部分成功还照常渲染会让人以为「数据就是少了」
-    const failure = [overview, series, breakdown].find((r) => !r.ok)
-    if (failure && !failure.ok) {
-      error.value = failure.error
-      loading.value = false
-      return
+      // 三个请求任一失败都提示 —— 部分成功还照常渲染会让人以为「数据就是少了」
+      const failure = [overview, series, breakdown].find((r) => !r.ok)
+      if (failure && !failure.ok) {
+        error.value = failure.error
+        return
+      }
+
+      if (overview.ok && series.ok && breakdown.ok) {
+        error.value = null
+        rows.value = breakdown.data.rows
+        summary.value = buildUsageSummary(
+          overview.data,
+          series.data,
+          breakdown.data.rows,
+          timeRange.value,
+        )
+      }
+    } finally {
+      if (seq === requestSeq) {
+        pending = false
+        loading.value = false
+      }
+      // 期间被合并掉的刷新要求：现在补上（读的是**当前**筛选值）
+      if (queued && seq === requestSeq) {
+        queued = false
+        void load()
+      }
     }
-
-    if (overview.ok && series.ok && breakdown.ok) {
-      error.value = null
-      rows.value = breakdown.data.rows
-      summary.value = buildUsageSummary(
-        overview.data,
-        series.data,
-        breakdown.data.rows,
-        timeRange.value,
-      )
-    }
-
-    loading.value = false
   }
 
   /** 强制服务端重扫日志后刷新。 */

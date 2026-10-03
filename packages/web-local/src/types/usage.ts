@@ -119,6 +119,14 @@ export interface UsageSummary {
    *   两者会给出不同的金额 —— 少了这一行，使用者没法判断该信哪个数。
    */
   costNote: string | null
+  /**
+   * 降级说明：这一轮的数据**不是刚算的**（服务端跳过了刷新，或换了直扫这条慢路径）。
+   *
+   * ★ 与 `sources` / `costNote` 同类，回答「这个数是怎么来的」。
+   *   「读的是上一次入库的结果」与「日志里就是这些」在页面上长得一模一样，
+   *   而它们的差别正是使用者最需要知道的一点。正常时恒为 null。
+   */
+  notice: string | null
   metricGroups: MetricGroup[]
   /** 明细表的分组行。 */
   rows: LocalBreakdownRow[]
