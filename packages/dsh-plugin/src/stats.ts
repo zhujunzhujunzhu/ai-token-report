@@ -200,27 +200,27 @@ export interface StatsContext {
    */
   dataDir: string
   /**
-   * ★ **带来源的根**（多客户端）—— 只有配置了 `extraSources` 才有值。
+   * ★ **带来源的根**（多客户端）—— 由 `extra-sources.ts` 给出**全部已注册来源**。
    *
-   * 不传（`undefined`）时 `openStats()` 只按 `sessionsRoots` 取数，也就是
-   * 「面板只统计 DSH」的既有行为**逐字不变**。给了它之后，DSH 走 zstd 分帧、
-   * 其余来源走纯文本通路，两条路写进**同一张** `usage_event`，靠 `source` 列区分，
-   * 于是面板上的数字天然是「全部已选来源的并集」。
+   * 给了它之后，DSH 走 zstd 分帧、其余来源走纯文本通路，两条路写进**同一张**
+   * `usage_event`，靠 `source` 列区分，于是面板上的数字天然是「全部来源的并集」。
    *
-   * ⚠️ 代价是**取数时会增量 ingest 这些来源的日志**（面板每 30 秒探一次），
-   *   所以白名单默认空、而且由使用者显式列出来（见 `extra-sources.ts` 文件头）。
+   * ⚠️ 代价是**取数时会增量 ingest 这些来源的日志**（面板每 30 秒探一次）：
+   *   首次冷扫会明显变慢（本机实测 Codex 1,495 个文件 / 2.8 GB），之后按文件
+   *   字节数增量。这是**刻意接受**的 —— 少统计一个来源与「那台客户端没用量」
+   *   在界面上长得一模一样，见 `extra-sources.ts` 文件头。
    */
   sourceRoots?: readonly SourceRoot[]
   /**
-   * ★ **查询期来源清单**（缺省 = `['dsh']`）——与 `sourceRoots` 是一对，
-   *   缺了它就只有「本次 ingest 谁」，没有「本次只算谁」。
+   * ★ **查询期来源清单**（`extra-sources.ts` 的 `statsSourceIds()` = 全部已注册来源）
+   *   ——与 `sourceRoots` 是一对：根管「本次 ingest 谁」，这份清单管「本次算谁」。
    *
    * 🚨 为什么必须有：本地库是 CLI / 本地页 / 插件 / report **共用的一个文件**，
-   *   库里天然躺着别的来源的行（CLI 跑过一次缺省运行就会有）。而
-   *   `openStats()` 的 `sources` 缺省语义是「**库里的全部来源**」——
-   *   面板配着 `extraSources: []`（默认 = 只统计 DSH）也会把 Codex 的行算进来，
-   *   数字看起来完全正常，只是不属于这个来源。见 `extra-sources.ts` 的
-   *   `statsSourceIds()`。
+   *   库里天然躺着别的来源的行（CLI 跑过一次缺省运行就会有）。不传时
+   *   `openStats()` 的缺省语义是「库里的全部来源」—— 那正是我们要的，
+   *   但**显式给全量**才不会被「库里躺着的未知来源」冒充面板自己的数字
+   *   （`db/stats.ts` 的 `narrowSources` 只在数量**少于**已注册来源数时才收窄，
+   *   所以给全量同时保住了汇总表那条快路径）。
    */
   sources?: readonly SessionSource[]
   /** 白名单里**配了但不存在**的根：页面/日志要能分辨「没装」与「路径写错」。 */
@@ -289,12 +289,14 @@ export async function executeQuery(ctx: StatsContext, query: UsageQuery, options
   const session = await openStats({
     sessionsRoot: ctx.sessionsRoots,
     dbPath: ctx.dbPath,
-    // ★ 来源清单**任何情况都要给**（缺省 = 只统计 DSH）：`openStats` 的 `sources`
-    //   缺省语义是「库里的全部来源」，而库是几个形态共用的一个文件 ——
-    //   不传就等于把 CLI 曾经入过库的 Codex / workbuddy 行当成面板自己的数字。
+    // ★ 来源清单**任何情况都要给**（= 全部已注册来源，见 `extra-sources.ts`）：
+    //   `openStats` 的 `sources` 缺省语义是「库里的全部来源」，而库是几个形态共用的
+    //   一个文件 —— 不传就等于让库里躺着的未知来源冒充面板自己的数字。
+    //   给**全量**在本仓与不传等价（`db/stats.ts` 的 `narrowSources` 只在数量少于
+    //   已注册来源数时才收窄），所以汇总表那条快路径也保住了。
     sources: ctx.sources ?? ['dsh'],
-    // ★ 白名单为空（`undefined`）⇒ 不传 `sourceRoots` ⇒ 只按 DSH 的会话根取数
-    //   （改动前的行为）。给了它才把其它来源并进来，并把它配了但不存在的根一并报出去。
+    // ★ 带来源的根 = 本机全部已注册来源（DSH 的根用生效配置里那一组）。
+    //   给了它才把其它来源并进来，并把它解析出来但**不存在**的根一并报出去。
     ...(ctx.sourceRoots !== undefined && ctx.sourceRoots.length > 0
       ? {
         sourceRoots: ctx.sourceRoots,

@@ -152,26 +152,6 @@ export interface EffectiveConfig {
    * 支持 `~` 展开；空白字符串视为「没配」。
    */
   dataDir?: string
-  /**
-   * ★ **在 DSH 之外额外并入统计的来源**（多客户端）。
-   *
-   * 缺省 `[]` = 面板只统计 DSH（**与改动前完全一致**）。取值与 CLI 的 `--source`
-   * 同义：`all` 或逐个 id（`codex` / `claude-code` / `trae` / `trae-cn` / `workbuddy`）。
-   *
-   * ```yaml
-   * - id: token-report
-   *   config:
-   *     extraSources: [trae, trae-cn]
-   * ```
-   *
-   * 🚨 为什么默认关、而且必须显式列：`openStats()` 拿到 `sourceRoots` 之后会在**取数时**
-   *   增量 ingest 这些来源的日志 —— 面板是每 30 秒探一次的东西，`all` 会连 Codex 的
-   *   1,495 个文件 / 2.8 GB 一起冷扫（本机实测十几秒到几分钟）。只并入真的想看的那几个。
-   *
-   * ⚠️ `dsh` 永远在（面板的主体就是 DSH 用量），写它等于没写；拼错的 id 会被
-   *   `planExtraSources()` 收进 `unknown` 并告警，绝不静默丢弃。
-   */
-  extraSources?: string[]
 }
 
 /** 默认上报地址 —— 与本仓部门服务端契约一致（`ARCHITECTURE.md` §5.2）。 */
@@ -278,7 +258,14 @@ export interface RawConfig {
   dshHomes?: unknown
   /** token-report 数据目录。见 `EffectiveConfig.dataDir`。 */
   dataDir?: string
-  /** ★ 额外并入统计的来源。见 `EffectiveConfig.extraSources`。非法项在归一化时丢弃。 */
+  /**
+   * @deprecated **已废弃，写了也不生效**：来源范围恒为**全部已注册来源**。
+   *
+   * 留着这一个字段**只为告警**：老部署的 `cordis.patch.yml` 里可能还写着它，
+   * 而「静默忽略一项配置」会让使用者以为「我限制成了只统计 DSH」，实际是全来源 ——
+   * 那正是本仓最反对的那种失败（数字看着正常，口径已经不是他要的）。
+   * `validateConfig()` 会把它报进启动日志。
+   */
   extraSources?: unknown
 }
 
@@ -341,9 +328,6 @@ export function resolveConfig(raw: RawConfig = {}): EffectiveConfig {
   const dshHome = raw.dshHome?.trim()
   const dshHomes = toStringList(raw.dshHomes)
   const dataDir = raw.dataDir?.trim() || envString(ENV.dataDir)
-  // 白名单只做「收成字符串数组」；**认不认识**留给 `planExtraSources()` ——
-  // 那里才拿得到已注册来源表，而这里要保持纯函数、无 IO（便于单测优先级）。
-  const extraSources = toStringList(raw.extraSources)
 
   return {
     name: raw.name?.trim() || envString(ENV.name) || DEFAULT_NAME,
@@ -381,7 +365,6 @@ export function resolveConfig(raw: RawConfig = {}): EffectiveConfig {
     ...(dshHome ? { dshHome } : {}),
     ...(dshHomes.length > 0 ? { dshHomes } : {}),
     ...(dataDir ? { dataDir } : {}),
-    ...(extraSources.length > 0 ? { extraSources } : {}),
   }
 }
 
@@ -430,6 +413,13 @@ export function validateConfig(config: EffectiveConfig, raw: RawConfig = {}): st
     problems.push(
       `ui.position 写了不认识的值 "${rawPosition}" —— 已回退为 ${UI_DEFAULT_POSITION}。` +
         ` 可选值：${UI_POSITIONS.join(' / ')}`,
+    )
+  }
+  // 废弃项必须**说出来**：静默忽略会让人以为「我限制成了只统计 DSH」，而实际是全来源。
+  if (raw.extraSources !== undefined) {
+    problems.push(
+      'extraSources 已废弃，写了也不生效 —— 统计与上报范围恒为**全部已注册来源**。' +
+        ' 想关掉某个来源请用它自己的环境开关（例如 DSH_TOKEN_REPORT_CODEX=0）。',
     )
   }
   return problems

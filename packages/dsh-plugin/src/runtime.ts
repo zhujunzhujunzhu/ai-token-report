@@ -65,6 +65,7 @@ import {
   type ReporterStats,
 } from './reporter.js'
 import type { OutboxStats } from './outbox.js'
+import { resolveStatsSourceRoots } from './extra-sources.js'
 import { reportPaths } from './paths.js'
 import { ReportLog, type ReportAttempt, type ReportLogOptions } from './report-log.js'
 import { withSavedConnection } from './settings.js'
@@ -490,10 +491,15 @@ export class ReportRuntime<B extends ReportBackendLike = ReportBackendLike> {
       //   「到底发出去了什么」，而不是只说「已启用」。
       onReport: (attempt) => this.#log.record(attempt),
     })
+    // ★ 补报范围 = DSH 的全部 home + **本机全部已注册来源**。
+    //   DSH 那一路刻意用 `paths.sessionsRoots`（不过滤存在性）：配了却读不到的根
+    //   必须在补报里报错，而不是被静默跳过（见 `backfill-runner.ts`）。
+    const backfillPaths = reportPaths(config)
     const backfill = this.#createBackfill({
       config,
       identity: foldIdentity,
-      sessionsRoots: reportPaths(config).sessionsRoots,
+      sessionsRoots: backfillPaths.sessionsRoots,
+      plainRoots: resolveStatsSourceRoots(backfillPaths.dshHomes).roots.filter((root) => root.source !== 'dsh'),
       onLog: log,
     })
     reporter.start()

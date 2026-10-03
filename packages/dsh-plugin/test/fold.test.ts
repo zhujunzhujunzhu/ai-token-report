@@ -251,6 +251,8 @@ describe('线上格式', () => {
         'reasoning_tokens',
         'seq',
         'session_id',
+        // ★ 来源：服务端缺这个字段时按 `dsh` 落库，所以非 DSH 来源必须带上它。
+        'source',
         'step',
         'total_tokens',
         'ts',

@@ -501,18 +501,6 @@ export interface UiSettingsPayload {
   effectiveRoots: { path: string; exists: boolean }[]
   /** 生效的日志根来自哪一级（面板 / 部署配置 / 环境变量 / 自动发现）。 */
   rootsSource: UiRootsSource
-  /**
-   * ★ 面板里存过的**其它来源**（多客户端：DSH 之外的 Codex / Claude Code / Trae …）。
-   *
-   * 空数组 = 没设过覆盖 ⇒ **只统计 DSH**（默认，也是改动前的行为）。
-   * 与 `dshHomes` 同一套语义：这是「我填了什么」，`extraSourcesEffective` 是
-   * 「现在真的并进了哪些」—— 两者都要有，否则「填了没生效」看不出来。
-   */
-  extraSources: string[]
-  /** 此刻**真正生效**的额外来源（已过滤掉未注册 / 重复项）。 */
-  extraSourcesEffective: string[]
-  /** 可以填的来源 id（宿主按已注册适配器给出；不含 `dsh`，`all` 由界面自己加）。 */
-  availableSources: string[]
 }
 
 /** 生效日志根的来源。与宿主 `settings.ts` 的 `DshHomesSource` 同义。 */
@@ -665,27 +653,6 @@ export function readUiRootsView(value: unknown): {
   return { dshHomes, effectiveRoots, rootsSource: coerceRootsSource(raw['rootsSource']) }
 }
 
-/** 收一串来源 id（脏值丢弃；小写归一 —— 与宿主 `parseExtraSources` 同口径）。 */
-function textList(value: unknown): string[] {
-  const out: string[] = []
-  for (const item of Array.isArray(value) ? value : []) {
-    if (typeof item !== 'string') continue
-    const id = item.trim().toLowerCase()
-    if (id !== '' && !out.includes(id)) out.push(id)
-  }
-  return out
-}
-
-/**
- * 从任意载荷（读取或保存响应）里取「面板存的其它来源」。
- *
- * ★ 与 `readUiRootsView` 同一个理由：保存响应与读取载荷共用一份形状，
- *   解析也**只能有一处** —— 各写一遍会出现「保存后回填错」这种偏一半的 bug。
- */
-export function readUiExtraSources(value: unknown): string[] {
-  return textList(record(value)?.['extraSources'])
-}
-
 /** 解析配置读取载荷。任何缺字段都回退到「未署名 + 默认位置」，绝不抛错。 */
 export function readUiSettings(value: unknown): UiSettingsPayload {
   const raw = record(value) ?? {}
@@ -704,10 +671,6 @@ export function readUiSettings(value: unknown): UiSettingsPayload {
     position: parseUiPosition(raw['position']) ?? UI_DEFAULT_POSITION,
     reporting: readUiReporting(raw['reporting']),
     ...readUiRootsView(raw),
-    // 老宿主没有这三项 ⇒ 空数组 ⇒ 面板显示「只统计 DSH」（正是老宿主的行为）
-    extraSources: textList(raw['extraSources']),
-    extraSourcesEffective: textList(raw['extraSourcesEffective']),
-    availableSources: textList(raw['availableSources']),
   }
 }
 

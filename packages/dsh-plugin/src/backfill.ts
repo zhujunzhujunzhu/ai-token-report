@@ -1,5 +1,6 @@
 /** 历史扫描与补报放在独立线程；插件启动只安排任务，不在宿主读取日志。 */
 import { Worker } from 'node:worker_threads'
+import type { SourceRoot } from '@ai-token-report/core'
 import type { EffectiveConfig } from './config.js'
 import type { FoldIdentity } from './fold.js'
 import { emptyBackfillStats, type BackfillStats } from './backfill-runner.js'
@@ -16,6 +17,13 @@ export interface HistoryBackfillOptions {
    * 少一个根就等于那套 DSH 的历史永远不会被确认。
    */
   sessionsRoots: string[]
+  /**
+   * ★ DSH 之外的来源根（Codex / Claude Code / Trae / WorkBuddy）。
+   *
+   * 同一句话：**少一个来源就等于那个客户端的用量在部门看板上永远是 0**，
+   * 而它与「这台机器没跑过它」长得一模一样。缺省由 `extra-sources.ts` 给全量。
+   */
+  plainRoots: readonly SourceRoot[]
   onLog?: (level: 'info' | 'warn', message: string) => void
 }
 
@@ -49,7 +57,7 @@ export function createHistoryBackfill(options: HistoryBackfillOptions): HistoryB
     try {
       const filename = import.meta.url.endsWith('.ts') ? './backfill-worker.ts' : './backfill-worker.js'
       const current = new Worker(new URL(filename, import.meta.url), {
-        workerData: { config: options.config, identity: options.identity, sessionsRoots: options.sessionsRoots, stats: snapshot },
+        workerData: { config: options.config, identity: options.identity, sessionsRoots: options.sessionsRoots, plainRoots: options.plainRoots, stats: snapshot },
       })
       worker = current
       current.on('message', (message: BackfillStats) => {

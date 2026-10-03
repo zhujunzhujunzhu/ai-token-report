@@ -426,6 +426,9 @@ try {
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     const worker = new Worker(new URL('./backfill-worker.js', import.meta.url), { workerData: {
       sessionsRoots: [join(home, 'sessions')],
+      // ★ 非 DSH 来源的根（纯文本通路）。这一轮只验 DSH 那条路，所以给空数组 ——
+      //   但**必须给**：漏了它产物里的补报线程会直接抛「读取 undefined 的 length」。
+      plainRoots: [],
       config: { dshHome: home, dataDir: join(home, 'token-report'), name: 'verify-history', appKey: 'synthetic-token',
         endpoint: 'http://127.0.0.1:' + server.address().port + '/api/v1/token-usage',
         batch: { maxRecords: 1, flushIntervalMillis: 1000, timeoutMillis: 3000 },

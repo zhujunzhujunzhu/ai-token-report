@@ -67,6 +67,8 @@ function billing(seq: number, tokens = 10): BillingRecord {
     cacheWriteTokens: 0,
     reasoningTokens: 0,
     totalTokens: tokens + 1,
+    // ★ 来源必须过线：缺了它服务端按 `dsh` 落库（非 DSH 的用量会被记在 DSH 名下）。
+    source: 'dsh',
     identityViolation: false,
     identity: IDENTITY,
   }

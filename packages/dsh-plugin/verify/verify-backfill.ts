@@ -70,6 +70,8 @@ function asBilling(record: UsageRecord): BillingRecord {
     inputTokens: record.usage.input, outputTokens: record.usage.output,
     cacheReadTokens: record.usage.cacheRead, cacheWriteTokens: record.usage.cacheWrite,
     reasoningTokens: record.usage.reasoning, totalTokens: record.usage.total,
+    // ★ 来源必须过线：缺了它服务端按 `dsh` 落库。
+    source: record.source,
     identityViolation: false, identity,
   }
 }
@@ -127,7 +129,9 @@ const config = resolveConfig({
   batch: { maxRecords: 2, flushIntervalMillis: 60_000, timeoutMillis: 5000 },
   outbox: { enabled: false },
 })
-const options = { config, identity, sessionsRoots: [sessionsRoot] }
+// ⚠️ `plainRoots` 必须显式给：本段验的是 **DSH 那条路**（分帧 zstd + 字节光标），
+//   非 DSH 来源（纯文本 + 字节数水位线）在下面单独一段验。
+const options = { config, identity, sessionsRoots: [sessionsRoot], plainRoots: [] as const }
 
 try {
   // 文件名顺序刻意先高 seq 再低 seq，不能拿全会话最大 seq 过滤未扫描的历史文件。
@@ -180,6 +184,44 @@ try {
   const completedTail = await runBackfillPass(options)
   check('尾部半帧补齐后仍补报成功', completedTail.status === 'complete')
   await assertParity('半帧补齐')
+
+  // ── 纯文本来源（Codex / Claude Code / Trae / WorkBuddy）──────────────────
+  //   与 DSH 不是同一种增量语义（只有字节数水位线，没有帧/光标），所以单独一轮：
+  //   `sessionsRoots` 空着，范围只由 `plainRoots` 决定，免得两族互相污染水位目录。
+  const codexRoot = join(home, 'codex', 'sessions')
+  const codexDir = join(codexRoot, '2026', '09', '27')
+  mkdirSync(codexDir, { recursive: true })
+  const codexId = '019d4d61-2656-7382-a473-689cdf1fced9'
+  const codexLine = (ordinal: number, type: string, payload: unknown): string =>
+    `${JSON.stringify({ timestamp: '2026-09-27T15:41:00.000Z', ordinal, type, payload })}\n`
+  writeFileSync(join(codexDir, `rollout-2026-09-27T15-31-00-${codexId}.jsonl`), [
+    codexLine(0, 'session_meta', { session_id: codexId, id: codexId,
+      timestamp: '2026-09-27T15:31:00.000Z', cwd: '/codex-project', model_provider: 'openai' }),
+    codexLine(1, 'turn_context', { model: 'gpt-5.5', cwd: '/codex-project' }),
+    codexLine(2, 'event_msg', { type: 'token_count', info: {
+      last_token_usage: { input_tokens: 1000, cached_input_tokens: 400, cache_write_input_tokens: 0,
+        output_tokens: 100, reasoning_output_tokens: 0, total_tokens: 1100 },
+      total_token_usage: { input_tokens: 1000, cached_input_tokens: 400, cache_write_input_tokens: 0,
+        output_tokens: 100, reasoning_output_tokens: 0, total_tokens: 1100 } } }),
+  ].join(''))
+  const plainOptions = { ...options, sessionsRoots: [] as string[], plainRoots: [{ path: codexRoot, source: 'codex' as const }] }
+  const plainPass = await runBackfillPass(plainOptions)
+  check('★ 非 DSH 来源（Codex）的历史也会补报', plainPass.status === 'complete' && plainPass.confirmed === 1)
+  const codexPortal = await openPortalStats(target, { identityView: 'member' })
+  try {
+    const rows = (await codexPortal.records(2000, 0)).rows.filter(row => row.sessionId === codexId)
+    // 🚨 缺了 `source` 服务端会按 `dsh` 落库 —— 看板上「按来源」整列就都是错的。
+    check('★ 非 DSH 来源的事件带着自己的 source 落库（缺了会冒充 DSH）',
+      rows.length === 1 && rows[0]!.source === 'codex')
+    // ★ `cached_input_tokens` **含在** `input_tokens` 内（与 DSH 相反）⇒ 输入要减掉它。
+    check('★ 纯文本来源的四列按各自码表拆开（input 1000 − cached 400 = 600）',
+      rows[0]!.input === 600 && rows[0]!.cacheRead === 400 &&
+      rows[0]!.output === 100 && rows[0]!.cacheWrite === 0)
+  } finally { await codexPortal.close() }
+  const beforePlainRepeat = reportRequests
+  await runBackfillPass(plainOptions)
+  check('★ 纯文本来源的字节数水位线生效（第二轮一个请求都不发）', reportRequests === beforePlainRepeat)
+
   check('所有 HTTP 请求均未携带对话正文', !leakedContent)
 } catch (error) {
   failures++

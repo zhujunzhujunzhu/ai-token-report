@@ -1,8 +1,43 @@
 # dsh-plugin-token-report
 
-在 DeepSeek Harness（DSH）里直接查看本机 token 用量：输入框摘要、趋势图、模型排行和自定义日期范围；需要团队汇总时，再配置身份与上报连接。
+在 **DeepSeek Harness（DSH）** 里直接查看本机 token 用量：输入框上方一条用量条，点开就是趋势图、
+模型排行与自定义日期范围；要往部门看板汇总时，再填「服务端地址 + appKey」开始上报。
 
-npm 包名：`dsh-plugin-token-report` · 仓内开发包名：`@ai-token-report/dsh-plugin`
+**不填就不发**：未署名 / 未配 appKey 时，插件只读本机日志 —— 不采集上报事件，也不上报。
+
+- 📊 **界面用量面板** —— 输入框上方的用量条（0.3.0 起是默认位置）或会话标题栏右上角的胶囊，共用同一个详情面板
+- 🧮 **只展示真值** —— 计费总量 = 未缓存输入 + 输出 + 缓存读 + 缓存写；`cacheRead` **不是** `input` 的一部分
+- 💰 **费用（估算）** —— 按本机单价快照现算；**未计价的用量写「未计价」而不是 `¥0.00`**，金额**绝不跨币种相加**
+- 🔗 **多套 DSH 并集** —— 命令行版与 DSH Desktop 的会话日志一起统计；互为镜像的会话按 `event_id` 去重，只算一次
+- 🔌 **本机客户端全覆盖** —— DSH / Codex / Claude Code / Trae（国际版与国内版）/ WorkBuddy **缺省就一起统计、也一起上报**；装了哪个就有哪个，不用配置
+- 📤 **实时上报 + 历史补报** —— 异步批量、磁盘 outbox、断网续传；服务端按事件 ID 去重，重复投递无害
+- 🤖 **Agent 可查询** —— `token_usage` / `token_usage_diagnostics` 工具，以及供其它插件调用的 `ctx.tokenReport` 服务
+- 🔒 **不采集对话内容** —— 只取 token 数值、模型名、工作目录与轮次等统计字段
+
+## 快速开始
+
+```bash
+dsh plugin --profile web add dsh-plugin-token-report@latest
+```
+
+1. **禁用官方 OTel 后端** —— 在同一个 profile 的 `cordis.patch.yml` 里合并 `- id: session-telemetry-otel` 与 `disabled: true`（cordis 同时只允许一个 `sessionTelemetry` 后端，不关会启动失败）
+2. **重启** —— `dsh --profile web --no-open`，用终端打印的完整地址打开浏览器
+3. **看用量** —— 选择工作区，输入框上方出现用量条。想汇总到部门看板，点面板右上角齿轮「配置」填服务端地址 + appKey，**保存即生效，不必重启**
+
+第 1 步的完整写法见「安装最新稳定版」；桌面端（DSH Desktop）的安装见「在 DSH Desktop（桌面端）上安装」。
+
+## 环境要求
+
+| 项 | 要求 |
+|---|---|
+| DSH 宿主 | **`0.1.7-rc.2` 或更高、`0.3.0` 之前**（本插件已在 `0.1.7-rc.2` 与 `0.2.0-rc.2` 上实测启动） |
+| 宿主模块 | 与宿主同代（`@deepseek-ai/cordis ~4.0.4`）。**不要把 0.1.5 / 0.1.6 的 telemetry 与 0.1.7 及以后的宿主混装** —— 旧版会把合法会话日志误报为损坏 |
+| Node.js | **≥ 22.15.0** |
+| profile | 需要 `web` profile（界面面板与 `/api` 数据通道在那里；headless profile 下只有上报与工具） |
+
+> 上面那个版本窗口是**兼容窗口**，不是精确版本：宿主启动时逐个 peer 判定，**任一不满足就跳过整个
+> bundle** —— 现象是「面板不见了 + 一条也不上报」，启动日志只有一行 `skipping profile bundle …`，
+> **不是报错**。排查看下方「升级与常见问题」的排查表。
 
 ## 实际使用截图
 
@@ -22,7 +57,7 @@ npm 包名：`dsh-plugin-token-report` · 仓内开发包名：`@ai-token-report
 
 ## 安装最新稳定版
 
-需要已经安装 DSH **`0.1.7-rc.2` 或更高、`0.3` 之前**（本插件已在 `0.1.7-rc.2` 与 `0.2.0-rc.2` 上实测启动），并使用同代宿主模块（`@deepseek-ai/cordis ~4.0.4`）。不要把 0.1.5 / 0.1.6 的 telemetry 与 0.1.7 及以后的宿主混装，否则旧版会把合法会话日志误报为损坏。Node.js 要求 **22.15.0 或更新版本**。
+前置要求（宿主版本窗口、Node 版本）见上方「环境要求」。安装本身只有一条命令：
 
 ```bash
 dsh plugin --profile web add dsh-plugin-token-report@latest
@@ -67,8 +102,8 @@ dsh --profile web --no-open
 桌面端与命令行版走的是**同一条装配路**，只是 home 与 profile 换成了 Desktop 自己那套；
 但桌面端的**图形入口装不了本插件**，所以下面给的是命令行步骤。
 
-> 照着逐条执行、带核对与回滚的交付版在**仓内** `docs/桌面端安装交付清单.md`
-> （该文件不在 npm 包里，所以这里只写路径不写相对链接）；本节是同一套步骤的说明版。
+> 同一套步骤的交付版在仓库的 `docs/桌面端安装交付清单.md`（逐条命令 + 核对 + 回滚，
+> 文件不在 npm 包里，所以这里只写路径）；本节是它的说明版。
 
 ### 为什么不能用桌面端的插件界面装
 
@@ -114,10 +149,9 @@ $env:PATH     = "$env:DSH_HOME\.desktop-bin;$env:PATH"   # ★ 用 Desktop 的 p
 # npm 稳定版
 node $desktopDsh plugin --profile web add dsh-plugin-token-report@latest
 
-# 本地 tarball：未发布的新版本 / 离线分发。
-#   先在仓里 `bun run publish:plugin:dry`（只打包、不发布），tgz 落在 .artifacts/releases/<时间戳>/ 下。
-#   ★ 路径用正斜杠；反斜杠会报 ERR_UNSUPPORTED_ESM_URL_SCHEME
-node $desktopDsh plugin --profile web add file:D:/Coding/ai-token-report/.artifacts/releases/<时间戳>/dsh-plugin-token-report-0.7.0.tgz
+# 本地 tarball：未发布的版本 / 离线分发。
+#   ★ 路径用正斜杠，反斜杠会报 ERR_UNSUPPORTED_ESM_URL_SCHEME；下面的版本号按实际 tarball 替换。
+node $desktopDsh plugin --profile web add file:D:/path/to/dsh-plugin-token-report-0.8.0.tgz
 ```
 
 `add` 会自动在 `profiles/web/package.json` 的 `dsh.profile.bundles` 里登记包名；**不要再手动 `insert`**。
@@ -132,7 +166,7 @@ node $desktopDsh plugin --profile web add file:D:/Coding/ai-token-report/.artifa
 **⑤ 核对**（只读，不起服务）：
 
 ```powershell
-node $desktopDsh plugin --profile web list              # 本机实测：dsh-plugin-token-report@0.7.0
+node $desktopDsh plugin --profile web list              # 本机实测：dsh-plugin-token-report@0.8.0
 node $desktopDsh --profile web --dump-config | Select-String token-report
 ```
 
@@ -157,9 +191,9 @@ node $desktopDsh --profile web --dump-config | Select-String token-report
 
 ### 三个坑
 
-1. 🚨 **版本窗口**：当前 `peerDependencies` 是 `>=0.1.7-rc.2 <0.3.0-0`，**放宽后的窗口从 `0.7.0` 起就在 npm 上**（`latest` = `0.7.0`；`0.6.0` 及更早那一版钉的是精确 `0.1.7-rc.2`）。宿主启动时由 `dsh-app-boot` 的 `evaluatePluginCompatibility` 逐个 peer 做 `semver.satisfies(runtime, range, { includePrerelease: true })`，**任一不满足就跳过整个 bundle** —— 日志只有一行 `skipping profile bundle …`，表现是「面板不见了 + 一条也不上报」，**不是报错**。所以：
+1. 🚨 **版本窗口**：当前 `peerDependencies` 是 `>=0.1.7-rc.2 <0.3.0-0`，**放宽后的窗口从 `0.7.0` 起就在 npm 上**（`0.6.0` 及更早那一版钉的是精确 `0.1.7-rc.2`）。宿主启动时由 `dsh-app-boot` 的 `evaluatePluginCompatibility` 逐个 peer 做 `semver.satisfies(runtime, range, { includePrerelease: true })`，**任一不满足就跳过整个 bundle** —— 日志只有一行 `skipping profile bundle …`，表现是「面板不见了 + 一条也不上报」，**不是报错**。所以：
    - Desktop 自带的 `0.1.7-rc.2`（以及 `0.2.x`）都在窗口内，**装 `@latest` 即可，不需要为了拿放宽窗口去手工打 tarball**（tarball 只在「装未发布版本」时才用得上）。
-   - 反过来，Desktop 升到 `0.3.0` 及以后会被跳过。那时要么等插件放宽并复验，要么按 §9.1 最后一行用 `allow-version … --accept-risk`（自担风险，不等于已验证）。
+   - 反过来，Desktop 升到 `0.3.0` 及以后会被跳过。那时要么等插件放宽并复验，要么用宿主自己的 `allow-version … --accept-risk` 强制放行（**自担风险，不等于已验证**）。
 2. **不要把仓内源码包 `@ai-token-report/dsh-plugin` 装进 Desktop**：它的 `main` 指向 `src/index.ts`，而宿主跑在 **Node**（只有 Bun 直接吃 ts），加载即失败。桌面端要用构建产物、tarball 或发布包。
 3. **升级 / 卸载走同一条路，不要只手改 `package.json`**：一旦 Desktop 的 generation 迁移成功，插件会被搬进不可变的 `.generations/live/<...>`，那时只有重新 `add` 才换得了版本（`plugin remove` 会走 Desktop 的 generation 下线流程）。
 
@@ -196,10 +230,26 @@ node $desktopDsh --profile web --dump-config | Select-String token-report
 **面板里就能改**（齿轮「配置」→「会话日志根」，保存即生效），也可以用部署配置
 `dshHomes` 或环境变量 `DSH_TOKEN_REPORT_DSH_HOMES` 统一钉死；
 想**让某套 DSH 单独用一份身份 / 库**用 `dataDir`（对应环境变量 `DSH_TOKEN_REPORT_DATA_DIR`，
-**只能在部署配置 / 环境变量里给**，面板刻意不提供）。完整清单与排查见 §1.1。
+**只能在部署配置 / 环境变量里给** —— 换掉它等于连身份 / 库 / outbox 一起换，会让人「突然变成另一个人」）。
 
 > 🚨 **不要用日志根去达到「分开身份」的目的**：`dshHome` / `dshHomes` 换掉的是**日志来源**，
 > 那会让面板少算另一套 DSH 的会话，而实时上报照常工作 —— 这个错误**不会**以「完全没数据」的形式暴露。
+
+### 别的 AI 客户端也算（缺省就是全算）
+
+面板、`token_usage` 工具与**上报**都覆盖本机全部已注册来源：DSH、Codex、Claude Code、
+Trae（国际版 `trae` / 国内版 `trae-cn`，两个发行版算两个来源）、WorkBuddy。
+**没有开关要打开** —— 本机装了哪个客户端，它的用量就进面板、也会进部门看板；
+没装的那些自然不会出现（诊断里会逐项报出解析到的根）。
+
+代价必须知情：**第一次取数与第一轮历史补报要冷扫这些日志**（本机实测 Codex 就有 1,500 个文件 /
+2.8 GB，十几秒到几分钟），之后按文件字节数增量，只解析变化过的文件。
+嫌慢就把那个客户端的日志目录挪走，或者用它自己的环境开关关掉
+（例如 `DSH_TOKEN_REPORT_CODEX=0`）—— ⚠️ **这一项刻意不在面板里**：
+「我不想统计 Codex」是一件部署策略级的事，不该和「我的服务端地址」放在同一个表单里。
+
+> 为什么不再做成「白名单」：少统计一个来源**没有任何下游信号** —— 面板数字看着完全正常，
+> 而它与「我在那台客户端上本来就没用量」长得一模一样。采集范围不是性能偏好，是一句会被读成结论的口径。
 
 ### 调整面板位置
 
@@ -241,10 +291,10 @@ node $desktopDsh --profile web --dump-config | Select-String token-report
 | 字段 | 说明 |
 |---|---|
 | 服务端地址 | 部门平台根地址（例如 `https://portal.example.com`，或本机自建的 `http://127.0.0.1:8787`）。上报地址由它推导（`<地址>/api/v1/token-usage`），不需要自己拼路径 |
-| appKey | 管理员在平台「appKey 管理」页签发的那一串。**已配置时留空 = 只改下面三项偏好**，不会重新校验、也不重写身份文件 |
+| appKey | 管理员在平台「appKey 管理」页签发的那一串。**已配置时留空 = 只改下面各项偏好**，不会重新校验、也不重写身份文件 |
 | 上报间隔 | 5 秒 / 10 秒（默认）/ 30 秒 / 1 分钟 / 5 分钟。这个数字直接决定部门服务端的请求密度，所以只给档位 |
 | 面板位置 | 见上一节；保存后**就地**换地方 |
-| 会话日志根 | 每行一个 DSH home；**留空 = 自动发现**。见下文「面板里改会话日志根」 |
+| 会话日志根 | 每行一个 DSH home；**留空 = 自动发现**。见上方「多套 DSH 并存」 |
 
 点击「验证并保存」后，插件用这个 appKey 向对应服务端的 `/api/v1/identity/verify` 校验身份，
 **姓名与分组以服务端返回值为准**（面板不再询问姓名 —— 它由 appKey 在服务端绑定的人决定）。
@@ -272,7 +322,7 @@ node $desktopDsh --profile web --dump-config | Select-String token-report
 
 身份与连接保存在**数据目录**下（缺省 `~/.ai-token-report/`；DSH Desktop 与命令行版**缺省就共用同一份**、不需要任何配置，见上方「多套 DSH 并存」）。插件与本地 Web 共用身份文件。部署侧固定了身份时，页面会提示配置由管理员管理。
 
-启用上报后，插件会在后台扫描**上面那些会话日志根**（缺省是本机全部 DSH）下的**全部历史会话**，分批补报用量，直到服务器全部确认收到；不需要逐个打开旧会话。实时新用量同时上报，服务端按事件 ID 去重。断网或退出后，下次启动会继续；更换服务端地址或 appKey 后，会向新连接重新全量补报。
+启用上报后，插件会在后台扫描**上面那些会话日志根**（缺省是本机全部 DSH home）**以及本机全部已注册来源**（Codex / Claude Code / Trae / WorkBuddy）下的**全部历史会话**，分批补报用量，直到服务器全部确认收到；不需要逐个打开旧会话。实时新用量同时上报，服务端按事件 ID 去重。断网或退出后，下次启动会继续；更换服务端地址或 appKey 后，会向新连接重新全量补报。
 
 历史补报只发送 token 数值、模型和会话归属等统计字段，不发送对话正文。`token_usage_diagnostics` 会显示历史扫描进度、服务器确认数、重试错误和最近完成时间。对照本地与部门看板时，请选择相同时间范围并筛选 appKey 对应人员。
 
@@ -299,6 +349,7 @@ DSH 升级会保留旧格式日志作为备份；同一会话存在多个规范�
 | 明细分析 | 模型 / 服务商 / 项目 / 会话分组，展开与分页 |
 | 费用（估算） | 面板顶部一行「费用（估算）」+ 明细表每行的金额列；`token_usage` 工具也给出同样一段。金额是**本机按 `pricing.json` 快照（没有就退回内置种子价）现算的估算**，与部门看板可能不同 —— 所以那行口径说明（单价来源 / 未计价比例 / 「估算 ≠ 财务账单」）永远与金额一起出现 |
 | 多套 DSH 并集 | 缺省统计本机全部 DSH 的会话日志（互为镜像的会话按 event_id 去重，只算一次） |
+| 多客户端来源 | 本机全部已注册来源（Codex / Claude Code / Trae / WorkBuddy）**缺省就一起统计、也一起上报**；装了哪个就有哪个。要收窄只能用各来源自己的环境开关（如 `DSH_TOKEN_REPORT_CODEX=0`） |
 | 本地增量查询 | SQLite 增量索引；库不可用时自动回退日志扫描并提示 |
 | 上报连接 | 面板内填服务端地址 + appKey，验证后**立即生效**（无需重启） |
 | 上报偏好 | 面板内选上报间隔、面板位置与会话日志根；只改偏好时不必重填 appKey，保存后即时生效 |
@@ -313,12 +364,35 @@ DSH 升级会保留旧格式日志作为备份；同一会话存在多个规范�
 趋势图**刻意没有金额曲线**：多币种绝不跨币种相加，那条判定规则的唯一实现留在部门看板。
 只采集用量相关字段（包含模型名、工作目录、轮次等），不采集对话内容。上报失败不会阻塞 DSH 的会话循环；服务端按事件 ID 去重。
 
+## 采集了什么，不采集什么
+
+| | 内容 |
+|---|---|
+| **采集** | 计费级的四类 token 数（未缓存输入 / 输出 / 缓存读 / 缓存写）、模型名、供应商、工作目录（项目）、会话与轮次标识、事件时间、来源客户端 |
+| **不采集** | 对话正文、提示词、模型回复、附件与文件内容 —— 内容开关恒为关，一个字节都不读 |
+| **不署名就不采** | 没有身份文件、没有 appKey，或部署侧关掉上报（`features.reporting: false`）时，**不注册上报后端**、一个字节都不发，只在启动日志里提示一次「去哪里填」 |
+| **为什么不做 `unknown` 兜底** | 那等于**未授权的数据采集**。宁可一条不报，也不替使用者做这个决定 |
+
+上报走 `Authorization: Bearer <appKey>`，地址由使用者自己填（缺省指向本机自建的
+`http://127.0.0.1:8787/api/v1/token-usage`）。插件不向任何其它地址发送数据。
+面板的「上报调试」页签能看到每一次真实请求的**请求体原文**与回执 —— 采集范围不必只看承诺，可以自己核。
+
 ## 升级与常见问题
 
 从旧版升级时，重新运行上方带 `@latest` 的安装命令即可安装最新稳定版。若曾源码直挂或手动 `insert`，先执行下方离线修复，再重启 DSH。
 
-> **从 0.5.0（或更早）升到 0.6.0 时，数据目录换了位置，需要手动搬一次家** —— 见下一节。
+> **从 0.5.0（或更早）升到 0.6.0 时，数据目录换了位置，需要手动搬一次家** —— 见下方「0.6.0 数据目录位置变更」。
 > 0.5.0 的下一个公开版本就是 0.6.0，中间没有需要单独安装的版本。
+
+### 各版本都变了什么
+
+| 版本 | 使用者能感知的变动 |
+|---|---|
+| **0.8.0** | ★ **统计与上报范围都改成「本机全部已注册来源」**（Codex / Claude Code / Trae / WorkBuddy 缺省就一起算、也一起报）；面板里可改「会话日志根」（保存即生效）；README 补齐 DSH Desktop 的安装步骤。旧的 `extraSources` 配置项**已废弃**（写了会在启动日志里告警） |
+| 0.7.0 | `peerDependencies` 从精确 `0.1.7-rc.2` 放宽成兼容窗口 `>=0.1.7-rc.2 <0.3.0-0` —— 宿主小版本升级不必再等插件跟进 |
+| 0.6.0 | ★ **数据目录搬到 `~/.ai-token-report`**（升级要手动搬一次家，见下一节）；面板里可改面板位置；**保存即生效**，不必重启；面板开始展示费用（估算） |
+| 0.4.0 | 随包提供离线修复工具 `repair-profile.mjs`（清理 `duplicate loader entry id`；开发期写作 0.3.1，npm 上没有这个版本） |
+| 0.3.0 | 面板默认位置改成输入框上方的用量条（`ui.position: dock`）—— 要保留 0.2.0 的外观就配 `both` |
 
 ### 🚨 0.6.0 数据目录位置变更：升级必须搬一次家
 
@@ -381,6 +455,7 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 | 现象 | 处理 |
 |---|---|
 | `sessionTelemetry` 已注册 | 确认官方 OTel 后端已禁用，且没有重复挂载插件 |
+| 面板不见了，且一条也不上报（启动日志只有 `skipping profile bundle …`） | 宿主版本落在**兼容窗口**之外 —— 见上方「环境要求」。这一行不是报错，是整个 bundle 被跳过了 |
 | 没有用量入口 | 确认安装在 `web` profile、bundle 数组包含发布包名，并已重启；`features.ui` 不能关闭 |
 | 桌面端（DSH Desktop）装不上 / 界面里搜不到 | 桌面端的社区市场只收 awesome-dsh-plugin 精选列表内的来源，本插件不在其中 —— 按上方「在 DSH Desktop（桌面端）上安装」走命令行 |
 | 401 / 未通过宿主鉴权 | 使用本次 DSH 启动时打印的完整地址重新打开 |
@@ -389,7 +464,8 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 | 改完配置没生效 | 0.6.0 起保存即生效（页面会回报状态）。若显示「需重启 DSH」，说明宿主没提供热生效入口（旧版本宿主），重启即可 |
 | 升级后面板要求重新署名 / 数字少了一块 | 数据目录换了位置，旧目录要搬一次家 —— 见上方「0.6.0 数据目录位置变更」 |
 
-源码与开发文档见 [GitHub 仓库](https://github.com/zhujunzhujunzhu/ai-token-report/tree/main/packages/dsh-plugin)。
+源码、开发文档与构建方式见 [GitHub 仓库](https://github.com/zhujunzhujunzhu/ai-token-report/tree/main/packages/dsh-plugin)
+（仓内开发包名是 `@ai-token-report/dsh-plugin`，npm 上的发布名是 `dsh-plugin-token-report`）。
 
 <!-- DEVELOPMENT-DOCS -->
 
@@ -467,14 +543,16 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
     #   不需要写这一项。想「各用一套」时才显式给 —— 改日志根会连会话日志来源一起换掉，见下一节。
     # dataDir: ~/.dsh/token-report            # 例：只让这套 DSH 用它（不跟随新缺省）
 
-    # ── 其它来源（多客户端，选填；缺省 = 只统计 DSH）──────────────────
-    # ★ 面板与 `token_usage` 工具**缺省只统计 DSH**。想把这台机器上别的 AI 客户端的
-    #   用量一起算进来，就在白名单里显式列出 —— 也可以在面板的齿轮「配置」里填同一项。
-    #   取值：all（全部已注册来源）或逐个 id：codex / claude-code / trae / trae-cn / workbuddy
-    #   （`dsh` 永远在，写它等于没写；拼错的 id 会被**当场拒绝**并给出可用值。）
-    # ⚠️ 并进来意味着面板每次取数都会去增量扫那些日志：只列真的想看的那些。
-    #   本机 Codex 就有 1,500 个文件 / 2.8 GB —— 填 all 的第一次取数会明显变慢。
-    # extraSources: [trae, trae-cn]
+    # ── 其它来源（多客户端）──────────────────────────────────────
+    # ★ 统计与上报范围**恒为「本机全部已注册来源」**：DSH + Codex / Claude Code /
+    #   Trae（国际版 / 国内版）/ WorkBuddy —— 装了哪个就有哪个，**这里没有开关**。
+    #   想收窄只能用各来源自己的环境开关（`SessionSourceAdapter.disableEnv`）：
+    #   DSH_TOKEN_REPORT_CODEX=0 / DSH_TOKEN_REPORT_CLAUDE=0 /
+    #   DSH_TOKEN_REPORT_TRAE=0 / DSH_TOKEN_REPORT_TRAE_CN=0 / DSH_TOKEN_REPORT_WORKBUDDY=0
+    # ⚠️ 代价：第一次取数与第一轮历史补报要冷扫这些日志（本机 Codex 1,500 个文件 /
+    #   2.8 GB），之后按文件字节数增量。
+    # ⚠️ 旧配置项 `extraSources` **已废弃**：写了不生效，但会在启动日志里告警
+    #   （静默忽略一项配置正是本仓最反对的错法）。
 
     # ── 身份（选填）─────────────────────────────────────────────
     # 留空则读 <数据目录>/identity.json（员工自己在本地页填的那份）

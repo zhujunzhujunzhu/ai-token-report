@@ -62,6 +62,15 @@ export interface BillingRecord {
   turn: number | null
   step: number | null
   /**
+   * ★ 这条用量是**哪个客户端**写的（`dsh` / `codex` / `claude-code` / `trae` /
+   *   `trae-cn` / `workbuddy`）—— 服务端落到 `usage_event.source`。
+   *
+   * 🚨 缺席时服务端按 `dsh` 落库（见 `shared/src/protocol.ts` 的 `WireTokenRecord.source`）。
+   *   历史补报现在会补报**非 DSH 来源**，所以这个字段**必须**跟着记录走：
+   *   漏了它不会报错，只会把 Codex 的用量记在 DSH 名下 —— 看板上「按来源」整列都是错的。
+   */
+  source: string
+  /**
    * ★ 四个 token 类目**始终分开**。
    *
    * 铁律 3：采集端一旦合并，后续任何拆分都无法还原。
@@ -167,6 +176,8 @@ export function foldRecord(
     cwd: str(record.attributes['session.cwd']),
     turn: optNum(pick(body, 'turn')),
     step: optNum(pick(body, 'step')),
+    // 实时 telemetry 只可能来自 DSH 自己（它就是宿主的会话事件）。
+    source: 'dsh',
     inputTokens: input,
     outputTokens: output,
     cacheReadTokens: cacheRead,
@@ -205,6 +216,8 @@ export function toWireRecord(rec: BillingRecord): Record<string, unknown> {
     cwd: rec.cwd,
     turn: rec.turn,
     step: rec.step,
+    // ★ 来源必须过线：服务端缺这个字段时按 `dsh` 落库（见 `BillingRecord.source` 的注释）。
+    source: rec.source,
   }
 }
 

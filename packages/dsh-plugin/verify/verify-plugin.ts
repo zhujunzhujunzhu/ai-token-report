@@ -32,6 +32,23 @@ import { apply, type ApplyContext } from '../src/index.js'
 import { UI_SETTINGS_PATH, UI_STATS_PATH } from '../src/client/protocol.js'
 import type { SessionTelemetryRecord } from '@deepseek-ai/dsh-session-telemetry'
 
+/**
+ * ★ 把**非 DSH 来源**关掉：本脚本断言的是**绝对 token 数**（1,110）。
+ *
+ * 缺省取数范围是「本机全部已注册来源」（见 `src/extra-sources.ts`），
+ * 所以不关的话，面板会把你机器上真实的 Codex / Claude Code 日志也 ingest 进
+ * 这个临时库 —— 本机实测多出 1,100 万 token，而且脚本耗时随机器上的日志量漂移。
+ *
+ * ⚠️ 这与 `[test] preload`（`scripts/test-preload.ts`）做的是同一件事，只是
+ *   `bun run <脚本>` 不走 `bun test` 的 preload。
+ *   「缺省就是全部来源」那条语义由 `test/extra-sources.test.ts` 与
+ *   `verify-client-bundle.ts` 各自钉住，不在这里重复。
+ */
+for (const key of [
+  'DSH_TOKEN_REPORT_CODEX', 'DSH_TOKEN_REPORT_CLAUDE',
+  'DSH_TOKEN_REPORT_TRAE', 'DSH_TOKEN_REPORT_TRAE_CN', 'DSH_TOKEN_REPORT_WORKBUDDY',
+]) process.env[key] = '0'
+
 let failures = 0
 let checks = 0
 
@@ -496,6 +513,7 @@ console.log('\n── 6. 面板改会话日志根：同一进程就地生效（�
 
     // ③ 改动前：面板里没有覆盖项，生效的是部署配置那一个根
     const before = await getSettings()
+    const totalBefore = await totalOf()
     check('GET 如实回「面板没设过」', Array.isArray(before['dshHomes']) && (before['dshHomes'] as unknown[]).length === 0)
     check('生效根来自部署配置', before['rootsSource'] === 'config')
     check(
@@ -503,7 +521,7 @@ console.log('\n── 6. 面板改会话日志根：同一进程就地生效（�
       JSON.stringify(before['effectiveRoots']) === JSON.stringify([{ path: logged, exists: true }]),
       JSON.stringify(before['effectiveRoots']),
     )
-    check('改动前按部署配置的根取到数（1,110 token）', (await totalOf()) === 1_110)
+    check('改动前按部署配置的根取到数（1,110 token）', totalBefore === 1_110, `实际 ${totalBefore}`)
 
     // ④ 面板里把它改成一个没有日志的 home（只存偏好，不需要凭证）
     const saved = await save({ dshHomes: [empty] })
@@ -520,16 +538,17 @@ console.log('\n── 6. 面板改会话日志根：同一进程就地生效（�
     // ⚠️ 比 JSON 而不是比子串：Windows 路径在 JSON 里是双反斜杠转义的
     check('落盘到数据目录（plugin-connection.json）',
       JSON.stringify(savedFile()['dshHomes']) === JSON.stringify([empty]))
-    check('★ 无需重启 DSH：同一次运行里的取数立刻换成新根（0 token）', (await totalOf()) === 0)
+    check('★ 无需重启 DSH：同一次运行里的取数立刻换成新根（0 token）', (await totalOf()) === 0, `实际 ${await totalOf()}`)
 
     const tools = provided['tokenReportTools'] as Record<string, { run(a: Record<string, unknown>): Promise<string> }>
     const afterText = await tools['token_usage']!.run({ period: 'today' })
-    check('★ `token_usage` 工具也按新根（未找到任何会话日志）', afterText.includes('未找到任何会话日志'))
+    check('★ `token_usage` 工具也按新根（未找到任何会话日志）', afterText.includes('未找到任何会话日志'),
+      afterText.slice(0, 160))
 
     // ⑤ 清空 = 清掉覆盖，回落部署配置（不是「一个根都不要」）
     const cleared = await save({ dshHomes: [] })
     check('清空后如实回报「回落到部署配置」', cleared['ok'] === true && cleared['rootsSource'] === 'config')
-    check('★ 清空后立刻又读到部署配置那个根（1,110 token）', (await totalOf()) === 1_110)
+    check('★ 清空后立刻又读到部署配置那个根（1,110 token）', (await totalOf()) === 1_110, `实际 ${await totalOf()}`)
 
     // ⑥ 非法输入在本地就被拦下，且盘上的范围原样不动
     const textBeforeReject = readFileSync(connectionFile, 'utf8')
@@ -537,28 +556,17 @@ console.log('\n── 6. 面板改会话日志根：同一进程就地生效（�
     check('非法列表被拒（说清原因）', rejected['ok'] === false && typeof rejected['reason'] === 'string')
     check('被拒后盘上的连接文件一个字节没被改写', readFileSync(connectionFile, 'utf8') === textBeforeReject)
 
-    // ⑦ 多客户端白名单（`extraSources`）：**默认关**，且拼错当场报错 ——
-    //   这一项的错法没有下游信号（数字不变，与「那个客户端没用量」一模一样）。
-    check('★ 默认关：面板没设过其它来源',
-      Array.isArray(before['extraSources']) && (before['extraSources'] as unknown[]).length === 0)
-    check('★ 默认关时一个额外来源都不并（只统计 DSH）',
-      Array.isArray(before['extraSourcesEffective']) && (before['extraSourcesEffective'] as unknown[]).length === 0)
-    check('GET 给出可填的来源清单（输入框据此自解释）',
-      Array.isArray(before['availableSources']) && (before['availableSources'] as unknown[]).includes('trae'))
-    const badSource = await save({ extraSources: ['trea'] })
-    check('🚨 拼错的来源名当场被拒，并给出可用值',
-      badSource['ok'] === false && String(badSource['reason']).includes('trae'))
-    const withTrae = await save({ extraSources: ['trae'] })
-    check('写入合法白名单后如实回报「已并入 trae」',
-      withTrae['ok'] === true
-      && JSON.stringify(withTrae['extraSourcesEffective']) === JSON.stringify(['trae']),
-      JSON.stringify(withTrae['extraSourcesEffective']))
-    check('白名单也落盘（plugin-connection.json）',
-      JSON.stringify(savedFile()['extraSources']) === JSON.stringify(['trae']))
-    const clearedSources = await save({ extraSources: [] })
-    check('★ 清空白名单 = 回到「只统计 DSH」',
-      clearedSources['ok'] === true
-      && JSON.stringify(clearedSources['extraSourcesEffective']) === JSON.stringify([]))
+    // ⑦ 多客户端来源：**已经不再是一项配置** —— 取数范围恒为「本机全部已注册来源」。
+    //   所以面板载荷里根本没有这一项，提交上来的也必须被忽略：
+    //   静默写进配置文件（或静默忽略）正是本仓最反对的错法 ——
+    //   使用者会以为「我限制成了只统计 DSH」，而实际范围是全来源。
+    check('★ 面板载荷里不再有「其它来源」三件套（范围不是配置项）',
+      !('extraSources' in before) && !('extraSourcesEffective' in before) && !('availableSources' in before),
+      JSON.stringify(Object.keys(before).filter((key) => key.toLowerCase().includes('source'))))
+    const legacyPost = await save({ extraSources: ['trae'] })
+    check('老面板提交的 extraSources 被忽略，而不是落盘',
+      legacyPost['ok'] === true && savedFile()['extraSources'] === undefined,
+      JSON.stringify(savedFile()['extraSources']))
   } finally {
     rmSync(home, { recursive: true, force: true })
   }

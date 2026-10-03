@@ -38,10 +38,6 @@ function loaded(overrides: Partial<UiSettingsPayload> = {}): UiSettingsPayload {
     dshHomes: [],
     effectiveRoots: [{ path: '/home/u/.dsh', exists: true }],
     rootsSource: 'auto',
-    // 多客户端白名单的默认态：空 = 只统计 DSH（面板主体），可选项由宿主给出
-    extraSources: [],
-    extraSourcesEffective: [],
-    availableSources: ['claude-code', 'codex', 'trae', 'trae-cn', 'workbuddy'],
     ...overrides,
   }
 }
