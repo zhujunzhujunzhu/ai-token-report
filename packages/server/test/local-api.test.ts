@@ -29,6 +29,7 @@ import { zstdCompressSync } from 'node:zlib'
 import { cacheHitRate } from '@ai-token-report/shared'
 import type { StatsSession } from '@ai-token-report/core/db'
 import { writePricingSnapshot } from '@ai-token-report/core/db'
+import { writeIdentity } from '@ai-token-report/core'
 
 import { CoreStatsProvider, LocalStatsRouter, type StatsProvider } from '../src/local-api.js'
 
@@ -595,9 +596,27 @@ describe('本地金额（估算）', () => {
   }
 
   function costRouter(): LocalStatsRouter {
+    // ★ 金额只在**配置过上报**时才下发（见用例组末尾那几条），所以这里先署名 ——
+    //   不署名量到的是「字段整块缺席」，而不是「价算得对不对」。
+    signIn()
     return new LocalStatsRouter(new CoreStatsProvider(sessionsRoot, dbPath), {
       dataDir: join(home, 'token-report'),
     })
+  }
+
+  /**
+   * 署名 = 「配置过上报」。
+   *
+   * 本地页的「配置」弹框与插件面板在 appKey 校验通过后写的正是这份
+   * `identity.json`（连接配置先落地、身份写失败就回滚），而 `/api/local/identity`
+   * 回答 `signed` 读的也是它 —— 两处同一个事实。
+   */
+  function signIn(): void {
+    const written = writeIdentity(join(home, 'token-report', 'identity.json'), {
+      name: '张三',
+      token: 'atr-local-api-test',
+    })
+    if (!written.ok) throw new Error(`署名夹具写入失败: ${written.reason}`)
   }
 
   type CostBody = {
@@ -690,6 +709,90 @@ describe('本地金额（估算）', () => {
     expect(row.cost.costs).toEqual([])
     expect(row.cost.unpricedTokens).toBe(500)
     expect(row.cost.unpricedRate).toBe(1)
+  })
+
+  // ── 「没配置上报 → 整块费用不出现」──────────────────────────────────────
+  //
+  // ★ 判据是**本机已署名**（`<dataDir>/identity.json`），与 `/api/local/identity`
+  //   的 `signed` 读同一份文件。三条断言分别守：字段整块缺席（不是 0）、
+  //   连算都不算、以及它是**活取值**（在页面里配完就出现，不必重启服务）。
+
+  /** 数据目录给全、价快照也在，但**这台机器没署过名**。 */
+  function unconfiguredRouter(): LocalStatsRouter {
+    return new LocalStatsRouter(new CoreStatsProvider(sessionsRoot, dbPath), {
+      dataDir: join(home, 'token-report'),
+    })
+  }
+
+  test('★ 未配置上报 → 概览 / 趋势 / 明细里一个 cost 字段都没有（不是 0）', async () => {
+    writeCostSession()
+    writeLocalPrices()
+    const r = unconfiguredRouter()
+
+    const results = [
+      await r.overview(params({ period: 'today' })),
+      await r.series(params({ bucket: 'hour' })),
+      await r.breakdown(params({ by: 'provider-model' })),
+    ]
+
+    for (const res of results) {
+      expect(res.status).toBe(200)
+      // 判据同样是**字段在不在**：写成 `cost: 0` 会让「没配置」看起来像「没花钱」
+      expect(JSON.stringify(res.body)).not.toContain('"cost"')
+    }
+
+    // 去掉的只是费用那一块，用量照常下发（未署名 ≠ 页面没数据）
+    expect((results[0]!.body as unknown as { totalTokens: number }).totalTokens).toBe(2060)
+  })
+
+  test('★ 未配置上报时连算都不算：`records()` 一次都没被碰过', async () => {
+    writeCostSession()
+    writeLocalPrices()
+
+    let recordsCalls = 0
+    const provider: StatsProvider = {
+      open: async (opts) => {
+        const { openStats } = await import('@ai-token-report/core/db')
+        const session = await openStats({
+          sessionsRoot,
+          dbPath,
+          ...(opts.period ? { period: opts.period } : {}),
+          providers: opts.providers,
+          models: opts.models,
+        })
+        // 影子方法只记账：逐条事件取价必须物化全量记录，所以金额真算了就一定会走它。
+        const real = session.records.bind(session)
+        session.records = () => {
+          recordsCalls += 1
+          return real()
+        }
+        return session
+      },
+    }
+
+    const body = (
+      await new LocalStatsRouter(provider, { dataDir: join(home, 'token-report') }).overview(
+        params({ period: 'today' }),
+      )
+    ).body as Record<string, unknown>
+
+    expect(body['cost']).toBeUndefined()
+    expect(recordsCalls).toBe(0)
+  })
+
+  test('★ 配置上报是活取值：署名前没有金额，署名后立刻出现（本地服务不必重启）', async () => {
+    writeCostSession()
+    writeLocalPrices()
+    // ⚠️ 同一个 router 实例连着请求两次：本地服务是长驻进程，而配置是页面里填的
+    const r = unconfiguredRouter()
+
+    const before = (await r.overview(params({ period: 'today' }))).body as Record<string, unknown>
+    expect(before['cost']).toBeUndefined()
+
+    signIn()
+
+    const after = (await r.overview(params({ period: 'today' }))).body as Record<string, unknown>
+    expect(after['cost']).toBeDefined()
   })
 
   test('SQL 路径与直扫路径给出同一笔金额（接口级口径一致）', async () => {

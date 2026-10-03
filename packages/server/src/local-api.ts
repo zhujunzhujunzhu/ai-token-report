@@ -44,6 +44,8 @@
 
 import {
   derive,
+  identityPath,
+  readIdentity,
   resolveRange,
   type GroupDimension,
   type SessionsRootInput,
@@ -171,6 +173,18 @@ export class CoreStatsProvider implements StatsProvider {
 }
 
 /**
+ * 一次请求的计价上下文。
+ *
+ * ★ **未配置上报时不存在**（`null`）—— 那时本层连单价文件都不读、连
+ * `session.records()` 都不物化，所以「没有金额」不是靠事后过滤得到的。
+ */
+interface CostContext {
+  pricing: LocalPricing
+  totals: CostTotals
+  byGroup: (dim: GroupDimension) => Map<string, CostTotals>
+}
+
+/**
  * 本地统计路由。所有方法都是纯函数式的
  * 「解析参数 → 打开会话 → 查询 → 组装响应」，不持有请求状态。
  *
@@ -186,10 +200,13 @@ export class LocalStatsRouter {
   /**
    * token-report 自己的**数据目录**（身份 / 本地库 / outbox / 补报水位）。
    *
-   * 只用于**展示来源**（页面上的「数据目录」那一行）与**离线单价快照**
-   * （`pricing.json`：它是配置，必须和身份 / 本地库放在一起，不跟着会话日志根走），
-   * 不参与「用量从哪来」—— 取数只认 provider 手里的会话日志根与本地库路径。
-   * `null` = 调用方没给（测试注入常见）：此时计价退回内置种子价，并在响应里说明。
+   * 只用于**展示来源**（页面上的「数据目录」那一行）、**离线单价快照**
+   * （`pricing.json`：它是配置，必须和身份 / 本地库放在一起，不跟着会话日志根走）
+   * 与**读取本机署名**（`identity.json` —— 见 `#reportingConfigured()`：
+   * 没配上报就整块不发金额），不参与「用量从哪来」——
+   * 取数只认 provider 手里的会话日志根与本地库路径。
+   * `null` = 调用方没给（测试注入常见）：那时**金额整块缺席**
+   * （拿不到身份就说不上「配过上报」，而默认给钱正是那条开关要防的）。
    */
   readonly #dataDir: string | null
   /** 上次强制失效的时刻（`refresh` 用；现在只是给页面一个回执）。 */
@@ -201,14 +218,48 @@ export class LocalStatsRouter {
   }
 
   /**
+   * ★ **这台机器配置过上报没有** —— 没配置就一整块费用都不出现。
+   *
+   * ## 判据：本机已署名
+   *
+   * 读的是数据目录下的 `identity.json`（`readIdentity()`），也就是
+   * `/api/local/identity` 回答 `signed` 时读的**同一份文件、同一个读取器** ——
+   * 于是页面不可能出现「弹框说没配置、卡片却有钱」这种自相矛盾的状态。
+   *
+   * 为什么「已署名」就等价于「配置上报」：署名文件只在 appKey 经部门服务端
+   * 校验通过之后才写出（本地页的「配置」弹框与插件面板两条路都是
+   * 「连接先落地、身份写失败就把连接回滚」）。反过来，只有连接配置而没有
+   * `identity.json` 的机器从未署名 ⇒ **不采集也不上报**，那正是「没配置上报」。
+   *
+   * ## 为什么要按这个开关把金额整块拿掉
+   *
+   * 没配上报时页面上的价只能来自**内置种子价**（它只覆盖 `deepseek-official`
+   * 那几个模型）。本机若在以 Claude Code / Codex / Trae 为主地产生用量，
+   * 那个数既不是这些模型的价、也不是这个部门谈的价 —— 它会以一个
+   * 「看起来正常」的金额出现在第一屏，而使用者无法从页面上分辨。
+   * 与其给一个自己都不认的数，不如整块不出现。
+   *
+   * ⚠️ 它**不是**权限：`/api/local/*` 本来就只监听回环、无鉴权（本地页没有
+   * 权限模型）。这是一条产品口径开关，表达的是「有没有一个可信的价来源」。
+   *
+   * 🚨 `#dataDir` 为 `null`（注入式调用方 / 测试没给数据目录）时按**未配置**处理：
+   * 拿不到身份就说明不了「配过」，而这时默认给钱正是这条开关要防的那件事。
+   */
+  #reportingConfigured(): boolean {
+    if (this.#dataDir === null) return false
+    return readIdentity(identityPath(undefined, this.#dataDir)).identity !== null
+  }
+
+  /**
    * 本次请求的计价上下文：**价 + 逐条事件的取价函数 + 全量记录**。
+   * 未配置上报时返回 `null`（调用方据此**整块不发 `cost` 字段**）。
    *
    * ## ★ 为什么这里的价来自数据目录，而 `#dataDir` 的注释说它「不参与取数」
    *
    * `pricing.json` 是**配置**，它必须和身份 / 本地库放在一起（数据目录），
    * 而不是跟着会话日志根走 —— 换个 home 不该换掉计价口径。
-   * 所以本文件是数据目录的**第二个**用途（第一个是页面上那行「数据目录」）。
-   * 除此之外它仍然不参与「用量从哪来」。
+   * 所以本文件读数据目录是有意的（展示来源 / 计价 / 读署名），
+   * 但它仍然不参与「用量从哪来」。
    *
    * ## ★ 为什么逐条事件取价，而不是按分组汇总后再乘
    *
@@ -218,12 +269,13 @@ export class LocalStatsRouter {
    * 也就是热态请求从 ~50ms 变成 ~110ms。这是**刻意付的代价**：
    * 唯一能省掉它的办法是「按 (provider, model) 汇总后再乘一个价」，
    * 而那正是上面这条错误。单机量级下 110ms 仍然是「点一下就出来」。
+   *
+   * 顺带一提：未配置上报时这条路**整个不执行**（连 `pricing.json` 都不读），
+   * 所以那种机器上取数还更快一点。
    */
-  #costContext(session: StatsSession): {
-    pricing: LocalPricing
-    totals: CostTotals
-    byGroup: (dim: GroupDimension) => Map<string, CostTotals>
-  } {
+  #costContext(session: StatsSession): CostContext | null {
+    if (!this.#reportingConfigured()) return null
+
     const pricing = loadLocalPricing({ dataDir: this.#dataDir })
     const resolve = priceResolver(pricing.prices)
     const records = session.records()
@@ -278,6 +330,8 @@ export class LocalStatsRouter {
       const total = session.totals()
       // ★ 口径来自 core 的 derive()，本文件不写公式
       const metrics = derive(total)
+      // ★ 未配置上报时为 `null` —— 那时连 `pricing.json` 都不读、连记录都不物化
+      const cost = this.#costContext(session)
 
       const body: LocalOverviewResponse = {
         range: { from: parsed.sinceMs ?? null, to: parsed.untilMs ?? null, label: parsed.label },
@@ -307,10 +361,11 @@ export class LocalStatsRouter {
         //   三个接口共用同一次刷新（`openStats` 的单飞），所以只在 overview 上带就够 ——
         //   页面把这一行显示在「数据来源」旁边。
         ...(session.degradedReason !== undefined ? { degradedReason: session.degradedReason } : {}),
-        // ★ 金额总在下发（本地页没有权限模型，它只读本机数据），
-        //   但「按哪份单价算的」跟着一起来 —— 离线端读快照、看板读库，
+        // ★ 金额只在**配置过上报**时下发：未配置时整个字段缺席（不是 0），
+        //   页面/CSV 靠「字段在不在」把费用卡片、费用列、口径行一起收掉。
+        //   下发时「按哪份单价算的」必然跟着一起来 —— 离线端读快照、看板读库，
         //   两者会给出不同的金额，而都「看起来正常」。
-        cost: this.#costContext(session).totals,
+        ...(cost ? { cost: cost.totals } : {}),
       }
 
       return { status: 200, body }
@@ -336,7 +391,7 @@ export class LocalStatsRouter {
       // 补零让趋势连续；core 的 series() 内部复用 timeSeries 的补零逻辑，
       // 因此 SQL 路径与直扫路径的桶集合必然一致。
       const cost = this.#costContext(session)
-      const costByBucket = cost.byGroup(bucket)
+      const costByBucket = cost?.byGroup(bucket)
       const points = session.series(bucket, true).map((p) => ({
         bucket: p.bucket,
         totalTokens: p.counts.total,
@@ -349,7 +404,11 @@ export class LocalStatsRouter {
         // ⚠️ 键与 `session.series()` 的桶**逐字相同**（两边都用 `toDayKey()` /
         //   `toHourKey()`），所以这里必然对得上；补零出来的桶没有事件，
         //   给一份 `costs: []` 的空金额（不是 0 元的一条记录）。
-        cost: costByBucket.get(p.bucket) ?? emptyCostTotals(cost.pricing.provenance),
+        // ★ 未配置上报时（`cost === null`）这个字段整块不出现 —— 与概览同一个开关，
+        //   否则会出现「卡上没有金额、趋势点上有」这种自相矛盾的一屏。
+        ...(cost && costByBucket
+          ? { cost: costByBucket.get(p.bucket) ?? emptyCostTotals(cost.pricing.provenance) }
+          : {}),
       }))
 
       const body: LocalSeriesResponse = {
@@ -379,7 +438,7 @@ export class LocalStatsRouter {
 
     try {
       const cost = this.#costContext(session)
-      const costByKey = cost.byGroup(toCoreDim(by))
+      const costByKey = cost?.byGroup(toCoreDim(by))
       const rows = session.groups(toCoreDim(by)).map((row) => ({
         key: row.key,
         totalTokens: row.counts.total,
@@ -390,7 +449,10 @@ export class LocalStatsRouter {
         calls: row.counts.calls,
         cacheHitRate: cacheHitRate({ input: row.counts.input, cacheRead: row.counts.cacheRead }),
         // 键复用 `groupKey()`，与排行里那一行逐字相同（金额与用量必然对得上）。
-        cost: costByKey.get(row.key) ?? emptyCostTotals(cost.pricing.provenance),
+        // ★ 未配置上报时整块不下发（明细表的费用列与 CSV 费用列靠它判定在不在）。
+        ...(cost && costByKey
+          ? { cost: costByKey.get(row.key) ?? emptyCostTotals(cost.pricing.provenance) }
+          : {}),
       }))
 
       const body: LocalBreakdownResponse = {
