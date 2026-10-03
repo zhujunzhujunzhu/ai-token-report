@@ -23,7 +23,7 @@ import { existsSync, readFileSync, mkdirSync, statSync, writeFileSync } from 'no
 import { dirname, resolve } from 'node:path'
 import type { Database } from './driver.js'
 import { describePortalTarget, openRawPortalStore, type PortalStore, type PortalTarget } from './portal-connection.js'
-import { PORTAL_SCHEMA_VERSION, PORTAL_SQLITE_INGEST_SQL, PORTAL_MYSQL_INGEST_SQL, portalSchemaChecksum, portalSchemaChecksumV6, portalSchemaChecksumV7, portalSchemaChecksumV8, portalSchemaStatements, portalV6Statements, portalV6TableStatement, portalV7Statements, portalV7TableStatement, portalV8Statements, portalV8TableStatement, PORTAL_V8_TABLES, PORTAL_SOURCE_COLUMN, portalV9AddColumnStatement } from './portal-schema-v5.js'
+import { PORTAL_SCHEMA_VERSION, PORTAL_SQLITE_INGEST_SQL, PORTAL_MYSQL_INGEST_SQL, portalSchemaChecksum, portalSchemaChecksumV6, portalSchemaChecksumV7, portalSchemaChecksumV8, portalSchemaChecksumV9, portalSchemaStatements, portalV6Statements, portalV6TableStatement, portalV7Statements, portalV7TableStatement, portalV8Statements, portalV8TableStatement, PORTAL_V8_TABLES, PORTAL_SOURCE_COLUMN, portalV10AddColumnStatements, PORTAL_OFFPEAK_SCHEDULE_COLUMN, portalV9AddColumnStatement } from './portal-schema-v5.js'
 import { PORTAL_SQLITE_V4_INGEST_SQL, PORTAL_MYSQL_V4_INGEST_SQL, portalSchemaChecksumV4, portalSchemaStatementsV4 } from './portal-schema-v4.js'
 import { checkExpressions, sameChecks, normalizeTrigger } from './portal-catalog.js'
 
@@ -61,6 +61,16 @@ const V7_VERSION = 7
  *   而 v9 只是给事实表补一列、一条 ALTER 就能升上去。
  */
 const V8_VERSION = 8
+/**
+ * v9 的**结构**版本号（= v8 + `usage_event.source`）。
+ *
+ * ★ 与 v7 / v8 同理：v10 的账本行是当前版本，而 v9 行必须能被认出来 ——
+ *   那是「这个库是完整的上一版、可以原地升 v10」的证据。
+ *   少了这一行，已经迁到 v9 的库（本机快照库就是、线上库升级后也是）
+ *   会变成 `unsupported`（服务端拒绝启动），而 v10 只是给 `model_price`
+ *   补五列、五条 ALTER 就能升上去。
+ */
+const V9_VERSION = 9
 type SchemaVersion = 4 | 5
 
 export interface PortalInspection {
@@ -128,6 +138,7 @@ async function readPortalState(store: PortalStore): Promise<Omit<PortalInspectio
   const v6Row = await migrationRow(store, tables, V6_VERSION)
   const v7Row = await migrationRow(store, tables, V7_VERSION)
   const v8Row = await migrationRow(store, tables, V8_VERSION)
+  const v9Row = await migrationRow(store, tables, V9_VERSION)
   let status: PortalInspection['status'] = 'unsupported'
   if (tables.length === 0 && version === 0) status = 'empty'
   else if (version === 0 && tables.length === 1 && tables[0] === 'portal_schema_migrations' && !current && !baseline) status = 'incomplete'
@@ -157,8 +168,14 @@ async function readPortalState(store: PortalStore): Promise<Omit<PortalInspectio
   //   才放行。少了它，一个被手工改过结构的 v8 库会冒充成「只差一次追加迁移」，
   //   而 v9 会给它补上 source 列 —— 手工改动会被一路带上去，且没有任何一步报错。
   else if (version === V8_VERSION && v8Row?.status === 'completed' && v8Row.checksum === portalSchemaChecksumV8(store.kind) && !current) status = 'legacy'
+  // ★ v9：结构 = v8 + `usage_event.source`，但受控 DDL 已经给 `model_price`
+  //   补了闲时五列。与 v6 / v7 / v8 同理，额外比对**冻结的 v9 摘要**：
+  //   只有「确实是本程序发布出去的那一版 v9」才放行。少了它，一个被手工改过结构的
+  //   v9 库会冒充成「只差一次追加迁移」，而 v10 会给它补五列 ——
+  //   手工改动会被一路带上去，且没有任何一步报错。
+  else if (version === V9_VERSION && v9Row?.status === 'completed' && v9Row.checksum === portalSchemaChecksumV9(store.kind) && !current) status = 'legacy'
   // v5/v6/v7/v8/v9 账本存在但 checksum 不符（程序换了 SQL 或库被改过）会落到 'unsupported'，绝不冒充 current。
-  return { kind: store.kind, label: store.label, version, status, tables, migration: current ?? v8Row ?? v7Row ?? v6Row ?? v5Row ?? baseline }
+  return { kind: store.kind, label: store.label, version, status, tables, migration: current ?? v9Row ?? v8Row ?? v7Row ?? v6Row ?? v5Row ?? baseline }
 }
 async function inspectStore(store: PortalStore): Promise<PortalInspection> {
   const state = await readPortalState(store)
@@ -938,6 +955,13 @@ async function upgradeV4ToV5(store: PortalStore, target: PortalTarget, options: 
     // 首次补齐由业务启动时的 `syncRollups()` 负责（可中断、可重试、不阻塞迁移）。
     await upgradeV7ToV8(store)
     await upgradeV8ToV9(store)
+    // v10 给 `model_price` 补五列闲时价。它**必须排在这里**（v5 的事实表重建之前）：
+    //   `verifyTable('model_price', …)` 是拿**受控定义全文**比对的，而受控定义
+    //   已经含这五列（`portalSchemaStatements()` 的拼接）—— 放到重建之后再跑，
+    //   中间那段时间里 model_price 与受控定义不一致，MySQL 侧的
+    //   `verifyCurrentMysql` 会把它当成结构不符。而且 model_price 在 v6→v7 里刚建好，
+    //   不引用任何既有表，放这里没有任何副作用。
+    await upgradeV9ToV10(store)
     if (!v5Ready) {
       if (kind === 'sqlite') await runV5Sqlite(store)
       else await runV5Mysql(store)
@@ -1020,13 +1044,33 @@ async function upgradeV5ToV6(store: PortalStore): Promise<void> {
  *   索要备份只会在运维流程里多一次手工步骤。真正的回退位是「删掉这张表」。
  */
 async function upgradeV6ToV7(store: PortalStore): Promise<void> {
-  const table = portalV7TableStatement(store.kind, 'model_price')
-  if (!(await tablesOf(store)).includes('model_price')) await store.exec(table)
+  /**
+   * ★ 建表用**当前受控定义**（= v7 的表 + 之后各版给 `model_price` 追加的列），
+   *   而不是 `portalV7TableStatement()` 那段冻结的 v7 文本 —— 与 `runV5Sqlite()`
+   *   用「拼接过 v9 列」的定义重建 `usage_event` 是同一个思路：新库一步到位，
+   *   后面的追加步骤（`upgradeV9ToV10`）幂等跳过。
+   */
+  const current = tableStatement(store.kind, 'model_price')
+  if (!(await tablesOf(store)).includes('model_price')) await store.exec(current)
   // 🚨 同 v5→v6：**建索引必须早于 `verifyTable`**。`idx_model_price_span` 是受控 DDL 里的
   //   独立 `CREATE UNIQUE INDEX`，而 MySQL 分支的 `verifyTable` 会把它算进期望的唯一约束 ——
   //   先校验后建索引会让 v6→v7 的第一步也报「唯一约束与主键不一致」。
   await ensureControlledIndexes(store, portalV7Statements(store.kind))
-  await verifyTable(store, 'model_price', table)
+  /**
+   * ⚠️ 逐列核对要**按这张表当前停在哪个版本**选期望形状：
+   *   - 老库（v7 / v8 / v9）：表还是 v7 的 13 列，期望形状就是那段冻结的 v7 文本；
+   *   - 全新库，或**结构已经升到更高版本、只是账本被回滚下来**的库（`verify-v8-migration.ts`
+   *     的「回滚-再迁移」演练与 v9 / v10 那些夹具都是这种）：表已经带上了后面版本追加的列，
+   *     期望形状必须是当前受控定义 —— 拿 v7 文本去比会当场判「列定义不一致」，
+   *     而它实际完全正确，紧随其后的追加步骤本来就是幂等的。
+   *   ★ 两种情况都会在**追加步骤的最后一步**（当前版本那一步）再整体核对一次，
+   *     所以这里选错形状不会让任何结构问题漏过去，只会误报。
+   */
+  const columns = await tableColumns(store, 'model_price')
+  const target = columns.includes(PORTAL_OFFPEAK_SCHEDULE_COLUMN)
+    ? current
+    : portalV7TableStatement(store.kind, 'model_price')
+  await verifyTable(store, 'model_price', target)
   for (const sql of portalV7Statements(store.kind)) {
     if (sql.startsWith('INSERT')) await store.exec(sql)
   }
@@ -1109,6 +1153,45 @@ async function upgradeV8ToV9(store: PortalStore): Promise<void> {
     await verifyTable(store, 'usage_event', tableStatement(store.kind, 'usage_event'))
   }
 }
+
+/**
+ * v9 → v10：给 `model_price` 补五列闲时（低谷）价。
+ *
+ * ## 为什么这一版也不需要备份证明
+ *
+ * 五列全部**可空、无默认值**，两种后端的 `ADD COLUMN` 都不重写既有行 ——
+ * 于是历史价行读出来就是「不分时段」，与它们当年被写入时的语义逐字一致，
+ * **历史金额一个字节都不会变**。与 v6 / v7 / v8 / v9 同一档。
+ *
+ * ## 为什么先查列再 ALTER（幂等是硬要求）
+ *
+ * 两条路径会在不同时刻把这几列带进来：
+ *   1. **全新库**：`portalSchemaStatements()` 里的 `model_price` 已经是**拼接过
+ *      闲时五列**的受控定义（见 `portal-schema-v10.ts`），建出来就有；
+ *   2. **已经是 v9 的库**：表里没有，靠下面这五条 `ALTER` 补。
+ * 不查就 ALTER 的话，第 1 条路径会在 `duplicate column name` 上炸掉，
+ * 而它的根因与迁移本身无关。
+ *
+ * ⚠️ **一列一条 ALTER**（见 `portalV10AddColumnStatements`）：MySQL 的 DDL 隐式提交，
+ *   一条语句里加五列中途失败会留下一套半成品列，而分开加能明确停在哪一列。
+ *
+ * ⚠️ 校验仍然逐列比对（`verifyTable`）：类型 / 可空写错（例如 MySQL 上用
+ *   `INTEGER` 而不是 `INT`）会在这里当场失败，而不是等看板按错误的档算钱。
+ *   SQLite 分支还会比对**表定义全文**（只抹空白与引号）—— 插入点必须与
+ *   `ALTER TABLE … ADD COLUMN` 的改写位置一致，见 `portal-schema-v10.ts`。
+ */
+async function upgradeV9ToV10(store: PortalStore): Promise<void> {
+  const existing = new Set((await tableColumns(store, PRICE_TABLE)).map(name => name.toLowerCase()))
+  for (const statement of portalV10AddColumnStatements(store.kind)) {
+    const column = /ADD COLUMN ([a-z_]+)/.exec(statement)?.[1]
+    if (column && existing.has(column)) continue
+    await store.exec(statement)
+  }
+  await verifyTable(store, PRICE_TABLE, tableStatement(store.kind, PRICE_TABLE))
+}
+
+/** 单价表的表名（与 `query.ts` 的 `PRICE_TABLE` 同一个字面量；这里刻意不 import 查询层）。 */
+const PRICE_TABLE = 'model_price'
 
 /**
  * SQLite 的 v5 升级。

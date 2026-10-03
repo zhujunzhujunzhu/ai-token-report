@@ -6,7 +6,7 @@
  * 本仓最怕的不是「语法写错」（那会报错），而是「语法在另一种后端上**语义变了**」——
  * 它不会报错，只会让某个数字悄悄不对。下面四处里有两处属于后者。
  *
- * ## 四处差异（全部本机实测）
+ * ## 五处差异（全部本机实测）
  *
  * | # | 差异 | SQLite | MySQL | 猜错会怎样 |
  * |---|---|---|---|---|
@@ -14,6 +14,7 @@
  * | 2 | upsert 冲突子句 | `ON CONFLICT(k) DO UPDATE SET x = excluded.x` | `AS new ON DUPLICATE KEY UPDATE x = new.x` | 语法错误（会报错） |
  * | 3 | 标量最大值 | `MAX(a, b)` | `GREATEST(a, b)` | 🚨 MySQL 的 `MAX()` 是**聚合函数**，用在 SET 里报错；但若写成子查询会**静默给出全表最大值** |
  * | 4 | 字符串拼接 | `a \|\| b` | `CONCAT(a, b)` | 🚨🚨 **MySQL 把 `\|\|` 当逻辑或**（除非开 `PIPES_AS_CONCAT`）。`provider \|\| '/' \|\| model` 会返回 0/1 —— 分组键静默变成 `"0"`/`"1"`，看板上的模型分布会变成两行，而**没有任何报错** |
+ * | 5 | 整数除法 | `a / b`（两整数即整除） | `a DIV b` | 🚨 MySQL 的 `/` 是**浮点**除法：闲时判定的「一天里的第几分钟」会整体错位，费用按错误的时段算，**不报错** |
  *
  * 第 4 条是本次迁移最危险的一处：`query.ts` 的 `provider-model` 维度正是这么写的。
  * 实测确认后改为走 `dialect.concat()`。
@@ -48,6 +49,18 @@ export interface PortalDialect {
   /** 字符串拼接（差异 4）。`parts` 里可以是列名或字面量（字面量请自带引号）。 */
   concat(parts: readonly string[]): string
   /**
+   * 整数除法（差异 5）。
+   *
+   * 🚨 MySQL 的 `/` 是**浮点**除法：`ts / 86400000` 会返回小数，
+   *   再 `% 1440` 得到的「一天里的第几分钟」就整个错位 —— 而它**不会报错**，
+   *   只是闲时判定的边界整体飘掉。所以取整必须走 `DIV`。
+   *   SQLite 的 `/` 在两个整数之间就是整数除法（`ts` 是 `INTEGER` 列）。
+   *
+   * ⚠️ 只用于**非负**操作数（`ts` 有 `>= 0` 的 CHECK）：MySQL 的 `DIV` 向零截断，
+   *   负数上与 SQLite 的向下取整不一致。闲时判定只用 epoch 毫秒，够用。
+   */
+  intDiv(a: string, b: string): string
+  /**
    * 展开一条 upsert 语句。
    *
    * 模板里可用 `{t}`（表名）、`{in}`（incoming 别名）、`{key}`（主键列）。
@@ -81,6 +94,10 @@ function makeDialect(kind: PortalBackendKind): PortalDialect {
     concat(parts) {
       // 🚨 见文件头差异 4：MySQL 的 `||` 是逻辑或，不是拼接。
       return kind === 'mysql' ? `CONCAT(${parts.join(', ')})` : parts.join(' || ')
+    },
+    intDiv(a, b) {
+      // 🚨 见接口注释：MySQL 的 `/` 是浮点除法，必须写 DIV。
+      return kind === 'mysql' ? `(${a} DIV ${b})` : `(${a} / ${b})`
     },
     render(input) {
       const cols = input.columns.join(', ')

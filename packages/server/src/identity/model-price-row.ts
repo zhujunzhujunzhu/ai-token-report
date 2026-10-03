@@ -37,6 +37,14 @@ export function modelPriceFromRow(row: Row): PortalModelPrice {
     //   而 `0` 是一个**合法的、早已过去的生效终点** —— 于是「至今有效」
     //   会渲染成 1970 年，且这条价从此再也用不上。
     effective_to_ms: row.effective_to_ms == null ? null : num(row, 'effective_to_ms'),
+    // ★ v10 闲时档：**五列都显式判 NULL**（同 `effective_to_ms` 的道理）——
+    //   把 NULL 读成 0 会让「没有闲时档」变成「闲时四类价都是 0 元」，
+    //   于是低谷时段整段免费，而页面上只看得出「这个月花得少」。
+    offpeak_schedule: row.offpeak_schedule == null ? null : str(row, 'offpeak_schedule'),
+    offpeak_input_micro_per_ktok: row.offpeak_input_micro_per_ktok == null ? null : num(row, 'offpeak_input_micro_per_ktok'),
+    offpeak_output_micro_per_ktok: row.offpeak_output_micro_per_ktok == null ? null : num(row, 'offpeak_output_micro_per_ktok'),
+    offpeak_cache_read_micro_per_ktok: row.offpeak_cache_read_micro_per_ktok == null ? null : num(row, 'offpeak_cache_read_micro_per_ktok'),
+    offpeak_cache_write_micro_per_ktok: row.offpeak_cache_write_micro_per_ktok == null ? null : num(row, 'offpeak_cache_write_micro_per_ktok'),
     note: row.note == null ? null : str(row, 'note'),
     created_at_ms: num(row, 'created_at_ms'),
     updated_at_ms: num(row, 'updated_at_ms'),

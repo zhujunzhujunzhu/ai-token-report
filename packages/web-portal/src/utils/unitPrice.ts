@@ -22,7 +22,7 @@
  *   —— `formatCostMicro(50, 'CNY')` 是 `0.0001`，而 50 微元/千 是 `¥0.05 / 百万 token`，
  *   混用就是差 2 倍（见 `shared/price.ts` 的 `formatUnitPriceMicro()`）。
  */
-import { MAX_MICRO_PER_KTOK } from '@ai-token-report/shared'
+import { ANY_PROVIDER, findPriceSchedule, MAX_MICRO_PER_KTOK } from '@ai-token-report/shared'
 import type { PortalModelPrice } from '@ai-token-report/shared'
 import { isPriceEffective } from '@ai-token-report/shared'
 
@@ -144,7 +144,12 @@ export function groupPricesByProvider(
   }
   return [...byProvider.entries()]
     .map(([provider, rows]) => ({ provider, rows, models: new Set(rows.map((row) => row.model)).size }))
-    .sort((a, b) => a.provider.localeCompare(b.provider))
+    .sort((a, b) => {
+      // ★ 基础价那一节排在最前：它是「没有专属价时用的兜底」，夹在几个供应商中间
+      //   会让人以为它只作用于相邻的那两个供应商。
+      if ((a.provider === ANY_PROVIDER) !== (b.provider === ANY_PROVIDER)) return a.provider === ANY_PROVIDER ? -1 : 1
+      return a.provider.localeCompare(b.provider)
+    })
 }
 
 /**
@@ -190,4 +195,90 @@ export const PRICE_STATUS_TEXT: Record<'active' | 'future' | 'past', string> = {
   active: '生效中',
   future: '未开始',
   past: '已结束',
+}
+
+// ---------------------------------------------------------------------------
+// 基础价（provider = '*'）★ v10
+// ---------------------------------------------------------------------------
+
+/**
+ * 保留供应商名 `'*'` 在界面上的说法。
+ *
+ * 🚨 页面**绝不**把这个值直接显示出来：`*` 看起来像通配符、像乱码，
+ *   而它实际是「没有专属价时用的那条价」—— 使用者看到 `*` 只会以为页面坏了。
+ */
+export const BASE_PROVIDER_LABEL = '不限供应商（基础价）'
+
+/** 这一行是不是「不限供应商」的基础价。 */
+export function isBasePrice(row: Pick<PortalModelPrice, 'provider'>): boolean {
+  return row.provider === ANY_PROVIDER
+}
+
+/** 供应商在界面上的名字（基础价单独说清）。 */
+export function providerLabel(provider: string): string {
+  return provider === ANY_PROVIDER ? BASE_PROVIDER_LABEL : provider
+}
+
+// ---------------------------------------------------------------------------
+// 闲时（低谷）档 ★ v10
+// ---------------------------------------------------------------------------
+
+/**
+ * 这一行有没有闲时档。
+ *
+ * ⚠️ 五个字段**同生共死**：只判时段表或只判四个价都会把「半套配置」
+ *   （只可能来自直接改库）误判成「有闲时档」，而那种行的闲时用量会按 0 元算。
+ */
+export function hasOffpeak(row: Pick<PortalModelPrice,
+  'offpeak_schedule' | 'offpeak_input_micro_per_ktok' | 'offpeak_output_micro_per_ktok' |
+  'offpeak_cache_read_micro_per_ktok' | 'offpeak_cache_write_micro_per_ktok'>): boolean {
+  return row.offpeak_schedule != null &&
+    row.offpeak_input_micro_per_ktok != null && row.offpeak_output_micro_per_ktok != null &&
+    row.offpeak_cache_read_micro_per_ktok != null && row.offpeak_cache_write_micro_per_ktok != null
+}
+
+/** 时段表 id → 界面上给人看的名字（未知 id 原样显示，绝不假装成某一个时段表）。 */
+export function scheduleLabel(id: string | null): string {
+  if (id === null || id === '') return '不分时段'
+  return findPriceSchedule(id)?.label ?? `未知时段表（${id}）`
+}
+
+/**
+ * 「高峰 / 闲时」两侧的时段说明，直接显示在表单里。
+ *
+ * ★ 文案由时段表**算出来**（不是手写的）：改了 `PRICE_SCHEDULES` 之后，
+ *   页面上的说明跟着变 —— 手写一段就会与真正生效的判定分叉，而它不会报错。
+ */
+export function scheduleHint(id: string): string {
+  const schedule = findPriceSchedule(id)
+  if (schedule === null) return `未知时段表「${id}」：闲时四类价不会生效`
+  const offsetHours = schedule.utcOffsetMinutes / 60
+  const zone = offsetHours === 8 ? '北京时间' : `UTC${offsetHours >= 0 ? '+' : ''}${offsetHours}`
+  const weekdayNames = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+  const weekdays = schedule.weekdays.map((day) => weekdayNames[day]).join('、')
+  const windows = schedule.windows
+    .map((w) => `${pad2(Math.floor(w.startMinute / 60))}:${pad2(w.startMinute % 60)}–${pad2(Math.floor(w.endMinute / 60))}:${pad2(w.endMinute % 60)}`)
+    .join('、')
+  return `${zone} ${weekdays} ${windows} 为高峰，其余（含周末与法定节假日全天）为闲时；`
+    + `节假日表覆盖到 ${schedule.holidaysThrough}，之后需要补表（过期会把节假日按高峰计）`
+}
+
+function pad2(value: number): string {
+  return String(value).padStart(2, '0')
+}
+
+/** 一条价的闲时四类单价（库里的整数微元 / 千 token）；没有闲时档时返回 `null`。 */
+export function offpeakRatesOf(row: PortalModelPrice): {
+  input: number
+  output: number
+  cacheRead: number
+  cacheWrite: number
+} | null {
+  if (!hasOffpeak(row)) return null
+  return {
+    input: row.offpeak_input_micro_per_ktok as number,
+    output: row.offpeak_output_micro_per_ktok as number,
+    cacheRead: row.offpeak_cache_read_micro_per_ktok as number,
+    cacheWrite: row.offpeak_cache_write_micro_per_ktok as number,
+  }
 }

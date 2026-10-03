@@ -39,11 +39,19 @@ import { SQLITE_DIALECT, type PortalDialect } from './dialect.js'
 import {
   applyProviderModel,
   coalesceOriginal,
+  modelCaseSql,
   providerCaseSql,
   providerModelKey,
   type ProviderNormalizer,
 } from './provider-alias.js'
-import { UNATTRIBUTED_USER, type BillableUsage } from '@ai-token-report/shared'
+import {
+  ANY_PROVIDER,
+  PRICE_SCHEDULES,
+  scheduleHolidayDayIndices,
+  UNATTRIBUTED_USER,
+  type BillableUsage,
+  type PriceSlot,
+} from '@ai-token-report/shared'
 
 /**
  * 查询层可用的分组维度 = 内核维度 + `user`。
@@ -567,10 +575,66 @@ export interface RawCostRow {
   model?: string | null
   price_id: string | null
   currency: string | null
+  /** 0 = 高峰档、1 = 闲时档（没有闲时档的价行恒为 0）。 */
+  price_slot: unknown
   input: unknown
   output: unknown
   cache_read: unknown
   cache_write: unknown
+}
+
+/**
+ * 单价表的 JOIN 子查询文本（**用两次**：专属价一次、基础价一次）。
+ *
+ * 🚨 必须把 `provider` / `model` 两列**改名**再 JOIN：它们在两张表里同名，
+ *   而分组维度表达式（`dimensionExpression`）产出的是裸列名
+ *   （`provider` / `model` / `provider` 与 `model` 的拼接）。
+ *   直接 `LEFT JOIN model_price mp` 会让它们变成**歧义列**：
+ *   SQLite 报 ambiguous column name: provider、MySQL 报 errno 1052，
+ *   于是「按供应商 / 按模型看金额」整条路径直接不可用。
+ *   子查询改名之后，外层作用域里的 provider / model 只属于事件表。
+ */
+function priceSourceSql(): string {
+  return `SELECT price_id, provider AS mp_provider, model AS mp_model, currency,
+                        effective_from_ms, effective_to_ms, offpeak_schedule
+                   FROM ${PRICE_TABLE}`
+}
+
+/**
+ * 闲时判定表达式 —— **`shared/price.ts` 的 `isPeakAt()` 在 SQL 里的镜像**。
+ *
+ * ## 为什么这里允许出现「时间判定」而 `day` / `hour` 分桶不行
+ *
+ * 分桶那条铁律针对的是 `strftime(..., 'localtime')` / `FROM_UNIXTIME()` /
+ * `DAYOFWEEK()` 这类**按 OS 或 SQL 会话时区**取值的函数 —— 它们与 JS 的进程 TZ
+ * 不是同一个东西（实测差 8 小时）。这里一个都不用：时段表带**固定偏移**
+ * （见 `PriceSchedule.utcOffsetMinutes`），判定退化成纯整数算术
+ * `(ts + 偏移) / 60000 % 1440`，两个后端与 JS 逐位一致。
+ *
+ * 🚨 两条硬约束：
+ *   1. 取整必须走 `dialect.intDiv()` —— MySQL 的 `/` 是浮点除法（差异 5）；
+ *   2. 🚨 表达式里的**每一个常量都来自 `PRICE_SCHEDULES`**（时段表在 `shared` 里
+ *      只有一份定义）。改时段表只需改那一处，两边同时生效。
+ *
+ * 未知时段表 id → 判成高峰（0）：与 `priceSlotAt()` 的兜底一致，
+ * 而写入路径本来就会拒绝未知 id。
+ */
+function slotExpressionSql(dialect: PortalDialect, scheduleExpr: string, tsExpr: string): string {
+  const branches = PRICE_SCHEDULES.map((schedule) => {
+    const shifted = `(${tsExpr} + ${schedule.utcOffsetMinutes * 60_000})`
+    const day = dialect.intDiv(shifted, '86400000')
+    const weekday = `((${day} + 4) % 7)`
+    const minute = `(${dialect.intDiv(shifted, '60000')} % 1440)`
+    const windows = schedule.windows
+      .map((w) => `(${minute} >= ${w.startMinute} AND ${minute} < ${w.endMinute})`)
+      .join(' OR ')
+    const holidays = scheduleHolidayDayIndices(schedule)
+    // ★ 节假日只把「工作日的高峰窗」翻成闲时：落在周末的节假日本来就是闲时。
+    const notHoliday = holidays.length === 0 ? '1 = 1' : `${day} NOT IN (${holidays.join(', ')})`
+    const peak = `(${weekday} IN (${schedule.weekdays.join(', ')}) AND (${windows}) AND ${notHoliday})`
+    return `WHEN ${scheduleExpr} = '${schedule.id}' THEN CASE WHEN ${peak} THEN 0 ELSE 1 END`
+  })
+  return `CASE\n                 ${branches.join('\n                 ')}\n                 ELSE 0\n               END`
 }
 
 /**
@@ -580,23 +644,36 @@ export interface RawCostRow {
  *
  * 把 `SUM(input * p_in + …)` 写进 SQL 看似少一趟，但它会**在 SQL 里造出
  * 第二个口径实现** —— 换价、加币种、改四类拆分时两边必然漂移，而它不会报错。
- * 所以这里只做两件 SQL 擅长的事：
+ * 所以这里只做三件 SQL 擅长的事：
  *
  * 1. `LEFT JOIN` 把每条事件**在它自己的时刻**能匹配到的价行取出来
  *    （`LEFT` 而不是 `JOIN`：没配价的事件必须留下来，它们要被计成「未计价」，
  *     而不是从结果里消失 —— 后者会让「没配价」看起来像「没用量」）；
- * 2. 按 `(分组键, price_id)` 分组求和四类 token。
+ * 2. 按 `(分组键, price_id, 币种, 时段)` 分组求和四类 token；
+ * 3. 时段（高峰 / 闲时）由 {@link slotExpressionSql} 判出来，**跟着一起分组**。
  *
  * 于是「未定价」那一撮天然落进 `price_id IS NULL` 的那一行，
  * 不需要 `SUM(CASE WHEN …)` 这类把口径混进 SQL 的写法。
  *
- * ⚠️ 两条已知代价（都刻意接受）：
- *   - 这是**区间连接**，代价约 O(事件数 × 单价行数)。单价只有几十行，
+ * ## ★ 两次 JOIN：专属价一次、基础价一次（`'*'`）
+ *
+ * 基础价（`ANY_PROVIDER`）必须在**没有专属价命中时**才生效。用
+ * `ON (mp_provider = provider OR mp_provider = '*')` 写会**同时命中两行**，
+ * 一条事件的 token 被算两遍（两个价各算一份）—— 而页面上只是数字变大。
+ * 所以这里 join 两次，第二次带 `mp_e.price_id IS NULL`：
+ * **有专属价时基础价那一侧必然为 NULL**，一条事件永远只落进一个价行。
+ * 这与 `shared/price.ts` 的 `resolvePrice()`（先专属、后基础）逐位一致，
+ * 连「库里同时存在两行」这种直接改库的情况也一致。
+ *
+ * ⚠️ 三条已知代价（都刻意接受）：
+ *   - 这是**区间连接**，代价约 O(事件数 × 单价行数 × 2)。单价只有几十行，
  *     所以实际影响很小；真要优化需要给 `usage_event(provider, model)` 加索引，
  *     那是一次 schema 变更（加索引 = 改受控 DDL = 改校验和），不在这一期做。
  *   - 区间**重叠**时一条事件会命中两行、被算两次。写入路径由
  *     `findPriceConflicts()` 回 409 挡住重叠，所以只可能来自直接改库；
  *     这条风险记在 `docs/费用统计方案.md`。
+ *   - 时段判定的表达式与 JS 是两份代码（一份口径、两处实现）。它们由
+ *     `core/test/portal-cost.test.ts` 的逐分钟网格逐位对账钉住。
  *
  * 🚨 JOIN 条件里的 `provider` 用的是**事件表的原值**，不是归一化后的展示名：
  *   单价按上报原值匹配，供应商归一化只是查询期的显示口径。
@@ -607,6 +684,7 @@ function costQueryFor(
   filter: QueryFilter,
   normalize: ProviderNormalizer | undefined,
   dimParams: Record<string, string | number>,
+  dialect: PortalDialect,
   withTarget = false,
 ): SqlQuery {
   const { sql, params: whereParams } = buildWhere(filter, normalize)
@@ -614,31 +692,34 @@ function costQueryFor(
   const targetGroup = withTarget ? 'provider, model, ' : ''
   const select = dimExpr === null ? '' : `${dimExpr} AS grp_key,\n                 `
   const group = dimExpr === null ? '' : 'grp_key, '
+  const ts = `${EVENT_TABLE}.ts`
+  // ★ 命中的价行只可能是「专属」或「基础」之一（见上面那段注释），COALESCE 只是取值。
+  const priceId = 'COALESCE(mp_e.price_id, mp_b.price_id)'
+  const currency = 'COALESCE(mp_e.currency, mp_b.currency)'
+  const schedule = 'COALESCE(mp_e.offpeak_schedule, mp_b.offpeak_schedule)'
+  const slot = slotExpressionSql(dialect, schedule, ts)
+  const range = (alias: string): string =>
+    `${ts} >= ${alias}.effective_from_ms
+                 AND (${alias}.effective_to_ms IS NULL OR ${ts} <= ${alias}.effective_to_ms)`
   return {
-    sql: `SELECT ${select}${targetCols}mp.price_id AS price_id,
-                 mp.currency  AS currency,
+    sql: `SELECT ${select}${targetCols}${priceId} AS price_id,
+                 ${currency} AS currency,
+                 ${slot} AS price_slot,
                  SUM(input_tokens)       AS input,
                  SUM(output_tokens)      AS output,
                  SUM(cache_read_tokens)  AS cache_read,
                  SUM(cache_write_tokens) AS cache_write
           FROM ${EVENT_TABLE}
-          LEFT JOIN (
-                 -- 🚨 必须把 provider / model 两列**改名**再 JOIN：它们在两张表里同名，
-                 --   而分组维度表达式（dimensionExpression）产出的是裸列名
-                 --   （provider / model / provider 与 model 的拼接）。
-                 --   直接 LEFT JOIN model_price mp 会让它们变成**歧义列**：
-                 --   SQLite 报 ambiguous column name: provider、MySQL 报 errno 1052，
-                 --   于是「按供应商 / 按模型看金额」整条路径直接不可用。
-                 --   子查询改名之后，外层作用域里的 provider / model 只属于事件表。
-                 SELECT price_id, provider AS mp_provider, model AS mp_model, currency,
-                        effective_from_ms, effective_to_ms
-                   FROM ${PRICE_TABLE}
-                 ) mp
-                 ON mp.mp_provider = ${EVENT_TABLE}.provider
-                AND mp.mp_model = ${EVENT_TABLE}.model
-                AND ts >= mp.effective_from_ms
-                AND (mp.effective_to_ms IS NULL OR ts <= mp.effective_to_ms)${sql}
-          GROUP BY ${group}${targetGroup}mp.price_id, mp.currency`,
+          LEFT JOIN (${priceSourceSql()}) mp_e
+                 ON mp_e.mp_provider = ${EVENT_TABLE}.provider
+                AND mp_e.mp_model = ${EVENT_TABLE}.model
+                AND ${range('mp_e')}
+          LEFT JOIN (${priceSourceSql()}) mp_b
+                 ON mp_b.mp_provider = '${ANY_PROVIDER}'
+                AND mp_b.mp_model = ${EVENT_TABLE}.model
+                AND mp_e.price_id IS NULL
+                AND ${range('mp_b')}${sql}
+          GROUP BY ${group}${targetGroup}${priceId}, ${currency}, ${slot}`,
     // ⚠️ 与 `groupsQuery` 同样的合并理由：`dimExpr` 内联了归一化映射的绑定值。
     params: { ...dimParams, ...whereParams },
   }
@@ -658,7 +739,7 @@ export function costByDimensionQuery(
   const dimParams: Record<string, string | number> = {}
   const dimExpr = dimensionExpression(dim, dialect, normalize, dimParams)
   if (!dimExpr) return null
-  return costQueryFor(dimExpr, filter, normalize, dimParams)
+  return costQueryFor(dimExpr, filter, normalize, dimParams, dialect)
 }
 
 /**
@@ -690,6 +771,13 @@ export interface CostRowCounts {
   priceId: string | null
   /** 该单价行的币种；未计价时为 `null`。 */
   currency: string | null
+  /**
+   * 这一撮用量落在哪个计价时段（由 SQL 的 `price_slot` 判出来）。
+   *
+   * ★ 没有它就只能按高峰价算闲时用量 —— 费用虚高一倍，而页面上看不出区别。
+   *   判定与 JS 的一致性由 `core/test/portal-cost.test.ts` 的逐分钟网格钉住。
+   */
+  slot: PriceSlot
   /** 仅整体金额取数带这两列（未计价的行靠它指出「该去补哪个价」）。 */
   provider: string | null
   model: string | null
@@ -702,6 +790,8 @@ export function mapCostRows(rows: readonly RawCostRow[]): CostRowCounts[] {
     key: text(row.grp_key),
     priceId: text(row.price_id),
     currency: text(row.currency),
+    // ⚠️ MySQL 的 CASE 结果可能以字符串回来（同 SUM(BIGINT)），所以按文本判 `'1'`。
+    slot: text(row.price_slot) === '1' ? 'offpeak' : 'peak',
     provider: text(row.provider),
     model: text(row.model),
     usage: {
@@ -716,14 +806,19 @@ export function mapCostRows(rows: readonly RawCostRow[]): CostRowCounts[] {
 /**
  * 明细行的**取数**投影（只出列与表达式，拼接 WHERE / ORDER BY / LIMIT 由调用方做）。
  *
- * ## ★ 为什么明细要同时取「原值」和「归一化名」
+ * ## ★ 为什么明细要同时取「原值」和「归一化名」（供应商与模型各一对）
  *
  * 聚合维度只认归一化名（`by=provider` 的行就该是 `bailian-tpp`），但明细是
  * 人用来**核对规则配得对不对**的地方：只显示归一化名的话，一条把
  * `dashscope` 错配成 `bailian-tpp` 的规则会表现得完全正常 ——
- * 总量对、名字错，没有任何地方能看出来。
+ * 总量对、名字错，没有任何地方能看出来。模型侧完全同理。
  *
- * ⚠️ 两个字段名刻意不叫 `provider` / `provider_raw`：
+ * 🚨 `provider` / `model` 两列必须是**原值**，不能是归一化结果：明细的金额是按
+ *   `(provider, model)` 去 `model_price` 解析单价的，而单价是按上报原值配的 ——
+ *   用展示名当计价键，等于「改一个显示名就把这家供应商的价换成了另一条」，
+ *   金额看起来仍然自洽，没有任何报错。
+ *
+ * ⚠️ 字段名刻意不叫 `provider` / `provider_raw`：
  *   取数层的字段名与线上契约解耦，「哪一个是展示名」这件事只由
  *   `stats-route.ts` 的映射决定，改契约时不会牵动 SQL。
  */

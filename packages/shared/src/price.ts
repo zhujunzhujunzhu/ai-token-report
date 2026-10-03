@@ -62,6 +62,45 @@ export const MAX_MICRO_PER_KTOK = 10_000_000
  */
 export const MAX_SAFE_BILLABLE_TOKENS = Math.floor(Number.MAX_SAFE_INTEGER / MAX_MICRO_PER_KTOK) * 1000
 
+/**
+ * 保留供应商名：**不限供应商的「基础价」**。
+ *
+ * ## 为什么用一个保留值，而不是把 `provider` 允许成空
+ *
+ * `model_price.provider` 有 `length(provider) BETWEEN 1 AND 255` 的 CHECK，
+ * 把它放开成「可以为空」意味着在 SQLite 上**重建整张表**（CHECK 不可 ALTER）、
+ * 在 MySQL 上摘挂引用该列的 CHECK 约束 —— 那是 v5 那一类高风险迁移，
+ * 换来的只是一个更好看的字面量。所以基础价写成 `'*'`，
+ * 由 {@link isAnyProvider} / 页面统一渲染成「不限供应商（基础价）」。
+ *
+ * ## 语义（★ 三条，改这里之前先读）
+ *
+ * 1. **专属价优先**：`(provider, model)` 命中就用它，命不中才用基础价（`'*'`, `model`）。
+ *    ⚠️ 这是**两层**匹配，不是「把 `'*'` 当成一个供应商」——
+ *    取数 SQL 因此 join 两次（专属一次、基础一次，且基础那次带 `mp_e.price_id IS NULL`），
+ *    基础价与专属价**可以共存**，不会互相把对方的 token 算进去。
+ * 2. 🚨 **两条基础价覆盖同一时刻仍然是冲突**：那时「用哪一条」没有别的判据，
+ *    一条事件会匹配两行、被算两遍（token 翻倍、两个价都算一份）。
+ *    这条不变量由写入路径的 {@link findPriceConflicts} 兜住（回 409）。
+ * 3. `'*'` **不是**合法的上报供应商名：它永远不会出现在 `usage_event.provider` 里，
+ *    所以不会与真实网关重名。
+ */
+export const ANY_PROVIDER = '*'
+
+/** 是否为「不限供应商」的基础价行。 */
+export function isAnyProvider(provider: string): boolean {
+  return provider === ANY_PROVIDER
+}
+
+/**
+ * 计价时段。
+ *
+ * ★ 只有两档：高峰（`peak`，价行自身那四个数）与闲时 / 低谷（`offpeak`，
+ *   价行的 `offpeakRates`）。**没有第三档** —— 再多一档就该建时段表，
+ *   而不是在这里加一个枚举值。
+ */
+export type PriceSlot = 'peak' | 'offpeak'
+
 /** 单价表的一行。`provider` + `model` 精确匹配，生效区间不得重叠。 */
 export interface ModelPrice extends PriceRates {
   provider: string
@@ -72,6 +111,21 @@ export interface ModelPrice extends PriceRates {
   effectiveFromMs: number
   /** epoch 毫秒，含；`null` = 至今。 */
   effectiveToMs: number | null
+  /**
+   * 闲时（低谷）四类单价；**缺席与 `null` 同义 = 这条价不分时段**（全天一个价）。
+   *
+   * ⚠️ 两种「没填」在这里没有区别 —— 与 `effective_to_ms` 的 `null` 完全不同
+   *   （那里 `null` = 至今、`0` = 早已失效，混了就是一条再也匹配不上的价）。
+   *   所以这里刻意允许省略：几十处测试夹具不必逐个补字段。
+   */
+  offpeakRates?: PriceRates | null
+  /**
+   * 闲时时段表 id（见 {@link PRICE_SCHEDULES}）；与 `offpeakRates` **同生共死**。
+   *
+   * 🚨 有 `offpeakRates` 却没有时段表 = 那四个数永远不会生效（闲时判定
+   *   必须先知道「哪段时间算闲时」），写入路径会直接拒绝这种行。
+   */
+  offpeakSchedule?: string | null
 }
 
 /** 四类 token 各自的单价。 */
@@ -96,6 +150,221 @@ export interface PricingProvenance {
   pricingSource: PricingSource
   /** 快照同步时刻；`db` / `builtin` 为 `null`。 */
   pricingSyncedAt: number | null
+}
+
+// ---------------------------------------------------------------------------
+// 闲时（低谷）时段表 —— ★ 全平台唯一的「哪段时间算高峰」的定义
+// ---------------------------------------------------------------------------
+
+/** 高峰时段：`[startMinute, endMinute)`，从时段表的偏移零点起算的分钟数。 */
+export interface PriceScheduleWindow {
+  readonly startMinute: number
+  readonly endMinute: number
+}
+
+/**
+ * 一个闲时时段表 = 「一天里哪些时刻算高峰」。
+ *
+ * ## 为什么用固定偏移（`utcOffsetMinutes`）而不是时区名
+ *
+ * 🚨 时区名会把 `Intl` / 操作系统时区 / 夏令时拖进来，而**取数 SQL 里也要算出同一个判定**
+ *   （见 {@link isOffpeakAt} 与 `core/src/db/query.ts` 的时段表达式）。
+ *   固定偏移是**纯整数算术**，两种后端与 JS 逐位一致；中国没有夏令时，
+ *   所以「北京时间 = UTC+8」用固定偏移表达是精确的，不是近似。
+ *
+ * ## 为什么节假日是常量表而不是配置
+ *
+ * 高峰窗只落在工作日的 09:00–12:00 / 14:00–18:00（北京），
+ * 其余时间（含**全部周末**，包括调休上班的周末 —— 官方明确把调休周末算空闲时段）
+ * 本来就是闲时。所以「节假日」只影响**落在工作日的高峰窗**，
+ * 一年最多十几个工作日。它的权威来源是国务院办公厅每年 11 月的通知，
+ * 没有任何接口能查 —— 只能逐年补表（{@link PriceSchedule.holidaysThrough} 明确写覆盖到哪天，
+ * 页面会把它显示出来，绝不让「表过期」变成静默低估）。
+ */
+export interface PriceSchedule {
+  readonly id: string
+  /** 页面上给人看的名字。 */
+  readonly label: string
+  /** 出处（人能照着核对）。 */
+  readonly source: string
+  /** 固定 UTC 偏移，分钟（北京 = `480`）。 */
+  readonly utcOffsetMinutes: number
+  /** 高峰落在星期几：`0` = 周日 … `6` = 周六。 */
+  readonly weekdays: readonly number[]
+  /** 高峰时段（可多段），按偏移后的一天内的分钟数。 */
+  readonly windows: readonly PriceScheduleWindow[]
+  /** 法定节假日（`YYYY-MM-DD`，按同一个固定偏移记日）—— 全天都算闲时。 */
+  readonly holidays: readonly string[]
+  /** 节假日表覆盖的年份下界（含）。更早的日子按「不豁免」处理。 */
+  readonly holidaysFrom: string
+  /** 节假日表覆盖到哪一天（含）。**超出这个日期必须补表**，否则工作日节假日会被按高峰计。 */
+  readonly holidaysThrough: string
+}
+
+/**
+ * DeepSeek 官方时段（`deepseek-official` 的人民币价目表）。
+ *
+ * | 档 | 时段（北京时间） |
+ * |---|---|
+ * | 高峰 | 周一至周五（不含法定节假日）09:00–12:00、14:00–18:00 |
+ * | 闲时 | 其余全部时间，**含周末与法定节假日全天** |
+ *
+ * 出处：<https://api-docs.deepseek.com/zh-cn/quick_start/pricing>
+ * （「空闲时段价格为高峰时段价格的一半」）。
+ * 英文页把同一时段写成 UTC 的 `01:00-04:00` 与 `06:00-10:00`，周一至周五 —— 与这里等价。
+ */
+const DEEPSEEK_CN: PriceSchedule = {
+  id: 'deepseek-cn',
+  label: 'DeepSeek 官方（北京时间工作日高峰）',
+  source: 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing',
+  utcOffsetMinutes: 480,
+  weekdays: [1, 2, 3, 4, 5],
+  windows: [
+    { startMinute: 9 * 60, endMinute: 12 * 60 },
+    { startMinute: 14 * 60, endMinute: 18 * 60 },
+  ],
+  // 国务院办公厅《关于 2026 年部分节假日安排的通知》（国办发明电〔2025〕7 号）与
+  // 《关于 2025 年部分节假日安排的通知》（国办发明电〔2024〕12 号）里的**全部放假日期**。
+  // 周末本来就在闲时，列进来是为了让这份表与通知逐条对得上（人核对时不用自己补周末）。
+  holidays: [
+    // 2025
+    '2025-01-01',
+    '2025-01-28', '2025-01-29', '2025-01-30', '2025-01-31', '2025-02-01', '2025-02-02', '2025-02-03', '2025-02-04',
+    '2025-04-04', '2025-04-05', '2025-04-06',
+    '2025-05-01', '2025-05-02', '2025-05-03', '2025-05-04', '2025-05-05',
+    '2025-05-31', '2025-06-01', '2025-06-02',
+    '2025-10-01', '2025-10-02', '2025-10-03', '2025-10-04', '2025-10-05', '2025-10-06', '2025-10-07', '2025-10-08',
+    // 2026
+    '2026-01-01', '2026-01-02', '2026-01-03',
+    '2026-02-15', '2026-02-16', '2026-02-17', '2026-02-18', '2026-02-19', '2026-02-20', '2026-02-21', '2026-02-22', '2026-02-23',
+    '2026-04-04', '2026-04-05', '2026-04-06',
+    '2026-05-01', '2026-05-02', '2026-05-03', '2026-05-04', '2026-05-05',
+    '2026-06-19', '2026-06-20', '2026-06-21',
+    '2026-09-25', '2026-09-26', '2026-09-27',
+    '2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04', '2026-10-05', '2026-10-06', '2026-10-07',
+  ],
+  holidaysFrom: '2025-01-01',
+  holidaysThrough: '2026-12-31',
+}
+
+/** 全部时段表。**按 id 引用**，价行只存 id（`offpeak_schedule`）。 */
+export const PRICE_SCHEDULES: readonly PriceSchedule[] = [DEEPSEEK_CN]
+
+/** 按 id 取时段表；未知 id 返回 `null`（**绝不兜底成某一个时段表**）。 */
+export function findPriceSchedule(id: string | null | undefined): PriceSchedule | null {
+  if (id === null || id === undefined || id === '') return null
+  return PRICE_SCHEDULES.find((schedule) => schedule.id === id) ?? null
+}
+
+/**
+ * `YYYY-MM-DD` → 「偏移后的一天」的序号（= `Math.floor(偏移后的 epoch ms / 86400000)`）。
+ *
+ * ⚠️ 用 `Date.UTC` 而不是 `new Date('2026-10-01')`：后者按**进程时区**解析，
+ *   在 `TZ=UTC` 与 `TZ=Asia/Shanghai` 下会得到相差一天的结果，
+ *   而这条判定同时被 SQL 用整数算术复现 —— 差一天就是「某天的价算错」，且不报错。
+ */
+function dayIndexOfDate(date: string): number | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date)
+  if (!match) return null
+  const utc = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]))
+  return Number.isFinite(utc) ? utc / 86_400_000 : null
+}
+
+/**
+ * 每个时段表的节假日「天序号」集合（惰性、只建一次）。
+ *
+ * 常量表里有非法日期就直接抛错：那是代码错误，宁可 import 时就炸，
+ * 也不要静默少一天 —— 少一天等于某个节假日的用量按高峰计价。
+ */
+const holidayDayIndexCache = new Map<string, ReadonlySet<number>>()
+
+/** 把状态里的节假日表落成天序号集合（也供 `query.ts` 内联进 SQL）。 */
+export function scheduleHolidayDayIndices(schedule: PriceSchedule): readonly number[] {
+  const cached = holidayDayIndexCache.get(schedule.id)
+  if (cached) return [...cached]
+  const days: number[] = []
+  for (const date of schedule.holidays) {
+    const day = dayIndexOfDate(date)
+    if (day === null) throw new Error(`时段表 ${schedule.id} 的节假日 ${date} 不是合法的 YYYY-MM-DD`)
+    days.push(day)
+  }
+  const unique = [...new Set(days)].sort((a, b) => a - b)
+  holidayDayIndexCache.set(schedule.id, new Set(unique))
+  return unique
+}
+
+/** 偏移后的一天里的第几分钟（`0`–`1439`）。 */
+function shiftedMinuteOfDay(schedule: PriceSchedule, atMs: number): number {
+  const shifted = atMs + schedule.utcOffsetMinutes * 60_000
+  return ((Math.floor(shifted / 60_000) % 1440) + 1440) % 1440
+}
+
+/** 偏移后的一天序号。 */
+function shiftedDayIndex(schedule: PriceSchedule, atMs: number): number {
+  return Math.floor((atMs + schedule.utcOffsetMinutes * 60_000) / 86_400_000)
+}
+
+/**
+ * `atMs` 在这个时段表下是否**高峰**。
+ *
+ * 🚨 这个函数与 `core/src/db/query.ts` 里由同一份时段表**生成的 SQL 表达式**
+ *   必须逐位一致 —— 前者管逐事件 / 离线路径，后者管聚合取数。
+ *   两边漂移的表现是「总览与明细的金额对不上」，而**两边都不报错**；
+ *   所以 `core/test/portal-cost.test.ts` 用一整天的逐分钟网格把这两条路对了一遍。
+ *   ⚠️ 那边**绝不允许**用 `strftime(..., 'localtime')` / `FROM_UNIXTIME()` / `DAYOFWEEK()`：
+ *   它们按 OS 或 SQL 会话时区算，而这里是固定偏移的整数算术。
+ */
+export function isPeakAt(schedule: PriceSchedule, atMs: number): boolean {
+  if (!Number.isFinite(atMs)) return false
+  const day = shiftedDayIndex(schedule, atMs)
+  // 0 = 周日；1970-01-01（第 0 天）是周四 = 4。
+  const weekday = ((day + 4) % 7 + 7) % 7
+  if (!schedule.weekdays.includes(weekday)) return false
+  const minute = shiftedMinuteOfDay(schedule, atMs)
+  if (!schedule.windows.some((w) => minute >= w.startMinute && minute < w.endMinute)) return false
+  // ★ 节假日**只在这时**才起作用：它们只把「工作日的高峰窗」翻成闲时，
+  //   落在周末的节假日本来就已经是闲时（不查表结果一样）。
+  return !scheduleHolidayDayIndices(schedule).includes(day)
+}
+
+/** `atMs` 是否闲时（低谷）= 不是高峰。没有时段表时**恒为 `false`**（不分时段）。 */
+export function isOffpeakAt(schedule: PriceSchedule | null, atMs: number): boolean {
+  if (schedule === null) return false
+  return !isPeakAt(schedule, atMs)
+}
+
+/**
+ * 这条价在 `atMs` 时刻落在哪个时段。
+ *
+ * ★ 没有闲时档（或缺时段表）时**恒为 `peak`**：那四个 `offpeak*` 数一个都用不上，
+ *   错误地报成 `offpeak` 会让一条没有闲时价的用量按**不存在**的价算。
+ */
+export function priceSlotAt(price: ModelPrice, atMs: number): PriceSlot {
+  const schedule = findPriceSchedule(price.offpeakSchedule)
+  if (price.offpeakRates == null || schedule === null) return 'peak'
+  return isOffpeakAt(schedule, atMs) ? 'offpeak' : 'peak'
+}
+
+/**
+ * 这条价在 `atMs` 时刻**实际适用**的四类单价。
+ *
+ * 🚨 凡是「逐事件算钱」的地方都必须过这里（看板逐事件路径、离线折叠、明细行、插件宿主）：
+ *   直接 `costMicroOf(usage, price)` 会把闲时用量按高峰价算 —— 费用虚高一倍。
+ */
+export function priceRatesAt(price: ModelPrice, atMs: number): PriceRates {
+  if (priceSlotAt(price, atMs) === 'offpeak') return price.offpeakRates as PriceRates
+  return price
+}
+
+/**
+ * 按 `slot` 取这条价该用的四类单价（聚合路径用：时段由 SQL 判好）。
+ *
+ * ⚠️ `slot === 'offpeak'` 却没有闲时档时**退回高峰价**而不是抛错：
+ *   那种行只可能来自直接改库，抛错会让整个看板挂掉；退回高峰价至少能显示出来。
+ */
+export function priceRatesForSlot(price: ModelPrice, slot: PriceSlot): PriceRates {
+  if (slot === 'offpeak') return price.offpeakRates ?? price
+  return price
 }
 
 // ---------------------------------------------------------------------------
@@ -132,10 +401,25 @@ export function isPriceEffective(price: Pick<ModelPrice, 'effectiveFromMs' | 'ef
  *   `deepseek-v4.1-flash-preview` 串成同一个价 —— 那是数据错误，不是便利。
  *   （与「人员筛选是精确匹配」同理。）
  *
+ * ★ **专属价优先，基础价兜底**：先找 `(provider, model)`，找不到再找
+ *   `({@link ANY_PROVIDER}, model)`。两条都找不到才算未计价。
+ *   ⚠️ 这里**不做**「模糊匹配」（例如拿 `deepseek-flash` 去配 `deepseek-v4.1-flash`）：
+ *   模型改名时宁可让它进「未计价」清单被人看见，也不要静默套一个别的模型的价。
+ *
  * 生效区间本应在写入时保证不重叠；真出现重叠时取 `effectiveFromMs` 最大的一行，
  * 让行为可预测而不是「看数据库返回顺序」。
  */
 export function resolvePrice(
+  prices: readonly ModelPrice[],
+  provider: string,
+  model: string,
+  atMs: number,
+): ModelPrice | null {
+  return bestEffectivePrice(prices, provider, model, atMs) ?? bestEffectivePrice(prices, ANY_PROVIDER, model, atMs)
+}
+
+/** 在价表里找「`provider` + `model` 且当刻生效」的那一行（起点最晚者优先）。 */
+function bestEffectivePrice(
   prices: readonly ModelPrice[],
   provider: string,
   model: string,
@@ -151,14 +435,22 @@ export function resolvePrice(
 }
 
 /**
- * 两行的 `(provider, model)` 是否相同。
+ * 两行的 `(provider, model)` 是否落在同一个「计价槽」里（= 同一时刻会同时命中）。
  *
- * ⚠️ **币种不同不构成豁免**：{@link resolvePrice} 只按 `(provider, model, 时点)` 返回
- *   **一行**，若同一区间下同时存在 USD 与 CNY 两行，取哪一行就取决于兜底顺序 ——
- *   那是「费用取决于数据库返回顺序」，必须由写入时的冲突校验挡掉。
+ * ★ **基础价（`'*'`）与同名的专属价不算同一个槽**：专属优先、基础兜底是
+ *   **两层**匹配，取数 SQL 也是这么写的（先 join 一次专属价，再在
+ *   `mp_e.price_id IS NULL` 的前提下 join 一次基础价）。
+ *   所以「基础价 + 某个供应商的专属价」是合法的组合 —— 明细里同一模型、
+ *   同一时刻两行给出不同金额，那正是「这个供应商另有协议价」的证据。
+ *
+ * 🚨 两条**基础价**覆盖同一时刻仍然是冲突（也由 `findPriceConflicts` 拒掉）：
+ *   那时「用哪一条」没有别的判据，一条事件会匹配两行、token 被算两遍。
+ *
+ * ⚠️ **币种不同不构成豁免**：同一槽里的两行会让费用的币种取决于读取顺序，
+ *   必须由写入时的冲突校验挡掉。
  */
 function sameTarget(a: ModelPrice, b: ModelPrice): boolean {
-  return a.provider === b.provider && a.model === b.model
+  return a.model === b.model && a.provider === b.provider
 }
 
 /**
@@ -178,13 +470,46 @@ export function priceRangesOverlap(
 }
 
 /**
- * 在既有单价表里找出与候选行冲突的行（同一 `provider` + `model` 且区间重叠）。
+ * 在既有单价表里找出与候选行冲突的行。
+ *
+ * ## 两类冲突
+ *
+ * 1. **同一个计价槽 + 区间重叠**：同一个 `(provider, model)` —— 注意基础价
+ *    （`'*'`）与同名的**专属价**刻意**不算**同一个槽（专属优先、基础兜底，
+ *    见 {@link sameTarget}），所以它们可以共存。
+ * 2. 区间重叠的判定两端都含，见 {@link priceRangesOverlap}。
  *
  * ★ 这条规则**只有这一份实现**：管理页的即时校验与服务端写入前的校验都调它，
  *   否则「页面允许但接口拒绝」这类不一致会长期存在。
+ *
+ * ⚠️ 数据库的 UNIQUE 索引**只拦「`(provider, model, effective_from_ms)` 完全相同」**
+ *   那一类，`[1,100]` vs `[50,200]` 与「两条基础价」它一概拦不住 ——
+ *   这两条只有应用层兜着（同 `AGENTS.md` 的 MySQL 坑 5）。
  */
 export function findPriceConflicts(existing: readonly ModelPrice[], candidate: ModelPrice): ModelPrice[] {
   return existing.filter((row) => sameTarget(row, candidate) && priceRangesOverlap(row, candidate))
+}
+
+/**
+ * 一条价行的「闲时档」是否自洽：**四个数全有 + 时段表已知**，或者**全都不要**。
+ *
+ * 返回 `null` = 合法，否则返回一句可直接展示的中文原因。
+ *
+ * ★ 放在 `shared` 里是因为它有**两个**消费者：服务端写入前的校验、
+ *   管理页提交前的即时校验。两边各写一份的话，「页面放行、接口拒绝」
+ *   或者更糟的「两边都放行、库里存了一行永远不生效的闲时价」都会出现。
+ */
+export function offpeakConfigError(price: Pick<ModelPrice, 'offpeakRates' | 'offpeakSchedule'>): string | null {
+  const rates = price.offpeakRates ?? null
+  const schedule = price.offpeakSchedule ?? null
+  if (rates === null && schedule === null) return null
+  if (rates === null) return '选了闲时时段就必须填闲时四类单价（否则这四个数没有对应的时段）'
+  if (!isValidPriceRates(rates)) return '闲时四类单价必须都是 0 到 10000000 之间的整数微元'
+  if (schedule === null) return '填了闲时单价就必须选择闲时时段（否则不知道哪段时间算闲时）'
+  if (findPriceSchedule(schedule) === null) {
+    return `未知的闲时时段「${schedule}」：时段表只有 ${PRICE_SCHEDULES.map((s) => s.id).join(' / ')}`
+  }
+  return null
 }
 
 // ---------------------------------------------------------------------------
@@ -261,8 +586,16 @@ export function unpricedRate(unpricedTokens: number, totalTokens: number): numbe
 /** 一个计价单元：通常来自一个 `(provider, model)` 分组的汇总。 */
 export interface CostPart {
   usage: BillableUsage
-  /** 该单元适用的单价；`null` = 未定价，整个单元计入 `unpricedTokens`。 */
+  /** 该单元适用的单价行；`null` = 未定价，整个单元计入 `unpricedTokens`。 */
   price: ModelPrice | null
+  /**
+   * 这一单元该用哪四类单价；缺席 = 用 `price` 自己的四类（高峰价）。
+   *
+   * ★ 聚合取数路径用它：时段由 SQL 判好（`price_slot`），JS 侧只需按时段取价。
+   *   逐事件路径不需要它 —— 那边直接 `priceRatesAt(price, ts)`。
+   * ⚠️ 它与 `price` 是**同一个币种**：时段只换四个数，不换币种。
+   */
+  rates?: PriceRates | null
 }
 
 /** 某个币种下的费用小计。 */
@@ -304,6 +637,10 @@ function totalOf(usage: BillableUsage): number {
  *
  * `pricedRate + unpricedRate === 1`（无数据时两者都是 0），
  * 所以页面永远能说清「这笔钱覆盖了多少用量」。
+ *
+ * ⚠️ 计价用的是 `part.rates ?? part.price`：聚合路径会把「这一撮用量落在哪个时段」
+ *   一起带进来（闲时价与高峰价是同一行的两套数），**不是**再乘一个折扣系数 ——
+ *   四类分价各自独立，任何「乘个比例」的写法都会在缓存那一档上算错。
  */
 export function summarizeCosts(parts: readonly CostPart[]): CostSummary {
   const byCurrency = new Map<string, CostByCurrency>()
@@ -319,7 +656,7 @@ export function summarizeCosts(parts: readonly CostPart[]): CostSummary {
       continue
     }
     const currency = normalizeCurrency(part.price.currency) ?? part.price.currency
-    const amountMicro = costMicroOf(part.usage, part.price)
+    const amountMicro = costMicroOf(part.usage, part.rates ?? part.price)
     const bucket = byCurrency.get(currency)
     if (bucket) {
       bucket.amountMicro += amountMicro
@@ -415,6 +752,19 @@ export interface WireModelPriceFields {
   effective_from_ms: number
   /** `null` = 至今有效。**绝不允许归一成 0** —— 0 是一个合法的、早已过去的终点。 */
   effective_to_ms: number | null
+  /**
+   * v10 的四类闲时单价；`null`（或旧服务端**整个字段缺席**）= 这条价不分时段。
+   *
+   * ⚠️ 四个字段必须**同进同出**：只来两个的话，那两档会按 0 元算
+   *   （0 元是合法单价，`costMicroForTokens()` 不会报错）。
+   *   所以下面一律「四个都是数字才认」，否则整条按「无闲时档」处理。
+   */
+  offpeak_input_micro_per_ktok?: number | null
+  offpeak_output_micro_per_ktok?: number | null
+  offpeak_cache_read_micro_per_ktok?: number | null
+  offpeak_cache_write_micro_per_ktok?: number | null
+  /** v10 的闲时时段表 id（见 {@link PRICE_SCHEDULES}）；缺席 = 不分时段。 */
+  offpeak_schedule?: string | null
 }
 
 /**
@@ -437,6 +787,7 @@ export interface WireModelPriceFields {
  *   文件不经过数据库约束（见 `parsePricingSnapshot()`）。
  */
 export function modelPriceFromWire(wire: WireModelPriceFields): ModelPrice {
+  const offpeakRates = offpeakRatesFromWire(wire)
   return {
     provider: wire.provider,
     model: wire.model,
@@ -447,7 +798,26 @@ export function modelPriceFromWire(wire: WireModelPriceFields): ModelPrice {
     cacheWriteMicroPerKtok: wire.cache_write_micro_per_ktok,
     effectiveFromMs: wire.effective_from_ms,
     effectiveToMs: wire.effective_to_ms === null ? null : wire.effective_to_ms,
+    offpeakRates,
+    offpeakSchedule: offpeakRates === null ? null : (wire.offpeak_schedule ?? null),
   }
+}
+
+/**
+ * 四个闲时单价**齐了才算**（见 {@link WireModelPriceFields} 里那条注释）。
+ *
+ * ⚠️ 缺一个就整条当「不分时段」，绝不把缺的那个当 0 元：0 是合法单价，
+ *   于是那个时段会被算成免费 —— 而页面上只看得出「这个月花得少」。
+ */
+function offpeakRatesFromWire(wire: WireModelPriceFields): PriceRates | null {
+  const rates: PriceRates = {
+    inputMicroPerKtok: wire.offpeak_input_micro_per_ktok as number,
+    outputMicroPerKtok: wire.offpeak_output_micro_per_ktok as number,
+    cacheReadMicroPerKtok: wire.offpeak_cache_read_micro_per_ktok as number,
+    cacheWriteMicroPerKtok: wire.offpeak_cache_write_micro_per_ktok as number,
+  }
+  if (Object.values(rates).some((value) => typeof value !== 'number' || !Number.isFinite(value))) return null
+  return isValidPriceRates(rates) ? rates : null
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +873,25 @@ export function parsePricingSnapshot(text: string): PricingSnapshot | null {
     if (effectiveFromMs === null) return null
     if (effectiveToMs === null && row.effectiveToMs !== null) return null
     if (!isValidPriceRates(row as Partial<PriceRates>)) return null
+    // ★ 闲时档（v10）：要么四个数齐全且时段表已知，要么两个字段都缺席。
+    //   半个闲时档**整份拒绝**（与其他不合法行同一条纪律）：按 0 元算的那两档
+    //   会让费用静默偏低，而文件里的 `syncedAtMs` 还显示同步成功。
+    const offpeakRates = row.offpeakRates === undefined || row.offpeakRates === null
+      ? null
+      : (typeof row.offpeakRates === 'object' && isValidPriceRates(row.offpeakRates as Partial<PriceRates>)
+        ? {
+            inputMicroPerKtok: (row.offpeakRates as PriceRates).inputMicroPerKtok,
+            outputMicroPerKtok: (row.offpeakRates as PriceRates).outputMicroPerKtok,
+            cacheReadMicroPerKtok: (row.offpeakRates as PriceRates).cacheReadMicroPerKtok,
+            cacheWriteMicroPerKtok: (row.offpeakRates as PriceRates).cacheWriteMicroPerKtok,
+          }
+        : undefined)
+    if (offpeakRates === undefined) return null
+    const offpeakSchedule = row.offpeakSchedule === undefined || row.offpeakSchedule === null
+      ? null
+      : (typeof row.offpeakSchedule === 'string' ? row.offpeakSchedule : undefined)
+    if (offpeakSchedule === undefined) return null
+    if (offpeakConfigError({ offpeakRates, offpeakSchedule }) !== null) return null
     prices.push({
       provider,
       model,
@@ -513,6 +902,8 @@ export function parsePricingSnapshot(text: string): PricingSnapshot | null {
       outputMicroPerKtok: row.outputMicroPerKtok as number,
       cacheReadMicroPerKtok: row.cacheReadMicroPerKtok as number,
       cacheWriteMicroPerKtok: row.cacheWriteMicroPerKtok as number,
+      offpeakRates,
+      offpeakSchedule,
     })
   }
   const endpoint = typeof record.endpoint === 'string' ? record.endpoint : undefined
@@ -529,24 +920,27 @@ export function parsePricingSnapshot(text: string): PricingSnapshot | null {
  * ## 来源与快照说明
  *
  * 取自 DeepSeek 官方定价页（https://api-docs.deepseek.com/zh-cn/quick_start/pricing）的
- * **高峰档**人民币报价 —— 官方原页的单位就是「元 / 百万 tokens」，
+ * 人民币报价 —— 官方原页的单位就是「元 / 百万 tokens」，
  * 与库里的「整数微元/千 token」正好差 1000 倍（见 {@link MicroPerKtok}）。
  * 官方原价目只有「cache hit / cache miss / output」三档，与这里的四类分价同构。
  *
- * | 模型 | 缓存命中 | 缓存未命中 | 输出 |
- * |---|---|---|---|
- * | `deepseek-flash` / `deepseek-v4.1-flash` | ¥0.04 | ¥2 | ¥8 |
- * | `deepseek-v4-pro` | ¥0.30 | ¥9 | ¥27 |
+ * | 模型 | 档 | 缓存命中 | 缓存未命中 | 输出 |
+ * |---|---|---|---|---|
+ * | `deepseek-flash` / `deepseek-v4.1-flash` | 高峰 | ¥0.04 | ¥2 | ¥8 |
+ * | 同上 | 空闲 | ¥0.02 | ¥1 | ¥4 |
+ * | `deepseek-v4-pro` | 高峰 | ¥0.30 | ¥9 | ¥27 |
+ * | 同上 | 空闲 | ¥0.15 | ¥4.5 | ¥13.5 |
  *
- * ## ⚠️ 两处刻意的口径简化，管理员必须知道
+ * ★ **两档都收**（v10 起）：空闲档是高峰档的一半，时段表是 {@link PRICE_SCHEDULES}
+ *   里的 `deepseek-cn`（北京时间周一至周五 09:00–12:00 / 14:00–18:00 为高峰，
+ *   其余含周末与**法定节假日**全天为空闲）。
+ *   ⚠️ 节假日表**逐年维护**（`PriceSchedule.holidaysThrough` 写明了覆盖到哪天）：
+ *   表过期之后，落在工作日高峰窗里的节假日会按高峰计 —— 费用偏高，页面会提示。
  *
- * 1. **只取高峰价。** 官方空闲档是高峰的一半，而高峰窗（北京时间周一至周五
- *    09:00-12:00 与 14:00-18:00）正是国内工作时段，所以对本部门而言高峰价就是实际价。
- *    按峰谷精确分类必须逐事件判定，会把时间口径复制进 SQL，
- *    与「时间分桶必须在 JS 侧做」的铁律冲突，故首版不做。
- *    界面上必须标注「未区分高峰/低谷」。
- * 2. **`effectiveFromMs = 0`（视作自始生效）。** 内置种子只是让首次部署立刻有数；
- *    管理员应在单价管理页按**真实生效日**修正，否则历史费用会按今天的价重算。
+ * ## ⚠️ 一处刻意的口径简化，管理员必须知道
+ *
+ * **`effectiveFromMs = 0`（视作自始生效）。** 内置种子只是让首次部署立刻有数；
+ * 管理员应在单价管理页按**真实生效日**修正，否则历史费用会按今天的价重算。
  *
  * ## 刻意不收录的
  *
@@ -554,6 +948,7 @@ export function parsePricingSnapshot(text: string): PricingSnapshot | null {
  * 这些网关的结算价是另一套口径（转售、折扣、汇总账单），拿官方零售价套上去
  * 会给出一个「看起来像官方价、其实不是自己付的钱」的数字 —— 那比留空更糟。
  * 留空会进 `unpricedTokens`，由页面显式告诉使用者「这部分没算钱」。
+ * ★ 需要的话由管理员在单价页配一条 `'*'` 的**基础价**（那是人的决定，不是内置默认）。
  */
 export const BUILTIN_PRICES: readonly ModelPrice[] = [
   {
@@ -571,6 +966,9 @@ export const BUILTIN_PRICES: readonly ModelPrice[] = [
     cacheWriteMicroPerKtok: 0,
     effectiveFromMs: 0,
     effectiveToMs: null,
+    // 空闲档 = 高峰档的一半（缓存命中 ¥0.02 / 未命中 ¥1 / 输出 ¥4）
+    offpeakRates: { cacheReadMicroPerKtok: 20, inputMicroPerKtok: 1000, outputMicroPerKtok: 4000, cacheWriteMicroPerKtok: 0 },
+    offpeakSchedule: 'deepseek-cn',
   },
   {
     provider: 'deepseek-official',
@@ -582,6 +980,8 @@ export const BUILTIN_PRICES: readonly ModelPrice[] = [
     cacheWriteMicroPerKtok: 0,
     effectiveFromMs: 0,
     effectiveToMs: null,
+    offpeakRates: { cacheReadMicroPerKtok: 20, inputMicroPerKtok: 1000, outputMicroPerKtok: 4000, cacheWriteMicroPerKtok: 0 },
+    offpeakSchedule: 'deepseek-cn',
   },
   {
     provider: 'deepseek-official',
@@ -594,5 +994,8 @@ export const BUILTIN_PRICES: readonly ModelPrice[] = [
     cacheWriteMicroPerKtok: 0,
     effectiveFromMs: 0,
     effectiveToMs: null,
+    // 空闲档 = 高峰档的一半（缓存命中 ¥0.15 / 未命中 ¥4.5 / 输出 ¥13.5）
+    offpeakRates: { cacheReadMicroPerKtok: 150, inputMicroPerKtok: 4500, outputMicroPerKtok: 13500, cacheWriteMicroPerKtok: 0 },
+    offpeakSchedule: 'deepseek-cn',
   },
 ]

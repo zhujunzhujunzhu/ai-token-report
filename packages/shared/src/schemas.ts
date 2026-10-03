@@ -41,6 +41,7 @@ import { z } from 'zod'
 
 import { SCHEMA_VERSION } from './protocol.js'
 import { validateName } from './identity.js'
+import { ANY_PROVIDER } from './price.js'
 
 /** 形状校验结果：要么给出归一化后的值，要么给出**可直接展示给排障者**的中文原因。 */
 export type ShapeResult<T> = { ok: true; value: T } | { ok: false; reason: string }
@@ -347,6 +348,47 @@ const providerName = z.string().min(1, { error: '供应商名不能为空' }).ma
   .refine((value) => /^[A-Za-z0-9](?:[A-Za-z0-9 ._:/+-]{0,126}[A-Za-z0-9._:/+-])?$/.test(value), {
     error: '供应商名需要以字母或数字开头和结尾，只能包含字母、数字与空格 . _ : / + -',
   })
+/**
+ * **带保留值 `'*'` 的供应商名**，供两处使用：
+ *
+ * 1. **单价行**：`'*'` = 不限供应商的基础价（任何没有专属价的供应商都落它）；
+ * 2. **归一化规则**：`'*'` = 任意供应商（模型规则里的「不管哪家报的，
+ *    这个模型名都折叠成同一个展示名」）。
+ *
+ * 🚨 它与 `providerName` 刻意分开：`providerName` 描述的是**上报里真实存在的供应商名**
+ * （它必须匹配 `usage_event.provider` 的值域），而 `'*'` 永远不会出现在用量里。
+ * 把 `'*'` 塞进 `providerName` 会让「建一条叫 `*` 的供应商归一化规则」这类无意义动作
+ * 变得合法，而它只会得到一条永远匹配不到任何用量的规则。
+ *
+ * ★ 两处**共用这一个定义**：它们匹配的都是 `usage_event.provider` 的值域，
+ *   各写一遍必然分叉，而分叉的表现是「单价填得进去、规则填不进去」。
+ */
+const starOrProviderName = z.union([
+  z.literal(ANY_PROVIDER, { error: '供应商名无效' }),
+  providerName,
+])
+/**
+ * 模型标识。
+ *
+ * ⚠️ 与 `providerName` **分开**，不能沿用它的字符集：模型 ID 里出现 `/` 是常态
+ * （`deepseek/deepseek-chat` 这类网关前缀），而 `providerName` 恰好禁止 `/`。
+ * 字符集刻意宽松（只禁不可见字符、要求首尾无空格）—— 模型名由各供应商自己定，
+ * 卡死了只会让新模型录不进来，而录入者唯一的办法是改代码。
+ *
+ * ★ 同一个定义同时服务**单价行**与**归一化规则里的模型名**：两处匹配的都是
+ *   `usage_event.model` 这个值域，一套规则即可。
+ *
+ * ⚠️ 长度上限 255 与 `provider_alias` 的 CHECK（`PORTAL_MODEL_MAX_LENGTH`）
+ *   以及 core 的 `modelNameError()` 是**同一个数**。
+ */
+const modelName = z.string().min(1, { error: '模型名不能为空' }).max(255, { error: '模型名不能超过 255 个字符' })
+  .refine((value) => !invisibleCharacters.test(value), { error: '模型名不能包含空格以外的空白或不可见字符' })
+  .refine((value) => value === value.trim(), { error: '模型名首尾不能是空格' })
+/**
+ * 单价行的**闲时时段表 id**。取值由服务端对照 `PRICE_SCHEDULES` 校验
+ * （这里只卡形状 —— 时段表是代码里的常量，不是这一层能穷举的东西）。
+ */
+const offpeakScheduleId = z.string().min(1, { error: '闲时时段表 id 不能为空' }).max(64, { error: '闲时时段表 id 不能超过 64 个字符' })
 /** ★ 归一化名允许中文 —— 它是给人看的名字，而 `阿里百炼` 比 `bailian-tpp` 更好读。 */
 const aliasName = z.string().min(1, { error: '归一化名不能为空' }).max(128, { error: '归一化名不能超过 128 个字符' })
   .refine((value) => !invisibleCharacters.test(value), { error: '归一化名不能包含空格以外的空白或不可见字符' })
@@ -403,13 +445,21 @@ const epochMs = z.int({ error: '时间需要是 epoch 毫秒' }).min(0, { error:
  *   这里拿不到库里已有的行，判断重叠必须读库。
  */
 export const portalSetModelPriceSchema = z.strictObject({
-  provider: providerName,
+  provider: starOrProviderName,
   model: modelName,
   currency: currencyCode,
   input_micro_per_ktok: microPerKtok,
   output_micro_per_ktok: microPerKtok,
   cache_read_micro_per_ktok: microPerKtok,
   cache_write_micro_per_ktok: microPerKtok,
+  // ★ 闲时档（v10）：五个字段都可选 —— 省略 / `null` = 这条价不分时段。
+  //   「五列同进同出」由服务端用 `offpeakConfigError()` 校验（它要读时段表，
+  //   而时段表不在这一层的可见范围内）。
+  offpeak_schedule: offpeakScheduleId.nullable().optional(),
+  offpeak_input_micro_per_ktok: microPerKtok.nullable().optional(),
+  offpeak_output_micro_per_ktok: microPerKtok.nullable().optional(),
+  offpeak_cache_read_micro_per_ktok: microPerKtok.nullable().optional(),
+  offpeak_cache_write_micro_per_ktok: microPerKtok.nullable().optional(),
   effective_from_ms: epochMs,
   effective_to_ms: epochMs.nullable().optional(),
   note: z.string().max(255, { error: '备注不能超过 255 个字符' }).nullable().optional(),

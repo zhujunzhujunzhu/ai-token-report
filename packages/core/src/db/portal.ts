@@ -89,7 +89,8 @@ import {
   type StackRow,
   type TimeBucketRow,
 } from './query.js'
-import { providerNormalizer, type ProviderAliasMap, type ProviderNormalizer } from './provider-alias.js'
+import { EMPTY_ALIAS_RULES, providerNormalizer, type AliasRules, type ProviderNormalizer } from './provider-alias.js'
+import { projectNormalizer, type ProjectAliasMap, type ProjectNormalizer } from './project-alias.js'
 import { EVENT_TABLE } from './schema.js'
 import { PRICE_TABLE } from './query.js'
 // ★ 费用类型与「未计价清单上限」的唯一来源：离线路径（本地页 / CLI）用同一份，
@@ -98,6 +99,9 @@ import { MAX_UNPRICED_TARGETS } from './cost.js'
 import type { CostTotals, CostTotalsWithTargets } from './cost.js'
 import {
   costMicroOf,
+  modelPriceFromWire,
+  priceRatesAt,
+  priceRatesForSlot,
   resolvePrice,
   summarizeCosts,
   UNATTRIBUTED_USER,
@@ -105,6 +109,7 @@ import {
   type CostPart,
   type CostSummary,
   type ModelPrice,
+  type PriceSlot,
   type PricingProvenance,
 } from '@ai-token-report/shared'
 // ⚠️ `toDayKey()` / `toHourKey()` / `projectName()` 是**内核**的（`aggregate.ts`），
@@ -164,6 +169,26 @@ interface PriceIndex {
   byId: Map<string, ModelPrice>
 }
 
+/**
+ * 逐事件计价单元：**专用价优先、基础价兜底** + **按事件时刻选时段**。
+ *
+ * 🚨 逐事件路径（`day` / `hour` 分组、趋势、堆叠、明细）必须走这里，不要自己
+ *   `costMicroOf(usage, resolvePrice(...))`：那样会把闲时用量按高峰价算，
+ *   费用虚高整整一倍，而页面上完全看不出区别。
+ *   聚合路径对应的是 `partOf()`（时段由 SQL 判好）。
+ */
+function eventCostPart(
+  prices: readonly ModelPrice[],
+  provider: string,
+  model: string,
+  atMs: number,
+  usage: BillableUsage,
+): CostPart {
+  const price = resolvePrice(prices, provider, model, atMs)
+  if (price === null) return { usage, price: null }
+  return { usage, price, rates: priceRatesAt(price, atMs) }
+}
+
 /** 单价表的取数行（snake_case 只活在这一层）。 */
 interface PortalPriceSqlRow {
   price_id: unknown
@@ -174,6 +199,12 @@ interface PortalPriceSqlRow {
   output_micro_per_ktok: unknown
   cache_read_micro_per_ktok: unknown
   cache_write_micro_per_ktok: unknown
+  /** v10 的闲时四类单价与时段表（可为 NULL = 这条价不分时段）。 */
+  offpeak_input_micro_per_ktok: unknown
+  offpeak_output_micro_per_ktok: unknown
+  offpeak_cache_read_micro_per_ktok: unknown
+  offpeak_cache_write_micro_per_ktok: unknown
+  offpeak_schedule: unknown
   effective_from_ms: unknown
   effective_to_ms: unknown
 }
@@ -406,19 +437,33 @@ export class PortalStatsSession {
         `SELECT price_id, provider, model, currency,
                 input_micro_per_ktok, output_micro_per_ktok,
                 cache_read_micro_per_ktok, cache_write_micro_per_ktok,
+                offpeak_input_micro_per_ktok, offpeak_output_micro_per_ktok,
+                offpeak_cache_read_micro_per_ktok, offpeak_cache_write_micro_per_ktok,
+                offpeak_schedule,
                 effective_from_ms, effective_to_ms
          FROM ${PRICE_TABLE}`,
       )
-      const list: ModelPrice[] = rows.map((row) => ({
+      // ★ 行 → 内存形状走 `shared/price.ts` 的 `modelPriceFromWire()`（服务端与 CLI 也用它）：
+      //   「四个闲时价缺一个怎么处理」「effective_to_ms 的 NULL 怎么处理」在这里
+      //   再写一遍，就等于把「什么时候算不分时段」变成两处判断 —— 分叉不会报错，
+      //   只会让某段时间的金额按错的档算。
+      const list: ModelPrice[] = rows.map((row) => modelPriceFromWire({
         provider: String(row.provider ?? ''),
         model: String(row.model ?? ''),
         currency: String(row.currency ?? ''),
-        inputMicroPerKtok: num(row.input_micro_per_ktok),
-        outputMicroPerKtok: num(row.output_micro_per_ktok),
-        cacheReadMicroPerKtok: num(row.cache_read_micro_per_ktok),
-        cacheWriteMicroPerKtok: num(row.cache_write_micro_per_ktok),
-        effectiveFromMs: num(row.effective_from_ms),
-        effectiveToMs: toNumberOrNull(row.effective_to_ms),
+        input_micro_per_ktok: num(row.input_micro_per_ktok),
+        output_micro_per_ktok: num(row.output_micro_per_ktok),
+        cache_read_micro_per_ktok: num(row.cache_read_micro_per_ktok),
+        cache_write_micro_per_ktok: num(row.cache_write_micro_per_ktok),
+        offpeak_input_micro_per_ktok: toNumberOrNull(row.offpeak_input_micro_per_ktok),
+        offpeak_output_micro_per_ktok: toNumberOrNull(row.offpeak_output_micro_per_ktok),
+        offpeak_cache_read_micro_per_ktok: toNumberOrNull(row.offpeak_cache_read_micro_per_ktok),
+        offpeak_cache_write_micro_per_ktok: toNumberOrNull(row.offpeak_cache_write_micro_per_ktok),
+        offpeak_schedule: row.offpeak_schedule === null || row.offpeak_schedule === undefined
+          ? null
+          : String(row.offpeak_schedule),
+        effective_from_ms: num(row.effective_from_ms),
+        effective_to_ms: toNumberOrNull(row.effective_to_ms),
       }))
       const byId = new Map<string, ModelPrice>()
       rows.forEach((row, index) => byId.set(String(row.price_id), list[index]!))
@@ -449,7 +494,7 @@ export class PortalStatsSession {
   async costTotals(): Promise<CostTotalsWithTargets | null> {
     if (!this.#withCost) return null
     const { byId } = await this.prices()
-    const q = costTotalsQuery(this.#filter, this.#normalize)
+    const q = costTotalsQuery(this.#filter, this.#normalize, this.#dialect)
     const rows = mapCostRows(await this.#store.all<RawCostRow>(q.sql, q.params))
     const targets = new Set<string>()
     for (const row of rows) {
@@ -457,15 +502,37 @@ export class PortalStatsSession {
       if (row.priceId === null && row.provider !== null) targets.add(`${row.provider}/${row.model ?? ''}`)
     }
     return {
-      ...this.summarize(rows.map((row) => ({ usage: row.usage, price: this.priceOf(row.priceId, byId) }))),
+      ...this.summarize(rows.map((row) => this.partOf(row.priceId, row.slot, row.usage, byId))),
       unpricedTargets: [...targets].sort().slice(0, MAX_UNPRICED_TARGETS),
     }
   }
 
-  /** 按 `price_id` 取价；取不到就按**未计价**处理（宁可少算，不可按 0 元算）。 */
+  /**
+   * 取一条价行。
+   *
+   * ★ 按 `price_id` 取；取不到就按**未计价**处理（宁可少算，不可按 0 元算）——
+   *   那说明这条价在两次查询之间被删了，或者直接改库留下了一条坏引用。
+   */
   private priceOf(priceId: string | null, byId: Map<string, ModelPrice>): ModelPrice | null {
     if (priceId === null) return null
     return byId.get(priceId) ?? null
+  }
+
+  /**
+   * 聚合取数行 → 计价单元：**时段由 SQL 判好**（`row.slot`），这里只按它取那四类单价。
+   *
+   * ⚠️ 少了 `rates` 就会把闲时用量按高峰价算 —— 费用虚高一倍，
+   *   而页面上完全看不出区别（这就是 `slot` 必须一路带到这里的原因）。
+   */
+  private partOf(
+    priceId: string | null,
+    slot: PriceSlot,
+    usage: BillableUsage,
+    byId: Map<string, ModelPrice>,
+  ): CostPart {
+    const price = this.priceOf(priceId, byId)
+    if (price === null) return { usage, price: null }
+    return { usage, price, rates: priceRatesForSlot(price, slot) }
   }
 
   /**
@@ -488,26 +555,35 @@ export class PortalStatsSession {
 
     if (dim === 'day' || dim === 'hour') {
       // ⚠️ 逐行的价必须按**每条事件自己的时刻**解析（`resolvePrice`），
-      //   不能拿分桶后的总量去乘一个价：一个桶里可能横跨一次换价。
+      //   不能拿分桶后的总量去乘一个价：一个桶里可能横跨一次换价，
+      //   也可能横跨高峰与闲时（同一行价的两套数）。
       const q = timeBucketRowsQuery(this.#filter, false, this.#normalize, true)
       const rows = await this.#store.all<TimeBucketRow & { provider?: unknown; model?: unknown }>(q.sql, q.params)
       for (const row of rows) {
         const ts = num(row.ts)
-        PortalStatsSession.push(parts, dim === 'day' ? toDayKey(ts) : toHourKey(ts), {
-          usage: this.usageOf(row),
-          price: resolvePrice(list, String(row.provider ?? ''), String(row.model ?? ''), ts),
-        })
+        PortalStatsSession.push(
+          parts,
+          dim === 'day' ? toDayKey(ts) : toHourKey(ts),
+          eventCostPart(list, String(row.provider ?? ''), String(row.model ?? ''), ts, this.usageOf(row)),
+        )
       }
     } else if (dim === 'project') {
-      const q = costByCwdQuery(this.#filter, this.#normalize)
+      const q = costByCwdQuery(this.#filter, this.#normalize, this.#dialect)
       for (const row of mapCostRows(await this.#store.all<RawCostRow>(q.sql, q.params))) {
-        PortalStatsSession.push(parts, projectName(row.key), { usage: row.usage, price: this.priceOf(row.priceId, byId) })
+        PortalStatsSession.push(
+          parts,
+          // 🚨 必须与 `groups('project')` 用**同一个**解析器：一条路径按归一化名、
+          //   另一条按 `projectName()` 的话，分布表与金额列会对不上号 ——
+          //   表现是「某些项目的费用列是空的」，而两边的数字各自都是「对的」。
+          this.#projectOf(row.key),
+          this.partOf(row.priceId, row.slot, row.usage, byId),
+        )
       }
     } else {
       const q = costByDimensionQuery(dim, this.#filter, this.#dialect, this.#normalize)
       if (!q) return result
       for (const row of mapCostRows(await this.#store.all<RawCostRow>(q.sql, q.params))) {
-        PortalStatsSession.push(parts, row.key ?? '', { usage: row.usage, price: this.priceOf(row.priceId, byId) })
+        PortalStatsSession.push(parts, row.key ?? '', this.partOf(row.priceId, row.slot, row.usage, byId))
       }
     }
 
@@ -984,10 +1060,11 @@ export class PortalStatsSession {
     const parts = new Map<string, CostPart[]>()
     for (const row of rows) {
       const ts = num(row.ts)
-      PortalStatsSession.push(parts, granularity === 'day' ? toDayKey(ts) : toHourKey(ts), {
-        usage: this.usageOf(row),
-        price: resolvePrice(list, String(row.provider ?? ''), String(row.model ?? ''), ts),
-      })
+      PortalStatsSession.push(
+        parts,
+        granularity === 'day' ? toDayKey(ts) : toHourKey(ts),
+        eventCostPart(list, String(row.provider ?? ''), String(row.model ?? ''), ts, this.usageOf(row)),
+      )
     }
     // 补零出来的点没有用量 —— 给一份全 0 的金额（币种列表为空），
     // 而不是让 `cost` 时有时无：后者会让页面在「有金额」和「没金额」之间闪。
@@ -1082,11 +1159,13 @@ export class PortalStatsSession {
       entry.tokensByBucket.set(bucket, (entry.tokensByBucket.get(bucket) ?? 0) + tokens)
       entry.callsByBucket.set(bucket, (entry.callsByBucket.get(bucket) ?? 0) + 1)
       if (this.#withCost) {
-        PortalStatsSession.push(entry.costParts, bucket, {
-          usage,
-          // ★ 逐条按**它自己的时刻**取价：一个桶里可能横跨一次换价。
-          price: resolvePrice(priceList, String(row.provider ?? ''), String(row.model ?? ''), ts),
-        })
+        PortalStatsSession.push(
+          entry.costParts,
+          bucket,
+          // ★ 逐条按**它自己的时刻**取价：一个桶里可能横跨一次换价，
+          //   也可能横跨高峰与闲时（同一行价的两套数）。
+          eventCostPart(priceList, String(row.provider ?? ''), String(row.model ?? ''), ts, usage),
+        )
       }
     }
 
@@ -1240,8 +1319,13 @@ export class PortalStatsSession {
           cacheWrite: usage.cacheWrite,
           // `currency: null` = 没配上价。**绝不写 0 元**：那会让「漏配价」
           // 在明细里看起来像「这条不要钱」。
+          // ⚠️ 计价必须过 `priceRatesAt()`：闲时那几条明细要用闲时价，
+          //    直接 `costMicroOf(usage, price)` 会把它们按高峰价算。
           ...(priceIndex === null ? {} : {
-            cost: { currency: price?.currency ?? null, amountMicro: price === null ? 0 : costMicroOf(usage, price) },
+            cost: {
+              currency: price?.currency ?? null,
+              amountMicro: price === null ? 0 : costMicroOf(usage, priceRatesAt(price, num(r.ts))),
+            },
           }),
         }
       }),

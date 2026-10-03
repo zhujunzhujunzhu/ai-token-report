@@ -836,6 +836,93 @@ describe('现状契约：/api/v1/admin/pricing*（模型单价 / v7）', () => {
       expect(r.allow).toBe('POST')
     }
   })
+
+  // ── v10：不限供应商的基础价（`provider = '*'`）与闲时（低谷）档 ─────────────
+  /**
+   * 读回单价目录里某个模型的**整行**（v10 的闲时五列也要看得见）。
+   *
+   * ⚠️ 与 `rowsOf` 同一个理由：断言必须限定在自己的模型名上 ——
+   *   这个文件所有用例共用同一个服务端与同一个库。
+   */
+  const fullRowsOf = async (model: string) => {
+    const r = await call(dept, 'GET', '/api/v1/admin/pricing', { headers: ADMIN })
+    expect(r.status).toBe(200)
+    return (r.body as { prices: (Record<string, unknown> & { model: string })[] }).prices.filter((p) => p.model === model)
+  }
+  /** 一套合法的闲时四类价（CNY / 百万 token 的微元）。 */
+  const offpeakRates = {
+    offpeak_input_micro_per_ktok: 1_000,
+    offpeak_output_micro_per_ktok: 4_000,
+    offpeak_cache_read_micro_per_ktok: 20,
+    offpeak_cache_write_micro_per_ktok: 0,
+  }
+
+  test('★ v10 基础价：`provider = \'*\'` 是合法保留值（不限供应商），落库后原样读回', async () => {
+    const created = await write(priceBody({ provider: '*', model: 'contract-any-provider' }))
+    expect(created.status).toBe(200)
+    const rows = await fullRowsOf('contract-any-provider')
+    expect(rows.length).toBe(1)
+    expect(rows[0]!.provider).toBe('*')
+    // 没给闲时档 ⇒ 五列全是 null（**不是 0**：0 会让低谷时段整段免费）
+    expect(rows[0]!.offpeak_schedule).toBeNull()
+    expect(rows[0]!.offpeak_input_micro_per_ktok).toBeNull()
+    expect(rows[0]!.offpeak_output_micro_per_ktok).toBeNull()
+    expect(rows[0]!.offpeak_cache_read_micro_per_ktok).toBeNull()
+    expect(rows[0]!.offpeak_cache_write_micro_per_ktok).toBeNull()
+  })
+
+  test('★ v10 基础价与同名模型的专属价**可以共存**（专属优先，不算区间重叠）', async () => {
+    expect((await write(priceBody({ provider: '*', model: 'contract-any-plus-exact' }))).status).toBe(200)
+    // 同一个模型、同一个起点，只是换成某个具体供应商：**必须放行**
+    // （写死成 409 就等于「配了基础价之后再也配不了专属价」）
+    expect((await write(priceBody({ provider: 'dashscope', model: 'contract-any-plus-exact' }))).status).toBe(200)
+    expect((await fullRowsOf('contract-any-plus-exact')).length).toBe(2)
+  })
+
+  test('🚨 v10 两条基础价覆盖同一时刻 → 409（否则一条事件会匹配两行、token 翻倍）', async () => {
+    expect((await write(priceBody({ provider: '*', model: 'contract-any-dup', effective_from_ms: 0, effective_to_ms: 1_000 }))).status).toBe(200)
+    expect((await write(priceBody({ provider: '*', model: 'contract-any-dup', effective_from_ms: 500, effective_to_ms: 2_000 }))).status).toBe(409)
+    // 错开接上就合法
+    expect((await write(priceBody({ provider: '*', model: 'contract-any-dup', effective_from_ms: 1_001, effective_to_ms: null }))).status).toBe(200)
+    expect((await fullRowsOf('contract-any-dup')).length).toBe(2)
+  })
+
+  test('★ v10 闲时档：五个字段同进同出 —— 半套配置一律 400', async () => {
+    // 只给时段表、不给四类价
+    expect((await write(priceBody({ model: 'contract-offpeak-half-a', offpeak_schedule: 'deepseek-cn' }))).status).toBe(400)
+    // 只给两个价、不给时段表
+    expect((await write(priceBody({
+      model: 'contract-offpeak-half-b',
+      offpeak_input_micro_per_ktok: 1_000, offpeak_output_micro_per_ktok: 4_000,
+    }))).status).toBe(400)
+    // 未知时段表（价目齐全也不行：那四个数永远不会生效）
+    expect((await write(priceBody({ model: 'contract-offpeak-unknown', offpeak_schedule: '不存在的表', ...offpeakRates }))).status).toBe(400)
+    // 一条都没落库
+    for (const model of ['contract-offpeak-half-a', 'contract-offpeak-half-b', 'contract-offpeak-unknown']) {
+      expect((await fullRowsOf(model)).length).toBe(0)
+    }
+  })
+
+  test('★ v10 闲时档：时段表 + 四类价齐全 → 200，读回原样（分成不合并）', async () => {
+    const created = await write(priceBody({ model: 'contract-offpeak-ok', offpeak_schedule: 'deepseek-cn', ...offpeakRates }))
+    expect(created.status).toBe(200)
+    const rows = await fullRowsOf('contract-offpeak-ok')
+    expect(rows.length).toBe(1)
+    expect(rows[0]).toMatchObject({ offpeak_schedule: 'deepseek-cn', ...offpeakRates })
+    // 改回「不分时段」也要能存下去（五个字段一起清掉）
+    expect((await write(priceBody({ model: 'contract-offpeak-ok', offpeak_schedule: null }))).status).toBe(200)
+    const cleared = await fullRowsOf('contract-offpeak-ok')
+    expect(cleared[0]!.offpeak_schedule).toBeNull()
+    expect(cleared[0]!.offpeak_input_micro_per_ktok).toBeNull()
+  })
+
+  test('★ v10 只读单价快照带上闲时五列（离线端要能按同一份价算）', async () => {
+    expect((await write(priceBody({ model: 'contract-offpeak-snapshot', offpeak_schedule: 'deepseek-cn', ...offpeakRates }))).status).toBe(200)
+    const r = await call(dept, 'GET', '/api/v1/stats/pricing', { headers: ADMIN })
+    expect(r.status).toBe(200)
+    const row = (r.body as { prices: (Record<string, unknown> & { model: string })[] }).prices.find((p) => p.model === 'contract-offpeak-snapshot')
+    expect(row).toMatchObject({ offpeak_schedule: 'deepseek-cn', ...offpeakRates })
+  })
 })
 
 // ─────────────────────────────────────────────────────────────

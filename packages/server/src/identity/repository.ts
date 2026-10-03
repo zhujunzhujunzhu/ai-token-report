@@ -1,10 +1,10 @@
 /** 人员 / 分组身份的数据库真值；与用量写入共用连接、锁顺序和提交边界。 */
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { openPortalStore, PORTAL_SCHEMA_VERSION, aliasNameError, providerNameError, type PortalProviderAlias, type PortalStore, type PortalTarget } from '@ai-token-report/core/db'
+import { openPortalStore, PORTAL_SCHEMA_VERSION, aliasNameError, providerNameError, modelNameError, ANY_PROVIDER, projectAliasNameError, projectPrefixError, normalizeProjectPrefix, type PortalProviderAlias, type PortalProjectAlias, type PortalStore, type PortalTarget } from '@ai-token-report/core/db'
 import { hashPassword, normalizeUsername, passwordError, usernameError } from '../auth/password.js'
 import type { CredentialInput } from '../credentials.js'
-import { APP_KEY_LABEL, APP_KEY_SCOPES, BUILTIN_PRICES, findPriceConflicts, isValidPriceRates, normalizeCurrency, MAX_MICRO_PER_KTOK, type ModelPrice, type PortalAppKeyEntry, type PortalAppKeyOwner, type PortalMember, type PortalMemberGroupRef, type PortalRole, type PortalGroup, type PortalReportToken, type PortalAuditResponse, type PortalStorageResponse, type PortalLegacyAttribution, type PortalModelPrice } from '@ai-token-report/shared'
-import { ADMIN_ROLE_ID, MEMBER_ROLE_ID, DEFAULT_SCOPES, RECOVERY_PERMISSIONS, PERMISSIONS, IdentityError, requirePermission, subset, str, num, textField, idField, intField, nullableIntField, listField, displayName, roleCode, type Principal, type Row, type MutationInput } from './types.js'
+import { APP_KEY_LABEL, APP_KEY_SCOPES, BUILTIN_PRICES, findPriceConflicts, isAnyProvider, isValidPriceRates, normalizeCurrency, offpeakConfigError, MAX_MICRO_PER_KTOK, type ModelPrice, type PortalAppKeyEntry, type PortalAppKeyOwner, type PortalMember, type PortalMemberGroupRef, type PortalRole, type PortalGroup, type PortalReportToken, type PortalAuditResponse, type PortalStorageResponse, type PortalLegacyAttribution, type PortalModelPrice, type PriceRates } from '@ai-token-report/shared'
+import { ADMIN_ROLE_ID, MEMBER_ROLE_ID, DEFAULT_SCOPES, RECOVERY_PERMISSIONS, PERMISSIONS, IdentityError, requirePermission, subset, str, num, textField, nullableTextField, idField, intField, nullableIntField, listField, displayName, roleCode, type Principal, type Row, type MutationInput } from './types.js'
 // ★ 单价的两种行映射都在这个模块里（`repository.ts` 与 `stats-route.ts` 共用一份）。
 import { modelPriceFromRow, priceShapeFromRow } from './model-price-row.js'
 
@@ -23,6 +23,16 @@ export type LegacyCredentialInput = CredentialInput & { loginEnabled?: boolean }
  */
 const describePriceSpan = (price: ModelPrice): string =>
   `${price.currency} ${new Date(price.effectiveFromMs).toISOString().slice(0, 10)} ~ ${price.effectiveToMs === null ? '至今' : new Date(price.effectiveToMs).toISOString().slice(0, 10)}`
+
+/**
+ * 冲突提示里给这条价一个**能认出来**的名字。
+ *
+ * ★ 基础价（`'*'`）必须显式说成「不限供应商」，否则使用者看到的是
+ *   `* / deepseek-flash …` —— 一个看起来像乱码、于是被当成「另一条无关的价」的东西，
+ *   而它恰恰就是挡住这次保存的那条。
+ */
+const describePriceTarget = (price: ModelPrice): string =>
+  `${isAnyProvider(price.provider) ? '不限供应商' : price.provider} / ${price.model}`
 
 export class IdentityRepository {
   readonly now: () => number
@@ -1028,8 +1038,13 @@ export class IdentityRepository {
    */
   async setModelPrice(actor: Principal, input: MutationInput) {
     const provider = textField(input, 'provider')
-    const providerReason = providerNameError(provider)
-    if (providerReason) throw new IdentityError(400, `供应商名无效：${providerReason}`)
+    // ★ `'*'` 是**保留值**（不限供应商的基础价）：它刻意不满足供应商名的字符集
+    //   （那条规则要求以字母 / 数字开头结尾），所以要在这里放行 ——
+    //   界面上的「基础价」选项写的就是它。
+    if (!isAnyProvider(provider)) {
+      const providerReason = providerNameError(provider)
+      if (providerReason) throw new IdentityError(400, `供应商名无效：${providerReason}`)
+    }
     // ⚠️ 模型名**不复用** `providerNameError`：模型 ID 里带 `/` 是常态
     //   （网关前缀），而那条规则恰好禁止 `/`。形状校验在 zod 层，这里只兜长度与首尾空格。
     const model = textField(input, 'model')
@@ -1047,26 +1062,90 @@ export class IdentityRepository {
     const effectiveToMs = nullableIntField(input, 'effective_to_ms')
     if (effectiveToMs !== null && effectiveToMs < effectiveFromMs) throw new IdentityError(400, '生效终点不能早于生效起点')
     const note = input.note == null ? null : (typeof input.note === 'string' ? input.note.trim().slice(0, 255) || null : (() => { throw new IdentityError(400, '备注需要是字符串') })())
+    /**
+     * v10 闲时档：**五个字段同进同出**（时段表 + 四类单价）。
+     *
+     * 🚨 校验落在 `shared/price.ts` 的 `offpeakConfigError()` —— 管理页提交前调的是
+     *   同一个函数。各写一份的话，「页面放行、接口拒绝」或者更糟的
+     *   「两边都放行、库里存了一行永远不生效的闲时价」都会出现。
+     */
+    const offpeakRates = {
+      inputMicroPerKtok: nullableIntField(input, 'offpeak_input_micro_per_ktok'),
+      outputMicroPerKtok: nullableIntField(input, 'offpeak_output_micro_per_ktok'),
+      cacheReadMicroPerKtok: nullableIntField(input, 'offpeak_cache_read_micro_per_ktok'),
+      cacheWriteMicroPerKtok: nullableIntField(input, 'offpeak_cache_write_micro_per_ktok'),
+    }
+    const offpeakAllNull = Object.values(offpeakRates).every((value) => value === null)
+    const offpeakAnyNull = Object.values(offpeakRates).some((value) => value === null)
+    if (!offpeakAllNull && offpeakAnyNull) throw new IdentityError(400, '闲时四类单价要一起填：缺一个就会有一档按 0 元算')
+    const offpeakSchedule = input.offpeak_schedule == null || input.offpeak_schedule === ''
+      ? null
+      : input.offpeak_schedule
+    if (offpeakSchedule !== null && typeof offpeakSchedule !== 'string') throw new IdentityError(400, '闲时时段表 id 需要是字符串')
+    const offpeakRatesOrNull: PriceRates | null = offpeakAllNull ? null : (offpeakRates as PriceRates)
+    const offpeakReason = offpeakConfigError({ offpeakRates: offpeakRatesOrNull, offpeakSchedule })
+    if (offpeakReason) throw new IdentityError(400, offpeakReason)
 
     return this.mutate(actor, 'pricing:manage', 'model_price.set', 'model_price', null, async (tx) => {
-      const rows = await tx.all<Row>('SELECT * FROM model_price WHERE provider = $provider AND model = $model ORDER BY effective_from_ms, price_id', { $provider: provider, $model: model })
+      /**
+       * ⚠️ 这里取的是**同一个模型的全部价行**（不再只是同一供应商）：
+       *   基础价（`'*'`）与同名的专属价互相冲突是 `findPriceConflicts()` 的判定，
+       *   而它需要看到两侧的行。查询放宽的代价可以忽略（单价只有几十行），
+       *   漏看的代价是「两行覆盖同一时刻」—— 那是重复计价。
+       */
+      const rows = await tx.all<Row>('SELECT * FROM model_price WHERE model = $model ORDER BY effective_from_ms, price_id', { $model: model })
       // ⚠️ 自身那条要先摘掉 —— 它是这次要改的行，不是「冲突」。
-      //   业务主键里就含 `effective_from_ms`，所以按它排除恰好等价于按 id 排除。
-      const candidate: ModelPrice = { provider, model, currency, ...rates, effectiveFromMs, effectiveToMs }
-      const clashes = findPriceConflicts(rows.filter((row) => num(row, 'effective_from_ms') !== effectiveFromMs).map((row) => priceShapeFromRow(row)), candidate)
-      if (clashes.length > 0) {
-        throw new IdentityError(409, `这个生效区间与已有的 ${clashes.length} 条单价重叠：${clashes.map(describePriceSpan).join('、')}。请先改掉那条的生效终点，或把这次的起点挪到它之后`)
+      //   业务主键是 `(provider, model, effective_from_ms)`，所以按起点排除时要**同时**
+      //   比供应商：放宽查询之后，另一个供应商在同一个起点上的价会跟着被误摘掉。
+      const candidate: ModelPrice = {
+        provider, model, currency, ...rates, effectiveFromMs, effectiveToMs,
+        offpeakRates: offpeakRatesOrNull, offpeakSchedule: offpeakRatesOrNull === null ? null : offpeakSchedule,
       }
-      const existing = rows.find((row) => num(row, 'effective_from_ms') === effectiveFromMs)
-      const values = { $currency: currency, $input: rates.inputMicroPerKtok, $output: rates.outputMicroPerKtok, $cacheRead: rates.cacheReadMicroPerKtok, $cacheWrite: rates.cacheWriteMicroPerKtok, $to: effectiveToMs, $note: note, $now: this.now() }
+      const clashes = findPriceConflicts(
+        rows.filter((row) => !(num(row, 'effective_from_ms') === effectiveFromMs && str(row, 'provider') === provider)).map((row) => priceShapeFromRow(row)),
+        candidate,
+      )
+      if (clashes.length > 0) {
+        throw new IdentityError(409, `这个生效区间与已有的 ${clashes.length} 条单价重叠：${clashes.map((row) => `${describePriceTarget(row)}（${describePriceSpan(row)}）`).join('、')}。请先改掉那条的生效终点，或把这次的起点挪到它之后`)
+      }
+      const existing = rows.find((row) => num(row, 'effective_from_ms') === effectiveFromMs && str(row, 'provider') === provider)
+      const values = {
+        $currency: currency,
+        $input: rates.inputMicroPerKtok,
+        $output: rates.outputMicroPerKtok,
+        $cacheRead: rates.cacheReadMicroPerKtok,
+        $cacheWrite: rates.cacheWriteMicroPerKtok,
+        $opSchedule: candidate.offpeakSchedule,
+        $opInput: offpeakRatesOrNull?.inputMicroPerKtok ?? null,
+        $opOutput: offpeakRatesOrNull?.outputMicroPerKtok ?? null,
+        $opCacheRead: offpeakRatesOrNull?.cacheReadMicroPerKtok ?? null,
+        $opCacheWrite: offpeakRatesOrNull?.cacheWriteMicroPerKtok ?? null,
+        $to: effectiveToMs, $note: note, $now: this.now(),
+      }
       if (existing) {
-        await tx.run('UPDATE model_price SET currency = $currency,input_micro_per_ktok = $input,output_micro_per_ktok = $output,cache_read_micro_per_ktok = $cacheRead,cache_write_micro_per_ktok = $cacheWrite,effective_to_ms = $to,note = $note,updated_at_ms = $now WHERE price_id = $id', { ...values, $id: str(existing, 'price_id') })
+        await tx.run(
+          `UPDATE model_price SET currency = $currency,
+             input_micro_per_ktok = $input,output_micro_per_ktok = $output,
+             cache_read_micro_per_ktok = $cacheRead,cache_write_micro_per_ktok = $cacheWrite,
+             offpeak_schedule = $opSchedule,
+             offpeak_input_micro_per_ktok = $opInput,offpeak_output_micro_per_ktok = $opOutput,
+             offpeak_cache_read_micro_per_ktok = $opCacheRead,offpeak_cache_write_micro_per_ktok = $opCacheWrite,
+             effective_to_ms = $to,note = $note,updated_at_ms = $now WHERE price_id = $id`,
+          { ...values, $id: str(existing, 'price_id') },
+        )
         return { ok: true as const, price: await this.modelPriceById(tx, str(existing, 'price_id')) }
       }
       const id = randomUUID()
-      await tx.run('INSERT INTO model_price (price_id,provider,model,currency,input_micro_per_ktok,output_micro_per_ktok,cache_read_micro_per_ktok,cache_write_micro_per_ktok,effective_from_ms,effective_to_ms,note,created_at_ms,updated_at_ms) VALUES ($id,$provider,$model,$currency,$input,$output,$cacheRead,$cacheWrite,$from,$to,$note,$now,$now)', {
-        ...values, $id: id, $provider: provider, $model: model, $from: effectiveFromMs,
-      })
+      await tx.run(
+        `INSERT INTO model_price (price_id,provider,model,currency,input_micro_per_ktok,output_micro_per_ktok,
+           cache_read_micro_per_ktok,cache_write_micro_per_ktok,offpeak_schedule,
+           offpeak_input_micro_per_ktok,offpeak_output_micro_per_ktok,
+           offpeak_cache_read_micro_per_ktok,offpeak_cache_write_micro_per_ktok,
+           effective_from_ms,effective_to_ms,note,created_at_ms,updated_at_ms)
+         VALUES ($id,$provider,$model,$currency,$input,$output,$cacheRead,$cacheWrite,$opSchedule,
+           $opInput,$opOutput,$opCacheRead,$opCacheWrite,$from,$to,$note,$now,$now)`,
+        { ...values, $id: id, $provider: provider, $model: model, $from: effectiveFromMs },
+      )
       return { ok: true as const, price: await this.modelPriceById(tx, id) }
     })
   }
@@ -1106,17 +1185,32 @@ export class IdentityRepository {
       if (existing > 0) throw new IdentityError(409, `单价表里已经有 ${existing} 条，不能再用种子价初始化；请逐条修改或删除后再试`)
       const now = this.now()
       for (const price of BUILTIN_PRICES) {
-        await tx.run('INSERT INTO model_price (price_id,provider,model,currency,input_micro_per_ktok,output_micro_per_ktok,cache_read_micro_per_ktok,cache_write_micro_per_ktok,effective_from_ms,effective_to_ms,note,created_at_ms,updated_at_ms) VALUES ($id,$provider,$model,$currency,$input,$output,$cacheRead,$cacheWrite,$from,$to,$note,$now,$now)', {
-          $id: randomUUID(), $provider: price.provider, $model: price.model, $currency: price.currency,
-          $input: price.inputMicroPerKtok, $output: price.outputMicroPerKtok,
-          $cacheRead: price.cacheReadMicroPerKtok, $cacheWrite: price.cacheWriteMicroPerKtok,
-          $from: price.effectiveFromMs, $to: price.effectiveToMs,
-          // ⚠️ 给种子行打上来源标记：页面要能一眼分出「内置种子价」与「人工调过的价」，
-          //   否则使用者会把一屏没核对过的数字当成已经确认过的计价。
-          //   `ModelPrice` 本身没有 `note` 字段（那是库里的列，不是计价形状的一部分），
-          //   所以这里写死一句固定说明。
-          $note: '内置种子价，请核对后再用', $now: now,
-        })
+        // ★ 闲时档（v10）也一起落库：内置种子价里带了官方空闲档（高峰价的一半），
+        //   不写就等于把「官方两档价」静默降级成单一价 —— 空闲时段的费用会虚高一倍。
+        const offpeak = price.offpeakRates ?? null
+        await tx.run(
+          `INSERT INTO model_price (price_id,provider,model,currency,input_micro_per_ktok,output_micro_per_ktok,
+             cache_read_micro_per_ktok,cache_write_micro_per_ktok,offpeak_schedule,
+             offpeak_input_micro_per_ktok,offpeak_output_micro_per_ktok,
+             offpeak_cache_read_micro_per_ktok,offpeak_cache_write_micro_per_ktok,
+             effective_from_ms,effective_to_ms,note,created_at_ms,updated_at_ms)
+           VALUES ($id,$provider,$model,$currency,$input,$output,$cacheRead,$cacheWrite,$opSchedule,
+             $opInput,$opOutput,$opCacheRead,$opCacheWrite,$from,$to,$note,$now,$now)`,
+          {
+            $id: randomUUID(), $provider: price.provider, $model: price.model, $currency: price.currency,
+            $input: price.inputMicroPerKtok, $output: price.outputMicroPerKtok,
+            $cacheRead: price.cacheReadMicroPerKtok, $cacheWrite: price.cacheWriteMicroPerKtok,
+            $opSchedule: offpeak === null ? null : (price.offpeakSchedule ?? null),
+            $opInput: offpeak?.inputMicroPerKtok ?? null, $opOutput: offpeak?.outputMicroPerKtok ?? null,
+            $opCacheRead: offpeak?.cacheReadMicroPerKtok ?? null, $opCacheWrite: offpeak?.cacheWriteMicroPerKtok ?? null,
+            $from: price.effectiveFromMs, $to: price.effectiveToMs,
+            // ⚠️ 给种子行打上来源标记：页面要能一眼分出「内置种子价」与「人工调过的价」，
+            //   否则使用者会把一屏没核对过的数字当成已经确认过的计价。
+            //   `ModelPrice` 本身没有 `note` 字段（那是库里的列，不是计价形状的一部分），
+            //   所以这里写死一句固定说明。
+            $note: '内置种子价，请核对后再用', $now: now,
+          },
+        )
       }
       return { ok: true as const, prices: (await tx.all<Row>('SELECT * FROM model_price ORDER BY provider, model, effective_from_ms')).map(modelPriceFromRow) }
     })

@@ -427,6 +427,23 @@ export interface PortalModelPrice {
   output_micro_per_ktok: number
   cache_read_micro_per_ktok: number
   cache_write_micro_per_ktok: number
+  /**
+   * 闲时（低谷）时段表 id；`null` = 这条价不分时段（全天一个价）。
+   *
+   * ★ 取值来自 `shared/price.ts` 的 `PRICE_SCHEDULES`（当前只有 `deepseek-cn`）。
+   *   「哪段时间算高峰」在那张表里只有一份定义，服务端**只存 id**。
+   */
+  offpeak_schedule: string | null
+  /**
+   * 闲时四类单价；与 `offpeak_schedule` **同生共死**（要么五个都是 `null`，要么全都有值）。
+   *
+   * 🚨 缺一个就是「那一档按 0 元算」—— 0 是合法单价，计价函数不会报错，
+   *   费用只是静默偏低。所以服务端写入前用 `offpeakConfigError()` 拒掉半套配置。
+   */
+  offpeak_input_micro_per_ktok: number | null
+  offpeak_output_micro_per_ktok: number | null
+  offpeak_cache_read_micro_per_ktok: number | null
+  offpeak_cache_write_micro_per_ktok: number | null
   /** 生效起点（含），epoch 毫秒。 */
   effective_from_ms: number
   /** 生效终点（含）；`null` = 至今有效。 */
@@ -451,11 +468,18 @@ export interface PortalModelPriceResult extends PortalMutationResult {
  * ⚠️ 业务主键是 `(provider, model, effective_from_ms)`：同一个模型的同一个
  *   生效起点只有一行，再次提交是**改**而不是新增 ——
  *   否则同一个起点会有两个价，结果取决于读取顺序。
- * 🚨 **生效区间不得重叠**（同 `provider` + `model`）：重叠的两行会让
+ * 🚨 **生效区间不得重叠**（同 `provider` + `model`，或「基础价与同名模型的专属价」
+ *   之间 —— 见 `shared/price.ts` 的 `ANY_PROVIDER`）：重叠的两行会让
  *   「某一时刻该用哪个价」变成读取顺序问题。服务端显式查重并回 `409`，
  *   而不是任选一行 —— 唯一的例外是「同一 id 的自身更新」。
  *   ⚠️ 数据库那条 UNIQUE 索引**拦不住**这种情况（它只认完全相同的
  *   `effective_from_ms`），所以这条规则只有应用层兜着。
+ *
+ * ## `provider = '*'` = 不限供应商的基础价
+ *
+ * 它不满足供应商名的字符集（那条规则要求以字母 / 数字开头结尾），
+ * 所以 zod 层与服务端都显式放行这一个值 —— 它**不是**供应商名，是保留值。
+ * 解析时专属价优先、基础价兜底（`resolvePrice()`）。
  */
 export interface PortalSetModelPriceRequest {
   provider: string
@@ -465,6 +489,17 @@ export interface PortalSetModelPriceRequest {
   output_micro_per_ktok: number
   cache_read_micro_per_ktok: number
   cache_write_micro_per_ktok: number
+  /**
+   * 闲时档（v10）：`offpeak_schedule` 与四个单价**要么一起给、要么一起不给**。
+   *
+   * ⚠️ 省略 / `null` = 这条价不分时段。**旧客户端不发这几个字段是完全合法的** ——
+   *   那是「全天一个价」，不是「漏配」。
+   */
+  offpeak_schedule?: string | null
+  offpeak_input_micro_per_ktok?: number | null
+  offpeak_output_micro_per_ktok?: number | null
+  offpeak_cache_read_micro_per_ktok?: number | null
+  offpeak_cache_write_micro_per_ktok?: number | null
   effective_from_ms: number
   effective_to_ms?: number | null
   note?: string | null

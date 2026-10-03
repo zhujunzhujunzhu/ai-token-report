@@ -12,6 +12,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  ANY_PROVIDER,
   BUILTIN_PRICES,
   MAX_MICRO_PER_KTOK,
   MAX_SAFE_BILLABLE_TOKENS,
@@ -19,6 +20,7 @@ import {
   costMicroForTokens,
   costMicroOf,
   findPriceConflicts,
+  findPriceSchedule,
   formatCostMicro,
   formatCostSummary,
   formatUnitPriceMicro,
@@ -26,13 +28,17 @@ import {
   isValidPriceRates,
   modelPriceFromWire,
   normalizeCurrency,
+  offpeakConfigError,
   parsePricingSnapshot,
   priceRangesOverlap,
+  priceRatesAt,
+  priceSlotAt,
   resolvePrice,
   summarizeCosts,
   unpricedRate,
   type BillableUsage,
   type ModelPrice,
+  type PriceRates,
 } from '../src/price.js'
 
 /** 实测样本：dashscope 全量汇总（`docs/口径实测结论.md` §2.2）。 */
@@ -259,6 +265,171 @@ describe('单价冲突（写入前唯一校验，页面与接口共用）', () =
     // 共用端点仍算冲突，所以必须真的错开 1 毫秒
     expect(findPriceConflicts([{ ...FLASH, effectiveToMs: 1_000 }], { ...repriced, effectiveFromMs: 1_001 })).toHaveLength(0)
   })
+
+  test('★ 基础价与同名模型的专属价**可以共存**（专属优先，两者不算冲突）', () => {
+    const base: ModelPrice = { ...FLASH, provider: ANY_PROVIDER }
+    expect(findPriceConflicts([base], { ...FLASH, provider: 'dashscope' })).toHaveLength(0)
+    expect(findPriceConflicts([{ ...FLASH, provider: 'dashscope' }], base)).toHaveLength(0)
+  })
+
+  test('★ 两条基础价覆盖同一时刻是冲突（否则一条事件会匹配两行、token 翻倍）', () => {
+    const base: ModelPrice = { ...FLASH, provider: ANY_PROVIDER }
+    expect(findPriceConflicts([base], { ...base, currency: 'CNY' })).toHaveLength(1)
+    // 不同模型的两条基础价互不影响
+    expect(findPriceConflicts([base], { ...base, model: 'other' })).toHaveLength(0)
+  })
+})
+
+describe('基础价（不限供应商）★ v10：专属优先、基础兜底', () => {
+  const base: ModelPrice = { ...FLASH, provider: ANY_PROVIDER, inputMicroPerKtok: 111 }
+  const exact: ModelPrice = { ...FLASH, provider: 'dashscope', inputMicroPerKtok: 222 }
+
+  test('没有专属价时用基础价（这正是「不选供应商」的语义）', () => {
+    expect(resolvePrice([base], 'dashscope', FLASH.model, 0)).toBe(base)
+    expect(resolvePrice([base], 'deepseek-official', FLASH.model, 0)).toBe(base)
+  })
+
+  test('★ 专属价优先', () => {
+    expect(resolvePrice([base, exact], 'dashscope', FLASH.model, 0)).toBe(exact)
+    // 另一个供应商仍然落到基础价
+    expect(resolvePrice([base, exact], 'bailian-tpp', FLASH.model, 0)).toBe(base)
+  })
+
+  test('基础价也受生效区间约束（补历史价时不改写更早的用量）', () => {
+    const bounded: ModelPrice = { ...base, effectiveFromMs: 100 }
+    expect(resolvePrice([bounded], 'dashscope', FLASH.model, 99)).toBeNull()
+    expect(resolvePrice([bounded], 'dashscope', FLASH.model, 100)).toBe(bounded)
+  })
+
+  test('基础价**不做子串匹配**：模型名仍要逐字一致', () => {
+    expect(resolvePrice([base], 'dashscope', `${FLASH.model}-preview`, 0)).toBeNull()
+  })
+
+  test('两条候选基础价时取生效起点更晚的那条（行为可预测，不看库返回顺序）', () => {
+    const early: ModelPrice = { ...base, effectiveFromMs: 0, effectiveToMs: 500 }
+    const late: ModelPrice = { ...base, effectiveFromMs: 400, effectiveToMs: null }
+    // 这个组合本该被写入路径拒掉（重叠），真出现时也要给出确定的结果
+    expect(resolvePrice([early, late], 'dashscope', FLASH.model, 450)).toBe(late)
+    expect(resolvePrice([early, late], 'dashscope', FLASH.model, 100)).toBe(early)
+  })
+})
+
+/**
+ * 闲时（低谷）时段 —— v10 的核心口径。
+ *
+ * ★ 这里的每个时点都写清了「北京时间的哪一天几点」，并对应用例名里的星期几：
+ *   时段表是**固定偏移 + 星期几 + 分钟**，任何一处改错都会落到这几条断言上。
+ */
+describe('闲时（低谷）时段 ★ v10（与 SQL 里的镜像表达式同一份时段表）', () => {
+  /** 北京时间 → epoch 毫秒（固定 UTC+8，中国没有夏令时）。 */
+  const bj = (year: number, month: number, day: number, hour: number, minute = 0): number =>
+    Date.UTC(year, month - 1, day, hour - 8, minute)
+
+  const OFFPEAK_RATES: PriceRates = { inputMicroPerKtok: 1_000, outputMicroPerKtok: 4_000, cacheReadMicroPerKtok: 20, cacheWriteMicroPerKtok: 0 }
+  const PRICE: ModelPrice = { ...FLASH, offpeakRates: OFFPEAK_RATES, offpeakSchedule: 'deepseek-cn' }
+
+  test('北京时间工作日 09:00–12:00、14:00–18:00 是高峰（2026-03-02 周一）', () => {
+    expect(priceSlotAt(PRICE, bj(2026, 3, 2, 9, 0))).toBe('peak')
+    expect(priceSlotAt(PRICE, bj(2026, 3, 2, 11, 59))).toBe('peak')
+    expect(priceSlotAt(PRICE, bj(2026, 3, 2, 14, 0))).toBe('peak')
+    expect(priceSlotAt(PRICE, bj(2026, 3, 2, 17, 59))).toBe('peak')
+  })
+
+  test('★ 窗口是半开区间：12:00 整与 18:00 整已经是闲时，08:59 与 13:59 也是', () => {
+    expect(priceSlotAt(PRICE, bj(2026, 3, 2, 8, 59))).toBe('offpeak')
+    expect(priceSlotAt(PRICE, bj(2026, 3, 2, 12, 0))).toBe('offpeak')
+    expect(priceSlotAt(PRICE, bj(2026, 3, 2, 13, 59))).toBe('offpeak')
+    expect(priceSlotAt(PRICE, bj(2026, 3, 2, 18, 0))).toBe('offpeak')
+    expect(priceSlotAt(PRICE, bj(2026, 3, 2, 0, 29))).toBe('offpeak')
+  })
+
+  test('★ 周末全天闲时（2026-03-07 周六、2026-03-08 周日）', () => {
+    expect(priceSlotAt(PRICE, bj(2026, 3, 7, 10, 0))).toBe('offpeak')
+    expect(priceSlotAt(PRICE, bj(2026, 3, 8, 15, 0))).toBe('offpeak')
+  })
+
+  test('★ 法定节假日整天闲时 —— 即使落在工作日的高峰窗里（2026-02-17 周二，春节假期）', () => {
+    expect(priceSlotAt(PRICE, bj(2026, 2, 17, 10, 0))).toBe('offpeak')
+    // 同一天的同一时刻、假期之外（2026-03-03 周二）则是高峰
+    expect(priceSlotAt(PRICE, bj(2026, 3, 3, 10, 0))).toBe('peak')
+    // 国庆假期里的工作日（2026-10-01 周四 起 7 天）
+    expect(priceSlotAt(PRICE, bj(2026, 10, 6, 15, 0))).toBe('offpeak')
+  })
+
+  test('没有闲时档 / 时段表未知 ⇒ 恒为高峰（那四个数一个都用不上）', () => {
+    expect(priceSlotAt({ ...FLASH, offpeakRates: OFFPEAK_RATES }, bj(2026, 3, 2, 10, 0))).toBe('peak')
+    expect(priceSlotAt({ ...FLASH, offpeakRates: OFFPEAK_RATES, offpeakSchedule: '不存在' }, bj(2026, 3, 2, 10, 0))).toBe('peak')
+    expect(priceSlotAt({ ...FLASH, offpeakSchedule: 'deepseek-cn' }, bj(2026, 3, 2, 3, 0))).toBe('peak')
+  })
+
+  test('★ priceRatesAt 换的是**整组四类价**，不是乘一个折扣系数', () => {
+    // 高峰档给的就是这条价自己的四类数（返回的是同一个对象，不拷贝）
+    expect(priceRatesAt(PRICE, bj(2026, 3, 2, 10, 0))).toBe(PRICE)
+    expect(priceRatesAt(PRICE, bj(2026, 3, 2, 10, 0)).inputMicroPerKtok).toBe(FLASH.inputMicroPerKtok)
+    // 闲时档换成另一组四类数（不是「在高峰价上打折」）
+    expect(priceRatesAt(PRICE, bj(2026, 3, 2, 3, 0))).toBe(OFFPEAK_RATES)
+    // 四类各自独立：闲时价里缓存读也减半，而不是「只有输入打折」
+    expect(costMicroOf({ input: 1_000, output: 1_000, cacheRead: 1_000, cacheWrite: 0 }, priceRatesAt(PRICE, bj(2026, 3, 2, 3, 0))))
+      .toBe(1_000 + 4_000 + 20)
+  })
+
+  test('★ 汇总路径按 SQL 判好的时段取价（rate 覆盖 price 的四类数）', () => {
+    const summary = summarizeCosts([
+      { usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0 }, price: PRICE, rates: OFFPEAK_RATES },
+    ])
+    expect(summary.costs).toEqual([{ currency: 'USD', amountMicro: 1_000, tokens: 1_000 }])
+  })
+})
+
+describe('闲时配置校验（半套配置必须被拒）', () => {
+  const RATES: PriceRates = { inputMicroPerKtok: 1, outputMicroPerKtok: 1, cacheReadMicroPerKtok: 1, cacheWriteMicroPerKtok: 1 }
+
+  test('全空 = 合法（这条价不分时段）', () => {
+    expect(offpeakConfigError({ offpeakRates: null, offpeakSchedule: null })).toBeNull()
+    expect(offpeakConfigError({})).toBeNull()
+  })
+
+  test('四类价 + 已知时段表 = 合法', () => {
+    expect(offpeakConfigError({ offpeakRates: RATES, offpeakSchedule: 'deepseek-cn' })).toBeNull()
+  })
+
+  test('★ 只有一半（缺时段表或缺价）必须给出原因，绝不放行', () => {
+    expect(offpeakConfigError({ offpeakRates: RATES, offpeakSchedule: null })).toContain('闲时时段')
+    expect(offpeakConfigError({ offpeakRates: null, offpeakSchedule: 'deepseek-cn' })).toContain('闲时四类单价')
+    expect(offpeakConfigError({ offpeakRates: RATES, offpeakSchedule: '未知表' })).toContain('未知的闲时时段')
+    expect(offpeakConfigError({ offpeakRates: { ...RATES, inputMicroPerKtok: 1.5 }, offpeakSchedule: 'deepseek-cn' })).toContain('整数微元')
+  })
+})
+
+describe('内置种子价：两档都在（v10）', () => {
+  test('★ deepseek-official 的每一行都带 `deepseek-cn` 时段与「高峰价一半」的空闲价', () => {
+    for (const price of BUILTIN_PRICES) {
+      expect(price.provider).toBe('deepseek-official')
+      expect(price.offpeakSchedule).toBe('deepseek-cn')
+      const offpeak = price.offpeakRates
+      expect(offpeak, `${price.model} 缺闲时档`).toBeTruthy()
+      // 官方口径：空闲时段价格为高峰时段价格的一半（四类各自减半）
+      expect(offpeak!.inputMicroPerKtok * 2).toBe(price.inputMicroPerKtok)
+      expect(offpeak!.outputMicroPerKtok * 2).toBe(price.outputMicroPerKtok)
+      expect(offpeak!.cacheReadMicroPerKtok * 2).toBe(price.cacheReadMicroPerKtok)
+      expect(offpeak!.cacheWriteMicroPerKtok).toBe(price.cacheWriteMicroPerKtok)
+    }
+  })
+
+  test('★ 时段的节假日表覆盖到期日必须写出来（过期会静默按高峰计）', () => {
+    const schedule = findPriceSchedule('deepseek-cn')
+    expect(schedule).not.toBeNull()
+    expect(schedule!.holidaysThrough).toBe('2026-12-31')
+    // 表里的节假日必须都落在覆盖区间内，且都是合法日期（顺序无关）
+    for (const date of schedule!.holidays) {
+      expect(date >= schedule!.holidaysFrom && date <= schedule!.holidaysThrough, date).toBe(true)
+    }
+    // 2026 年春节 / 国庆的头一天必须在表里（抽样，防止整段被误删）
+    expect(schedule!.holidays).toContain('2026-02-17')
+    expect(schedule!.holidays).toContain('2026-10-01')
+    // 空闲档的时段表 id 必须在注册表里（否则那四类价永远不生效）
+    expect(findPriceSchedule('deepseek-cn')!.utcOffsetMinutes).toBe(480)
+  })
 })
 
 describe('汇总：绝不跨币种相加', () => {
@@ -399,7 +570,9 @@ describe('离线单价快照解析', () => {
     expect(parsed?.syncedAtMs).toBe(1_700_000_000_000)
     expect(parsed?.endpoint).toBe('https://p.example.com')
     expect(parsed?.prices).toHaveLength(1)
-    expect(parsed?.prices[0]).toEqual(FLASH)
+    // 快照走的是 `ModelPrice` 的 camelCase 形状：没有闲时档就是两个 `null`
+    // （写盘时也照原样落 `null`，读回来仍是「不分时段」）。
+    expect(parsed?.prices[0]).toEqual({ ...FLASH, offpeakRates: null, offpeakSchedule: null })
   })
 
   test('币种小写被归一化', () => {
@@ -452,6 +625,10 @@ describe('线上单价 → 内存形态（映射只有一份）', () => {
       cacheWriteMicroPerKtok: 0,
       effectiveFromMs: 500,
       effectiveToMs: null,
+      // ★ v10 闲时档：老服务端的响应里**根本没有这几个字段**，
+      //   归一成 `null` = 「这条价不分时段」，而不是「闲时四类价都是 0 元」。
+      offpeakRates: null,
+      offpeakSchedule: null,
     })
   })
 

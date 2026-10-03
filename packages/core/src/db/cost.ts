@@ -24,11 +24,15 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import {
+  ANY_PROVIDER,
   BUILTIN_PRICES,
   costMicroOf,
+  isAnyProvider,
   parsePricingSnapshot,
+  priceRatesAt,
   resolvePrice,
   summarizeCosts,
+  type CostPart,
   type CostSummary,
   type ModelPrice,
   type PricingProvenance,
@@ -78,17 +82,34 @@ export type PriceResolver = (
  *   所以传进去的桶越小越好 —— 逐条事件、几万条记录时这是唯一的性能杠杆。
  *   桶内保留**多条区间**（同一个模型可以有多条生效区间），由 `resolvePrice()`
  *   取「当刻生效且起点最晚」的那条。
+ *
+ * ★ **基础价（`'*'`）单独按模型分桶**，在专属桶没命中时查第二个桶 ——
+ *   这与 `resolvePrice()` 的「专属优先、基础兜底」是同一条语义。
+ *   🚨 少了这一步，基础价在离线路径上**永远不会生效**（专属桶里查不到 `'*'`），
+ *   而金额看起来只是「没配价」——那是这套机制最隐蔽的一种失效。
  */
 export function priceResolver(prices: readonly ModelPrice[]): PriceResolver {
   const buckets = new Map<string, ModelPrice[]>()
+  const anyBuckets = new Map<string, ModelPrice[]>()
   for (const price of prices) {
+    if (isAnyProvider(price.provider)) {
+      const base = anyBuckets.get(price.model)
+      if (base) base.push(price)
+      else anyBuckets.set(price.model, [price])
+      continue
+    }
     const key = `${price.provider}\u0000${price.model}`
     const bucket = buckets.get(key)
     if (bucket) bucket.push(price)
     else buckets.set(key, [price])
   }
-  return (provider, model, atMs) =>
-    resolvePrice(buckets.get(`${provider}\u0000${model}`) ?? [], provider, model, atMs)
+  return (provider, model, atMs) => {
+    const exact = buckets.get(`${provider}\u0000${model}`)
+    const hit = exact ? resolvePrice(exact, provider, model, atMs) : null
+    if (hit !== null) return hit
+    const base = anyBuckets.get(model)
+    return base ? resolvePrice(base, ANY_PROVIDER, model, atMs) : null
+  }
 }
 
 /**
@@ -96,15 +117,22 @@ export function priceResolver(prices: readonly ModelPrice[]): PriceResolver {
  *
  * ⚠️ `price` 为 `null` 的那一条**不会被丢掉**：它整个计入 `unpricedTokens`。
  *   把没配价的用量直接跳过，会让「漏配了价」看起来像「这段没花钱」。
+ *
+ * 🚨 `rates` 必须一起带上：闲时（低谷）用量要用同一条价行里的**另一套四个数**。
+ *   少了它就是按高峰价算闲时 —— 费用虚高一倍，且不会有任何报错。
  */
 export function costPartsOf(
   records: readonly UsageRecord[],
   resolve: PriceResolver,
-): { usage: UsageRecord['usage']; price: ModelPrice | null }[] {
-  return records.map((record) => ({
-    usage: record.usage,
-    price: resolve(record.provider, record.model, record.time),
-  }))
+): CostPart[] {
+  return records.map((record) => costPartOf(record, resolve))
+}
+
+/** 单条事件的计价单元（`price` + 该时刻适用的 `rates`）。 */
+export function costPartOf(record: UsageRecord, resolve: PriceResolver): CostPart {
+  const price = resolve(record.provider, record.model, record.time)
+  if (price === null) return { usage: record.usage, price: null }
+  return { usage: record.usage, price, rates: priceRatesAt(price, record.time) }
 }
 
 /** 汇总一组事件的金额。 */
@@ -143,13 +171,10 @@ export function costByGroupOf(
   resolve: PriceResolver,
   provenance: PricingProvenance,
 ): Map<string, CostTotals> {
-  const buckets = new Map<string, { usage: UsageRecord['usage']; price: ModelPrice | null }[]>()
+  const buckets = new Map<string, CostPart[]>()
   for (const record of records) {
     const key = groupKey(record, dim)
-    const part = {
-      usage: record.usage,
-      price: resolve(record.provider, record.model, record.time),
-    }
+    const part = costPartOf(record, resolve)
     const bucket = buckets.get(key)
     if (bucket) bucket.push(part)
     else buckets.set(key, [part])
@@ -166,6 +191,7 @@ export function costByGroupOf(
  *
  * `currency: null` = 这条事件没有配价，**不是 0 元**（与上报库契约
  * `StatsRecordCost` 同一个语义：明细页上两者必须长得不一样）。
+ * ★ 价按**这条事件自己的时刻**选时段（闲时价 / 高峰价）。
  */
 export function recordCostOf(
   record: UsageRecord,
@@ -173,7 +199,7 @@ export function recordCostOf(
 ): { currency: string | null; amountMicro: number } {
   const price = resolve(record.provider, record.model, record.time)
   if (price === null) return { currency: null, amountMicro: 0 }
-  return { currency: price.currency, amountMicro: costMicroOf(record.usage, price) }
+  return { currency: price.currency, amountMicro: costMicroOf(record.usage, priceRatesAt(price, record.time)) }
 }
 
 /**

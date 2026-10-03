@@ -59,6 +59,10 @@ const SNAPSHOT_PRICE = {
   cacheWriteMicroPerKtok: 300_000,
   effectiveFromMs: 0,
   effectiveToMs: null,
+  // v10 闲时档：服务端的这条价没有闲时档 ⇒ 写盘也是两个 `null`
+  // （读回来仍是「不分时段」，而不是「闲时四类价 = 0 元」）。
+  offpeakRates: null,
+  offpeakSchedule: null,
 }
 
 interface FakePortal {

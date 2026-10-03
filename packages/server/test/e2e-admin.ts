@@ -355,6 +355,33 @@ try {
   equal((await request(a, 'admin/pricing', adminToken, { ...firstPrice, model: 'x', input_micro_per_ktok: -1 })).status, 400, '负单价是 400')
   equal((await request(a, 'admin/pricing', adminToken, { ...firstPrice, model: 'x', currency: '人民币' })).status, 400, '非 ISO 4217 三位码是 400')
   equal((await request(a, 'admin/pricing', adminToken, { ...firstPrice, model: 'x', effective_from_ms: 5_000, effective_to_ms: 1_000 })).status, 400, '终点早于起点是 400')
+  // ── ★ v10：不限供应商的基础价（`provider = '*'`）与闲时（低谷）档 ──
+  // 基础价解决的是「同一个模型被多个网关转售」：配一条 `*`，所有没有专属价的网关都兜得住。
+  const anyPrice = { provider: '*', model: 'deepseek-v4.1-flash-base', currency: 'CNY', input_micro_per_ktok: 2_000, output_micro_per_ktok: 8_000, cache_read_micro_per_ktok: 40, cache_write_micro_per_ktok: 0, effective_from_ms: 0 }
+  equal((await request(a, 'admin/pricing', adminToken, anyPrice)).status, 200, '不限供应商的基础价可以写入（`*` 是保留值）')
+  const anyRow = (await request(a, 'admin/pricing')).data.prices.find((p: any) => p.model === 'deepseek-v4.1-flash-base')
+  equal(anyRow.provider, '*', '基础价的 provider 原样存取')
+  equal(anyRow.offpeak_schedule, null, '没配闲时时段表就是 null（不是空串）')
+  equal(anyRow.offpeak_input_micro_per_ktok, null, '没配闲时价就是 null —— 绝不是 0（0 会让低谷时段整段免费）')
+  // 🚨 基础价与同名模型的**专属价可以共存**：专属优先、基础兜底，两条都覆盖同一时刻也不会重复计价。
+  equal((await request(a, 'admin/pricing', adminToken, { ...anyPrice, provider: 'dashscope' })).status, 200, '同名模型的专属价与基础价共存（专属优先）')
+  // 🚨 但**两条基础价**覆盖同一时刻必须挡住 —— 那时一条事件会匹配两行、token 翻倍。
+  const dupBase = { ...anyPrice, model: 'deepseek-v4.1-flash-dup', effective_from_ms: 0, effective_to_ms: 1_000 }
+  equal((await request(a, 'admin/pricing', adminToken, dupBase)).status, 200, '第一条基础价')
+  equal((await request(a, 'admin/pricing', adminToken, { ...dupBase, effective_from_ms: 500 })).status, 409, '两条基础价重叠回 409')
+  // 闲时档：五个字段同生共出 —— 半套配置会让缺的那几档按 0 元算。
+  equal((await request(a, 'admin/pricing', adminToken, { ...anyPrice, model: 'offpeak-half-a', offpeak_schedule: 'deepseek-cn' })).status, 400, '只给时段表、不给闲时价 → 400')
+  equal((await request(a, 'admin/pricing', adminToken, { ...anyPrice, model: 'offpeak-half-b', offpeak_input_micro_per_ktok: 1_000 })).status, 400, '只给一个闲时价 → 400')
+  equal((await request(a, 'admin/pricing', adminToken, { ...anyPrice, model: 'offpeak-unknown', offpeak_schedule: '不存在的表', offpeak_input_micro_per_ktok: 1_000, offpeak_output_micro_per_ktok: 4_000, offpeak_cache_read_micro_per_ktok: 20, offpeak_cache_write_micro_per_ktok: 0 })).status, 400, '未知时段表 → 400（那四个数永远不会生效）')
+  const offpeakOk = { ...anyPrice, model: 'offpeak-ok', offpeak_schedule: 'deepseek-cn', offpeak_input_micro_per_ktok: 1_000, offpeak_output_micro_per_ktok: 4_000, offpeak_cache_read_micro_per_ktok: 20, offpeak_cache_write_micro_per_ktok: 0 }
+  equal((await request(a, 'admin/pricing', adminToken, offpeakOk)).status, 200, '时段表 + 四类闲时价齐全 → 200')
+  const offpeakRow = (await request(a, 'admin/pricing')).data.prices.find((p: any) => p.model === 'offpeak-ok')
+  equal(offpeakRow.offpeak_schedule, 'deepseek-cn', '时段表 id 原样存取')
+  equal(offpeakRow.offpeak_input_micro_per_ktok, 1_000, '闲时四类价分开存（不合并、不打折）')
+  // 只读单价快照也要带上这五列 —— 离线端（本地页 / CLI / 插件）靠它按同一份价算钱。
+  const snapshotRow = (await request(a, 'stats/pricing', adminToken)).data.prices.find((p: any) => p.model === 'offpeak-ok')
+  equal(snapshotRow.offpeak_schedule, 'deepseek-cn', '只读单价快照带上闲时时段表')
+  equal(snapshotRow.offpeak_cache_read_micro_per_ktok, 20, '只读单价快照带上闲时缓存读价')
   // 种子价只在空表时能写 —— 非空时必须挡住「一键覆盖我调好的价」。
   equal((await request(a, 'admin/pricing/seed', adminToken, { confirm: true })).status, 409, '单价表非空时种子初始化回 409')
   equal((await request(a, 'admin/pricing/seed', adminToken, {})).status, 400, '种子初始化必须显式确认')

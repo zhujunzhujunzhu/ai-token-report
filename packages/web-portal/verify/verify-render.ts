@@ -648,6 +648,16 @@ try {
     pricingHtml.includes('多币种各自累加，绝不换算也绝不相加') &&
     pricingHtml.includes('自建计价永远不会等于财务账单'))
   check('模型单价不混排人员或分组列表', !pricingHtml.includes('人员列表') && !pricingHtml.includes('分组列表'))
+  // ★ v10 的两条新口径也必须写在页面上（它们是「不看代码就猜不到」的那类规则）：
+  //   ① 没有专属价时会落到**不限供应商的基础价**（保留值 `*` 绝不直接显示给人看）；
+  //   ② 闲时（低谷）价是**同一行的另一套四个数**，不是给高峰价乘一个折扣系数。
+  check('★ v10：模型单价写明「不限供应商的基础价」是兜底价',
+    pricingHtml.includes('没有为某个供应商单独配价时') &&
+    pricingHtml.includes('不限供应商的基础价') &&
+    pricingHtml.includes('不限供应商的那条是兜底价'))
+  check('★ v10：模型单价写明闲时价是同一行的另一套四个数（不是乘折扣）',
+    pricingHtml.includes('闲时（低谷）价是同一行的另一套四个数') &&
+    pricingHtml.includes('法定节假日表需要逐年补'))
   const allHtml =
     loginHtml +
     dashboardHtml +

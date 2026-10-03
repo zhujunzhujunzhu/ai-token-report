@@ -10,18 +10,24 @@
  * | v6 | 结构追加步骤 | 追加 `provider_alias` 表与权限码 `providers:*` |
  * | v7 | 结构追加步骤 | 追加 `model_price` 表（模型单价）与权限码 `cost:read` / `pricing:manage` |
  * | v8 | 结构追加步骤 | 追加 `usage_rollup_*` 三张看板汇总表（`portal-schema-v8.ts`） |
- * | v9 | ★ **当前终态** | `usage_event` 加一列 `source`（这条用量是哪个客户端写的） |
+ * | v9 | 结构追加步骤 | `usage_event` 加一列 `source`（这条用量是哪个客户端写的） |
+ * | v10 | ★ **当前终态** | `model_price` 加五列：闲时（低谷）时段表 + 四类闲时单价 |
  *
  * ⚠️ **本文件的 SQL 常量代表 v7 终态**（v5 的 `usage_event` 那一列除外，见下），
  *   v5 / v6 / v7 的结构变化都是它的一部分：
- *   `PORTAL_SCHEMA_VERSION = 9` + 末尾的 {@link PORTAL_SQLITE_V6_ADDITIONS}
+ *   `PORTAL_SCHEMA_VERSION = 10` + 末尾的 {@link PORTAL_SQLITE_V6_ADDITIONS}
  *   + {@link PORTAL_SQLITE_V7_ADDITIONS} + `portal-schema-v8.ts` 的三张汇总表
- *   + `portal-schema-v9.ts` 的 `source` 列（追加 `provider_alias`、`model_price`、
- *   `usage_rollup_*`、`usage_event.source` 与权限行）共同构成受控定义。
- *   ⚠️ v8 / v9 的 DDL 刻意放在**独立文件**：v8 是一组「可以从事实表完整重建」的
- *   性能设施，v9 则是**唯一一处动既有表**的追加（`source` 列不进 v5 常量，
- *   否则冻结摘要会变），两者与身份 / 事实表不是一类东西。
- *   已经迁到 v6 / v7 / v8 的库不会被误判为 `current` ——
+ *   + `portal-schema-v9.ts` 的 `source` 列 + `portal-schema-v10.ts` 的闲时五列
+ *   + `portal-schema-v11.ts` 的 `project_alias` + `portal-schema-v12.ts` 的
+ *   `provider_alias.model`（含唯一索引替换）
+ *   （追加 `provider_alias`、`model_price`、`usage_rollup_*`、`usage_event.source`、
+ *   `model_price.offpeak_*`、`project_alias`、`provider_alias.model` 与权限行）
+ *   共同构成受控定义。
+ *   ⚠️ v8 / v9 / v10 / v11 / v12 的 DDL 刻意放在**独立文件**：v8 是一组「可以从事实表
+ *   完整重建」的性能设施，v9 / v10 / v12 则是**动既有表**的追加（v12 连唯一索引一起换），
+ *   v11 是又一张只引用 `members` 的规则表（都不进 v5 常量，否则冻结摘要会变），
+ *   与身份 / 事实表不是一类东西。
+ *   已经迁到 v6 / v7 / v8 / v9 / v10 / v11 的库不会被误判为 `current` ——
  *   受控定义的文本摘要变了，旧库会落入 `legacy` 并**必须显式迁移**，
  *   这正是「schema 变更绝不自愈」这条铁律要的行为。
  *
@@ -59,12 +65,26 @@ import { createHash } from 'node:crypto'
 import type { PortalBackendKind } from './dialect.js'
 import { PORTAL_MYSQL_V8_ADDITIONS, PORTAL_SQLITE_V8_ADDITIONS, portalV8Statements, portalV8TableStatement, PORTAL_V8_TABLES, ROLLUP_HOUR_RETAIN_DAYS, rollupTimezoneKey, portalV8MentionsAllTables } from './portal-schema-v8.js'
 import { portalV9ChecksumInput, portalV9UsageEventStatement } from './portal-schema-v9.js'
+import {
+  portalV10AddColumnStatements,
+  portalV10ChecksumInput,
+  portalV10ModelPriceStatement,
+  PORTAL_OFFPEAK_RATE_COLUMNS,
+  PORTAL_OFFPEAK_SCHEDULE_COLUMN,
+} from './portal-schema-v10.js'
 
 // 交付面：调用方（迁移器 / 汇总构建 / 测试）一律从本模块取，
-// 不必知道 v8 / v9 的实现住在独立文件里 —— 与 v6 / v7 的导出方式保持一致。
+// 不必知道 v8 / v9 / v10 的实现住在独立文件里 —— 与 v6 / v7 的导出方式保持一致。
 export { portalV8Statements, portalV8TableStatement, PORTAL_V8_TABLES, ROLLUP_HOUR_RETAIN_DAYS, rollupTimezoneKey, portalV8MentionsAllTables }
 export { portalV9AddColumnStatement, portalV9UsageEventStatement, PORTAL_SOURCE_COLUMN, PORTAL_SOURCE_DEFAULT, portalSourceColumnLine } from './portal-schema-v9.js'
-export const PORTAL_SCHEMA_VERSION = 9
+export {
+  portalV10AddColumnStatements,
+  portalV10ChecksumInput,
+  portalV10ModelPriceStatement,
+  PORTAL_OFFPEAK_RATE_COLUMNS,
+  PORTAL_OFFPEAK_SCHEDULE_COLUMN,
+} from './portal-schema-v10.js'
+export const PORTAL_SCHEMA_VERSION = 10
 export const PORTAL_SQLITE_V5_SQL = `-- 数据库 v5：分组（多对多）+ 权限码 groups:*。
 -- 不执行 ALTER/DROP，不修改本地 usage.sqlite 的 schema v3。
 -- 部署前必须另行实现带备份、版本闸门与恢复点的生产迁移。
@@ -970,7 +990,17 @@ export function portalSchemaStatements(kind: PortalBackendKind): string[] {
   const statements = base.map(statement => statement.startsWith('CREATE TABLE usage_event (')
     ? portalV9UsageEventStatement(kind, statement)
     : statement)
-  return [...statements, ...portalV6Statements(kind), ...portalV7Statements(kind), ...portalV8Statements(kind)]
+  const all = [...statements, ...portalV6Statements(kind), ...portalV7Statements(kind), ...portalV8Statements(kind)]
+  // ★ v10：`model_price` 多五列闲时价。⚠️ 它**必须在合并之后**再拼：
+  //   这张表来自 v7 的追加常量（那段文本已冻结、一个字都不许改），
+  //   在 `base` 上找 `CREATE TABLE model_price (` 是找不到的 —— 找不到就不会拼，
+  //   而表现是「建出来的表少五列、随后每条金额查询报 no such column」。
+  //   拼接只改**生效的受控定义**，`portalV7TableStatement()`（v6→v7 那一步用）
+  //   仍是原始 v7 文本，v9→v10 再把这五列 ALTER 上去。
+  const withOffpeak = all.map(statement => statement.startsWith('CREATE TABLE model_price (')
+    ? portalV10ModelPriceStatement(kind, statement)
+    : statement)
+    return withOffpeak
 }
 /**
  * 受控定义的文本摘要 —— 迁移账本据此识别「这个库的结构是不是当前版本」。
@@ -979,12 +1009,31 @@ export function portalSchemaStatements(kind: PortalBackendKind): string[] {
  *   而摘要还按旧文本算，会让已经迁到上一版的库**恰好**被判成 `current` ——
  *   闸门放行，然后看板查询撞上不存在的表，
  *   报错文案是「上报库不可用」，排查方向整个跑偏。
- *   所以这里把 v6 / v7 / v8 的追加一并算进摘要。
+ *   所以这里把 v6 / v7 / v8 / v9 / v10 / v11 / v12 的追加一并算进摘要。
  *
  * ⚠️ 摘要只覆盖 **DDL 文本**，不含权限行：权限是数据而不是结构，
  *   把它算进摘要会让「手工补了一条角色权限」把库判成「结构不符」。
  */
 export function portalSchemaChecksum(kind: PortalBackendKind): string {
+  const source = kind === 'mysql' ? PORTAL_MYSQL_V5_SQL : PORTAL_SQLITE_V5_SQL
+  const additions = kind === 'mysql'
+    ? `${PORTAL_MYSQL_V6_ADDITIONS}\n${PORTAL_MYSQL_V7_ADDITIONS}\n${PORTAL_MYSQL_V8_ADDITIONS}\n${portalV9ChecksumInput(kind)}\n${portalV10ChecksumInput(kind)}`
+    : `${PORTAL_SQLITE_V6_ADDITIONS}\n${PORTAL_SQLITE_V7_ADDITIONS}\n${PORTAL_SQLITE_V8_ADDITIONS}\n${portalV9ChecksumInput(kind)}\n${portalV10ChecksumInput(kind)}`
+  return createHash('sha256').update(`${source}\n${additions}`).digest('hex')
+}
+/**
+ * ★ **已发布的 v9 摘要，冻结于此**（= v5 文本 + v6 + v7 + v8 + v9，**不含 v10 的闲时五列**）。
+ *
+ * 作用与 {@link portalSchemaChecksumV8} 完全一样：让**已经迁到 v9 的库**
+ *   （本机快照库、以及线上库升级后的形态）仍然被判成 `legacy` =
+ *   「结构是上一版、完整、可迁移」。不冻结的后果同样致命：那些库的账本里
+ *   记的是 v9 摘要，而 `portalSchemaChecksum()` 现在返回 v10 摘要 —— 永远对不上，
+ *   于是它从「可迁移的起点」变成 `unsupported`（服务端拒绝启动、迁移脚本也拒绝接手），
+ *   而 v10 只多五列、五条 ALTER 就能升上去。
+ *
+ * ⚠️ v8 / v9 的文本一个字都不许再改（本函数按它们的当前全文求摘要）。
+ */
+export function portalSchemaChecksumV9(kind: PortalBackendKind): string {
   const source = kind === 'mysql' ? PORTAL_MYSQL_V5_SQL : PORTAL_SQLITE_V5_SQL
   const additions = kind === 'mysql'
     ? `${PORTAL_MYSQL_V6_ADDITIONS}\n${PORTAL_MYSQL_V7_ADDITIONS}\n${PORTAL_MYSQL_V8_ADDITIONS}\n${portalV9ChecksumInput(kind)}`

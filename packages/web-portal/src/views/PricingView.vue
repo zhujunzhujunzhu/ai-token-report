@@ -30,6 +30,16 @@
  * 3. **未定价 ≠ 0 元**：没有价的那部分用量是「未计价」，不是「没花钱」。
  *    把它显示成 0，会让「漏配了价」看起来像「省下了钱」。
  *
+ * ## v10 新增的两件事（都在这一页上）
+ *
+ * - **不限供应商的基础价**（`provider = '*'`）：没有专属价时用它兜底。
+ *   页面把 `*` 渲染成「不限供应商（基础价）」，**绝不把 `*` 直接显示出来** ——
+ *   它看起来像通配符，而使用者只会以为页面坏了。
+ * - **闲时（低谷）价**：一条价可以带另一套「闲时四类单价」+ 一个时段表
+ *   （`shared/price.ts` 的 `PRICE_SCHEDULES`，当前是 DeepSeek 官方口径）。
+ *   🚨 五个字段**同生共死**：要么都不填（这条价全天一个价），要么时段表 + 四个价齐全。
+ *   半套配置会让缺的那一档按 **0 元**算 —— 0 是合法单价，不会有任何报错。
+ *
  * ## 默认币种是人民币
  *
  * 筛选下拉与新增 / 编辑弹框都默认 **CNY**（`utils/unitPrice.ts` 的
@@ -45,14 +55,15 @@ import {
   ElMessage, ElMessageBox, ElOption, ElSelect, ElSkeleton, ElSwitch, ElTable, ElTableColumn, ElTag,
 } from 'element-plus'
 import type { FormInstance, FormRules } from 'element-plus'
-import { formatUnitPriceMicro } from '@ai-token-report/shared'
+import { ANY_PROVIDER, PRICE_SCHEDULES, formatUnitPriceMicro, offpeakConfigError } from '@ai-token-report/shared'
 import type { PortalModelPrice } from '@ai-token-report/shared'
 import * as api from '../api/admin.js'
 import { useSessionStore } from '../stores/session.js'
 import { formatFullDateTime } from '../utils/format.js'
 import {
-  DEFAULT_CURRENCY, PRICE_STATUS_TEXT, defaultCurrencyForFilter, defaultCurrencyForNewPrice,
-  groupPricesByProvider, microToRateText, priceSpanText, priceStatusOf, rateTextToMicro,
+  BASE_PROVIDER_LABEL, DEFAULT_CURRENCY, PRICE_STATUS_TEXT, defaultCurrencyForFilter, defaultCurrencyForNewPrice,
+  groupPricesByProvider, hasOffpeak, microToRateText, offpeakRatesOf, priceSpanText, priceStatusOf, providerLabel,
+  rateTextToMicro, scheduleHint, scheduleLabel,
 } from '../utils/unitPrice.js'
 
 const session = useSessionStore()
@@ -82,8 +93,17 @@ const canManage = computed(() => session.can('pricing:manage'))
 const draft = reactive({
   provider: '', model: '', currency: DEFAULT_CURRENCY,
   input: '', output: '', cacheRead: '', cacheWrite: '',
+  /** v10：基础价开关（打开时 `provider` 写保留值 `'*'`，输入框交给它，不让手打）。 */
+  basePrice: false,
+  /** v10：闲时档 —— 时段表为空 = 这条价不分时段。 */
+  offpeakSchedule: '',
+  offpeakInput: '', offpeakOutput: '', offpeakCacheRead: '', offpeakCacheWrite: '',
   from: '', to: '', note: '',
 })
+
+/** 可选时段表（名称 + id）；「不分时段」由空串表示。 */
+const SCHEDULES = PRICE_SCHEDULES.map((schedule) => ({ id: schedule.id, label: schedule.label }))
+const scheduleTip = computed(() => (draft.offpeakSchedule ? scheduleHint(draft.offpeakSchedule) : ''))
 
 const rules: FormRules = {
   provider: [{ required: true, message: '请填写供应商（与上报值逐字一致）', trigger: 'blur' }],
@@ -145,6 +165,7 @@ async function load(): Promise<void> {
 
 function openForm(row: PortalModelPrice | null = null): void {
   selected.value = row
+  draft.basePrice = row?.provider === ANY_PROVIDER
   draft.provider = row?.provider ?? ''
   draft.model = row?.model ?? ''
   // 编辑时用这条价自己的币种；新增时默认 CNY（见 `defaultCurrencyForNewPrice`）。
@@ -153,11 +174,24 @@ function openForm(row: PortalModelPrice | null = null): void {
   draft.output = row ? microToRateText(row.output_micro_per_ktok) : ''
   draft.cacheRead = row ? microToRateText(row.cache_read_micro_per_ktok) : ''
   draft.cacheWrite = row ? microToRateText(row.cache_write_micro_per_ktok) : ''
+  // 闲时档：**只有五个字段齐全**才回填（半套配置只可能来自直接改库，
+  // 回填一半会让使用者一保存就把它变成一套「看起来完整」的配置）。
+  const offpeak = row ? offpeakRatesOf(row) : null
+  draft.offpeakSchedule = offpeak === null ? '' : (row?.offpeak_schedule ?? '')
+  draft.offpeakInput = offpeak ? microToRateText(offpeak.input) : ''
+  draft.offpeakOutput = offpeak ? microToRateText(offpeak.output) : ''
+  draft.offpeakCacheRead = offpeak ? microToRateText(offpeak.cacheRead) : ''
+  draft.offpeakCacheWrite = offpeak ? microToRateText(offpeak.cacheWrite) : ''
   draft.from = row && row.effective_from_ms > 0 ? localInput(row.effective_from_ms) : ''
   draft.to = row?.effective_to_ms ? localInput(row.effective_to_ms) : ''
   draft.note = row?.note ?? ''
   error.value = null
   showForm.value = true
+}
+
+/** 基础价开关：打开就把 `provider` 置成保留值（输入框不再参与），关掉就交回手填。 */
+function toggleBasePrice(): void {
+  draft.provider = draft.basePrice ? ANY_PROVIDER : ''
 }
 
 /** epoch 毫秒 → `<el-date-picker value-format="YYYY-MM-DDTHH:mm">` 认的本地墙上时间。 */
@@ -174,6 +208,25 @@ function fillSame(): void {
   draft.output = value
   draft.cacheRead = value
   draft.cacheWrite = value
+}
+
+/**
+ * 闲时四类价按**高峰价的一半**填满（DeepSeek 官方口径），四类各自减半。
+ *
+ * ⚠️ 减半在「微元 / 千 token」这个整数上做，**不经过元**：先转成十进制文本再除 2
+ *   会引入一轮浮点，而四类分价恰恰是最经不起「一点点误差」的地方。
+ *   奇数微元的一半取整到最近的整数（官方价目里都是偶数，取整只是兜底）。
+ */
+function fillOffpeakSame(): void {
+  const half = (text: string): string => {
+    const micro = rateTextToMicro(text)
+    if (micro === null) return ''
+    return microToRateText(Math.round(micro / 2))
+  }
+  draft.offpeakInput = half(draft.input)
+  draft.offpeakOutput = half(draft.output)
+  draft.offpeakCacheRead = half(draft.cacheRead)
+  draft.offpeakCacheWrite = half(draft.cacheWrite)
 }
 
 /**
@@ -202,6 +255,42 @@ async function save(): Promise<void> {
   }
   const currency = draft.currency.trim().toUpperCase()
   if (!/^[A-Z]{3}$/.test(currency)) { error.value = '币种需要是三位大写字母的 ISO 4217 代码（如 USD、CNY）'; return }
+  /**
+   * 闲时档（v10）：**要么全空、要么四类价 + 时段表齐全**。
+   *
+   * ⚠️ 判定调的是 `shared/price.ts` 的 `offpeakConfigError()` —— 服务端写入前调的是
+   *   同一个函数。这里再判一次只是为了即时反馈（不必等一个来回），而不是第二套规则。
+   */
+  const anyOffpeakFilled = [draft.offpeakInput, draft.offpeakOutput, draft.offpeakCacheRead, draft.offpeakCacheWrite]
+    .some((text) => text.trim() !== '')
+  const allOffpeakFilled = [draft.offpeakInput, draft.offpeakOutput, draft.offpeakCacheRead, draft.offpeakCacheWrite]
+    .every((text) => text.trim() !== '')
+  let offpeak = { schedule: null as string | null, rates: null as Record<string, number> | null }
+  if (anyOffpeakFilled || draft.offpeakSchedule) {
+    if (!allOffpeakFilled) { error.value = '闲时四类单价要一起填：缺一个就会有一档按 0 元算'; return }
+    const parsed = {
+      input_micro_per_ktok: rateTextToMicro(draft.offpeakInput),
+      output_micro_per_ktok: rateTextToMicro(draft.offpeakOutput),
+      cache_read_micro_per_ktok: rateTextToMicro(draft.offpeakCacheRead),
+      cache_write_micro_per_ktok: rateTextToMicro(draft.offpeakCacheWrite),
+    }
+    if (Object.values(parsed).some((value) => value === null)) {
+      error.value = '闲时四类单价都要填：非负数字、最多 6 位小数；超过上限（10000 元/百万 token）请先确认单价是否录错'
+      return
+    }
+    offpeak = { schedule: draft.offpeakSchedule || null, rates: parsed as Record<string, number> }
+  }
+  // 与服务端同一份校验（时段表是否存在 / 五个字段是否配套）—— 只为即时反馈
+  const offpeakReason = offpeakConfigError({
+    offpeakRates: offpeak.rates === null ? null : {
+      inputMicroPerKtok: offpeak.rates.input_micro_per_ktok!,
+      outputMicroPerKtok: offpeak.rates.output_micro_per_ktok!,
+      cacheReadMicroPerKtok: offpeak.rates.cache_read_micro_per_ktok!,
+      cacheWriteMicroPerKtok: offpeak.rates.cache_write_micro_per_ktok!,
+    },
+    offpeakSchedule: offpeak.schedule,
+  })
+  if (offpeakReason) { error.value = offpeakReason; return }
   const from = draft.from ? new Date(draft.from).getTime() : 0
   const to = draft.to ? new Date(draft.to).getTime() : null
   if (!Number.isSafeInteger(from) || from < 0) { error.value = '生效起点无效'; return }
@@ -209,10 +298,15 @@ async function save(): Promise<void> {
   if (to !== null && to < from) { error.value = '生效终点不能早于生效起点'; return }
   busy.value = true
   const result = await api.setModelPrice({
-    provider: draft.provider.trim(),
+    provider: draft.basePrice ? ANY_PROVIDER : draft.provider.trim(),
     model: draft.model.trim(),
     currency,
     ...(rates as Record<keyof typeof rates, number>),
+    // 不分时段时五个字段一个都不发（服务端与旧客户端同一条语义：缺席 = 全天一个价）
+    ...(offpeak.rates === null ? {} : {
+      offpeak_schedule: offpeak.schedule,
+      ...(offpeak.rates as Record<string, number>),
+    }),
     effective_from_ms: from,
     effective_to_ms: to,
     note: draft.note.trim() || null,
@@ -277,10 +371,11 @@ onMounted(() => { void load() })
         <h1>模型单价</h1>
         <p>
           费用按「<strong>供应商 + 模型</strong>」精确匹配单价后现场计算：四类 token 各乘各自的价
-          （<code>输入 / 输出 / 缓存读 / 缓存写</code>），再按<strong>事件发生时刻</strong>选用当时生效的那条价。
-          同一供应商下不同模型可以各不相同 —— 旗舰与轻量模型的价差常常在 10 倍以上。
+          （<code>输入 / 输出 / 缓存读 / 缓存写</code>），再按<strong>事件发生时刻</strong>选用当时生效的那条价，
+          并区分<strong>高峰 / 闲时</strong>两档。同一供应商下不同模型可以各不相同 —— 旗舰与轻量模型的价差常常在 10 倍以上。
         </p>
         <p class="muted">
+          没有为某个供应商单独配价时，会落到那条<strong>不限供应商的基础价</strong>（用于同一个模型被多个网关转售的情形）。
           库里<strong>只存单价、绝不存金额</strong>：所以改价、补历史价都是即时生效的，
           而历史用量一个字节都不会被动。这也意味着<strong>未配单价的用量是「未计价」，不是 0 元</strong>。
         </p>
@@ -311,17 +406,23 @@ onMounted(() => { void load() })
         </el-select>
         <el-switch v-model="onlyEffective" active-text="只看当前生效" aria-label="只看当前生效" />
         <span class="muted">
-          共 {{ prices.length }} 条价 · {{ groups.length }} 个供应商<template v-if="visibleCount !== prices.length">（当前筛选出 {{ visibleCount }} 条）</template>
+          共 {{ prices.length }} 条价 · {{ groups.length }} 个分组<template v-if="visibleCount !== prices.length">（当前筛选出 {{ visibleCount }} 条）</template>
         </span>
       </div>
       <el-skeleton v-if="loading && !prices.length" :rows="5" animated />
       <template v-else-if="groups.length">
-        <!-- ★ 一个供应商一张表：这就是「同一供应商下不同模型各自定价」的可读形态。 -->
+        <!-- ★ 一个供应商一张表：这就是「同一供应商下不同模型各自定价」的可读形态。
+             基础价（`*`）单独成一组并排在最前 —— 它是没有专属价时的兜底。 -->
         <section v-for="group in groups" :key="group.provider" class="provider-group">
           <h3>
-            <code>{{ group.provider }}</code>
+            <code>{{ providerLabel(group.provider) }}</code>
+            <el-tag v-if="group.provider === ANY_PROVIDER" type="warning" size="small">兜底</el-tag>
             <span class="muted"> · {{ group.rows.length }} 条价 · {{ group.models }} 个模型</span>
           </h3>
+          <p v-if="group.provider === ANY_PROVIDER" class="muted base-price-hint">
+            这一组是<strong>不限供应商</strong>的价：只有当某个供应商<strong>没有</strong>自己那条专属价时才用它。
+            给某个网关单独配一条同名模型的价即可覆盖它 —— 两条可以共存，专属价优先。
+          </p>
           <el-table :data="group.rows" row-key="price_id">
             <el-table-column label="模型" min-width="200">
               <template #default="{ row }"><code>{{ row.model }}</code></template>
@@ -333,6 +434,22 @@ onMounted(() => { void load() })
             <el-table-column label="输出" min-width="150"><template #default="{ row }">{{ formatUnitPriceMicro(row.output_micro_per_ktok, row.currency) }}</template></el-table-column>
             <el-table-column label="缓存读" min-width="150"><template #default="{ row }">{{ formatUnitPriceMicro(row.cache_read_micro_per_ktok, row.currency) }}</template></el-table-column>
             <el-table-column label="缓存写" min-width="150"><template #default="{ row }">{{ formatUnitPriceMicro(row.cache_write_micro_per_ktok, row.currency) }}</template></el-table-column>
+            <el-table-column label="闲时（低谷）" min-width="240">
+              <template #default="{ row }">
+                <template v-if="hasOffpeak(rowPrice(row))">
+                  <div class="muted">{{ scheduleLabel(rowPrice(row).offpeak_schedule) }}</div>
+                  <div>
+                    输入 {{ formatUnitPriceMicro(rowPrice(row).offpeak_input_micro_per_ktok, row.currency) }} ·
+                    输出 {{ formatUnitPriceMicro(rowPrice(row).offpeak_output_micro_per_ktok, row.currency) }}
+                  </div>
+                  <div class="muted">
+                    缓存读 {{ formatUnitPriceMicro(rowPrice(row).offpeak_cache_read_micro_per_ktok, row.currency) }} ·
+                    缓存写 {{ formatUnitPriceMicro(rowPrice(row).offpeak_cache_write_micro_per_ktok, row.currency) }}
+                  </div>
+                </template>
+                <span v-else class="muted">不分时段（全天一个价）</span>
+              </template>
+            </el-table-column>
             <el-table-column label="生效区间" min-width="230"><template #default="{ row }">{{ spanText(rowPrice(row)) }}</template></el-table-column>
             <el-table-column label="状态" width="100">
               <template #default="{ row }">
@@ -376,6 +493,15 @@ onMounted(() => { void load() })
           直接改旧价会让<strong>历史费用一起变</strong>——虽然用量没变，但金额会重算。
         </li>
         <li>
+          <strong>不限供应商的那条是兜底价</strong>：只有当某个供应商<strong>没有</strong>自己的同名模型价时才用它。
+          给某个网关单独配一条即可覆盖它，两条可以共存 —— 专属价优先，且一条事件只会被算一次。
+        </li>
+        <li>
+          <strong>闲时（低谷）价是同一行的另一套四个数</strong>：高峰与闲时各自成组、绝不「乘一个折扣系数」
+          （缓存读与输入价的比值在不同档上未必相同）。时段表定义在 <code>shared/price.ts</code> 里，
+          全平台只有一份；**法定节假日表需要逐年补**，页面会在时段说明里写明覆盖到哪天。
+        </li>
+        <li>
           <strong>多币种各自累加，绝不换算也绝不相加</strong>：页面用 <code>+</code> 连接不同币种的金额。
           汇率是随时间变的外部事实，烧进结果里等于给历史数字埋雷。
         </li>
@@ -390,8 +516,23 @@ onMounted(() => { void load() })
       <el-form ref="form" :model="draft" :rules="rules" label-position="top" :disabled="busy" @submit.prevent="save">
         <div class="form-grid">
           <el-form-item label="供应商" prop="provider">
-            <el-input v-model="draft.provider" maxlength="128" placeholder="例如 deepseek-official" autocomplete="off" />
-            <p class="muted">必须与上报值逐字一致（区分大小写）；归一化只影响展示口径，不改变这里的匹配。</p>
+            <el-switch
+              v-model="draft.basePrice"
+              active-text="不限供应商（基础价）"
+              aria-label="不限供应商的基础价"
+              @change="toggleBasePrice"
+            />
+            <el-input
+              v-model="draft.provider"
+              :disabled="draft.basePrice"
+              maxlength="128"
+              :placeholder="draft.basePrice ? '不限供应商' : '例如 deepseek-official'"
+              autocomplete="off"
+            />
+            <p class="muted">
+              必须与上报值逐字一致（区分大小写）；归一化只影响展示口径，不改变这里的匹配。
+              <strong>不限供应商</strong>那条是兜底价：某个供应商没有自己的价时才用它（用于同一个模型被多个网关转售的情形）。
+            </p>
           </el-form-item>
           <el-form-item label="模型" prop="model">
             <el-input v-model="draft.model" maxlength="255" placeholder="例如 deepseek-v4.1-flash" autocomplete="off" />
@@ -434,6 +575,47 @@ onMounted(() => { void load() })
             <el-date-picker v-model="draft.to" type="datetime" value-format="YYYY-MM-DDTHH:mm" format="YYYY-MM-DD HH:mm" placeholder="留空 = 至今有效" aria-label="生效终点" />
           </el-form-item>
         </div>
+        <el-card shadow="never" class="offpeak-card">
+          <template #header>
+            <div class="panel-heading">
+              <div>
+                <h3>闲时（低谷）价 · 可选</h3>
+                <p class="muted">
+                  留空 = 这条价<strong>不分时段</strong>（全天一个价）。填了时段表就必须把四类闲时单价一起填 ——
+                  🚨 <strong>缺一个就会让那一档按 0 元算</strong>，而 0 元是合法单价，费用只会悄悄偏低。
+                </p>
+              </div>
+            </div>
+          </template>
+          <div class="form-grid">
+            <el-form-item label="闲时时段表">
+              <el-select v-model="draft.offpeakSchedule" clearable placeholder="不分时段" aria-label="闲时时段表">
+                <el-option v-for="schedule in SCHEDULES" :key="schedule.id" :label="schedule.label" :value="schedule.id" />
+              </el-select>
+              <p class="muted">{{ scheduleTip || '时段表定义在 shared/price.ts 里，全平台只有一份。' }}</p>
+            </el-form-item>
+            <el-form-item label="闲时四类单价">
+              <el-button :disabled="busy || !draft.input.trim()" @click="fillOffpeakSame">按高峰价的一半填满</el-button>
+              <p class="muted">官方空闲档通常就是高峰档的一半；这里只是省一次手算，**不作数**，请按自己的价目核对。</p>
+            </el-form-item>
+          </div>
+          <div class="form-grid">
+            <el-form-item :label="`闲时输入（${draft.currency || '货币单位'} / 百万 token）`">
+              <el-input v-model="draft.offpeakInput" placeholder="例如 1" autocomplete="off" />
+            </el-form-item>
+            <el-form-item :label="`闲时输出（${draft.currency || '货币单位'} / 百万 token）`">
+              <el-input v-model="draft.offpeakOutput" placeholder="例如 4" autocomplete="off" />
+            </el-form-item>
+          </div>
+          <div class="form-grid">
+            <el-form-item :label="`闲时缓存读（${draft.currency || '货币单位'} / 百万 token）`">
+              <el-input v-model="draft.offpeakCacheRead" placeholder="例如 0.02" autocomplete="off" />
+            </el-form-item>
+            <el-form-item :label="`闲时缓存写（${draft.currency || '货币单位'} / 百万 token）`">
+              <el-input v-model="draft.offpeakCacheWrite" placeholder="例如 0（不单列就填 0）" autocomplete="off" />
+            </el-form-item>
+          </div>
+        </el-card>
         <el-form-item label="备注">
           <el-input v-model="draft.note" maxlength="255" placeholder="例如：2026-01 起的官方价；或「内置种子价，未核对」" autocomplete="off" />
         </el-form-item>
@@ -449,6 +631,9 @@ onMounted(() => { void load() })
 <style scoped>
 .provider-group { margin-bottom: 22px; }
 .provider-group h3 { margin: 0 0 8px; font-size: 15px; font-weight: 600; }
+.base-price-hint { margin: 0 0 10px; }
+.offpeak-card { margin: 4px 0 18px; }
+.offpeak-card h3 { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
 .heading-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 0 18px; }
 </style>

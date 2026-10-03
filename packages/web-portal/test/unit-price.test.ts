@@ -6,11 +6,12 @@
  *   倍数写错一位就是 1000 倍误差，而页面上只显示一个看起来很正常的数字。
  */
 import { describe, expect, test } from 'bun:test'
-import { MAX_MICRO_PER_KTOK, formatUnitPriceMicro } from '@ai-token-report/shared'
+import { ANY_PROVIDER, MAX_MICRO_PER_KTOK, formatUnitPriceMicro } from '@ai-token-report/shared'
 import type { PortalModelPrice } from '@ai-token-report/shared'
 import {
-  DEFAULT_CURRENCY, PRICE_STATUS_TEXT, defaultCurrencyForFilter, defaultCurrencyForNewPrice,
-  groupPricesByProvider, microToRateText, priceSpanText, priceStatusOf, rateTextToMicro,
+  BASE_PROVIDER_LABEL, DEFAULT_CURRENCY, PRICE_STATUS_TEXT, defaultCurrencyForFilter, defaultCurrencyForNewPrice,
+  groupPricesByProvider, hasOffpeak, isBasePrice, microToRateText, offpeakRatesOf, priceSpanText, priceStatusOf,
+  providerLabel, rateTextToMicro, scheduleHint, scheduleLabel,
 } from '../src/utils/unitPrice.js'
 
 const price = (over: Partial<PortalModelPrice> = {}): PortalModelPrice => ({
@@ -18,6 +19,9 @@ const price = (over: Partial<PortalModelPrice> = {}): PortalModelPrice => ({
   input_micro_per_ktok: 2_000, output_micro_per_ktok: 8_000,
   cache_read_micro_per_ktok: 40, cache_write_micro_per_ktok: 0,
   effective_from_ms: 0, effective_to_ms: null, note: null,
+  offpeak_schedule: null,
+  offpeak_input_micro_per_ktok: null, offpeak_output_micro_per_ktok: null,
+  offpeak_cache_read_micro_per_ktok: null, offpeak_cache_write_micro_per_ktok: null,
   created_at_ms: 1, updated_at_ms: 1, ...over,
 })
 
@@ -148,7 +152,6 @@ describe('按供应商分组（同一供应商下不同模型各自定价）', (
 
 describe('生效区间的展示', () => {
   const fmt = (ms: number | null): string => (ms === null ? '—' : `T${ms}`)
-
   test('`effective_from_ms === 0` 是「自始」而不是缺失值', () => {
     // 内置种子价就是这么标的；渲染成 `—` 会让人以为这条价没填起点。
     expect(priceSpanText({ effective_from_ms: 0, effective_to_ms: null }, fmt)).toBe('自始 → 至今')
@@ -163,5 +166,64 @@ describe('生效区间的展示', () => {
     expect(PRICE_STATUS_TEXT).toEqual({ active: '生效中', future: '未开始', past: '已结束' })
     // 至今有效的那条永远是「生效中」，不会因为没写终点就被判成已结束。
     expect(priceStatusOf({ effective_from_ms: 0, effective_to_ms: null }, 10 ** 15)).toBe('active')
+  })
+})
+
+describe('基础价（不限供应商）★ v10', () => {
+  test('保留值 `*` 在界面上说成「不限供应商（基础价）」——绝不把 `*` 直接显示给人看', () => {
+    expect(isBasePrice(price({ provider: ANY_PROVIDER }))).toBe(true)
+    expect(isBasePrice(price({ provider: 'dashscope' }))).toBe(false)
+    expect(providerLabel(ANY_PROVIDER)).toBe(BASE_PROVIDER_LABEL)
+    expect(providerLabel(ANY_PROVIDER)).not.toContain('*')
+    // 真实供应商名原样显示（归一化是另一条链路的事，这一页只认上报原值）
+    expect(providerLabel('dashscope')).toBe('dashscope')
+  })
+
+  test('★ 基础价那一组排在最前（它是兜底，夹在供应商中间会被误读成只作用于相邻的两个）', () => {
+    const groups = groupPricesByProvider([
+      price({ price_id: 'a', provider: 'dashscope', model: 'm' }),
+      price({ price_id: 'b', provider: ANY_PROVIDER, model: 'm' }),
+      price({ price_id: 'c', provider: 'bailian-tpp', model: 'm' }),
+    ], { nowMs: 0 })
+    expect(groups.map((g) => g.provider)).toEqual([ANY_PROVIDER, 'bailian-tpp', 'dashscope'])
+  })
+})
+
+describe('闲时（低谷）档 ★ v10', () => {
+  const offpeak = (over: Partial<PortalModelPrice> = {}): PortalModelPrice => price({
+    offpeak_schedule: 'deepseek-cn',
+    offpeak_input_micro_per_ktok: 1_000,
+    offpeak_output_micro_per_ktok: 4_000,
+    offpeak_cache_read_micro_per_ktok: 20,
+    offpeak_cache_write_micro_per_ktok: 0,
+    ...over,
+  })
+
+  test('五个字段齐全才算「有闲时档」', () => {
+    expect(hasOffpeak(offpeak())).toBe(true)
+    expect(hasOffpeak(price())).toBe(false)
+    // ★ 半套配置（只可能来自直接改库）必须判成「没有闲时档」：
+    //   把它当成有，会让缺的那几档按 0 元算，而页面上看不出来。
+    expect(hasOffpeak(offpeak({ offpeak_schedule: null }))).toBe(false)
+    expect(hasOffpeak(offpeak({ offpeak_input_micro_per_ktok: null }))).toBe(false)
+    expect(hasOffpeak(offpeak({ offpeak_cache_write_micro_per_ktok: null }))).toBe(false)
+  })
+
+  test('闲时四类价原样取出（不换算、不打折）', () => {
+    expect(offpeakRatesOf(offpeak())).toEqual({ input: 1_000, output: 4_000, cacheRead: 20, cacheWrite: 0 })
+    expect(offpeakRatesOf(price())).toBeNull()
+  })
+
+  test('时段的说明文本由时段表算出来（不是手写的一段话）', () => {
+    const hint = scheduleHint('deepseek-cn')
+    expect(hint).toContain('北京时间')
+    expect(hint).toContain('09:00–12:00')
+    expect(hint).toContain('14:00–18:00')
+    expect(hint).toContain('节假日表覆盖到 2026-12-31')
+    expect(scheduleLabel('deepseek-cn')).toContain('DeepSeek')
+    expect(scheduleLabel(null)).toBe('不分时段')
+    // 未知 id 原样显示，绝不假装成某一个时段表
+    expect(scheduleLabel('未来时段表')).toBe('未知时段表（未来时段表）')
+    expect(scheduleHint('未来时段表')).toContain('未知时段表')
   })
 })
