@@ -26,7 +26,7 @@
  */
 
 import type { IncrementalScanResult, SessionsRootInput } from '@ai-token-report/core'
-import { scanIncremental, type WatermarkLookup } from '@ai-token-report/core'
+import { scanIncremental, scanPlainSources, type SourceRoot, type WatermarkLookup } from '@ai-token-report/core'
 import {
   ackRecords,
   emptyState,
@@ -75,6 +75,13 @@ export interface RunReportOptions {
   statePath?: string
   /** 真实投递器。`dry-run` 时不需要提供。 */
   deliver?: Deliverer
+  /**
+   * **DSH 之外**的来源根（Codex / Claude Code / Trae / WorkBuddy …）。
+   *
+   * 不给 = 只上报 DSH（改动前的行为）；给了就按**字节数水位线**增量扫描并一起上报。
+   * 它们的 `source` 随记录一起发出去，看板因此能按来源出数（见 `deliver.ts`）。
+   */
+  plainRoots?: readonly SourceRoot[]
   /** 干跑：扫描 + 落盘 pending，但不投递、不推进 lastFlushMs。 */
   dryRun?: boolean
   /** 只看不改：不写状态文件。用于纯观察当前增量。 */
@@ -88,6 +95,18 @@ export interface RunReportResult {
   records: UsageRecord[]
   counts: TokenCounts
   scan: IncrementalScanResult
+  /**
+   * DSH 之外那批来源本轮的情况（没配 `plainRoots` 时**缺席**，不是 0）。
+   *
+   * 缺席 = 这次根本没扫它们（老调用点），0 = 扫了但一个文件都没变 —— 两者
+   * 在输出里必须能分辨，否则「没扫」会被读成「没用量」。
+   */
+  plain?: {
+    records: number
+    filesScanned: number
+    skippedUnchanged: number
+    missingRoots: string[]
+  }
   /** 状态文件路径。 */
   statePath: string
   /** 扫描前的状态统计。 */
@@ -138,8 +157,32 @@ export async function runReport(options: RunReportOptions): Promise<RunReportRes
     onProgress: options.onProgress,
   })
 
+  /**
+   * ★ **DSH 之外的来源（Codex / Claude Code / Trae / WorkBuddy）也要上报**。
+   *
+   * 它们的日志是**纯文本行式**（`plain-jsonl`），与 DSH 的分帧 zstd 不是同一种
+   * 增量语义，所以走 `scanPlainSources()` —— 它只按**字节数**判「要不要重解析」
+   * （没有 L2 帧/光标），重解析带回来的老记录由服务端的 `event_id` 主键吸收。
+   *
+   * 🚨 共用同一份 `state.json`：DSH 的水位按 `filePath` 索引（帧数 + 光标），
+   *   纯文本来源只写 `size`（`frameCount: 0`、没有 `cursor`）。两类路径的键空间
+   *   天然不重叠（DSH 是 `sessions/<项目>/<会话>/session*.jsonl.zstd`，
+   *   各来源是自己的根），所以**一份状态文件足够**，不必再分叉第二个水位线文件
+   *   —— 分叉之后「上次发到哪了」就会有两个答案。
+   * ⚠️ 不上报的后果是**静默的**：这些来源的用量在部门看板上永远是 0，
+   *   与「这台机器没跑过 Codex」长得一模一样。所以默认就该带上它们。
+   */
+  const plain = options.plainRoots?.length
+    ? await scanPlainSources(options.plainRoots, {
+      sizeOf: (filePath) => state.files[filePath]?.size,
+      cwdOf: (sessionId) => state.cwdBySession[sessionId],
+      ...(options.onProgress ? { onProgress: options.onProgress } : {}),
+    })
+    : null
+
   // 3. 暂存：pending + 内存水位线（此时尚未落盘）
   stageRecords(state, scan.records)
+  if (plain) stageRecords(state, plain.records)
 
   // 4. 先落盘再投递 —— 崩溃安全的关键顺序
   if (!options.noSave) {
@@ -153,13 +196,32 @@ export async function runReport(options: RunReportOptions): Promise<RunReportRes
         ...(f.cursor ? { cursor: f.cursor } : {}),
       }
     }
+    for (const file of plain?.files ?? []) {
+      if (!file.changed) continue
+      // ⚠️ `frameCount: 0` 是**纯文本来源的语义**（没有帧可分）：写成别的数字会让
+      //   DSH 那条路（若哪天有人把同一个路径喂进去）按错误的帧数续读。
+      state.files[file.meta.filePath] = {
+        size: file.size,
+        frameCount: 0,
+        mtimeMs: file.mtimeMs,
+        firstSeenMs: state.files[file.meta.filePath]?.firstSeenMs ?? Date.now(),
+      }
+    }
     saveState(statePath, state)
   }
 
+  // 本轮的全部新记录（两个来源族合并后才是「这一轮采到了什么」）。
+  const records = [...scan.records, ...(plain?.records ?? [])]
   const result: RunReportResult = {
-    records: scan.records,
-    counts: totalOfRecords(scan.records),
+    records,
+    counts: totalOfRecords(records),
     scan,
+    ...(plain ? { plain: {
+      records: plain.records.length,
+      filesScanned: plain.filesScanned,
+      skippedUnchanged: plain.skippedUnchanged,
+      missingRoots: plain.missingRoots,
+    } } : {}),
     statePath,
     before,
     after: statsOf(state),

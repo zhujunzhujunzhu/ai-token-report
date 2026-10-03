@@ -21,6 +21,8 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { zstdCompressSync } from 'node:zlib'
 
+import { pinnedChildEnv } from './child-env.js'
+
 const CLI = resolve(import.meta.dir, '../src/cli.ts')
 
 /** 快照的同步时刻（本地 2026-01-01 09:00）。 */
@@ -79,6 +81,8 @@ interface Fixture {
  * ⚠️ 数据目录与会话日志根**都显式传给子进程**，而且关掉自动发现：`bun test` 的 preload
  *   改的 `process.env` 不被子进程继承（实测 Bun 1.4.2），少了这几项这条用例会连带扫
  *   使用者真实的 home 并把本地库写进 `~/.ai-token-report`。
+ * ⚠️ **来源清单也必须钉**（`pinnedChildEnv()`）：CLI 缺省统计全部已注册来源，
+ *   不钉就会读开发者真实的 Codex / Claude Code / Trae / WorkBuddy 日志。
  */
 function setup(): Fixture {
   const root = mkdtempSync(join(tmpdir(), 'atr-cli-cost-'))
@@ -122,7 +126,10 @@ function setup(): Fixture {
       {
         stdout: 'pipe',
         stderr: 'pipe',
-        env: { ...process.env, DSH_TOKEN_REPORT_DISCOVER: '0' },
+        // ★ 来源也要钉：CLI 缺省是**全部已注册来源**，只关自动发现挡不住
+        //   「冷扫开发者真实的 ~/.codex」（本机 1,513 个文件 / 2.8 GB）——
+        //   症状是这条用例 5 秒超时，而失败信息与断言毫无关系。见 `child-env.ts`。
+        env: pinnedChildEnv(),
       },
     )
     const [stdout, stderr, code] = await Promise.all([

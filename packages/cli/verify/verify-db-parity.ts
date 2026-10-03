@@ -6,14 +6,60 @@
  *   bun run packages/cli/verify/verify-db-parity.ts
  */
 
-import { resolvePaths } from '@ai-token-report/core'
+import { resolvePaths, resolveSourceRoots } from '@ai-token-report/core'
 import { openStats } from '@ai-token-report/core/db'
 import { derive } from '@ai-token-report/core'
 import type { GroupDimension } from '@ai-token-report/core'
 
 const paths = resolvePaths()
-const periods = [undefined, 'today', 'last7d', 'last30d', 'month'] as const
+/**
+ * ★ **冻结窗口**：右端落在**昨天 24:00**，不可能再被写入。
+ *
+ * 为什么不用 `period`（today / last7d / …）：那些窗口的右端是「现在」，
+ * 而这条脚本要跑两次取数（库一次、直扫一次）——**这台机器上正在进行的工作
+ * 本身就在写日志**，两次取数之间落进来的新事件足以让断言失败。
+ * 实测症状：失败项在两次运行之间**来回变**（先 `today`、后 `(全部)`），
+ * 与口径毫无关系；同一台机器用冻结窗口对照时逐位一致（1,609 条 / 2.69 亿 token）。
+ *
+ * 要看含今天的实时窗口，加 `--live`（那是信息性的，天然可能因新事件而不同）。
+ */
+const DAY = 86_400_000
+const todayStart = new Date(new Date().setHours(0, 0, 0, 0)).getTime()
+const windows = process.argv.includes('--live')
+  ? [
+    { label: '截至昨天（全部历史）', untilMs: todayStart - 1 },
+    { label: '今天（实时，可能漂移）', period: 'today' },
+    { label: '近 7 天（含今天，实时）', period: 'last7d' },
+    { label: '本月（含今天，实时）', period: 'month' },
+  ]
+  : [
+    { label: '截至昨天（全部历史）', untilMs: todayStart - 1 },
+    { label: '昨天', sinceMs: todayStart - DAY, untilMs: todayStart - 1 },
+    { label: '近 7 天（截至昨天）', sinceMs: todayStart - 7 * DAY, untilMs: todayStart - 1 },
+    { label: '近 30 天（截至昨天）', sinceMs: todayStart - 30 * DAY, untilMs: todayStart - 1 },
+  ] as const
 const dims: GroupDimension[] = ['provider', 'model', 'provider-model', 'project', 'day', 'hour']
+
+/**
+ * ★ 多来源之下，**两条路径必须吃同一份带来源的根清单**。
+ *
+ * 这条脚本比的是「库查询 == 直扫」，而它们的取数范围来自两个不同的入参：
+ *
+ * | 路径 | 范围从哪来 |
+ * |---|---|
+ * | 库（`openStats` 不传 `forceScan`） | `sources: ['dsh']` ⇒ SQL 里按来源筛 |
+ * | 直扫（`forceScan: true`） | **`sourceRoots`** —— 不传就退回 `sessionsRoot`（DSH 的根） |
+ *
+ * 只筛 `sources` 而不给 `sourceRoots` 时，直扫那侧仍会按**全部已注册来源**列举：
+ * 于是屏幕上出现的是「库 = 只有 DSH / 直扫 = DSH + Codex + Claude Code」，
+ * 表现为一大堆 `records.length` / `records.content` 断言失败，而**根因与口径无关**。
+ * 本机实测（2026-10，`~/.claude` 有 551 次真实调用）差了 5,000 多万 token。
+ */
+const dshRoots = resolveSourceRoots({ sources: ['dsh'] })
+if (dshRoots.roots.length === 0) {
+  process.stderr.write(`❌ 没有可用的 DSH 会话目录：${paths.sessionsRoots.join(' / ')}\n`)
+  process.exit(1)
+}
 
 let failures = 0
 let checks = 0
@@ -35,15 +81,32 @@ function counts(c: { input: number; output: number; cacheRead: number; cacheWrit
 console.log('='.repeat(70))
 console.log('SQL 路径 vs 直扫路径 双轨对照（真实日志）')
 console.log('='.repeat(70))
-console.log(`会话日志: ${paths.sessionsRoots.join(' + ')}（${paths.sessionsRoots.length} 个根）`)
+console.log(`会话日志: ${dshRoots.roots.map((r) => r.path).join(' + ')}（${dshRoots.roots.length} 个 DSH 根）`)
 console.log(`本地库  : ${paths.dbPath}\n`)
 
-for (const period of periods) {
-  const label = period ?? '(全部)'
-  console.log(`── period = ${label} ──`)
+for (const win of windows) {
+  const label = win.label
+  const windowParam = 'period' in win && win.period !== undefined
+    ? { period: win.period }
+    : {
+      ...('sinceMs' in win && win.sinceMs !== undefined ? { sinceMs: win.sinceMs } : {}),
+      ...('untilMs' in win && win.untilMs !== undefined ? { untilMs: win.untilMs } : {}),
+    }
+  console.log(`── ${label} ──`)
 
-  const sql = await openStats({ sessionsRoot: paths.sessionsRoots, dbPath: paths.dbPath, ...(period ? { period } : {}) })
-  const scan = await openStats({ sessionsRoot: paths.sessionsRoots, dbPath: paths.dbPath, ...(period ? { period } : {}), forceScan: true })
+  // 🚨 多来源之后必须**同时**给「来源筛选」与「带来源的根」：
+  //   - `sources: ['dsh']` 让**库**那条路按来源筛（库里装着 Codex / Claude Code 的记录，
+  //     那是正确的，但这里只对照 DSH）；
+  //   - `sourceRoots` 让**直扫**那条路用同一批根 —— 不给它，直扫会按全部已注册来源列举，
+  //     比的就是「只有 DSH 的库」与「DSH + 别的来源的直扫」。
+  const scope = {
+    sessionsRoot: dshRoots.roots.map((root) => root.path),
+    dbPath: paths.dbPath,
+    sources: ['dsh'] as const,
+    sourceRoots: dshRoots.roots,
+  }
+  const sql = await openStats({ ...scope, ...windowParam })
+  const scan = await openStats({ ...scope, ...windowParam, forceScan: true })
 
   try {
     if (sql.source !== 'sql') {

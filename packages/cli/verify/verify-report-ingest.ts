@@ -19,11 +19,15 @@
  * 这样才回答得了「CLI 能不能上报」这个问题 —— 只测服务端是不够的，
  * 两边字段对不上时（`toWireRecord` vs `record`）只有真往返才暴露。
  *
- * 覆盖四条最容易出错的语义：
+ * 覆盖五条最容易出错的语义：
  *   1. 增量：只投新增，重跑一轮不重复投递
  *   2. 幂等：服务端的 `event_id` 去重让重发无害
  *   3. 归属：以 token 为准，客户端自填的姓名不生效
  *   4. 崩溃安全：投递失败时 pending 保留（下一轮重试），不静默丢数据
+ *   5. ★ **非 DSH 来源**（Codex 这类纯文本日志）也走同一条链路，
+ *      且 `source` 一路落到上报库的 `usage_event.source`（v9）——
+ *      这一段只有「真 CLI + 真 HTTP + 真库」才验得出来：
+ *      任何一环丢了 source，表现都是「看板上全是 dsh」，**不报错**。
  */
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs'
@@ -31,7 +35,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { zstdCompressSync } from 'node:zlib'
 
-import { loadState, resetState, resolveStatePath } from '@ai-token-report/core'
+import { loadState, resetState, resolveStatePath, type SourceRoot } from '@ai-token-report/core'
 import { EVENT_TABLE, openDb, preparePortalDatabase } from '@ai-token-report/core/db'
 import { createServer } from '@ai-token-report/server'
 import { IdentityRepository } from '../../server/src/identity/repository.js'
@@ -262,6 +266,76 @@ check('★ 服务端全部判为重复（accepted=0）', replay.delivered?.accep
 check('★ duplicates=4', replay.delivered?.duplicates === 4)
 check('★ 库里仍是 4 行（没有重复计费）', countRows() === 4)
 check('重发也正常 ack（pending 清空）', pendingCount() === 0)
+
+// ── 7. ★ 非 DSH 来源：Codex 的纯文本 rollout 也一路带 source 进库 ─────────────
+console.log('\n【7】非 DSH 来源（Codex）也上报，且 source 落到上报库')
+{
+  // Codex 的 rollout 是**纯文本 JSONL**（不是 DSH 的分帧 zstd），根是 `<home>/sessions`。
+  // 夹具口径：两次调用各写两条同值 `token_count`（第二次累计快照不变 ⇒ 必须去重），
+  // `cached_input_tokens` **含在** `input_tokens` 内 ⇒ 输入要减（与 DSH 相反）。
+  const codexHome = join(HOME, 'codex-home')
+  const codexSessions = join(codexHome, 'sessions', '2026', '10', '03')
+  mkdirSync(codexSessions, { recursive: true })
+  const codexUuid = '019d4d61-2656-7382-a473-689cdf1fced9'
+  const codexFile = join(codexSessions, `rollout-2026-10-03T10-00-00-${codexUuid}.jsonl`)
+  const codexUsage = (input: number, cached: number, output: number, total: number): Record<string, number> => ({
+    input_tokens: input, cached_input_tokens: cached, cache_write_input_tokens: 0,
+    output_tokens: output, reasoning_output_tokens: 0, total_tokens: total,
+  })
+  const delta = codexUsage(1_000, 400, 100, 1_100)
+  const cumulative = codexUsage(2_000, 800, 200, 2_200)
+  const codexLine = (ordinal: number, type: string, payload: unknown): string =>
+    `${JSON.stringify({ timestamp: '2026-10-03T10:00:01.000Z', ordinal, type, payload })}\n`
+  const codexTokenCount = (ordinal: number, last: unknown, total: unknown): string =>
+    codexLine(ordinal, 'event_msg', { type: 'token_count', info: { last_token_usage: last, total_token_usage: total } })
+  writeFileSync(codexFile, [
+    codexLine(0, 'session_meta', { session_id: codexUuid, id: codexUuid, timestamp: '2026-10-03T10:00:00.000Z', cwd: 'D:\\Coding_agent\\demo', model_provider: 'openai', cli_version: '0.149.0', source: 'cli' }),
+    codexLine(1, 'turn_context', { model: 'gpt-5.5', cwd: 'D:\\Coding_agent\\demo' }),
+    codexTokenCount(2, delta, delta),
+    codexTokenCount(3, delta, delta),        // 同值重复 ⇒ 去重
+    codexTokenCount(4, delta, cumulative),   // 累计快照推进 ⇒ 第二次调用
+    codexTokenCount(5, delta, cumulative),   // 同值重复 ⇒ 去重
+  ].join(''))
+
+  const plainRoots: SourceRoot[] = [{ path: join(codexHome, 'sessions'), source: 'codex' }]
+  const withPlain = await runReport({ sessionsRoot, dshHome: HOME, statePath, deliver, plainRoots })
+  check('★ 纯文本来源的 2 条被采到（双写去重后）', withPlain.records.length === 2, String(withPlain.records.length))
+  check('本轮确实走了非 DSH 分支', withPlain.plain?.filesScanned === 1 && withPlain.plain?.skippedUnchanged === 0,
+    JSON.stringify(withPlain.plain))
+  check('服务端接受 2 条', withPlain.delivered?.accepted === 2, JSON.stringify(withPlain.delivered))
+  check('库里 4 + 2 = 6 行', countRows() === 6, String(countRows()))
+
+  const bySource = (): { source: string; c: number; input: number; cacheRead: number }[] => {
+    const db = openDb(dbPath)
+    try {
+      return db.query<
+        { source: string; c: number; input: number; cacheRead: number },
+        []
+      >(`SELECT source, COUNT(*) AS c, SUM(input_tokens) AS input, SUM(cache_read_tokens) AS cacheRead
+         FROM ${EVENT_TABLE} GROUP BY source ORDER BY source`).all()
+        .map((row) => ({ source: row.source, c: Number(row.c), input: Number(row.input), cacheRead: Number(row.cacheRead) }))
+    } finally {
+      db.close()
+    }
+  }
+  check('★ 库里按来源正好两组：codex 2 条 / dsh 4 条', JSON.stringify(bySource()) === JSON.stringify([
+    { source: 'codex', c: 2, input: 1_200, cacheRead: 800 },
+    // DSH 那 4 条：7772+120+500+300 与 1024+98976+2000+900
+    { source: 'dsh', c: 4, input: 8_692, cacheRead: 102_900 },
+  ]), JSON.stringify(bySource()))
+
+  // 状态文件里纯文本来源的水位：只有 size，`frameCount: 0`（没有帧可分），**没有光标**。
+  const plainState = loadState(statePath).state.files[codexFile]
+  check('★ 纯文本来源的水位是 size + frameCount 0，且没有 cursor',
+    plainState?.size !== undefined && plainState.frameCount === 0 && plainState.cursor === undefined,
+    JSON.stringify(plainState))
+
+  // 热态：文件没变 ⇒ 一条都不重发（每文件一次 stat 就够）。
+  const again = await runReport({ sessionsRoot, dshHome: HOME, statePath, deliver, plainRoots })
+  check('未变更时不重发（accepted=0）', (again.delivered?.accepted ?? 0) === 0, JSON.stringify(again.delivered))
+  check('★ 仍未变更的文件连解析都不做', again.plain?.skippedUnchanged === 1, JSON.stringify(again.plain))
+  check('库里仍是 6 行', countRows() === 6)
+}
 
 // ── 清理 ────────────────────────────────────────────────────────────────────
 await portal.stop()

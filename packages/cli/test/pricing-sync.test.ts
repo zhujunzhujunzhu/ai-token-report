@@ -21,6 +21,8 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { loadLocalPricing } from '@ai-token-report/core/db'
 
+import { pinnedChildEnv } from './child-env.js'
+
 const CLI = resolve(import.meta.dir, '../src/cli.ts')
 
 /**
@@ -107,7 +109,8 @@ function setup(): Fixture {
         stderr: 'pipe',
         // 数据目录与会话日志根**都显式传给子进程**并关掉自动发现：preload 改的
         // `process.env` 不被子进程继承（实测 Bun 1.4.2），少了这几项会连带扫使用者真实的 home。
-        env: { ...process.env, DSH_TOKEN_REPORT_DISCOVER: '0' },
+        // ★ 来源清单也在这里钉住（`pinnedChildEnv()`）：CLI 缺省统计全部已注册来源。
+        env: pinnedChildEnv(),
       },
     )
     const [stdout, stderr, code] = await Promise.all([

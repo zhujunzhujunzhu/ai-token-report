@@ -99,6 +99,7 @@ function lookupFrom(state: ReturnType<typeof emptyState>) {
 
 function makeRecord(sessionId: string, seq: number): UsageRecord {
   return {
+    source: 'dsh',
     eventId: `${sessionId}:${seq}`,
     sessionId,
     seq,
@@ -281,6 +282,55 @@ test('runReport：跨轮次保留项目归属（cwd 持久化生效）', tracked
   const second = await runReport({ sessionsRoot: join(home, 'sessions'), statePath, deliver })
   assert.equal(second.records.length, 1)
   assert.equal(second.records[0]!.cwd, 'D:\\proj', '持久化的 cwd 必须跨轮次生效')
+}))
+
+test('★ runReport：非 DSH 来源（Codex 等）也上报，且带自己的 source 与字节数水位线', tracked(async () => {
+  const home = makeHome(); roots.push(home)
+  // 一个空的 DSH 根（这台机器只有 Codex），一个真的 Codex rollout。
+  const dshRoot = join(home, 'dsh', 'sessions')
+  mkdirSync(dshRoot, { recursive: true })
+  const codexRoot = join(home, 'codex', 'sessions')
+  const dayDir = join(codexRoot, '2026', '09', '25')
+  mkdirSync(dayDir, { recursive: true })
+  const sessionId = '11111111-2222-3333-4444-555555555555'
+  const file = join(dayDir, `rollout-2026-09-25T04-00-00-${sessionId}.jsonl`)
+  const envelope = (ordinal: number, type: string, payload: unknown, at: string) =>
+    JSON.stringify({ timestamp: at, ordinal, type, payload })
+  const usage = (input: number) => ({ input_tokens: input, cached_input_tokens: 0, cache_write_input_tokens: 0,
+    output_tokens: 10, reasoning_output_tokens: 0, total_tokens: input + 10 })
+  writeFileSync(file, [
+    envelope(0, 'session_meta', { session_id: sessionId, timestamp: '2026-09-25T04:00:00.000Z', cwd: '/work/codex', model_provider: 'openai' }, '2026-09-25T04:00:00.000Z'),
+    envelope(1, 'turn_context', { model: 'gpt-5-codex', cwd: '/work/codex' }, '2026-09-25T04:00:00.500Z'),
+    envelope(2, 'event_msg', { type: 'token_count', info: { last_token_usage: usage(100), total_token_usage: usage(100) } }, '2026-09-25T04:00:01.000Z'),
+  ].join('\n') + '\n')
+
+  const statePath = join(home, 'state.json')
+  const sent: UsageRecord[] = []
+  const deliver = async (recs: UsageRecord[]) => { sent.push(...recs); return { accepted: recs.length, duplicates: 0, rejected: 0 } }
+  const plainRoots = [{ path: codexRoot, source: 'codex' as const }]
+
+  const first = await runReport({ sessionsRoot: dshRoot, plainRoots, statePath, deliver })
+  // ★ source 必须随记录一起走：不发它，服务端会按库内默认值记成 `dsh`，
+  //   而看板上这条 Codex 用量就永远显示成 DSH 的。
+  assert.equal(first.records.length, 1)
+  assert.equal(first.records[0]!.source, 'codex')
+  assert.equal(first.plain?.filesScanned, 1)
+  assert.equal(sent[0]!.source, 'codex')
+  // 纯文本来源只写**字节数**水位线（没有帧、没有光标）。
+  const saved = loadState(statePath).state
+  assert.equal(saved.files[file]!.size, statSync(file).size)
+  assert.equal(saved.files[file]!.frameCount, 0)
+  assert.equal(saved.files[file]!.cursor, undefined)
+
+  // 第二轮：文件没变 ⇒ 一个字节都不重解析，也没有新记录。
+  const second = await runReport({ sessionsRoot: dshRoot, plainRoots, statePath, deliver })
+  assert.equal(second.records.length, 0)
+  assert.equal(second.plain?.filesScanned, 0)
+  assert.equal(second.plain?.skippedUnchanged, 1)
+  // 不传 `plainRoots` 时**整块缺席**（不是 0）：老调用点没扫它们，
+  // 输出里必须能分辨「没扫」与「扫了没变化」。
+  const third = await runReport({ sessionsRoot: dshRoot, statePath, deliver })
+  assert.equal(third.plain, undefined)
 }))
 
 test('scanIncremental：文件被截断时回退重扫该文件', tracked(async () => {

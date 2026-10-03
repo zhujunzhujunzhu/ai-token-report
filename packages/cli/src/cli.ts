@@ -38,11 +38,16 @@ import {
 } from '@ai-token-report/core'
 import {
   discoverDshHomesDetailed,
+  envFlagOff,
   inspectSessionRoots,
+  registeredSources,
   resolvePaths,
   resolveSessionsRoots,
+  resolveSourceRoots,
   splitHomeList,
   type ResolvedPaths,
+  type SessionSource,
+  type SourceRoot,
 } from '@ai-token-report/core'
 import {
   RangeError as RangeParseError,
@@ -184,6 +189,33 @@ dsh-token-report —— DSH token 用量统计
   --list-providers 只列出发现的所有 provider/model 后退出
   -h, --help       显示帮助
 
+其他客户端（Codex / Claude Code / Trae / WorkBuddy）:
+  --source <id>    只统计这些来源（dsh / codex / claude-code / trae / trae-cn / workbuddy；
+                   可重复或逗号分隔，all = 全部）。
+                   **缺省统计全部已注册来源**（想只看 DSH 就 --source dsh；本机存在别的客户端时，
+                   多出来的来源会逐项出现在输出与诊断里，绝不静默并进总量）
+                   ⚠️ 环境开关（下面那几行）在**缺省**时才生效；显式给了 --source 就以它为准
+  --codex-home <p> 指定 Codex home（默认 $CODEX_HOME > ~/.codex）;**可重复**
+  --claude-home <p> 指定 Claude Code 配置目录（默认 $CLAUDE_CONFIG_DIR > ~/.claude）;**可重复**
+  --trae-home <p>  指定 Trae 用户数据目录（国际版，默认 %APPDATA%/Trae 等）;**可重复**
+  --trae-cn-home <p> 指定 Trae CN 用户数据目录（国内版，默认 %APPDATA%/TraeCN 等）;**可重复**
+  --workbuddy-home <p> 指定 WorkBuddy 配置目录（默认 $WORKBUDDY_CONFIG_DIR > ~/.workbuddy）;**可重复**
+  --no-codex       本次不统计 Codex（等价于把它从 --source all 里去掉）
+  --no-claude-code 本次不统计 Claude Code
+  --no-trae        本次不统计 Trae（国际版）
+  --no-trae-cn     本次不统计 Trae CN（国内版）
+  --no-workbuddy   本次不统计 WorkBuddy
+  环境开关: DSH_TOKEN_REPORT_CODEX=0 / DSH_TOKEN_REPORT_CLAUDE=0
+            / DSH_TOKEN_REPORT_TRAE=0 / DSH_TOKEN_REPORT_TRAE_CN=0
+            / DSH_TOKEN_REPORT_WORKBUDDY=0
+  多根: DSH_TOKEN_REPORT_CODEX_HOMES / DSH_TOKEN_REPORT_CLAUDE_HOMES
+        / DSH_TOKEN_REPORT_TRAE_HOMES / DSH_TOKEN_REPORT_TRAE_CN_HOMES
+        / DSH_TOKEN_REPORT_WORKBUDDY_HOMES
+
+  ⚠️ Trae 的国际版与国内版是**两个来源**（两套安装 / 账号 / 模型族），
+     目录名推不出对方（家目录 '.trae' vs '.trae-cn'，用户数据目录 Trae vs TraeCN），
+     两个都按平台约定目录自动解析；合并统计请显式 --source trae --source trae-cn
+
   不给 --dsh-home 时**自动发现**本机所有 DSH：$DSH_HOME + ~/.dsh + ~/.dsh*
   + 各平台应用数据目录下的客户端目录（例如第三方 dsh-desktop 的 harness），
   只收有 sessions 的那个。关闭发现: DSH_TOKEN_REPORT_DISCOVER=0
@@ -198,6 +230,11 @@ dsh-token-report —— DSH token 用量统计
   dsh-token-report --dsh-home ~/.dsh --dsh-home "$env:APPDATA/dsh-desktop/harness"
   dsh-token-report --format csv --out report.csv
   dsh-token-report --period today --no-db        # 直扫日志（与库结果对照）
+
+  dsh-token-report --source all --by source      # 多客户端：DSH + Codex + Claude Code + Trae + WorkBuddy
+  dsh-token-report --source claude-code --by model   # 只看 Claude Code
+  dsh-token-report --source trae --source trae-cn --by source   # Trae 国际版 + 国内版
+  dsh-token-report --source workbuddy --by model      # 只看 WorkBuddy
 
   dsh-token-report web                           # 本地页面（推荐入口）
   dsh-token-report web --no-open --port 8899     # 指定端口、不开浏览器
@@ -214,6 +251,8 @@ dsh-token-report —— DSH token 用量统计
 
 interface CliOptions {
   by: GroupDimension[]
+  /** `--by` 是否由使用者显式给出（决定多来源时要不要把 `provider-model` 升级成带来源的维度）。 */
+  byExplicit?: boolean
   series?: 'day' | 'hour'
   cross: boolean
   top: number
@@ -270,6 +309,40 @@ interface CliOptions {
    * 关掉发现用 `DSH_TOKEN_REPORT_DISCOVER=0`。
    */
   dshHomes?: string[]
+  /**
+   * ★ 只启用这些**来源**（`dsh` / `codex` / `claude-code` / `workbuddy` / `trae` /
+   * `trae-cn`）。
+   *
+   * 缺省 = 全部已注册且未被开关关闭的来源（Codex 用 `DSH_TOKEN_REPORT_CODEX=0` 关，
+   * Claude Code 用 `DSH_TOKEN_REPORT_CLAUDE=0` 关，WorkBuddy 用
+   * `DSH_TOKEN_REPORT_WORKBUDDY=0` 关）。
+   * 给了未注册的来源会**明确报错**：安静地统计出 0 条，看起来与
+   * 「这台机器没用过那个客户端」一模一样，而两者的处置完全不同。
+   */
+  sources?: string[]
+  /**
+   * 各来源的**显式 home 列表**（键是来源 id）。
+   *
+   * `--dsh-home` / `--codex-home` / `--claude-home` / `--trae-home` /
+   * `--trae-cn-home` / `--workbuddy-home` 均可重复，`--*-homes`
+   * 一次给多个（用系统路径分隔符）。缺某一个键 = 该来源按自己的默认规则解析
+   * （环境变量 > 约定目录）。
+   *
+   * ★ 用**一张表**而不是每加一个来源就加一个字段：取值处若各写一遍，
+   *   新增来源时必然漏掉某一处，而症状是「`--claude-home` 明明给了却没生效」——
+   *   数字只是**沉默地**来自缺省目录。
+   */
+  sourceHomes: Partial<Record<SessionSource, string[]>>
+  /** `--no-codex`：本次不统计 Codex（等价于把它从来源里去掉）。 */
+  noCodex?: boolean
+  /** `--no-claude-code`：本次不统计 Claude Code（等价于把它从来源里去掉）。 */
+  noClaudeCode?: boolean
+  /** `--no-trae`：本次不统计 Trae（国际版）。 */
+  noTrae?: boolean
+  /** `--no-trae-cn`：本次不统计 Trae CN（国内版）。 */
+  noTraeCn?: boolean
+  /** `--no-workbuddy`：本次不统计 WorkBuddy。 */
+  noWorkbuddy?: boolean
   /** `--discover`：只打印发现了哪些 home（含会话数与最新写入）后退出。 */
   discover?: boolean
   /**
@@ -325,9 +398,11 @@ interface ReportOptions {
  * 所以这里不需要再手工维护白名单。
  */
 const VALID_DIMS: GroupDimension[] = [
+  'source',
   'provider',
   'model',
   'provider-model',
+  'source-provider-model',
   'project',
   'session',
   'day',
@@ -350,6 +425,7 @@ function parseArgs(argv: string[]): CliOptions | null {
     noDb: false,
     resetDb: false,
     listProviders: false,
+    sourceHomes: {},
     report: {
       dryRun: false,
       reset: false,
@@ -488,6 +564,7 @@ function parseArgs(argv: string[]): CliOptions | null {
         }
         opts.by = byExplicit ? [...opts.by, ...(dims as GroupDimension[])] : (dims as GroupDimension[])
         byExplicit = true
+        opts.byExplicit = true
         i++
         break
       }
@@ -569,6 +646,7 @@ function parseArgs(argv: string[]): CliOptions | null {
         //   刻意不做「最后一次覆盖」——那会让多根统计在命令行上无法表达。
         const value = takeValue(i, arg)
         opts.dshHomes = [...(opts.dshHomes ?? []), value]
+        opts.sourceHomes.dsh = [...(opts.sourceHomes.dsh ?? []), value]
         i++
         break
       }
@@ -576,11 +654,106 @@ function parseArgs(argv: string[]): CliOptions | null {
         const parts = splitHomeList(takeValue(i, arg))
         if (parts.length === 0) throw new UsageError('--dsh-homes 没有给出任何有效路径')
         opts.dshHomes = [...(opts.dshHomes ?? []), ...parts]
+        opts.sourceHomes.dsh = [...(opts.sourceHomes.dsh ?? []), ...parts]
         i++
         break
       }
       case '--discover':
         opts.discover = true
+        break
+      // ── 来源选择（多客户端：dsh / codex / …）──────────────────────────
+      case '--source': {
+        // 可重复，也接受逗号分隔：`--source codex --source dsh` / `--source codex,dsh`
+        // `all` = 全部已注册来源。
+        const parts = takeValue(i, arg).split(',').map((part) => part.trim()).filter((part) => part !== '')
+        if (parts.length === 0) throw new UsageError('--source 没有给出任何来源')
+        const known = registeredSources().map((adapter) => adapter.id)
+        for (const part of parts) {
+          // 未注册的来源必须在**参数层**就失败：安静地统计出 0 条，看起来与
+          // 「这台机器没用过那个客户端」一模一样，而两者的处置完全不同。
+          if (part !== 'all' && !known.includes(part as SessionSource)) {
+            throw new UsageError(`未注册的来源：${part}（已支持：${known.join(' / ')}；用 all 表示全部）`)
+          }
+        }
+        opts.sources = [...(opts.sources ?? []), ...parts]
+        i++
+        break
+      }
+      // ── 来源目录：`--<来源>-home`（可重复）/ `--<来源>-homes`（一次给多个）──
+      case '--codex-home': {
+        opts.sourceHomes.codex = [...(opts.sourceHomes.codex ?? []), takeValue(i, arg)]
+        i++
+        break
+      }
+      case '--codex-homes': {
+        const parts = splitHomeList(takeValue(i, arg))
+        if (parts.length === 0) throw new UsageError('--codex-homes 没有给出任何有效路径')
+        opts.sourceHomes.codex = [...(opts.sourceHomes.codex ?? []), ...parts]
+        i++
+        break
+      }
+      case '--claude-home': {
+        opts.sourceHomes['claude-code'] = [...(opts.sourceHomes['claude-code'] ?? []), takeValue(i, arg)]
+        i++
+        break
+      }
+      case '--claude-homes': {
+        const parts = splitHomeList(takeValue(i, arg))
+        if (parts.length === 0) throw new UsageError('--claude-homes 没有给出任何有效路径')
+        opts.sourceHomes['claude-code'] = [...(opts.sourceHomes['claude-code'] ?? []), ...parts]
+        i++
+        break
+      }
+      case '--trae-home': {
+        opts.sourceHomes.trae = [...(opts.sourceHomes.trae ?? []), takeValue(i, arg)]
+        i++
+        break
+      }
+      case '--trae-homes': {
+        const parts = splitHomeList(takeValue(i, arg))
+        if (parts.length === 0) throw new UsageError('--trae-homes 没有给出任何有效路径')
+        opts.sourceHomes.trae = [...(opts.sourceHomes.trae ?? []), ...parts]
+        i++
+        break
+      }
+      case '--trae-cn-home': {
+        opts.sourceHomes['trae-cn'] = [...(opts.sourceHomes['trae-cn'] ?? []), takeValue(i, arg)]
+        i++
+        break
+      }
+      case '--trae-cn-homes': {
+        const parts = splitHomeList(takeValue(i, arg))
+        if (parts.length === 0) throw new UsageError('--trae-cn-homes 没有给出任何有效路径')
+        opts.sourceHomes['trae-cn'] = [...(opts.sourceHomes['trae-cn'] ?? []), ...parts]
+        i++
+        break
+      }
+      case '--workbuddy-home': {
+        opts.sourceHomes.workbuddy = [...(opts.sourceHomes.workbuddy ?? []), takeValue(i, arg)]
+        i++
+        break
+      }
+      case '--workbuddy-homes': {
+        const parts = splitHomeList(takeValue(i, arg))
+        if (parts.length === 0) throw new UsageError('--workbuddy-homes 没有给出任何有效路径')
+        opts.sourceHomes.workbuddy = [...(opts.sourceHomes.workbuddy ?? []), ...parts]
+        i++
+        break
+      }
+      case '--no-codex':
+        opts.noCodex = true
+        break
+      case '--no-claude-code':
+        opts.noClaudeCode = true
+        break
+      case '--no-trae':
+        opts.noTrae = true
+        break
+      case '--no-trae-cn':
+        opts.noTraeCn = true
+        break
+      case '--no-workbuddy':
+        opts.noWorkbuddy = true
         break
       case '--data-dir':
         opts.dataDir = takeValue(i, arg)
@@ -614,17 +787,29 @@ function renderDimension(rows: GroupRow[], dim: GroupDimension, top: number): st
   const shown = top > 0 ? rows.slice(0, top) : rows
   const suffix = top > 0 && rows.length > top ? `（共 ${rows.length} 组，显示前 ${top}）` : ''
   const label = dimLabel(dim)
-  return formatGroupTable(shown, `${label}${suffix}`)
+  // 来源进分组键的维度 ⇒ 表格多一列「来源」（键的首段就是它，见 `groupKey()`）；
+  // 既然来源已经单列，分组列就不再重复那个前缀。
+  const sourceOf = dim === 'source' || dim === 'source-provider-model'
+    ? (row: GroupRow) => row.key.split('/')[0]!
+    : undefined
+  const labelOf = dim === 'source-provider-model'
+    ? (row: GroupRow) => row.key.split('/').slice(1).join('/')
+    : undefined
+  return formatGroupTable(shown, `${label}${suffix}`, sourceOf, labelOf)
 }
 
 function dimLabel(dim: GroupDimension): string {
   switch (dim) {
+    case 'source':
+      return '按来源 (source)'
     case 'provider':
       return '按厂商 (provider)'
     case 'model':
       return '按模型 (model)'
     case 'provider-model':
       return '按厂商 / 模型 (provider/model)'
+    case 'source-provider-model':
+      return '按来源 / 厂商 / 模型 (source/provider/model)'
     case 'project':
       return '按项目 (cwd)'
     case 'session':
@@ -634,6 +819,22 @@ function dimLabel(dim: GroupDimension): string {
     case 'hour':
       return '按小时 (hour)'
   }
+}
+
+/**
+ * 终端表格实际使用的维度。
+ *
+ * ★ 多来源（DSH + Codex + …）时把默认的 `provider-model` 换成
+ *   `source-provider-model`：否则同一行会**混两个来源的数字**，
+ *   而这一行里没有任何一列能说明「这个数字是谁的」——
+ *   把两个来源并成一行是**信息被销毁**，不是「看得更简洁」。
+ *
+ * 单来源时保持 `provider-model` 不动：那时来源恒为同一个值，
+ * 多一列只是噪音，而「命令行输出无谓变化」本身也是一种成本。
+ */
+function terminalDimensions(by: GroupDimension[], sources: readonly string[]): GroupDimension[] {
+  if (sources.length <= 1) return by
+  return by.map((dim) => (dim === 'provider-model' ? 'source-provider-model' : dim))
 }
 
 /**
@@ -648,7 +849,7 @@ function dimLabel(dim: GroupDimension): string {
  * 两者在多根场景下**可能不同**（例如显式配了单根、或关掉了发现），
  * 打在一起才不会让人把「配了什么」与「读了什么」混为一谈。
  */
-async function printDiscover(paths: ResolvedPaths): Promise<number> {
+async function printDiscover(paths: ResolvedPaths, opts: CliOptions): Promise<number> {
   const report = discoverDshHomesDetailed()
   const inspections = await inspectSessionRoots(resolveSessionsRoots(report.homes))
 
@@ -676,6 +877,41 @@ async function printDiscover(paths: ResolvedPaths): Promise<number> {
     '',
     '  固定统计范围: --dsh-home <p>（可重复）或 DSH_TOKEN_REPORT_DSH_HOMES',
     '  关闭自动发现: DSH_TOKEN_REPORT_DISCOVER=0',
+  )
+
+  // ★ 其它来源（Codex / Claude Code 等）也要逐个根报出来：多来源下
+  //   「我加了 --claude-home 数字没变」必须能分辨是「镜像去重」「目录不存在」
+  //   还是「来源没被选中」—— 三者在这个命令的输出里必须长得不一样。
+  lines.push('', '=== 其它来源 ===')
+  const otherRoots = resolveSourceRoots({
+    sources: registeredSources().map((adapter) => adapter.id).filter((id) => id !== 'dsh'),
+    homes: opts.sourceHomes,
+  })
+  if (otherRoots.roots.length === 0 && otherRoots.missing.length === 0 && otherRoots.disabled.length === 0) {
+    lines.push('  (没有发现其它来源的日志目录)')
+  }
+  for (const root of otherRoots.roots) {
+    // ★ 巡检走这个来源**自己的**实现（拿 DSH 的巡检去数 Codex 的日期目录会报 0/0）。
+    const adapter = registeredSources().find((item) => item.id === root.source)
+    const info = adapter?.inspect === undefined ? null : await adapter.inspect(root)
+    lines.push(
+      `  [✓] [${root.source}] ${root.path}${root.secondary ? '（次要副本）' : ''}`,
+      info === null
+        ? '        会话 - / 日志 -（该来源未提供巡检）'
+        : `        会话 ${fmtInt(info.sessions)} / 日志 ${fmtInt(info.files)} / 最新写入 ${
+          info.latestMs === null ? '-' : fmtTime(info.latestMs)}`,
+    )
+    if (info?.error !== undefined) lines.push(`        ⚠ ${info.error}`)
+  }
+  for (const root of otherRoots.missing) lines.push(`  [✗] [${root.source}] ${root.path}（不存在）`)
+  for (const id of otherRoots.disabled) lines.push(`  [关闭] ${id}（由环境开关关闭）`)
+  lines.push(
+    '',
+    '  指定来源目录: --codex-home <p> / --claude-home <p> / --trae-home <p> / --trae-cn-home <p>',
+    '                / --workbuddy-home <p>（均可重复）',
+    '  对应环境变量: DSH_TOKEN_REPORT_CODEX_HOMES / DSH_TOKEN_REPORT_CLAUDE_HOMES',
+    '                / DSH_TOKEN_REPORT_TRAE_HOMES / DSH_TOKEN_REPORT_TRAE_CN_HOMES',
+    '                / DSH_TOKEN_REPORT_WORKBUDDY_HOMES',
     '',
   )
   process.stdout.write(lines.join('\n'))
@@ -694,20 +930,26 @@ async function printDiscover(paths: ResolvedPaths): Promise<number> {
  * 多套 DSH 并存时「读了哪几处」必须打印出来 —— 否则「我加了一个 home 数字没变」
  * 无法区分是**镜像去重**（正确）还是**那个根根本没读到**（错误）。
  */
-function describeRoots(roots: readonly string[]): string {
+function describeRoots(roots: readonly string[], dshOnly = true): string {
   if (roots.length === 0) return '(未配置)'
   if (roots.length === 1) return roots[0]!
-  return `${roots.length} 个 DSH home: ${roots.join(' + ')}`
+  // 多来源时不能再说「N 个 DSH home」——那会把 Codex 的根也说成 DSH 的。
+  return dshOnly
+    ? `${roots.length} 个 DSH home: ${roots.join(' + ')}`
+    : `${roots.length} 个会话日志根: ${roots.join(' + ')}`
 }
 
 function describeSource(
   source: 'sql' | 'scan',
   paths: ResolvedPaths,
   dbStats: { events: number; earliest: number | null; latest: number | null } | null,
+  /** 本次**实际读取**的根（多来源时必须按来源报，不能报 DSH 的根当成全部）。 */
+  roots: readonly string[],
+  dshOnly = true,
 ): string {
-  if (source === 'scan') return `直扫日志 ${describeRoots(paths.sessionsRoots)}`
+  if (source === 'scan') return `直扫日志 ${describeRoots(roots, dshOnly)}`
   const count = dbStats?.events ?? 0
-  return `本地库 ${paths.dbPath}（${fmtInt(count)} 条记录；来源 ${describeRoots(paths.sessionsRoots)}）`
+  return `本地库 ${paths.dbPath}（${fmtInt(count)} 条记录；来源 ${describeRoots(roots, dshOnly)}）`
 }
 
 /**
@@ -826,8 +1068,99 @@ async function main(): Promise<number> {
 
   const paths = resolvePaths({ dshHomes: opts.dshHomes, dataDir: opts.dataDir })
 
+  // ★ 来源根（多客户端）：`--source` 显式给出即**完全接管**；**不给 = 全部已注册来源**
+  //   （逐个去掉用 `--no-<来源>`，或环境开关 `DSH_TOKEN_REPORT_<来源>=0`）。
+  //   ⚠️ 缺省曾经是**纯 DSH**：那是在 Codex 的本地库与页面还没落地时定的，为的是
+  //      「DSH 结果无回归」。四个来源（codex / claude-code / trae / trae-cn / workbuddy）
+  //      各自都有适配器 + 格式哨兵之后，缺省的代价从「数字悄悄变」变成「数字可解释」，
+  //      所以这里翻成全部来源 —— 与 `CliOptions.sources` 的注释、`--help` 一致。
+  //   🚨 翻转的代价必须说清楚：`bun run stats --period today` 的数字会比以前**大**
+  //      （本机实测 Codex 就有 5.5B 量级）。想回到旧口径：`--source dsh`。
+  const explicitSources = opts.sources
+  const knownSources = registeredSources().map((adapter) => adapter.id)
+  const wantsAll = explicitSources?.includes('all') === true
+  // ★ 缺省不是「**全部**已注册来源」，而是「**没被环境开关关掉**的那些」。
+  //
+  //   来源开关（`SessionSourceAdapter.disableEnv`，如 `DSH_TOKEN_REPORT_CODEX=0`）
+  //   在 `resolveSourceRoots()` 里只在**没有显式 sources** 时才生效，因为
+  //   「显式指定即接管」——否则 preload 把开关全设成 0 之后，
+  //   `verify:*` 与单测里的 `resolveSourceRoots({ sources: ['codex'] })` 会一条也拿不到
+  //   （那是它们唯一的数据来源）。
+  //   而 CLI 这一层**永远**把清单显式传下去，于是开关在这里被整个跳过：
+  //   实测 `DSH_TOKEN_REPORT_CODEX=0 bun run stats` 与不设时读的根**逐字相同**
+  //   （2.8 GB 的 Codex 日志照扫）—— 使用者以为自己关掉了它，不报错，只是慢 + 数字里多了别的来源。
+  //   所以缺省这一刻必须由这里读开关（判据与 `resolveSourceRoots` 同一份实现）。
+  const enabledByEnv = registeredSources()
+    .filter((adapter) => adapter.disableEnv === undefined || !envFlagOff(process.env[adapter.disableEnv]))
+    .map((adapter) => adapter.id)
+  const disabledByEnv = knownSources.filter((id) => !enabledByEnv.includes(id))
+  // 先按 `--source` 定出这次**想**统计哪些来源，再让 `--no-*` 开关去减 ——
+  // 冲突判定必须发生在「减掉」之前，否则 `--no-codex --source codex`
+  // 会被减成一个空表，而「空表」在下面等同于「缺省 = 全部来源」，静默变成全来源统计。
+  const requestedSources = (explicitSources !== undefined && explicitSources.length > 0
+    ? (wantsAll ? knownSources : explicitSources.filter((id) => id !== 'all'))
+    : enabledByEnv) as SessionSource[]
+  if (opts.noCodex === true && !requestedSources.includes('dsh')) {
+    // `--no-codex` 与「只选了 Codex」是自相矛盾的组合，明确拒绝而不是猜。
+    throw new UsageError('--no-codex 与只选 Codex 的 --source 冲突')
+  }
+  if (opts.noClaudeCode === true && !requestedSources.includes('dsh')) {
+    // `--no-claude-code` 同理：它只在「DSH 是其中之一」时才有意义。
+    throw new UsageError('--no-claude-code 与只选别的来源的 --source 冲突')
+  }
+  // `--no-trae` / `--no-trae-cn` 同理，但这两个**分别**对应 Trae 的两个发行版：
+  // 国际版与国内版是两个来源，所以必须是两个开关（见 `sources/trae.ts` 文件头）。
+  if (opts.noTrae === true && !requestedSources.includes('dsh')) {
+    throw new UsageError('--no-trae 与只选别的来源的 --source 冲突')
+  }
+  if (opts.noTraeCn === true && !requestedSources.includes('dsh')) {
+    throw new UsageError('--no-trae-cn 与只选别的来源的 --source 冲突')
+  }
+  if (opts.noWorkbuddy === true && !requestedSources.includes('dsh')) {
+    throw new UsageError('--no-workbuddy 与只选别的来源的 --source 冲突')
+  }
+  // `--no-codex` / `--no-claude-code` / … 表达的是「本次别并进这个来源」，不是「只要这一个」。
+  // ⚠️ 这几个开关在早先版本里**收了却没人用**（症状：加了 `--no-codex`，数字一点没变）。
+  // ★ 用一张表而不是继续堆三元表达式：每加一个来源只加一行，漏一行的症状正是上面那句话。
+  const suppressed: ReadonlyArray<readonly [SessionSource, boolean]> = [
+    ['codex', opts.noCodex === true],
+    ['claude-code', opts.noClaudeCode === true],
+    ['trae', opts.noTrae === true],
+    ['trae-cn', opts.noTraeCn === true],
+    ['workbuddy', opts.noWorkbuddy === true],
+  ]
+  const removed = new Set(suppressed.filter(([, on]) => on).map(([id]) => id))
+  const chosenSources = requestedSources.filter((id) => !removed.has(id))
+  if (chosenSources.length === 0) {
+    // 全被 `--no-*` 减掉了。交给 `resolveSourceRoots` 会得到「没指定来源」⇒ 缺省全部来源，
+    // 也就是**恰好相反**的结果，所以必须在这里明确拒绝。
+    throw new UsageError('--no-* 开关把 --source 给的来源全都去掉了，没有来源可统计')
+  }
+  const sourceRoots = resolveSourceRoots({
+    sources: chosenSources,
+    homes: opts.sourceHomes,
+  })
+  // 纯 DSH 的一次运行保留改动前的**文案与根清单**（错误信息、`--discover`、走库的判定都不动）；
+  // ⚠️ 但**数字**不再等价于「库里的全部来源」—— `openStats` 会显式收到 `sources: ['dsh']`，
+  //    否则库里别的来源的行（CLI 缺省运行入进去的）会被算成 DSH 的（见下面 openStats 处的注释）。
+  const pureDsh = sourceRoots.sources.length === 1 && sourceRoots.sources[0] === 'dsh'
+  // 「本机有别的客户端日志、但这次没统计」必须说出来：否则「没看到 Codex / Claude Code」
+  // 分不清是没跑过、还是没选来源 —— 两种情况的输出完全一样。
+  // 逐个来源报（而不是只报 Codex）：多客户端之后，漏报一个来源就少一条线索。
+  if (pureDsh && !opts.quiet) {
+    for (const id of knownSources) {
+      if (id === 'dsh') continue
+      const other = resolveSourceRoots({ sources: [id], homes: opts.sourceHomes })
+      if (other.roots.length > 0) {
+        process.stderr.write(
+          `ⓘ 检测到 ${id} 会话目录，本次未统计（加 --source ${id}，或 --source all 统计全部来源）\n`,
+        )
+      }
+    }
+  }
+
   // `--discover`：只回答「本机有哪些 DSH home」，不统计、不碰库。
-  if (opts.discover) return printDiscover(paths)
+  if (opts.discover) return printDiscover(paths, opts)
 
   // 🚨 `pricing sync` **不读会话日志**，所以必须在「有没有会话目录」这道检查之**前**分派：
   //   一台还没装 DSH、或 home 在别处的机器，正是最需要先把单价同步下来的情形，
@@ -838,7 +1171,31 @@ async function main(): Promise<number> {
   //   多写了一个暂时不存在的 home（外接盘没插、客户端刚卸载）不该让整个命令挂掉，
   //   但也不能静默：`⚠` 那行是使用者分辨「镜像去重」与「根本没读到」的唯一线索。
   const missingRoots = paths.sessionRoots.filter((info) => !info.exists)
-  if (!paths.sessionsRootExists) {
+  if (!pureDsh) {
+    // 多来源：根的存在性判定改用「带来源的根清单」，否则 `--source codex`
+    // 在没装 DSH 的机器上会被 DSH 的那道检查拦下（报错与真正的原因毫无关系）。
+    if (sourceRoots.roots.length === 0) {
+      // 关掉的来源要一起报：否则「这台机器没有 Codex 目录」与
+      // 「你自己把 Codex 关了」在输出上完全一样（都是空列表 + 报错）。
+      // ⚠️ `sourceRoots.disabled` 只在「没显式给 sources」时才有值，而 CLI 永远显式给，
+      //    所以这里必须并上本层读出来的 `disabledByEnv`（见上面那段注释）。
+      const disabledAll = [...new Set([...sourceRoots.disabled, ...disabledByEnv])]
+      process.stderr.write(
+        `错误: 没有可用的会话目录。\n` +
+          sourceRoots.missing.map((root) => `  [${root.source}] ${root.path}`).join('\n') +
+          (disabledAll.length > 0 ? `\n被开关关闭的来源：${disabledAll.join(', ')}\n` : '') +
+          `\n请用 --source 选择来源，--dsh-home / --codex-home / --claude-home / --trae-home / --trae-cn-home / --workbuddy-home 指定目录（均可重复）。\n` +
+          `想看本机有哪些来源目录: --discover\n`,
+      )
+      return 1
+    }
+    if (sourceRoots.missing.length > 0) {
+      process.stderr.write(
+        `⚠ 以下来源目录不存在，已跳过（逐项列出，不静默）：\n` +
+          sourceRoots.missing.map((root) => `    [${root.source}] ${root.path}`).join('\n') + '\n',
+      )
+    }
+  } else if (!paths.sessionsRootExists) {
     process.stderr.write(
       `错误: 没有可用的会话目录。\n` +
         missingRoots.map((info) => `  ${info.root}`).join('\n') +
@@ -876,7 +1233,9 @@ async function main(): Promise<number> {
 
   // 子命令分派：report 走增量上报，web 起本地服务，都不进入统计流程
   if (opts.command === 'report') {
-    return runReportCommand(opts, paths.sessionsRoots)
+    // ★ 上报要带**全部已选来源**（不只是 DSH）：给 `runReport` 的是非 DSH 的那批根，
+    //   DSH 走它自己的分帧水位线（`sessionsRoot`），两者共用同一份 state.json。
+    return runReportCommand(opts, paths.sessionsRoots, sourceRoots.roots.filter((root) => root.source !== 'dsh'))
   }
   if (opts.command === 'web') {
     return runWebCommand(opts, paths)
@@ -904,7 +1263,25 @@ async function main(): Promise<number> {
   //   `--no-db` 强制走直扫日志，用于与库结果做对照验证（两条路径必须给出同一个数）。
   const session = await openStats({
     // ★ 一组根：库路径与直扫路径吃的是同一个入参，两者必然给出同一个并集。
-    sessionsRoot: paths.sessionsRoots,
+    //   多来源时改用带类型的根清单（非 DSH 来源在库路径落地之前会**明说**改走直扫）。
+    sessionsRoot: pureDsh ? paths.sessionsRoots : sourceRoots.roots.map((root) => root.path),
+    // 🚨 **来源筛选两条分支都必须给**（纯 DSH 也要）。
+    //   本地库是四种形态**共用的一个文件**，只要这台机器上跑过一次缺省运行或
+    //   `--source all`，库里就躺着别的来源的行；而 `sources` 的缺省语义是
+    //   「库里的**全部**来源」——
+    //   于是 `--source dsh`（文档里那句「想回到旧口径」）会静默返回并集。
+    //   实测本机：先 `--source all` 再 `--source dsh`，两次总量**逐位相同**
+    //   （326,041,147），`--by source` 里还挂着 workbuddy —— 这正是最危险的
+    //   「看起来完全正常」的错数字。
+    //   ⚠️ 代价：显式收窄来源会绕过汇总表（`usage_rollup_*` 的键里没有来源，
+    //   见 `openStats` 的 `scoped`）—— 库很大时纯 DSH 查询会比以前慢一点，
+    //   但「快而错」不是可选项。
+    sources: pureDsh ? ['dsh'] : sourceRoots.sources,
+    ...(pureDsh ? {} : {
+      sourceRoots: sourceRoots.roots,
+      // 缺失的来源根也要报出来（它们不在 `sessionsRoot` 那个路径数组里）。
+      ...(sourceRoots.missing.length > 0 ? { missingRoots: sourceRoots.missing.map((root) => root.path) } : {}),
+    }),
     dbPath: paths.dbPath,
     rollup: true,
     ...(opts.period ? { period: opts.period } : {}),
@@ -923,6 +1300,15 @@ async function main(): Promise<number> {
         },
   })
   if (!opts.quiet) process.stderr.write('\r' + ' '.repeat(40) + '\r')
+
+  // 本次**实际读取**的根：纯 DSH 时与改动前逐字一致；多来源时按带类型的根清单报
+  // （报 DSH 的根当全部 = 来源不可见，而「数字是谁的」正是多来源下第一个要回答的问题）。
+  const effectiveRoots = pureDsh ? paths.sessionsRoots : sourceRoots.roots.map((root) => root.path)
+
+  // ★ 多来源时把默认维度升级成带来源的组合维度（表格因此多一列「来源」）。
+  //   使用者**显式**给了 `--by` 就尊重他的选择：那时他已经在指定要看的切面，
+  //   替他改写等于把「我明明筛了 provider-model」变成一个谜题。
+  if (opts.byExplicit !== true) opts.by = terminalDimensions(opts.by, sourceRoots.sources)
 
   // 普通统计直接复用压缩索引的分组，只有交叉表和 JSON 的 provider 趋势需要原始记录。
   // 百万记录不能为了打印前 30 行而全部搬到 CLI 内存重新聚合。
@@ -1011,8 +1397,8 @@ async function main(): Promise<number> {
       // 数据目录一并给出：身份 / 本地库都在那里，排查「读的是哪一份」时
       // 只看 home 会得到错误答案（两者现在是独立的）。
       dataDir: paths.dataDir,
-      sessionsRoots: paths.sessionsRoots,
-      sessionsRoot: paths.sessionsRoot,
+      sessionsRoots: effectiveRoots,
+      sessionsRoot: effectiveRoots[0] ?? paths.sessionsRoot,
       // 给了但不存在、因而被跳过的根（「加了 home 数字没变」要能分辨原因）
       ...(missingRoots.length > 0 ? { missingRoots: missingRoots.map((info) => info.root) } : {}),
       // 数据源与是否降级：脚本消费方据此判断这次数字的可信度与新鲜度
@@ -1046,8 +1432,15 @@ async function main(): Promise<number> {
             cacheRead: p.counts.cacheRead,
             calls: p.counts.calls,
             cacheHitRate: p.metrics.cacheHitRate,
+            // ⚠️ 供应商键**排序**后再输出：`byProvider` 的插入顺序取决于记录被并进
+            //   桶里的先后（库路径按 `ts` 取、直扫按文件顺序），所以同一个桶在两条路径上
+            //   会给出**同一个映射、不同的键序**。JSON 对象本身无序，数字不受影响；
+            //   但「库 == 直扫」在本仓是被逐字对照的契约（本机 `--source all` 实测：
+            //   133 个桶的数值全等，只有 8 个桶的键序不同 ⇒ 看着像不一致）。
             byProvider: Object.fromEntries(
-              [...p.byProvider].map(([k, v]) => [k, v.total]),
+              [...p.byProvider]
+                .sort(([a], [b]) => a.localeCompare(b))
+                .map(([k, v]) => [k, v.total]),
             ),
           }))
         : undefined,
@@ -1103,7 +1496,7 @@ async function main(): Promise<number> {
 
   // 终端表格输出
   const out: string[] = []
-  out.push(`DSH token 统计  |  ${describeRangeFull(range)}  |  数据源 ${describeSource(source, paths, dbStats)}`)
+  out.push(`DSH token 统计  |  ${describeRangeFull(range)}  |  数据源 ${describeSource(source, paths, dbStats, effectiveRoots, pureDsh)}`)
   if (source === 'scan' && !opts.noDb) {
     // 降级必须显式告警：用户会明显感觉变慢，不说清原因会被当成「库没生效」
     out.push(`⚠ ${degradedReason ?? '本次走直扫日志'}（用 --no-db 可显式指定）`)
@@ -1398,7 +1791,7 @@ function topSlice<T>(rows: T[], top: number): T[] {
  * - `2` 参数错误
  * - `3` 投递失败（pending 已保留，下一轮会重试）
  */
-async function runReportCommand(opts: CliOptions, sessionsRoots: string[]): Promise<number> {
+async function runReportCommand(opts: CliOptions, sessionsRoots: string[], plainRoots: SourceRoot[] = []): Promise<number> {
   const r = opts.report
   // ⚠️ 状态文件只由 dataDir 决定（多根共用同一份水位文件）：
   //   水位按**绝对路径**索引，多根并存天然不冲突，推进顺序也保持一致。
@@ -1470,6 +1863,9 @@ async function runReportCommand(opts: CliOptions, sessionsRoots: string[]): Prom
       dataDir: opts.dataDir,
       statePath,
       deliver,
+      // ★ 非 DSH 来源一起上报：不传它们的话，看板上的来源列永远是 `dsh`
+      //   （而「没上报」与「没跑过那个客户端」在页面上长得一模一样）。
+      ...(plainRoots.length > 0 ? { plainRoots } : {}),
       dryRun: r.dryRun,
       noSave: r.noSave,
       onProgress: opts.quiet
@@ -1504,6 +1900,20 @@ async function runReportCommand(opts: CliOptions, sessionsRoots: string[]): Prom
   out.push(
     `会话文件  ${result.scan.files.length} 个（未变化跳过 ${result.scan.skippedUnchanged} 个，实际解压 ${result.scan.diagnostics.filesScanned} 个）`,
   )
+  // ★ 非 DSH 来源本轮的情况：`plain` 缺席 = 这次根本没扫它们（老调用点），
+  //   0 = 扫了但一个文件都没变。两者必须能分辨，否则「没扫」会被读成「没用量」。
+  if (result.plain) {
+    const bySource = new Map<string, number>()
+    for (const root of plainRoots) bySource.set(root.source, (bySource.get(root.source) ?? 0) + 1)
+    out.push(
+      `其它来源  ${[...bySource.keys()].sort().join(' + ') || '(none)'}（根 ${plainRoots.length} 个，` +
+        `解析 ${result.plain.filesScanned} 个文件、跳过 ${result.plain.skippedUnchanged} 个，` +
+        `本轮 ${fmtInt(result.plain.records)} 条）`,
+    )
+    if (result.plain.missingRoots.length > 0) {
+      out.push(`⚠ 以下来源目录不存在，已跳过：${result.plain.missingRoots.join(' / ')}`)
+    }
+  }
   if (result.scan.filteredBySeq > 0) {
     out.push(`⚠ 事件级水位线过滤 ${result.scan.filteredBySeq} 条（帧边界偏差时的兜底，通常为 0）`)
   }

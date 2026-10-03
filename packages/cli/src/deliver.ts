@@ -71,6 +71,10 @@ function toWireRecord(rec: UsageRecord): Record<string, unknown> {
     cwd: rec.cwd,
     turn: rec.turn,
     step: rec.step,
+    // ★ v9：来源随记录一起上报（`dsh` / `codex` / `claude-code` / `trae` /
+    //   `trae-cn` / `workbuddy`）。**不发它就等于告诉服务端「这是 DSH 的」**：
+    //   上报库的默认值是 `dsh`，而看板的来源筛选与来源排行正是按这一列出数的。
+    source: rec.source,
   }
 }
 
