@@ -178,6 +178,19 @@ export const CSS = calendarCss.replaceAll('.rdp-', '.atr-rdp-') + `
 .atr-detail-section{gap:8px}
 .atr-table-head{font-size:11px;margin-top:6px;padding:10px 12px;background:var(--dsw-specific-tip,var(--dsw-alias-bg-layer-1));border:0;border-radius:7px}
 .atr-row{grid-template-columns:minmax(130px,1fr) 110px 90px 80px;gap:12px;padding:13px 12px}
+/* 🚨 带金额时多一列，且**必须紧跟在上面那条 .atr-row 之后**。
+   两条规则特异性完全相同（都只有一个类），所以「5 条轨道」这件事
+   只由书写顺序决定：后出现的那条赢。这一层（对话详情）曾经漏了这条配对，
+   于是 .atr-row 的 4 条轨道盖掉了上一层 .atr-row-cost 的 5 条，
+   第 5 格（表头的「费用（估算）」与每行金额）被挤到第二行 ——
+   实测就是表头与数据行的金额各自单独占一行、缩在「明细」那列下面，
+   看着像整张表错位。不会报错，只会静默画错。
+   test/client/styles.test.ts 逐条钉住这处配对（本文件里 .atr-row
+   一共出现三次：紧凑层 / 对话层 / 窄屏层，每一处都要配一条）。
+   🚨 这段注释位于**模板字符串内部**，所以一个反引号都不能写：
+   它会提前结束字符串，整个模块直接无法解析（实测 typecheck 报 TS1005），
+   而按文本读取本文件的 styles.test.ts 却照常全绿。 */
+.atr-row-cost{grid-template-columns:minmax(130px,1fr) 110px 90px 80px minmax(96px,auto)}
 .atr-row-detail:last-child{border-bottom:0}
 .atr-row-detail summary{border-radius:7px;list-style:none}
 .atr-row-detail summary::-webkit-details-marker{display:none}
@@ -226,7 +239,10 @@ export const CSS = calendarCss.replaceAll('.rdp-', '.atr-rdp-') + `
 .atr-calendar-footer{display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid var(--dsw-alias-border-l1);margin-top:16px;padding-top:16px}.atr-calendar-footer>span{color:var(--dsw-alias-label-tertiary);font-size:11px}.atr-calendar-footer>div{display:flex;gap:8px}
 .atr-dialog .atr-primary{background:var(--atr-accent);border-color:var(--atr-accent);color:#fff}.atr-dialog .atr-primary:hover{filter:brightness(1.06)}
 .atr-calendar button:focus-visible,.atr-date-trigger:focus-visible,.atr-chart-data summary:focus-visible{outline:2px solid var(--atr-accent);outline-offset:2px}
-@media(max-width:700px){.atr-cells{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.atr-dialog .atr-card{padding:18px;gap:16px}.atr-mask{padding:8px}.atr-title{font-size:20px}.atr-row{grid-template-columns:minmax(70px,1fr) 65px 55px 58px;gap:6px;padding:12px 4px}.atr-cell{padding:16px}.atr-cell-v{font-size:24px}.atr-strip-metrics{gap:8px}.atr-strip-period{max-width:120px;overflow:hidden;text-overflow:ellipsis}.atr-section{padding:14px}.atr-chart{height:190px}.atr-filter-bar{gap:8px}.atr-filter-bar .atr-segmented{flex-basis:100%;justify-content:space-between}.atr-filter-bar .atr-segmented .atr-btn{padding:8px}.atr-calendar-popover{width:330px;padding:14px}.atr-calendar .atr-rdp-months{justify-content:center}.atr-calendar-footer{flex-wrap:wrap}.atr-calendar-footer>div{margin-left:auto}.atr-calendar-hint{font-size:10px}}
+@media(max-width:700px){.atr-cells{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.atr-dialog .atr-card{padding:18px;gap:16px}.atr-mask{padding:8px}.atr-title{font-size:20px}.atr-row{grid-template-columns:minmax(70px,1fr) 65px 55px 58px;gap:6px;padding:12px 4px}
+/* 窄屏同样要配对（见对话层那条注释）：少一条轨道，金额列就会被挤到第二行。 */
+.atr-row-cost{grid-template-columns:minmax(70px,1fr) 65px 55px 58px minmax(68px,auto)}
+.atr-cell{padding:16px}.atr-cell-v{font-size:24px}.atr-strip-metrics{gap:8px}.atr-strip-period{max-width:120px;overflow:hidden;text-overflow:ellipsis}.atr-section{padding:14px}.atr-chart{height:190px}.atr-filter-bar{gap:8px}.atr-filter-bar .atr-segmented{flex-basis:100%;justify-content:space-between}.atr-filter-bar .atr-segmented .atr-btn{padding:8px}.atr-calendar-popover{width:330px;padding:14px}.atr-calendar .atr-rdp-months{justify-content:center}.atr-calendar-footer{flex-wrap:wrap}.atr-calendar-footer>div{margin-left:auto}.atr-calendar-hint{font-size:10px}}
 @media(prefers-reduced-motion:reduce){.atr-dialog .atr-btn{transition:none}.atr-refresh[aria-busy="true"] svg{animation:none}.atr-calendar-popover{animation:none}.atr-date-trigger .atr-chevron{transition:none}}
 @media(max-width:700px){.atr-dialog .atr-card{padding:0;gap:0}.atr-page-head{padding:18px 18px 0;gap:16px}.atr-body{padding:16px 18px 18px;gap:16px}.atr-heading-actions{gap:6px}}
 @media(max-height:760px){.atr-calendar-popover{max-height:calc(90vh - 220px);overflow:auto;overscroll-behavior:contain}

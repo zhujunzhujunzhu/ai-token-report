@@ -248,6 +248,22 @@ describe('详情体', () => {
   })
 })
 
+/**
+ * 明细表头的格子。
+ *
+ * 格子数必须等于 CSS 里 `.atr-row-cost` 的轨道数（配对规则见
+ * `styles.test.ts`）。轨道少一条时，浏览器会把最后一格**挤到第二行** ——
+ * 表头的「费用（估算）」与每行金额各自单独占一行、缩在「明细」列下面，
+ * 整张表看着像错位。HTML 本身完全看不出这件事（类名都是对的），
+ * 所以两边各钉一半：这里钉格子数，样式那份钉轨道数。
+ */
+function headerCells(html: string, withCost: boolean): string[] {
+  const pattern = withCost
+    ? /<div class="atr-row atr-row-cost atr-table-head">((?:<span>[^<]*<\/span>)+)<\/div>/
+    : /<div class="atr-row atr-table-head">((?:<span>[^<]*<\/span>)+)<\/div>/
+  return pattern.exec(html)?.[1]?.match(/<span>[^<]*<\/span>/g) ?? []
+}
+
 describe('★ 金额（估算）在面板里的三态', () => {
   /**
    * 三种载荷必须画出**三种不同的东西**：
@@ -269,6 +285,7 @@ describe('★ 金额（估算）在面板里的三态', () => {
     expect(html).not.toContain('¥0.00')
     // 明细表头也不该多出金额列
     expect(html).not.toContain('atr-row-cost')
+    expect(headerCells(html, false)).toHaveLength(4)
   })
 
   test('一条价都没配上 → 写「未计价」，并且不写 ¥0.00', async () => {
@@ -301,6 +318,10 @@ describe('★ 金额（估算）在面板里的三态', () => {
     })
     const html = renderToStaticMarkup(createElement(UsageDetail, { state: store.getSnapshot(), store }))
     expect(html).toContain('费用（估算）')
+    // 表头 5 格，且金额列排在最后 —— 与 CSS 的 5 条轨道一一对应
+    const head = headerCells(html, true)
+    expect(head).toHaveLength(5)
+    expect(head.at(-1)).toBe('<span>费用（估算）</span>')
     // 多币种**原样**显示：页面不做任何换算（那是第二个口径实现）
     expect(html).toContain('¥12.35 + $0.5000')
     expect(html).toContain('本机单价快照')
