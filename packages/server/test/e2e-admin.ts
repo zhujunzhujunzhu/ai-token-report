@@ -277,8 +277,8 @@ try {
   // ★ 这就是使用者要的效果：`dashscope` 与 `fixture` 都折进各自配好的名字里。
   assert(collapsedKeys.includes('bailian-tpp') && collapsedKeys.includes('验收供应商')); checks++
   equal(collapsedKeys.includes('dashscope') || collapsedKeys.includes('fixture'), false, '配过规则的原始名不再作为分组出现')
-  // `provider-model` 组合维度：此刻只有**供应商**规则，所以只换 provider 那一段 ——
-  // 模型名原样保留（模型规则一配，那一段也会折叠，见下面 v12 那一段）。
+  // `provider-model` 组合维度：此刻还没有任何**模型**规则，所以只换 provider 那一段 ——
+  // 模型名原样保留（模型规则一配，那一段也会折叠，见 `model-alias.test.ts`）。
   const modelKeys = (await request(a, 'stats/breakdown?identity_view=member&by=provider-model')).data.rows.map((entry: any) => entry.key)
   assert(modelKeys.includes('验收供应商/fixture')); checks++
   assert(modelKeys.includes('bailian-tpp/fixture')); checks++
@@ -337,59 +337,6 @@ try {
   // 🚨 事实表一个字节都没被改写：归一化只是查询侧的表达式。
   const rawProviders = (await request(a, 'stats/records?identity_view=member')).data.rows.map((row: any) => row.providerRaw ?? row.provider)
   assert(rawProviders.includes('fixture') && rawProviders.includes('dashscope')); checks++
-
-  // ── ★ v12 模型归一化：与供应商同一套机制，折叠的是 `model` ──
-  // 这一段的重点是「**一条规则只折叠一个维度**」与「两类规则可以落在同一个原始值上」：
-  //   `coexist-demo` 既是供应商名也被配成模型规则的限定供应商，两条规则必须能并存 ——
-  //   v12 把唯一索引换成 `(member_id, provider, model)` 正是为了这一步。
-  // 先补一条**另一个模型名**的用量：归一化的意义就是把它折进同一个口径。
-  equal((await request(b, 'token-usage', aliasSecret, { schemaVersion: 1, client: {}, generatedAt: new Date().toISOString(), records: [{ ...event('v12:model:1'), model: 'fixture-v2' }] })).data.accepted, 1, '补一条另一个模型名的用量')
-  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: '*', model: 'fixture', alias: '统一模型' })).status, 200, '★ 任意供应商的模型规则可配置（provider = *）')
-  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: '*', model: 'fixture-v2', alias: '统一模型' })).status, 200, '另一个原始模型名可以折进同一个口径')
-  // ⚠️ 跨字段约束由服务端判定：`model` 为空时 `provider` 不能是 `*` ——
-  //   那是一条折叠「任意供应商的供应商名」的规则，永远匹配不到任何用量。
-  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: '*', alias: 'x' })).status, 400, '★ 供应商规则不能「任意供应商」（那是一条永远不命中的规则）')
-  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: 'fixture', model: 'fixture ', alias: 'ok' })).status, 400, '模型名首尾空格是 400（它会静默不命中）')
-  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: 'fixture', model: 'fixture', alias: 'a/b' })).status, 400, '模型规则的归一化名同样不能带 /（拼接歧义）')
-
-  // 按模型维度：两个原始模型名折成一行 —— 而且**只有**这一行。
-  const byModel = (await request(a, 'stats/breakdown?identity_view=member&by=model')).data.rows.map((entry: any) => entry.key)
-  equal(byModel, ['统一模型'], '★ 两个原始模型名折成同一个分组（库里只有这两个模型名）')
-  // 组合维度：**两段都折叠**。`v6:alias:2` 的供应商被供应商规则折成 `bailian-tpp`，
-  // 模型被模型规则折成 `统一模型` —— 只折一半的表现是「看起来像规则没生效」。
-  const comboKeys = (await request(a, 'stats/breakdown?identity_view=member&by=provider-model')).data.rows.map((entry: any) => entry.key)
-  assert(comboKeys.includes('bailian-tpp/统一模型')); checks++
-  equal(comboKeys.includes('bailian-tpp/fixture'), false, '组合维度里模型那一段也被折叠')
-  // ★ 明细同时给出模型的原值：它既是核对规则的地方，**也是计价用的键**。
-  const modelRows = (await request(a, 'stats/records?identity_view=member')).data.rows
-  equal(modelRows.find((row: any) => row.eventId === 'v6:alias:2').model, '统一模型', '明细里 model 是归一化名')
-  equal(modelRows.find((row: any) => row.eventId === 'v6:alias:2').modelRaw, 'fixture', '明细同时给出模型原值')
-  equal(modelRows.find((row: any) => row.eventId === 'v12:model:1').modelRaw, 'fixture-v2', '另一个原始模型名的原值同样保留')
-  // 🚨 事实表里的 model 同样是原值，归一化不改写一个字节。
-  const rawModels = (await request(a, 'stats/records?identity_view=member')).data.rows.map((row: any) => row.modelRaw ?? row.model)
-  assert(rawModels.includes('fixture') && rawModels.includes('fixture-v2')); checks++
-
-  // ★ 同一原始名上的供应商规则与模型规则**并存**（用库里没有用量的名字，
-  //   免得把上面的口径断言搅乱）：旧的两列唯一索引会把第二条挡在门外。
-  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: 'coexist-demo', alias: '并存的供应商规则' })).status, 200, '配一条供应商规则')
-  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: 'coexist-demo', model: 'm1', alias: '并存的模型规则' })).status, 200, '★ 同一原始名的模型规则也能配上（旧索引会把它挡在门外）')
-  equal((await request(a, 'admin/provider-aliases')).data.aliases.filter((entry: any) => entry.provider === 'coexist-demo').length, 2, '★ 两条规则并存，各占一行')
-
-  // ★ 限定供应商的模型规则**优先于**通配规则（`CASE` 分支顺序即语义）：
-  //   给 `dashscope` 单独配一条，那条用量的模型名就该变，而别家的仍走通配。
-  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: 'dashscope', model: 'fixture', alias: '百炼专属模型' })).status, 200, '限定供应商的模型规则可配置')
-  const scopedModelRows = (await request(a, 'stats/records?identity_view=member')).data.rows
-  equal(scopedModelRows.find((row: any) => row.eventId === 'v6:alias:2').model, '百炼专属模型', '★ 限定供应商的规则优先于通配')
-  equal(scopedModelRows.find((row: any) => row.eventId === 'v6:alias:1').model, '统一模型', '别家的同名模型仍走通配规则')
-
-  // ⚠️ 空串模型名会被折成「供应商规则」，而不是写出一条「模型名是空串」的幽灵规则。
-  equal((await request(a, 'admin/provider-aliases', adminToken, { scope: 'global', provider: 'openai', model: '', alias: '空串规则' })).data.alias.model, null, '★ 空串模型名按「供应商规则」落库（不会是空串模型名）')
-
-  // 清理这一段的规则：后面的用例断言的是供应商与项目口径，别让模型名与上面这些
-  // 临时名字影响它们。
-  for (const entry of (await request(a, 'admin/provider-aliases')).data.aliases.filter((item: any) => item.model !== null || ['coexist-demo', 'openai'].includes(item.provider))) {
-    equal((await request(a, 'admin/provider-aliases/delete', adminToken, { alias_id: entry.alias_id })).status, 200, '清理本段的归一化规则')
-  }
 
   // ── ★ v11 项目归一化：把散开的 cwd 折成一个项目口径 ──
   // 这一段的重点是**前缀语义**与供应商那套刻意不同之处：
