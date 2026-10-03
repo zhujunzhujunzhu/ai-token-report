@@ -18,10 +18,11 @@ DSH token 用量统计平台。四种形态：**CLI / 本地页面 / 部门看�
 
 ```bash
 bun install
-bun test                        # 全仓 1446 pass / 13 skip / 0 fail（设了 ATR_V4_TEST_MYSQL_URL 时 MySQL 用例实跑，否则跳过）
+bun test                        # 不带 MySQL：1610 pass / 13 skip / 0 fail；
+                                # 带 ATR_V4_TEST_MYSQL_URL：**1626 pass / 0 skip / 0 fail**（那 13 条 MySQL 用例实跑）
 bun run typecheck               # 7 个包全部 exit 0
 bun run build                   # web-local + web-portal 均构建成功
-bun run stats -- --period today # 终端统计（读本地库，热态 ~50ms）
+bun run stats -- --period today # 终端统计（读本地库：**热态 ~0.2s**；首次冷建库含全部来源 ~13s，见 benchmark:sources）
 bun run stats -- --period today --no-db   # 直扫日志（与库结果做对照）
 bun run stats -- --discover               # 本机有哪些 DSH home（逐根会话数 / 最新写入）
 bun run stats -- --dsh-home ~/.dsh --dsh-home "$env:APPDATA/dsh-desktop/harness"   # 固定多根
@@ -34,12 +35,16 @@ bun run dev:portal              # web-portal 开发服务器（5198，/api 代�
 
 # 上报链路端到端（真 HTTP，不是 mock；改上报相关代码后全跑）
 bun run packages/server/test/e2e-ingest.ts           # 服务端侧 POST /api/v1/token-usage（37 项）
-bun run packages/cli/verify/verify-report-ingest.ts  # ④整条链 CLI report → 服务端 → 库（28 项）
+bun run packages/cli/verify/verify-report-ingest.ts  # ④整条链 CLI report → 服务端 → 库（37 项；含★非 DSH 来源 Codex
+                                                    # 也上报、且 source 落到 usage_event.source —— 真 HTTP + 真库）
 
 # 人员管理与权限端到端（真 HTTP；改 admin 路由 / 数据库身份 / 角色后全跑）
 bun run packages/server/test/e2e-admin.ts            # 签发即刻生效 + 401/403 + 护栏 + appKey 列表 + 分组多对多 + 供应商归一化 + 模型单价 + 数据范围（185 项；`--mysql` 同款）
 
-# 分发面契约（99 项，含 S12.3 的静态托管断言与分组目录 / 供应商归一化 / 模型单价路由族 / 看板金额门禁 / **看板数据范围** / 旧路径 404；改 app.ts / 路由 / 方法 / 状态码后必跑）
+# 分发面契约（100 项，含 S12.3 的静态托管断言与分组目录 / 供应商归一化 / 模型单价路由族 / 来源目录 / 看板金额门禁 / **看板数据范围** / 旧路径 404；改 app.ts / 路由 / 方法 / 状态码后必跑）
+# ⚠️ 它里面有一条会**冷建本机库**（`GET /api/v1/local/stats/overview`，单条 5 秒超时）：
+#   与 `bun test` 全仓或其他重活**并发**跑会超时，并让临时目录清理跟着 `EBUSY` 失败（实测 2 条 fail）。
+#   要跑就单独跑（本仓实测 100 pass / 5.34s）。
 bun test packages/server/test/http-contract.test.ts
 
 # 双轨对照验证（真实日志上跑 SQL vs 直扫，断言两者逐位一致）
@@ -62,6 +67,55 @@ bun run --filter '@ai-token-report/core' verify:multi-home -- --real
 bun run --filter '@ai-token-report/core' benchmark:multi-home
 bun run --filter '@ai-token-report/core' benchmark:multi-home -- --real
 
+# ★ 多来源（纯文本：Codex / Claude Code / Trae / WorkBuddy）性能（8 项）：
+#   热态成本**只随文件数**走（每文件一次 stat，一条 JSON 都不解析）、冷态与直扫都随**字节数**走、
+#   只改一个文件时只重解析那一个、镜像根去重不省 IO。合成场景只用临时目录；
+#   `-- --real` 只读本机真实日志（库一律落临时目录）。改采集路径 / 加来源后必跑
+bun run --filter '@ai-token-report/core' benchmark:sources
+bun run --filter '@ai-token-report/core' benchmark:sources -- --real
+
+# ★ Codex 来源（rollout JSONL：Codex CLI / Desktop / VSCode 扩展共用）：
+#   格式哨兵（合成 30 项 + `--real` 34 项）。`--real` 只读本机 ~/.codex
+#   核心口径：`cached_input_tokens` 与 `cache_write_input_tokens` **都含在** `input_tokens` 内
+#   ⇒ 必须减（与 DSH 相反）；同一次调用会写两条同值 `token_count`（逐行相加正好翻倍，
+#   故按累计快照是否推进去重）；两代遥测并存时**先出现的代际说了算**；
+#   幂等键主体是**文件名里的 uuid**（信封 `session_id` 实测 51 个文件与文件名不符，
+#   多文件共用同一个信封 id ⇒ 拿它当键会静默丢数）。改适配器 / 升级 Codex 后必跑
+bun run --filter '@ai-token-report/core' verify:codex-format
+bun run --filter '@ai-token-report/core' verify:codex-format -- --real
+
+# ★ Claude Code 来源：格式哨兵（合成 15 项 + `--real` 7 项）。`--real` 只读本机 ~/.claude
+#   核心口径：同一次调用会被写成 1~4 行（message.id 相同、uuid 各不相同）——
+#   不去重则总量**正好翻倍**（本机实测 63,842,793 → 126,348,873）。
+#   改适配器 / 改四列映射 / 升 Claude Code 版本后必跑
+bun run --filter '@ai-token-report/core' verify:claude-code
+bun run --filter '@ai-token-report/core' verify:claude-code -- --real
+bun test packages/core/test/claude-code-source.test.ts
+
+# ★ Trae 来源（**两个发行版 = 两个来源**：国际版 trae / 国内版 trae-cn）：
+#   格式哨兵（合成 46 项 + `--real` 9 项）。`--real` 只读本机 %APPDATA%\Trae\logs
+#   核心口径：`prompt_tokens` **含** cache_read / cache_creation ⇒ 必须减
+#   （与 Claude Code **相反**；不减则总量 10,870,794 → 20,928,266，1.93 倍）。
+#   模型名不在用量事件里（`name` 实测恒空）⇒ model 恒 (unknown)、这一源配不上价；
+#   cwd 恒 null（一个日志文件实测跨 7 个工作区）。改适配器 / 升级 Trae 后必跑
+bun run --filter '@ai-token-report/core' verify:trae
+bun run --filter '@ai-token-report/core' verify:trae -- --real
+bun test packages/core/test/trae-source.test.ts
+
+# ★ WorkBuddy 来源（`~/.workbuddy/projects/<cwd 压缩名>/<sessionId>.jsonl`）：
+#   格式哨兵（合成 43 项 + `--real` 10 项）。`--real` 只读本机配置目录
+#   核心口径：`prompt_tokens` **含**缓存命中 ⇒ 必须减（与 Codex / Trae 同）；
+#   缓存字段顺序 = prompt_cache_hit_tokens > cache_read_input_tokens（后者实测恒为 0，
+#   写反则输入与缓存整块对调）；用量挂在「该响应的最后一行」**行类型不固定**
+#   （实测 3/4 落在 function_call，只认 message/assistant 会漏掉工具轮次）。
+#   **两代格式并存**：老代际（migratedFrom agent-history）没有缓存字段、每个用户轮次
+#   只落最后一次调用 ⇒ 命中率被系统性低估（`workbuddyUsageWithoutCache` 计数，本机 6/10）；
+#   其 `timestamp: 0` 必须跳过（退化成 1970 = 用量静默落到时间窗之外）。
+#   改适配器 / 升级 WorkBuddy 后必跑
+bun run --filter '@ai-token-report/core' verify:workbuddy
+bun run --filter '@ai-token-report/core' verify:workbuddy -- --real
+bun test packages/core/test/workbuddy-source.test.ts
+
 # MySQL 方言活体验证（17 项；需要可创建隔离 schema 的测试连接；只建/删自己随机测试库）
 # 本机可用开发 Docker 管理连接；别的机器用 ATR_MYSQL_URL，禁止拿业务库做建删演练
 bun run --filter '@ai-token-report/core' verify:mysql
@@ -77,6 +131,13 @@ bun run --filter '@ai-token-report/server' verify:mysql:bun-auth
 #   （人员目录 `/api/v1/stats/members` 不能逐位比对 —— 两侧 UUID 各自随机生成 ——
 #    它比的是名册与分组关联条数）
 bun run packages/server/verify/verify-mysql-portal.ts
+
+# ★ 迁移链与回滚（18 项；SQLite + 真 MySQL）：v7 → v8 → **当前版本** 连续升级、
+#   事件指纹逐位不变、两轮回滚-再迁移、v9 的加列幂等（列只有一份）。
+#   ⚠️ 断言一律对着 `PORTAL_SCHEMA_VERSION`，不许写死版本号（v9 落地时这里误报过）
+bun run packages/server/verify/verify-v8-migration.ts
+#   各版本自己的用例在：`bun test packages/core/test/portal-v9.test.ts`（v9 加列 / 迁移 / 幂等）
+#   与 `portal-v5.test.ts`（v3→v5 真实迁移、备份证明）—— 都要带 ATR_V4_TEST_MYSQL_URL 才实跑
 
 # ★ 断言 zod 没进前端产物（S12.5；shared 根入口一旦 re-export schemas 就会变大且不报错）
 bun run --filter '@ai-token-report/shared' verify:bundles
@@ -175,12 +236,13 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
 | **权限 / 人员管理 / token 发放** | `packages/server/src/identity/` + `docs/数据库重设计.md` + `ARCHITECTURE.md` §4.5.5~§4.5.8；`member-admin.ts` 仅历史兼容测试 |
 | **工程约定**（命令 / 测试位置 / 命名 / 中文注释 / 依赖） | `.agents/skills/repo-conventions/SKILL.md` + `docs/本仓工程约定.md` |
 | 目录分工 / 数据通路 | `ARCHITECTURE.md` |
+| **多客户端来源适配器**（新增一个客户端 / 各来源的日志与四列映射） | `packages/core/src/sources/types.ts` 文件头（三步）+ `docs/Codex会话采集方案.md` + `docs/ClaudeCode会话采集方案.md` + `docs/Trae会话采集方案.md` + `docs/WorkBuddy会话采集方案.md` |
 | 插件方案（历史） | `docs/插件方案.md` |
 | **DSH 插件**（配置 / 安装 / 排障 / 为什么不能碰私有字段） | `packages/dsh-plugin/README.md` |
 | **DSH Desktop 桌面端安装**（命令行步骤 / peer 版本窗口 / 验收 / 回滚） | `docs/桌面端安装交付清单.md` + `packages/dsh-plugin/README.md` |
 | **server 层分层 / 要不要引入第三方库** | `docs/server架构重构方案.md` + `.agents/skills/repo-conventions/SKILL.md` |
 | **部门上报库接 MySQL（方言坑 / 部署 / 备份）** | `docs/mysql上报库.md` |
-| **Portal v7 部署 / v4→v5→v6→v7 显式迁移 / 身份导入** | `docs/数据库部署与迁移.md` + `docs/数据库重设计.md` |
+| **Portal v9 部署 / v4→v5→v6→v7→v8→v9 显式迁移 / 身份导入** | `docs/数据库部署与迁移.md` + `docs/数据库重设计.md` + `docs/汇总表设计规格.md`（v8） |
 | **供应商归一化（查询期口径 / 按查看者解析）** | `packages/core/src/db/provider-alias.ts` + `docs/数据库重设计.md` §4.3.1 |
 | **分组（多对多）/ 归属展开** | `docs/数据库重设计.md` + `ARCHITECTURE.md` §4.5；归属权威是关联表 `member_group_assignments`，`usage_event.group_name` 只是文本快照 |
 
@@ -474,7 +536,7 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
   两边必然漂移且不会报错。
 - **🚨 server 的路由与中间件只在 `server/src/app.ts` 一份**（S12 起用 Hono，4.13.9 精确锁版）。
   改任何路径 / 方法 / 状态码，先跑 `packages/server/test/http-contract.test.ts`
-  （97 项契约断言，重构前 `bun test` 完全不覆盖分发面）。
+  （100 项契约断言，重构前 `bun test` 完全不覆盖分发面）。
   四条实测踩出来的坑，改这里之前必读 `app.ts` 的注释：
   1. **Hono 不做 405**，方法不匹配默认回**纯文本 404**且无 `Allow` ——
      405 靠 `hono/method-not-allowed` 读 `app.routes` 反查；
@@ -506,6 +568,17 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
   没装时明确报错并给出 `cd packages/server && bun add mysql2`）。
   Node 那条路的活体验证：`bun run --filter '@ai-token-report/server' verify:mysql:node`
   （真 Node，49 项 + 编排 6 项）。详见 `docs/mysql上报库.md`。
+- **🚨 `ATR_V4_TEST_MYSQL_URL` 是「管理连接」，不是「目标库」**：本机开发容器里它指向
+  `information_schema`（别的机器给一个可建库的账号即可）。任何 MySQL 用例 / 验证脚本都必须
+  **自己创建随机隔离 schema 并 DROP**（照 `core/test/portal-v5.test.ts`、
+  `core/test/portal-batch-ingest.test.ts`、`server/verify/mysql-isolation.ts` 的写法）。
+  直接把它当上报库目标用过一次，症状是 `上报库状态 unsupported，版本 0`，
+  而且**差一点就往一个共用 schema 里建 portal 表**。这条只有活体 MySQL 才暴露：
+  SQLite 分支没有 schema 这一层（2026-10-03 实测，`portal-v9.test.ts` 就踩在这里）。
+- **🚨 版本号断言一律写 `PORTAL_SCHEMA_VERSION`，绝不写死数字**；脚本里「降级到 vN」
+  必须删掉**所有 `version > N` 的账本行**（只删 `N+1` 那一行时，判定逻辑里的 `current`
+  仍为真 ⇒ 库被判成 `unsupported` 而不是 `legacy`，整条回滚路径失效）。
+  一条会**因为加了新版本而误报**的断言比没有断言更糟。2026-10-03 v9 落地时两处都实测到。
 - **🚨 MySQL 有三处「静默语义变化」的方言坑**（都在 `core/src/db/dialect.ts` 收口，
   改 SQL 前必读）：
   1. `a || b` 在 MySQL 是**逻辑或**，`provider || '/' || model` 会返回 `0`/`1` ——
@@ -530,18 +603,31 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
   差额就是他们 —— 页面必须能说清这一点。看板的分组候选项走 `GET /api/v1/stats/groups`
   （`stats:read`），**不要**让页面去读管理接口 `/api/v1/admin/groups`（那是 `groups:read`）；
   人员候选项同理走 `GET /api/v1/stats/members`（`stats:read`），不是 `/api/v1/admin/members`。
-- **上报库的 schema 变更绝不能自愈**：portal 当前是 v7（**v4 是冻结基线**：v3 库先经
-  `portal-schema-v4.ts` 迁到 v4，再依次走 v4→v5、v5→v6、v6→v7；v5 的 `usage_event` 去掉了一列并把 `dept`
+- **上报库的 schema 变更绝不能自愈**：portal 当前是 **v9**（**v4 是冻结基线**：v3 库先经
+  `portal-schema-v4.ts` 迁到 v4，再依次走 v4→v5、v5→v6、v6→v7、v7→v8、v8→v9；v5 的 `usage_event` 去掉了一列并把 `dept`
   改名 `group_name`；**v6 只增表** `provider_alias` 与两个权限码；**v7 同样只增表** `model_price`
-  与两个权限码（`cost:read` = `...114`、`pricing:manage` = `...115`），
-  两步都不改既有列、不重建事实表），本地 `usage.sqlite` 仍为 v3。
+  与两个权限码（`cost:read` = `...114`、`pricing:manage` = `...115`）；
+  **v8 只增表** `usage_rollup_*` 三张看板汇总表（`portal-schema-v8.ts`）；
+  **v9 是唯一一次给既有表加列**：`usage_event.source`（`portal-schema-v9.ts`）），
+  本地 `usage.sqlite` 为 **v4**（同样只多了 `source`，靠 `rebuildSchema()` 重建而不是迁移）。
   - **当前版本的受控 DDL 恒在 `portal-schema-v5.ts`**（v5 结构 + `_V6_ADDITIONS` + `_V7_ADDITIONS`），
     **不要新建 `portal-schema-v7.ts`** —— 分成两个文件会让「哪些表属于当前版本」变成两处各自维护，
-    而它们必然漂移。
-  - **v6 的校验和已冻结**为 `portalSchemaChecksumV6(kind)`，用来把「已经是 v6」的库识别成
-    **可迁移起点**；不冻结它，已迁到 v6 的库会从「起点」退化成 `unsupported`。
-  - ⚠️ `type SchemaVersion = 4 | 5` **刻意没有扩到 6/7**：`tableStatement(kind, table, version)`
+    而它们必然漂移。v8 / v9 各自独立成文件（前者是性能设施，后者动既有表）。
+  - 🚨 **v9 的那一列不能写进 v5 常量**：`portalSchemaChecksumV6/V7` 按 v5 文本的**当前全文**
+    求摘要，改了它会让已经迁到 v6 / v7 的库从「可迁移起点」退化成 `unsupported`（服务端拒绝启动）。
+    所以受控定义里的 `usage_event` 由 `portalV9UsageEventStatement()` **拼接**得到，
+    插入点（最后一个列定义之后、第一条表级约束之前）**由 SQLite 的 `ALTER … ADD COLUMN`
+    改写规则钉住** —— `verifyTable()` 在 SQLite 分支按表定义**全文**比对（只抹空白与引号），
+    位置不一致就是「迁移做完了却判失败」。
+  - **v6 / v7 / v8 的校验和都已冻结**（`portalSchemaChecksumV6/V7/V8`），用来把「已经是那一版」的库
+    识别成**可迁移起点**；不冻结它，那些库的账本摘要永远对不上，从「起点」退化成 `unsupported`
+    （而它们只差一次追加迁移）。
+  - ⚠️ `type SchemaVersion = 4 | 5` **刻意没有扩到 6/7/8/9**：`tableStatement(kind, table, version)`
     把 ≠5 一律映射到 v4 的 DDL，加上 6 会让它**静默返回 v4 DDL**。
+  - ⚠️ v9 的迁移步骤（`upgradeV8ToV9`）**位置是刻意的**：它在 v5 的事实表重建**之前**跑
+    （MySQL 的 `alignMysqlEventColumns()` 要求「实际列数 == 受控定义列数」，所以列必须先加），
+    于是它必须**幂等**（`!v5Ready` 的库由 v5 重建直接产出带 `source` 的表）且
+    **只在事实表已是 v5 形态时逐列核对**（v5 之前的表形状与受控定义本来就不同）。
   空 portal 库可初始化；旧库/半完成迁移拒绝普通业务写入，只能通过 `packages/server/scripts/migrate-db.ts`
   显式 inspect/migrate/resume。SQLite 先一致性备份（v5 在 SQLite 分支**必须重建事实表**才能去掉列，
   所以按备份流程执行），MySQL 需离线确认和备份证明；迁移前后逐位校验事件指纹，**不改写任何事件原值**。
@@ -599,6 +685,49 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
   库是**日志的派生物**，不是真值 —— 为它让页面白屏是不划算的。
 - **本地库坏了就重建，不要写迁移逻辑**：`DB_SCHEMA_VERSION` 不符 → `rebuildSchema()`。
   数据全部可从日志重扫，迁移代码比「重建」更容易出错且更难测试。
+  ⚠️ 于是**升级期会出现库在版本之间来回抖**：一个**还在跑的旧版客户端**（它的
+  `DB_SCHEMA_VERSION` 还是旧的）每次取数都会把库重建回旧版本，而新代码下一次运行又建回来。
+  实测症状：`no such column: source` 突然出现（2026-10-03 本机 `verify-db-parity` 在**第 2 个窗口**
+  炸在这里，而把它指到一个**隔离的新库**上立刻 160/160 全过）、或对账脚本跑到一半失败。
+  **处置：重启那个客户端进程（DSH）**，别改代码 —— 库是日志的派生物，重建不丢数据。
+  详见 `docs/Codex会话采集方案.md` 的「两条必须记住的运维/验证事实」第 2 条。
+- **🚨 「选了哪些来源」有两个落点，缺一个就是错数字**（多客户端之后最容易踩的一处）：
+  - **根**（`sourceRoots`）决定**本次 ingest 谁**；**查询期来源清单**（`openStats` 的
+    `sources`）决定**本次只算谁**。只给根，库里别的来源的行就会混进来 ——
+    而本地库 `usage.sqlite` 是 CLI / 本地页 / 插件 / report **共用的一个文件**。
+  - `sources` 的**缺省语义是「库里的全部来源」**，所以每一条「只想看某几个来源」
+    的调用都必须显式给。实测（2026-10-03）：CLI 的纯 DSH 分支（`--source dsh`，
+    也就是 `--help` 里承诺的「回到旧口径」）与 `--source all` 的总量**逐位相同**
+    （326,041,147），`--by source` 里还挂着 workbuddy；插件的
+    `extraSources: []`（= 面板只统计 DSH）同样会把库里 Codex 的行算进面板。
+    两处都已修，回归用例：`packages/cli/test/source-filter.test.ts`、
+    `packages/dsh-plugin/test/stats-worker.test.ts` / `extra-sources.test.ts`。
+  - **`DSH_TOKEN_REPORT_<来源>=0` 只在「没显式给 sources」时生效**（`resolveSourceRoots`
+    的「显式即接管」语义 —— 测试正是靠它才能在 preload 全关的情况下显式指定来源）。
+    而 CLI **永远**显式给清单 ⇒ 那个开关曾经整个失效（实测：设与不设读的根**逐字相同**，
+    2.8 GB 的 Codex 日志照扫，只是慢、不报错）。CLI 的缺省清单因此由它自己按同一判据算出来。
+  - 同理 **spawn 子进程的测试必须自己钉住来源**（preload 改的 env 不被 `Bun.spawn`
+    继承）：漏了会让「装过 Codex 的机器」上 8 条 CLI 用例全部 5 秒超时（本机实测），
+    而失败信息与断言毫无关系。公共件：`packages/cli/test/child-env.ts` 的 `pinnedChildEnv()`。
+- **★ 「来源」是端到端的一个维度（v9 起，部门看板也能按它筛与分组）**：
+  - 链路上的落点，缺一处就是静默错数：`shared/protocol.ts`（`WireTokenRecord.source?`
+    + `GroupBy` 的 `'source'` + `StatsSourcesResponse`）→ `shared/schemas.ts` 的
+    `sourceOrNull`（**只校验形状 `[a-z0-9-]{1,32}`，不按注册表白名单** —— 客户端比服务端新
+    时严格枚举会让整批上报被拒，而 CLI 会把 pending 一直重发）→ `core/db/ingest.ts`
+    的 `ATTRIBUTED_COLUMNS`（缺省 `?? 'dsh'`，**不是 NULL**：列是 NOT NULL，而 v9 之前
+    只有 DSH 上报过，所以 `dsh` 是事实）→ `core/db/query.ts` 的 `filter.sources`
+    （**精确匹配** `source = ?`，与 provider 的子串匹配刻意相反）→ `stats-route.ts`
+    的 `GROUP_BYS` + `parseWindow()`（只校验形状）→ web-portal 的来源下拉与「来源」页签。
+  - **查询期要不要绕开汇总表，由 `portal.ts` 的 `isTimeWindowOnly()` 判**：`usage_rollup_*`
+    的键里没有来源列，`?source=` / `by=source` 必须**显式**退原始表 —— 漏判的后果是
+    带着 `source = ?` 去查汇总表（`no such column`）而**靠 `try/catch` 静默回退**：
+    数字看起来仍然对，但那条路从此永远依赖异常（「汇总表坏了」与「这个筛选不支持汇总表」
+    变成同一个现象）。回归：`packages/core/test/rollup.test.ts` 的
+    「★ v9 来源维度与汇总表」+ `packages/server/test/stats-api.test.ts` 的「★ 来源维度（v9）」。
+  - **上报链路必须带上非 DSH 来源**（否则看板上的来源永远是 `dsh`）：`report` 的
+    `plainRoots` 走 `scanner.ts` 的 `scanPlainSources()`（与本地库 `ingestPlainSources()`
+    **同一份** L1 字节数水位线实现），水位写进同一份 `state.json` 的 `files[path]`（`frameCount: 0`）。
+    实测：`report --dry-run` 在本机采到 69,027 条 / 12.4s（DSH 118 个文件 + 五个非 DSH 根 1,528 个文件）。
 - **🚨 「会话日志根」与「token-report 数据目录」是两个概念，别合并**
   （`core/src/home.ts`）：`dshHomes`（**一组** home，默认**自动发现**本机全部 DSH）
   决定**日志从哪读**，`dataDir`（默认 **`~/.ai-token-report`**，**刻意与 home 无关**，可用
@@ -611,7 +740,11 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
     `--format json` 给 `dshHomes` / `sessionsRoots` / `missingRoots`；**本地页面**
     `/api/local/stats/{overview,diagnostics}` 都带 `sources`（`LocalStatsSources` =
     `sessionsRoots` + `missingRoots` + `dataDir`，见 `shared/src/protocol.ts`），
-    由 `UsageStatsView` 渲染成一行「数据来源」并对缺失根告警；
+    由 `UsageStatsView` 渲染成一行「数据来源」；
+    ⚠️ 那一行**刻意不渲染缺失根**（「以下会话日志根不存在，已跳过」曾出现过，已去掉）——
+    来源缺省是全部已注册来源，没装 Trae CN / Codex 这类「本来就没有」的根每次都会命中，
+    页面上只剩噪音（要关掉得改环境变量，使用者什么也做不了）。
+    「配了但读不到」仍然查得出：CLI 每次统计都在 stderr 逐项打印，接口也照旧下发 `missingRoots`；
     插件诊断打印全部根；`inspectSessionRoots()` 回答「这次统计到底读了哪几处」。
     配了但不存在的根**逐项报出**，绝不静默 —— 否则「加了 home 数字没变」分不清是
     镜像去重还是那个根根本没读到（两种情况的数字看起来一模一样）。
@@ -671,6 +804,18 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
     spawn **真实 DSH 宿主**（`dsh --profile …`）时只能走环境变量 —— `dsh` 本体不认这些 CLI 参数；
     而且那几个脚本会「删掉所有 `DSH_TOKEN_REPORT_*`」，救场变量必须在删完之后再钉上。
     helper：`core/verify/lib/runtime.ts` 的 `scratchDataDir(home)` / `scratchDshHomes(...homes)`。
+- **🚨 来源范围有三个不同的缺省，别混**（2026-10-03 起）：
+  | 形态 | 缺省统计哪些来源 |
+  |---|---|
+  | CLI（`stats` / `report` 的参数解析） | **全部已注册来源**（`--source dsh` 回到旧口径；`--no-<来源>` / `DSH_TOKEN_REPORT_<来源>=0` 逐个去掉） |
+  | 本地页面 `/api/local/*` | **全部已注册来源**（`resolveSourceRoots()` 不带 `sources`） |
+  | DSH 插件面板 / `token_usage` | **只有 DSH**；要并入别的来源得在插件 config 或面板齿轮里写 `extraSources: [trae, …]`（白名单默认空，见 `dsh-plugin/src/extra-sources.ts`） |
+  | `report`（上报部门库） | **只有 DSH** —— 它走 `scanIncremental`，`--source` 对它无效（未接通多客户端上报） |
+  - spawn 子进程的测试/脚本**必须**按注册表钉住全部 `disableEnv`（`cli/test/child-env.ts` 与
+    `cli/verify/verify-npm-package.ts` 的 `pinnedEnv()` 都这么做了）——
+    漏一个来源的症状是「用例慢到超时」或「数字里多出别的来源」，而不是报错。
+  - Trae 的日志**会被 Trae 自己删掉**（2026-10-03 实测：一次启动之后旧会话目录全没了），
+    所以「按需扫描」对它是**有损**的；面板/本地页每次取数都会 ingest，别让它们的白名单空着。
 - **🚨 上报库（`portal.sqlite`）是唯一副本，绝不自动重建**：它由
   `openPortalDb()` 打开，schema 版本不符时**抛错**（不是 `rebuildSchema`）。
   客户端投递成功后已清掉自己的 pending / outbox，删掉 = 全员历史用量永久消失。
