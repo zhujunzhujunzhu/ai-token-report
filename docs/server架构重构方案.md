@@ -600,7 +600,7 @@ bun run packages/server/verify/verify-mysql-portal.ts       # 53 项（双后端
 
 | 风险 | 实情 | 处置 / 结果 |
 |---|---|---|
-| 新依赖进 npm 产物 | `cli` 依赖 `server`，`build:npm` 会把 server 打进 `dsh-token-report` tarball | ✅ **实测仍为零运行时依赖**：`hono` 被内联进 `cli.js`（233.3 KB），`verify:npm:cli` 断言「零运行时依赖」通过 |
+| 新依赖进 npm 产物 | `cli` 依赖 `server`，`build:npm` 会把 server 打进 `ai-token-usage` tarball | ✅ **实测仍为零运行时依赖**：`hono` 被内联进 `cli.js`（233.3 KB），`verify:npm:cli` 断言「零运行时依赖」通过 |
 | 版本漂移 | `bunfig.toml` 是 `exact = true` | ✅ 锁成 `hono: "4.13.9"` |
 | 「第二套路由」复发 | 有人为 Node 单独写分支 | 路由与中间件**只在 `app.ts` 一份**；两个运行时的差异只允许出现在 `runtime/listen.ts` 与 `serve-node.ts` |
 | 状态码悄悄变 | Hono 默认**不做 405**、404 是纯文本 | ✅ 契约测试 41 项钉住；`Allow` 逐字断言 |

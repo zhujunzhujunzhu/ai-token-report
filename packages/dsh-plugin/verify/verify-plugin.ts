@@ -227,7 +227,7 @@ console.log('\n── 2. 已署名：会话事件 → 上报 → 服务端收下
   try {
     const host = makeCtx()
     const config = {
-      name: 'dsh-token-report',
+      name: 'ai-token-report',
       appKey: 'atr-smoke-key',
       endpoint: receiver.url,
       dshHome: home,
@@ -259,7 +259,7 @@ console.log('\n── 2. 已署名：会话事件 → 上报 → 服务端收下
 
     const payload = receiver.received[0]
     check('schemaVersion = 1', payload?.schemaVersion === 1)
-    check('client.name 用的是配置里的插件名', payload?.client.name === 'dsh-token-report')
+    check('client.name 用的是配置里的插件名', payload?.client.name === 'ai-token-report')
     check('client.userName 来自身份文件', payload?.client.userName === '张三')
     check('client.group 来自身份文件', payload?.client.group === '研发一部')
     check('appKey 走 Authorization: Bearer 头', receiver.authHeaders[0] === 'Bearer atr-smoke-key')

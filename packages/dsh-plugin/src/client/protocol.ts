@@ -790,7 +790,7 @@ export function readUiReports(value: unknown): UiReportsPayload {
   const interval = count(raw['flushIntervalMillis'])
   return {
     reporting: readUiReporting(raw['reporting']),
-    name: text(raw['name'], 'dsh-token-report'),
+    name: text(raw['name'], 'ai-token-report'),
     flushIntervalMillis: interval > 0 ? interval : 0,
     maxRecords: count(raw['maxRecords']),
     timeoutMillis: count(raw['timeoutMillis']),

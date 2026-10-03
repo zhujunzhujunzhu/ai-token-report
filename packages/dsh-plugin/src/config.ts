@@ -178,7 +178,7 @@ export interface EffectiveConfig {
 export const DEFAULT_ENDPOINT = 'http://127.0.0.1:8787/api/v1/token-usage'
 
 /** 默认插件名。 */
-export const DEFAULT_NAME = 'dsh-token-report'
+export const DEFAULT_NAME = 'ai-token-report'
 
 /**
  * 代码默认值。

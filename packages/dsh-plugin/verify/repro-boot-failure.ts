@@ -56,7 +56,7 @@ console.log(`名称  ${mod.default.name}`)
 //   `DSH_HOME` —— 不钉住就会扫真实 home，并把身份 / 本地库指向真实 `~/.ai-token-report`。
 const reproHome = join(process.env['TEMP'] ?? process.env['TMPDIR'] ?? '.', 'atr-repro-home')
 const config = {
-  name: 'dsh-token-report',
+  name: 'ai-token-report',
   appKey: '',
   endpoint: 'http://127.0.0.1:8787/api/v1/token-usage',
   batch: { maxRecords: 50, flushIntervalMillis: 10000, timeoutMillis: 15000 },

@@ -50,7 +50,7 @@ export async function request<T>(
       ok: false,
       error:
         err instanceof Error && err.name === 'TypeError'
-          ? '无法连接本地服务，请确认 dsh-token --web 仍在运行'
+          ? '无法连接本地服务，请确认 ai-token --web 仍在运行'
           : err instanceof Error
             ? err.message
             : String(err),

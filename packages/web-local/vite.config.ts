@@ -12,7 +12,7 @@ import { defineConfig } from 'vite'
  * 「服务端返回了非 JSON 响应（HTTP 200）」—— 报错看起来像后端坏了，
  * 实际是后端压根没被访问到。
  *
- * 后端由 `dsh-token --web` / `bun run web` 提供（只监听 127.0.0.1，默认 8787）。
+ * 后端由 `ai-token --web` / `bun run web` 提供（只监听 127.0.0.1，默认 8787）。
  * 端口被占用时 CLI 会自动 +1，此时用 `DSH_LOCAL_API` 指定实际地址即可，
  * 例如：`$env:DSH_LOCAL_API='http://127.0.0.1:8788'; bun run dev:local`
  */

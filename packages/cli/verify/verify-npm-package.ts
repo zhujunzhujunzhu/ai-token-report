@@ -1,5 +1,5 @@
 /**
- * 发布产物（npm 包 `dsh-token-report`）的**双运行时端到端验证**。
+ * 发布产物（npm 包 `ai-token-usage`）的**双运行时端到端验证**。
  *
  * ## 为什么需要它
  *
@@ -91,7 +91,13 @@ check(
   '否则 Node 在 import 阶段就崩',
 )
 check('零运行时依赖', !manifest.dependencies || Object.keys(manifest.dependencies).length === 0)
-check('包名正确', manifest.name === 'dsh-token-report', manifest.name)
+check('包名正确', manifest.name === 'ai-token-usage', manifest.name)
+// ⚠️ bin 名与包名**刻意不同**：包名避开 npm 占名，命令名才是产品名。
+check(
+  'bin 是两个产品命令名',
+  Object.keys(manifest.bin).sort().join(',') === 'ai-token,ai-token-report',
+  Object.keys(manifest.bin).join(','),
+)
 check('bin 指向 cli.js', Object.values(manifest.bin).every((v) => v === 'cli.js'))
 check(
   'engines 声明了 Node 下限',

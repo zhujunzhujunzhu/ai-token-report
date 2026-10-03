@@ -1,5 +1,5 @@
 /**
- * DSH token 上报插件 —— 团队统一铺开的入口。
+ * AI token 上报插件 —— 团队统一铺开的入口。
  *
  * ## 一句话职责
  *
@@ -14,7 +14,7 @@
  * ③ 统计服务   ctx.tokenReport（其它插件可调用）
  * ```
  *
- * ②③ 与 CLI `dsh-token`、本地页面走的是**同一套聚合与同一套口径**，
+ * ②③ 与 CLI `ai-token`、本地页面走的是**同一套聚合与同一套口径**，
  * 所以「工具报的数」与「页面上的数」必然一致（`ARCHITECTURE.md` §3）。
  *
  * ## 挂载点：一个 `SessionTelemetryBackend`
@@ -573,7 +573,7 @@ function registerTools(
     ctx.reflect.provide('tokenReportTools', {
       [TOOL_NAME]: {
         description:
-          '统计本机 DSH token 用量（计费级，来自 provider 真实上报值）。' +
+          '统计本机 AI token 用量（计费级，来自 provider 真实上报值）。' +
           '可按周期、维度、模型过滤；返回计费总量、缓存命中率与分组排行。' +
           '只读取本机会话日志，不产生任何上报。',
         parameters: {

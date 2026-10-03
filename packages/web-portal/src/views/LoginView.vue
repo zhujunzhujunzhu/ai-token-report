@@ -84,7 +84,7 @@ async function submit(): Promise<void> {
         <span class="brand-mark"
           ><el-icon><DataAnalysis /></el-icon></span
         ><span class="brand-copy"
-          ><strong>DSH <span>Token</span></strong
+          ><strong>AI <span>Token</span></strong
           ><small>团队用量管理平台</small></span
         >
       </div>
@@ -234,7 +234,7 @@ async function submit(): Promise<void> {
           登录状态保留 8 小时，使用完毕请在账号菜单退出。
         </p>
       </div>
-      <footer class="login-copyright">DSH Token · 团队用量管理平台</footer>
+      <footer class="login-copyright">AI Token · 团队用量管理平台</footer>
     </section>
   </main>
 </template>

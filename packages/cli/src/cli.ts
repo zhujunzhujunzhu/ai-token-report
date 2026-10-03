@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * dsh-token-report —— DSH token 用量统计 CLI。
+ * ai-token-report —— AI token 用量统计 CLI。
  *
  * 数据源：`$DSH_HOME/sessions/**\/session*.jsonl.zstd` 中的 `assistant/message` 事件。
  * 只有该事件的 `data.usage` 是 provider 真实上报的计费级数据。
@@ -77,13 +77,13 @@ import { PRICING_SYNC_USAGE, syncPricing } from './pricing-sync.js'
 import { toAssertion } from '@ai-token-report/shared'
 
 const HELP = `
-dsh-token-report —— DSH token 用量统计
+ai-token-report —— AI token 用量统计
 
 用法:
-  dsh-token-report [选项]
-  dsh-token-report web [选项]          起本地页面（内嵌服务 + 自动开浏览器）
-  dsh-token-report report [选项]      增量上报（每 10 分钟由计划任务调用）
-  dsh-token-report pricing sync [选项]  拉取部门服务端的单价快照到本地
+  ai-token-report [选项]
+  ai-token-report web [选项]          起本地页面（内嵌服务 + 自动开浏览器）
+  ai-token-report report [选项]      增量上报（每 10 分钟由计划任务调用）
+  ai-token-report pricing sync [选项]  拉取部门服务端的单价快照到本地
 
 ── 统计（默认）──────────────────────────────────────────
 数据维度:
@@ -141,11 +141,12 @@ dsh-token-report —— DSH token 用量统计
 
   首次启动会全量建库（约 15 秒，需解析历史日志），之后都是毫秒级。
 
-  服务对象是「我自己」：页面上看到的数与你执行 dsh-token-report --period X
+  服务对象是「我自己」：页面上看到的数与你执行 ai-token-report --period X
   完全一致 —— 两者走同一个数据源与同一套口径公式。
 
   --port <n>       监听端口 (默认 8787，被占用自动 +1)
-  --portal <url>   部门服务端**根地址**（如 http://host:8787）；配置后页面才能校验并保存署名
+  --portal <url>   部门服务端**根地址**（如 http://host:8787）；作为页面「配置」弹框的缺省地址
+                   （页面里填过的那份优先；两处都没有时页面会要求用户填）
   --no-open        不自动打开浏览器
 
 ── 增量上报 report ──────────────────────────────────────
@@ -171,7 +172,7 @@ dsh-token-report —— DSH token 用量统计
   从部门服务端拉一份**只读单价快照**落到本地数据目录；之后 CLI 的 --cost、
   本地页与插件宿主都按这份快照算金额（与看板同源）。
 
-  dsh-token-report pricing sync --portal <url> --token <token>
+  ai-token-report pricing sync --portal <url> --token <token>
 
   --portal <url>   部门服务端**根地址**（如 http://host:8787），与 web 的 --portal 同一语义
   --token <t>      后台账号签发的、带 cost:read 的凭证；**不接受 appKey**
@@ -221,32 +222,32 @@ dsh-token-report —— DSH token 用量统计
   只收有 sessions 的那个。关闭发现: DSH_TOKEN_REPORT_DISCOVER=0
 
 示例:
-  dsh-token-report --period today                # 今天
-  dsh-token-report --period week --series day    # 本周 + 每日趋势
-  dsh-token-report --provider dashscope --period month   # 数字集团本月
-  dsh-token-report --by provider --cross         # 全量按厂商
-  dsh-token-report --list-providers              # 先摸清有哪些厂商
-  dsh-token-report --discover                    # 看本机有哪些 DSH home
-  dsh-token-report --dsh-home ~/.dsh --dsh-home "$env:APPDATA/dsh-desktop/harness"
-  dsh-token-report --format csv --out report.csv
-  dsh-token-report --period today --no-db        # 直扫日志（与库结果对照）
+  ai-token-report --period today                # 今天
+  ai-token-report --period week --series day    # 本周 + 每日趋势
+  ai-token-report --provider dashscope --period month   # 数字集团本月
+  ai-token-report --by provider --cross         # 全量按厂商
+  ai-token-report --list-providers              # 先摸清有哪些厂商
+  ai-token-report --discover                    # 看本机有哪些 DSH home
+  ai-token-report --dsh-home ~/.dsh --dsh-home "$env:APPDATA/dsh-desktop/harness"
+  ai-token-report --format csv --out report.csv
+  ai-token-report --period today --no-db        # 直扫日志（与库结果对照）
 
-  dsh-token-report --source all --by source      # 多客户端：DSH + Codex + Claude Code + Trae + WorkBuddy
-  dsh-token-report --source claude-code --by model   # 只看 Claude Code
-  dsh-token-report --source trae --source trae-cn --by source   # Trae 国际版 + 国内版
-  dsh-token-report --source workbuddy --by model      # 只看 WorkBuddy
+  ai-token-report --source all --by source      # 多客户端：DSH + Codex + Claude Code + Trae + WorkBuddy
+  ai-token-report --source claude-code --by model   # 只看 Claude Code
+  ai-token-report --source trae --source trae-cn --by source   # Trae 国际版 + 国内版
+  ai-token-report --source workbuddy --by model      # 只看 WorkBuddy
 
-  dsh-token-report web                           # 本地页面（推荐入口）
-  dsh-token-report web --no-open --port 8899     # 指定端口、不开浏览器
+  ai-token-report web                           # 本地页面（推荐入口）
+  ai-token-report web --no-open --port 8899     # 指定端口、不开浏览器
 
-  dsh-token-report report --dry-run              # 看这一轮会发什么
-  dsh-token-report report --no-save --dry-run    # 只看不改
-  dsh-token-report report --out-file out.jsonl   # 落本地文件演练
-  dsh-token-report report --endpoint https://portal/api/v1/token-usage --token $env:DSH_REPORT_TOKEN
-  dsh-token-report report --reset                # 清空水位线
+  ai-token-report report --dry-run              # 看这一轮会发什么
+  ai-token-report report --no-save --dry-run    # 只看不改
+  ai-token-report report --out-file out.jsonl   # 落本地文件演练
+  ai-token-report report --endpoint https://portal/api/v1/token-usage --token $env:DSH_REPORT_TOKEN
+  ai-token-report report --reset                # 清空水位线
 
-  dsh-token-report pricing sync --portal http://portal:8787 --token $env:ATR_COST_TOKEN
-  dsh-token-report --period month --cost         # 本月用量 + 金额（估算）
+  ai-token-report pricing sync --portal http://portal:8787 --token $env:ATR_COST_TOKEN
+  ai-token-report --period month --cost         # 本月用量 + 金额（估算）
 `
 
 interface CliOptions {
@@ -439,7 +440,7 @@ function parseArgs(argv: string[]): CliOptions | null {
   let byExplicit = false
 
   // 子命令：第一个非 flag 的 token 若是 `report` / `web`，后续按该子命令解析。
-  // 保持 `dsh-token-report [选项]` 的既有用法完全不变。
+  // 保持 `ai-token-report [选项]` 的既有用法完全不变。
   // 同时兼容 `--web` 这种历史写法（package.json 的 web 脚本就是这么调的）。
   if (argv[0] === 'report') {
     opts.command = 'report'
@@ -532,7 +533,7 @@ function parseArgs(argv: string[]): CliOptions | null {
         break
       // ── web 子命令专用 ─────────────────────────────────────────────────
       // `--web` 等价于 `web` 子命令：package.json 的 web 脚本用的是这种写法，
-      // 手工敲 `dsh-token --web` 也很常见，两者都要认。
+      // 手工敲 `ai-token --web` 也很常见，两者都要认。
       case '--web':
         opts.command = 'web'
         break
@@ -1496,10 +1497,15 @@ async function main(): Promise<number> {
 
   // 终端表格输出
   const out: string[] = []
-  out.push(`DSH token 统计  |  ${describeRangeFull(range)}  |  数据源 ${describeSource(source, paths, dbStats, effectiveRoots, pureDsh)}`)
+  out.push(`AI token 统计  |  ${describeRangeFull(range)}  |  数据源 ${describeSource(source, paths, dbStats, effectiveRoots, pureDsh)}`)
   if (source === 'scan' && !opts.noDb) {
     // 降级必须显式告警：用户会明显感觉变慢，不说清原因会被当成「库没生效」
     out.push(`⚠ ${degradedReason ?? '本次走直扫日志'}（用 --no-db 可显式指定）`)
+  } else if (degradedReason) {
+    // ★ SQL 路径也可能「这一轮没刷成」（库被别的写入者占用时**刻意不直扫**，
+    //   见 core `openStats`）：此时数字来自上一次入库的结果。
+    //   不说出来，「旧数据」与「日志里就是这些」在终端上完全一样。
+    out.push(`⚠ ${degradedReason}`)
   }
   if (opts.providers.length) out.push(`provider 过滤: ${opts.providers.join(', ')}`)
   if (opts.models.length) out.push(`model 过滤: ${opts.models.join(', ')}`)
@@ -1686,7 +1692,7 @@ async function runWebCommand(opts: CliOptions, paths: ResolvedPaths): Promise<nu
   out.push(`  本地库    ${paths.dbPath}`)
   out.push(`  页面资源  ${staticDir}`)
   out.push(
-    `  署名校验  ${opts.portal ?? '未配置（--portal）—— 可看本机统计，但无法保存署名'}`,
+    `  署名校验  ${opts.portal ?? '未配置（--portal）—— 可在页面「配置」弹框里填服务端地址'}`,
   )
   out.push('')
   out.push('  只监听 127.0.0.1，仅本机可访问；数据来自本地库（不联网上报）。')
@@ -1725,7 +1731,7 @@ async function runWebCommand(opts: CliOptions, paths: ResolvedPaths): Promise<nu
  *
  * ★ 发布形态把页面资源**内嵌在包里**（`build-npm.ts` 会把
  *   `packages/web-local/dist` 整个拷进产物目录）。这样 `npm i -g` 之后
- *   `dsh-token-report web` 不需要用户再去 clone 仓库构建前端 ——
+ *   `ai-token-report web` 不需要用户再去 clone 仓库构建前端 ——
  *   否则「本地页面」这个子命令对 npm 用户就是不可用的。
  */
 function candidateDistDirs(): string[] {
@@ -1816,7 +1822,7 @@ async function runReportCommand(opts: CliOptions, sessionsRoots: string[], plain
     process.stdout.write(
       (identity.error ? `身份文件无法使用：${identity.error}\n` : '') +
       '未署名，已跳过采集和上报；不会创建或修改待上报记录。\n' +
-      '请先运行 dsh-token-report web --portal <部门地址> 填写署名，或提供 --token / DSH_REPORT_TOKEN。\n',
+      '请先运行 ai-token-report web 在页面「配置」里填服务端地址与 appKey，或提供 --token / DSH_REPORT_TOKEN。\n',
     )
     return 0
   }

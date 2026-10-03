@@ -1,45 +1,47 @@
-# dsh-token-report
+# ai-token-report
 
-DSH（DeepSeek Harness）的 **token 用量统计 CLI**：直接读本机的会话日志，
+本机 **AI token 用量统计 CLI**：直接读各家客户端留在本机的会话日志
+（DSH / Codex / Claude Code / Trae / WorkBuddy），
 算清楚每一分用量花在哪个厂商、哪个模型、哪个项目、哪个会话上。
 
 - 📊 终端报表：按 provider / model / 项目 / 会话 / 天 / 小时分组，支持 JSON 与 CSV
-- 🖥️ 本地页面：`dsh-token-report web` 一条命令打开，**只监听 127.0.0.1、不出网**
-- 📤 增量上报：`dsh-token-report report` 定时把新增用量投递到部门服务端
+- 🖥️ 本地页面：`ai-token-report web` 一条命令打开，**只监听 127.0.0.1、不出网**
+- 📤 增量上报：`ai-token-report report` 定时把新增用量投递到部门服务端
 - ⚡ 毫秒级热查询：本地 SQLite 增量库（日志的派生物，坏了自动回退直扫）
 - 🔌 **Node 与 Bun 都能跑**：同一份产物，Node ≥22.15 走 `node:sqlite`，Bun 走 `bun:sqlite`
 
 ## 安装
 
 ```bash
-# 任意包管理器之一
-npm i -g dsh-token-report
-bun add -g dsh-token-report
-pnpm add -g dsh-token-report
+# 包名是 ai-token-usage（`ai-token-report` 在 npm 上被别的项目占了）；
+# 装出来的命令仍叫 ai-token-report —— 见 docs/npm发布-CLI.md §1
+npm i -g ai-token-usage
+bun add -g ai-token-usage
+pnpm add -g ai-token-usage
 ```
 
 也可以用 `npx` / `bunx` 免安装运行：
 
 ```bash
-npx dsh-token-report --period today
-bunx dsh-token-report --period today
+npx ai-token-usage --period today
+bunx ai-token-usage --period today
 ```
 
-安装后会得到两个等价的命令：`dsh-token-report` 与更短的 `dsh-token`。
+安装后会得到两个等价的命令：`ai-token-report` 与更短的 `ai-token`。
 
 ## 快速开始
 
 ```bash
-dsh-token-report --period today              # 今天的用量
-dsh-token-report --period week --series day  # 本周 + 每日趋势
-dsh-token-report --list-providers            # 先看看有哪些厂商/模型
-dsh-token-report web                         # 打开本地页面
+ai-token-report --period today              # 今天的用量
+ai-token-report --period week --series day  # 本周 + 每日趋势
+ai-token-report --list-providers            # 先看看有哪些厂商/模型
+ai-token-report web                         # 打开本地页面
 ```
 
 输出示例：
 
 ```
-DSH token 统计  |  今天（2026-09-25 ~ 现在）  |  数据源 本地库 .../usage.sqlite（3,476 条记录）
+AI token 统计  |  今天（2026-09-25 ~ 现在）  |  数据源 本地库 .../usage.sqlite（3,476 条记录）
 
 === 按厂商 / 模型 (provider/model) ===
 分组                                总量  未缓存输入     输出      缓存读  命中率  调用数  会话数
@@ -75,7 +77,7 @@ $DSH_HOME/sessions/**/session*.jsonl.zstd
 计费级数据。**不采集对话内容**，只取 token 数值与模型名。
 
 ```bash
-dsh-token-report --dsh-home /path/to/.dsh --period today
+ai-token-report --dsh-home /path/to/.dsh --period today
 ```
 
 ## 常用选项
@@ -93,18 +95,18 @@ dsh-token-report --dsh-home /path/to/.dsh --period today
 | `--no-db` | 强制直扫日志、不走本地库（用于与库结果对照） |
 | `--reset-db` | 删掉本地库；下次运行自动全量重建（日志仍在，不丢数据） |
 
-完整列表见 `dsh-token-report --help`。
+完整列表见 `ai-token-report --help`。
 
 ## 本地页面
 
 ```bash
-dsh-token-report web --port 8899 --no-open
+ai-token-report web --port 8899 --no-open
 ```
 
 - **只监听 `127.0.0.1`**，同内网的其他人访问不到
 - 数据来自本机日志，**不上报、断网可用**
 - 首次启动会全量建库（约 15 秒，取决于日志总量），之后每次请求约 50 ms
-- 页面上的数字与 `dsh-token-report --period X` 完全一致（同一数据源、同一套口径）
+- 页面上的数字与 `ai-token-report --period X` 完全一致（同一数据源、同一套口径）
 
 ## 增量上报（可选）
 
@@ -112,8 +114,8 @@ dsh-token-report web --port 8899 --no-open
 服务端去重，所以重复投递无害。
 
 ```bash
-dsh-token-report report --dry-run                 # 先看这一轮会发什么
-dsh-token-report report --endpoint https://portal.example.com/api/v1/token-usage --token <TOKEN>
+ai-token-report report --dry-run                 # 先看这一轮会发什么
+ai-token-report report --endpoint https://portal.example.com/api/v1/token-usage --token <TOKEN>
 ```
 
 退出码：`0` 成功（含 dry-run、本轮无新增）/ `2` 参数错误 / `3` 投递失败
@@ -126,7 +128,7 @@ dsh-token-report report --endpoint https://portal.example.com/api/v1/token-usage
 库损坏、磁盘满、权限不足时**自动回退直扫日志**并在输出里说明原因 ——
 不会因为库坏了就让你看不到数。
 
-要重建就删掉它：`dsh-token-report --reset-db`。
+要重建就删掉它：`ai-token-report --reset-db`。
 
 ## 环境要求
 

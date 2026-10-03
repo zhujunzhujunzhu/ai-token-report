@@ -413,7 +413,7 @@ export function formatUsage(result: UsageResult, options: { maskUser?: boolean }
   const n = (v: number): string => v.toLocaleString('en-US')
   const lines: string[] = []
 
-  lines.push(`DSH token 用量  |  ${result.rangeLabel}`)
+  lines.push(`AI token 用量  |  ${result.rangeLabel}`)
   lines.push(`数据来源  ${sourceLabel(result.source)}${result.degradedReason ? `（${result.degradedReason}）` : ''}`)
   lines.push(`耗时      ${result.elapsedMs}ms`)
   lines.push('')

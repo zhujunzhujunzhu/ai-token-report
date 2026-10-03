@@ -32,7 +32,7 @@ console.log(`静态 inject = ${JSON.stringify((mod.default as unknown as { injec
 //   会话日志根默认自动发现，不钉住就会扫真实 home、并把身份 / 本地库指向真实 `~/.ai-token-report`。
 const probeHome = join(process.env['TEMP'] ?? process.env['TMPDIR'] ?? '.', 'atr-probe-home')
 const config = {
-  name: 'dsh-token-report',
+  name: 'ai-token-report',
   appKey: 'atr-probe',
   endpoint: 'http://127.0.0.1:1/nope',
   dshHome: probeHome,

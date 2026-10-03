@@ -115,7 +115,7 @@ export function createPortalRouter(
   })
   router.afterEach((to) => {
     if (typeof document !== 'undefined')
-      document.title = `${String(to.meta.title ?? '管理后台')} · DSH Token`
+      document.title = `${String(to.meta.title ?? '管理后台')} · AI Token`
   })
   return router
 }

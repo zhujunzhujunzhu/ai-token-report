@@ -129,7 +129,7 @@ export class IdentityResolver {
         '⚠ token 上报未启用：本地身份文件无法解析。',
         `  文件：${where}`,
         `  原因：${state.detail ?? '未知'}`,
-        '  处理：运行 `dsh-token --web` 打开页面重新填写署名。',
+        '  处理：运行 `ai-token --web` 打开页面，在「配置」弹框里重新填服务端地址与 appKey。',
       ].join('\n')
     }
 
@@ -137,7 +137,7 @@ export class IdentityResolver {
       '⚠ token 上报未启用：尚未署名。',
       '  ★ 在你填写之前，本插件不采集、也不上报任何数据。',
       '  填写方式（任选其一）：',
-      '    1. 运行 `dsh-token --web`，在打开的页面里填写姓名与 token',
+      '    1. 运行 `ai-token --web`，在打开的页面「配置」里填服务端地址与 appKey',
       `    2. 手动创建 ${where}，内容：`,
       '       { "name": "你的姓名", "token": "管理员发放的 token" }',
     ].join('\n')

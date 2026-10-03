@@ -49,7 +49,7 @@ const statsUrl = computed(() => `${baseUrl.value}/api/v1/stats/*`)
  *   然后插件怎么配都无效。
  */
 const text = computed(() => [
-  'DSH Token 用量上报配置',
+  'AI Token 用量上报配置',
   `服务端地址：${baseUrl.value}`,
   `上报接口：${reportUrl.value}（POST，Authorization: Bearer <appKey>）`,
   `统计接口：${statsUrl.value}（GET）`,

@@ -1,11 +1,11 @@
 /**
- * 把 CLI 打包成**可发布到 npm 的独立包**（`dsh-token-report`）。
+ * 把 CLI 打包成**可发布到 npm 的独立包**（`ai-token-usage`）。
  *
  * ## 产物形态
  *
  * ```
  * packages/cli/dist/
- *   package.json      ← 发布用的清单（名字是 dsh-token-report，不是 workspace 名）
+ *   package.json      ← 发布用的清单（名字是 ai-token-usage，不是 workspace 名）
  *   cli.js            ← 单文件产物，零运行时依赖
  *   web-local/        ← 本地页面的静态资源（内嵌，`web` 子命令要用）
  *   README.md
@@ -47,8 +47,15 @@ const distDir = join(pkgRoot, 'dist')
 const entry = join(pkgRoot, 'src', 'cli.ts')
 const webDist = join(repoRoot, 'packages', 'web-local', 'dist')
 
-/** 发布用的包名。与 workspace 内的 `@ai-token-report/cli` 是两回事。 */
-const PUBLISH_NAME = 'dsh-token-report'
+/**
+ * 发布用的包名。与 workspace 内的 `@ai-token-report/cli` 是两回事。
+ *
+ * ⚠️ **不叫 `ai-token-report`**：那个名字在 npm 上已被一个无关项目占用
+ *   （`TokenGobbler`，2026-03-21 发布 0.1.0，实测 registry 返回 200）。
+ *   与当年 `dsh-token-stats` 被占用时同样的处理 —— 见 `docs/npm发布-CLI.md` §1。
+ *   命令名（bin）不受包名影响，仍是 `ai-token-report` / `ai-token`。
+ */
+const PUBLISH_NAME = 'ai-token-usage'
 
 /**
  * 版本号**从 workspace 包的 `package.json` 读**，不在这里写死。
@@ -116,13 +123,15 @@ const manifest = {
   name: PUBLISH_NAME,
   version: VERSION,
   description:
-    'DSH token 用量统计 CLI：读本地会话日志，输出按厂商/模型/项目/会话/时间的用量报表，支持本地页面与增量上报。支持 Node 与 Bun。',
+    'AI token 用量统计 CLI：读本地会话日志，输出按厂商/模型/项目/会话/时间的用量报表，支持本地页面与增量上报。支持 Node 与 Bun。',
   type: 'module',
   bin: {
-    [PUBLISH_NAME]: 'cli.js',
-    // 沿用仓库里既有的短命令名。npm 上的 `dsh-token` 包只是占名、**没有 bin**，
-    // 因此这里不会和任何已发布的可执行文件冲突。
-    'dsh-token': 'cli.js',
+    // ⚠️ bin 名**刻意与包名不同**：包名要避开 npm 占名（`ai-token-usage`），
+    //   而使用者敲的是命令。产品名是 AI Token Report，所以命令名就是它。
+    'ai-token-report': 'cli.js',
+    // 短名：npm 上的 `ai-token` 包与本包无关，且 bin 名只在**同一个包内**才可能冲突，
+    // 所以短命令可以照留。
+    'ai-token': 'cli.js',
   },
   main: 'cli.js',
   exports: {
@@ -132,7 +141,7 @@ const manifest = {
   // ⚠️ 这里**不写** `cli.js`：`bin` 的目标文件会被打包器自动带上，
   //   列在这里是多余的（`npm pack` 确认最终仍是 6 个文件）。
   //
-  //   📌 已知无害瑕疵：因为下面声明了**两个** bin（`dsh-token-report` + `dsh-token`）
+  //   📌 已知无害瑕疵：因为下面声明了**两个** bin（`ai-token-report` + `ai-token`）
   //   都指向同一个 `cli.js`，**`bun pm pack` / `bun publish` 会把它打包两次**
   //   （7 个条目 / 113 KB；`npm pack` 则是 6 个 / 80.7 KB）。
   //   两条 tar 条目路径相同，解包时后者覆盖前者，安装与执行都不受影响 ——

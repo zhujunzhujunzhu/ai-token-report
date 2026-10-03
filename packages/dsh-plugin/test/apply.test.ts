@@ -462,7 +462,7 @@ describe('服务与工具的形状', () => {
     const service = provided['tokenReport'] as { config: Record<string, unknown> }
     expect(service.config).not.toHaveProperty('appKey')
     expect(JSON.stringify(service.config)).not.toContain('atr-secret')
-    expect(service.config['name']).toBe('dsh-token-report')
+    expect(service.config['name']).toBe('ai-token-report')
   })
 
   test('signed() 反映真实的署名状态', () => {

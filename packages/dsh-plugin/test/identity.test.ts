@@ -226,7 +226,7 @@ describe('提示文案', () => {
 
     expect(text).toContain('尚未署名')
     // 必须给出可执行的下一步
-    expect(text).toContain('dsh-token --web')
+    expect(text).toContain('ai-token --web')
     // 必须明确承诺不采集
     expect(text).toContain('不采集')
   })

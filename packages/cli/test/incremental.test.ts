@@ -37,7 +37,7 @@ import { runReport } from '@ai-token-report/cli/report'
 
 /** 每个测试一个独立 DSH home，避免互相污染状态文件。 */
 function makeHome(): string {
-  return mkdtempSync(join(tmpdir(), 'dsh-token-report-'))
+  return mkdtempSync(join(tmpdir(), 'ai-token-report-'))
 }
 
 /** 构造一个 `assistant/message` 事件行。 */

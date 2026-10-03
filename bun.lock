@@ -14,7 +14,7 @@
       "name": "@ai-token-report/cli",
       "version": "0.2.0",
       "bin": {
-        "dsh-token": "src/cli.ts",
+        "ai-token": "src/cli.ts",
       },
       "dependencies": {
         "@ai-token-report/core": "workspace:*",
@@ -39,7 +39,7 @@
     },
     "packages/dsh-plugin": {
       "name": "@ai-token-report/dsh-plugin",
-      "version": "0.6.1",
+      "version": "0.7.0",
       "dependencies": {
         "@ai-token-report/core": "workspace:*",
         "@ai-token-report/shared": "workspace:*",

@@ -26,7 +26,7 @@ afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
 /** 造一份「只有 extraSources 有用」的生效配置。 */
 function config(extraSources?: string[]): EffectiveConfig {
   return {
-    name: 'dsh-token-report',
+    name: 'ai-token-report',
     appKey: '',
     endpoint: 'http://127.0.0.1:8787/api/v1/token-usage',
     batch: { maxRecords: 50, flushIntervalMillis: 10_000, timeoutMillis: 15_000 },

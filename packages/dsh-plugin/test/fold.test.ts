@@ -15,7 +15,7 @@ import type { SessionTelemetryRecord } from '@deepseek-ai/dsh-session-telemetry'
 import { foldRecord, toTokenUsage, toWireRecord, type FoldIdentity } from '../src/fold.js'
 
 const IDENTITY: FoldIdentity = {
-  clientName: 'dsh-token-report',
+  clientName: 'ai-token-report',
   claimedUserId: '张三',
   userName: '张三',
   // 分组名（原 `dept`）—— 进上报体的 `client.group`

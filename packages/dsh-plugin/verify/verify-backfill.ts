@@ -37,7 +37,7 @@ const dataDir = join(home, 'token-report')
 const dbPath = join(home, 'portal.sqlite')
 const target = { sqlitePath: dbPath }
 const token = 'isolated-backfill-member-key'
-const identity: FoldIdentity = { clientName: 'dsh-token-report', claimedUserId: '客户端错误署名', userName: '客户端错误署名' }
+const identity: FoldIdentity = { clientName: 'ai-token-report', claimedUserId: '客户端错误署名', userName: '客户端错误署名' }
 const epoch = 1_790_000_000_000
 
 /** 同时覆盖四个独立 token 列，reasoning 有值但不能重复加进总量。 */

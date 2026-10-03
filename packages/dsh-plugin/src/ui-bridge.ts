@@ -360,7 +360,7 @@ export function createUiStatsProvider(options: {
       //
       //   曾想顺手加一条「代次没变就直接复用」——那是错的，而且错得很隐蔽：
       //   代次只反映**本进程**采集到的用量，而库里的数还可能被别的 DSH 实例、
-      //   被 CLI `dsh-token` 改动。一旦让它短路掉 TTL，
+      //   被 CLI `ai-token` 改动。一旦让它短路掉 TTL，
       //   「代次很久没动」就等于「缓存永不失效」——
       //   兜底全量轮询会永远返回同一份旧载荷，而页面看起来一切正常。
       //   代次只用来回答探针（`?gen=N` → 204），不参与缓存判定。
@@ -569,7 +569,7 @@ export function installUiRoute(
   } = {},
 ): UiRouteInstall {
   const provider = createUiStatsProvider({
-    // ★ 与 CLI `dsh-token` / `token_usage` 工具调用的是**同一个函数**，
+    // ★ 与 CLI `ai-token` / `token_usage` 工具调用的是**同一个函数**，
     //   所以面板上的数与终端、与 Agent 报的数必然一致。
     run: (query) => queryUsage(stats, query),
     // ★ 缓存跟着**取数范围**走：`StatsContext` 的路径都是活取值，

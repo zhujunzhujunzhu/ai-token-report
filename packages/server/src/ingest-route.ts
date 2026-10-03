@@ -9,7 +9,7 @@
  * Content-Type: application/json
  *
  * { "schemaVersion": 1,
- *   "client": { "name": "dsh-token-report", "userId": "张三", "userName": "张三" },
+ *   "client": { "name": "ai-token-report", "userId": "张三", "userName": "张三" },
  *   "generatedAt": "2026-09-25T10:00:00Z",
  *   "records": [ { "event_id": "s:17", "session_id": "s", "seq": 17, "ts": 1790245427069,
  *                  "provider": "dashscope", "model": "m", "input_tokens": 1, "output_tokens": 1,

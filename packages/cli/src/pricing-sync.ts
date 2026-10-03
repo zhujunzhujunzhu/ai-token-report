@@ -44,7 +44,7 @@ import {
 /** `pricing sync` 的完整用法（缺参数时逐字打印，避免「只报一个错、不知道怎么改」）。 */
 export const PRICING_SYNC_USAGE = `
 用法:
-  dsh-token-report pricing sync --portal <部门服务端根地址> --token <带 cost:read 的凭证>
+  ai-token-report pricing sync --portal <部门服务端根地址> --token <带 cost:read 的凭证>
 
 参数:
   --portal <url>   部门服务端**根地址**（如 http://host:8787），与 web 的 --portal 同一个语义

@@ -23,7 +23,7 @@ import { MAX_REPORT_BODY_BYTES, Reporter } from '../src/reporter.js'
 let home: string
 
 const IDENTITY: FoldIdentity = {
-  clientName: 'dsh-token-report',
+  clientName: 'ai-token-report',
   claimedUserId: '张三',
   userName: '张三',
   // 分组名（原 `dept`）—— 上报体的 `client.group`
@@ -168,7 +168,7 @@ describe('★ 请求形状与凭证', () => {
     const body = calls[0]?.body as Record<string, unknown>
     expect(body['schemaVersion']).toBe(1)
     expect(body['client']).toEqual({
-      name: 'dsh-token-report',
+      name: 'ai-token-report',
       userId: '张三',
       userName: '张三',
       // 上报体只发新字段名 `group`（旧客户端发 `dept` 由服务端兼容，规范 §5）

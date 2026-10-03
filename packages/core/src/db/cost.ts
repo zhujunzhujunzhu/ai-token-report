@@ -264,7 +264,7 @@ export function loadLocalPricing(opts: {
     //   而 `pricingSyncedAt` 还显示着同步成功 —— 那是最难排查的一种。
     return builtin(
       `单价快照解析失败（${path}）：按内置种子价估算；` +
-        '请重新执行 `dsh-token-report pricing sync`，否则金额会与看板不一致',
+        '请重新执行 `ai-token-report pricing sync`，否则金额会与看板不一致',
     )
   }
   return {

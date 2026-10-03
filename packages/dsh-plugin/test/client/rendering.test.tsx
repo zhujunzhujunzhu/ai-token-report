@@ -122,7 +122,7 @@ describe('详情体', () => {
     const store = await readyStore()
     const html = renderToStaticMarkup(createElement(UsageDetail, { state: store.getSnapshot(), store }))
 
-    expect(html).toContain('DSH token 用量')
+    expect(html).toContain('AI token 用量')
     expect(html).toContain('计费总量')
     expect(html).toContain('2.39B')
     expect(html).toContain('未缓存输入')

@@ -100,12 +100,12 @@ async function signOut(): Promise<void> {
       @click="mobileOpen = false"
     />
     <aside class="portal-sidebar" :class="{ 'is-mobile-open': mobileOpen }">
-      <router-link to="/overview" class="brand" aria-label="DSH Token 用量总览">
+      <router-link to="/overview" class="brand" aria-label="AI Token 用量总览">
         <span class="brand-mark"
           ><el-icon><DataAnalysis /></el-icon
         ></span>
         <span class="brand-copy"
-          ><strong>DSH <span>Token</span></strong
+          ><strong>AI <span>Token</span></strong
           ><small>团队用量管理平台</small></span
         >
       </router-link>
@@ -182,7 +182,7 @@ async function signOut(): Promise<void> {
       </header>
       <main id="main-content" class="portal-content"><router-view /></main>
       <footer class="portal-footer">
-        DSH Token <span>·</span> 让每一次 AI 使用清晰可见
+        AI Token <span>·</span> 让每一次 AI 使用清晰可见
       </footer>
     </div>
   </div>
