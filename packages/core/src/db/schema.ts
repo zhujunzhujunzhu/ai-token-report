@@ -57,12 +57,17 @@ import { dirname } from 'node:path'
  * |---|---|
  * | 2 | `ingest_run` 补解析计数列 |
  * | 3 | `usage_event` 加归属三列 `user_id` / `user_name` / `dept`（服务端上报写入） |
+ * | 4 | `usage_event` 加 `source`（会话来源：`dsh` / `codex` / …）—— 多客户端采集 |
  *
  * ⚠️ 第 3 版里的 `dept` 列**名字没跟着实体改名**：本地库是日志的派生物、
  *   坏了直接重建，为一次改名去升版本 + 迁移不划算。它承载的语义已经是「分组」，
  *   上报库里的对应列叫 `group_name`（见 `portal-schema-v5.ts`）。
+ *
+ * ⚠️ 第 4 版的 `source` 有默认值 `'dsh'`：**老库的行全部来自 DSH**（那时候只支持它），
+ *   所以重建时默认值就是事实，不需要（也不允许）猜。列只是维度，
+ *   **绝不参与任何口径公式**（见 `db/query.ts` 的「只做 SUM(原始列)」）。
  */
-export const DB_SCHEMA_VERSION = 3
+export const DB_SCHEMA_VERSION = 4
 
 /** 单条计费事件表名。 */
 export const EVENT_TABLE = 'usage_event'
@@ -85,9 +90,13 @@ CREATE TABLE IF NOT EXISTS ${EVENT_TABLE} (
   ts                  INTEGER NOT NULL,
   provider            TEXT    NOT NULL,
   model               TEXT    NOT NULL,
-  -- 项目归属：取自 session 首行 cwd。增量块里通常没有该行，
-  -- 靠 session_state 表继承，否则「按项目统计」会退化成 (unknown)。
+  -- 项目归属：取自 session 首行 cwd（Codex 取自 session_meta / turn_context）。
+  -- 增量块里通常没有该行，靠 session_state 表继承，否则「按项目统计」会退化成 (unknown)。
   cwd                 TEXT,
+  -- ★ 来源（会话日志是哪个客户端写的）：'dsh' / 'codex' / … 见 core/src/sources/。
+  --   它只作为**筛选与分组维度**，绝不参与任何口径公式；
+  --   默认值 'dsh' 是历史事实（这一列出现之前，库里的行只可能来自 DSH）。
+  source              TEXT    NOT NULL DEFAULT 'dsh',
   -- ★ 归属：这条用量算谁的。**只由服务端按 Bearer token 查凭证表得出**
   --   （server/src/verify-route.ts 的 resolveIngestIdentity），
   --   客户端在请求体里自称的姓名一律忽略 —— 否则改一下本地配置就能冒用他人。
@@ -121,6 +130,8 @@ CREATE INDEX IF NOT EXISTS idx_usage_session ON ${EVENT_TABLE}(session_id);
 -- 人员归属：部门页的「人员排行」（breakdown by=user）与「只看某人」筛选
 -- 都打在这一列上，和 provider/model 同级的高频分组维度。
 CREATE INDEX IF NOT EXISTS idx_usage_user ON ${EVENT_TABLE}(user_id);
+-- 来源维度（多客户端）：按来源筛选与「分来源看用量」都打在这一列上。
+CREATE INDEX IF NOT EXISTS idx_usage_source ON ${EVENT_TABLE}(source);
 
 -- ── 文件水位线（L1 字节数 / L2 帧数），对应 state.ts 的 FileWatermark ──
 CREATE TABLE IF NOT EXISTS file_watermark (

@@ -345,6 +345,7 @@ describe('db schema', () => {
 
 function makeRecord(sessionId: string, seq: number, over: Partial<UsageRecord> = {}): UsageRecord {
   return {
+    source: 'dsh',
     eventId: `${sessionId}:${seq}`,
     sessionId,
     seq,

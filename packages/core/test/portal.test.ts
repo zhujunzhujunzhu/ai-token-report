@@ -86,6 +86,7 @@ async function seed(): Promise<void> {
   //   因此这里单独开一个同步 SQLite 句柄。
   const local: UsageRecord[] = [
     {
+      source: 'dsh',
       eventId: 'u:1',
       sessionId: 'sess-u',
       seq: 1,

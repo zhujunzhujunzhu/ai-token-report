@@ -78,6 +78,21 @@ const nullableInt = z.int().nullable().catch(null)
 /** 是字符串就 trim 后保留，空串与非法类型都降级成 null（`cwd`：纯元数据）。 */
 const nullableTrimmedString = z.string().trim().min(1).nullable().catch(null)
 
+/**
+ * 来源（`dsh` / `codex` / `claude-code` / `trae` / `trae-cn` / `workbuddy`）。
+ *
+ * ★ **只校验形状，不按注册表做严格枚举**：客户端比服务端新时（新来源已经发布、
+ *   服务端还没升级）严格枚举会让**整批**上报被拒，而 CLI 会把 pending 一直重发 ——
+ *   采集在那台机器上**永久停住**。未知值原样入库，并由 `/api/v1/stats/sources`
+ *   与注册表取并集列出来，于是看板上既看得到、也筛得中。
+ * ⚠️ 缺失 / 空串 / 超长 / 非法字符一律降级成 `null`，由入库路径按库内默认值
+ *   `'dsh'` 兜底（v9 之前只有 DSH 上报过，所以那是事实而不是猜测）。
+ * ⚠️ 形状限成 `[a-z0-9-]{1,32}`：它是**列值**也是分组键，放行空格 / 换行 / 超长
+ *   会让分组里冒出看不出区别的几行，而 `usage_event.source` 上有 32 的长度上限 ——
+ *   超长会被 MySQL 截断或报错（整批回滚、客户端无限重试）。
+ */
+const sourceOrNull = z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,31}$/).nullable().catch(null)
+
 // ─────────────────────────────────────────────────────────────
 // 上报：POST /api/v1/token-usage
 // ─────────────────────────────────────────────────────────────
@@ -116,6 +131,8 @@ export const ingestRecordSchema = z.object({
   cwd: nullableTrimmedString,
   turn: nullableInt,
   step: nullableInt,
+  // ★ v9：哪台客户端写的。缺失即 null ⇒ 入库按 `'dsh'` 兜底（见 `sourceOrNull`）。
+  source: sourceOrNull,
 })
 
 /** 校验通过后的归一化结果 —— 与 `core/db` 的 `IngestRecord` 逐字段一致。 */

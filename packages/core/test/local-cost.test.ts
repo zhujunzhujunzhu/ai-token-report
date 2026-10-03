@@ -35,6 +35,7 @@ import type { UsageRecord } from '../src/types.js'
 /** 一个 1200 token 的事件：1000 未缓存输入 + 200 输出。 */
 function record(over: Partial<UsageRecord> & { time: number }): UsageRecord {
   return {
+    source: 'dsh',
     eventId: `s:${over.time}`,
     sessionId: 's',
     seq: 0,

@@ -21,6 +21,9 @@
 export * from './driver.js'
 export * from './schema.js'
 export * from './ingest.js'
+// 纯文本来源（Codex 等）的增量入库：与 `ingest.ts` 共用 schema 与幂等语义，
+// 但判据不同（没有 zstd 帧，用文件级 L1 + `event_id` 去重），所以是两个入口。
+export * from './ingest-plain.js'
 export * from './query.js'
 export * from './stats.js'
 export * from './local-rollup.js'

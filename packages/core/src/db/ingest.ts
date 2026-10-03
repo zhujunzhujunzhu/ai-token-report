@@ -39,6 +39,7 @@ import type { ScanDiagnostics, SessionMeta, UsageRecord } from '../types.js'
 import type { WireTokenRecord } from '@ai-token-report/shared'
 import { portalDialect, type PortalStore } from './portal-db.js'
 import { openDb, ensureSchema, needsRebuild, rebuildSchema, EVENT_TABLE, DB_SCHEMA_VERSION } from './schema.js'
+import { PORTAL_SOURCE_DEFAULT } from './portal-schema-v9.js'
 
 /** 一次 ingest 的结果。 */
 export interface IngestResult {
@@ -162,10 +163,10 @@ export async function ingest(options: IngestOptions): Promise<IngestResult> {
     // ── 单事务：写数据 + 推水位线 + 更新诊断 ──────────────────────────
     const insert = db.prepare(
       `INSERT OR IGNORE INTO ${EVENT_TABLE}
-       (event_id, session_id, seq, ts, provider, model, cwd,
+       (event_id, session_id, seq, ts, provider, model, cwd, source,
         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
         reasoning_tokens, turn, step)
-       VALUES ($eventId, $sessionId, $seq, $ts, $provider, $model, $cwd,
+       VALUES ($eventId, $sessionId, $seq, $ts, $provider, $model, $cwd, $source,
                $input, $output, $cacheRead, $cacheWrite,
                $reasoning, $turn, $step)`,
     )
@@ -232,6 +233,9 @@ export async function ingest(options: IngestOptions): Promise<IngestResult> {
           $provider: rec.provider,
           $model: rec.model,
           $cwd: rec.cwd,
+          // 来源由解析阶段决定（每条记录自带），不是「这次跑了哪些来源」——
+          // 后者在混合来源的一轮里会把 Codex 的记录写成 dsh。
+          $source: rec.source,
           $input: rec.usage.input,
           $output: rec.usage.output,
           $cacheRead: rec.usage.cacheRead,
@@ -625,6 +629,21 @@ export function insertRecords(db: Database, records: UsageRecord[]): {
   inserted: number
   duplicates: number
 } {
+  // 🚨 这个函数**刻意不写 `source` 列**（上报库 v9 起已有这一列，不是没有）。
+  //   它是本地库与上报库**共用**的种子/迁移入口，语义是「没有来源信息的历史数据」，
+  //   落库默认值 'dsh' 正是那个事实。若这里也带 `source`，就会出现**第二条来源写入路径** ——
+  //   它没有采集证据（不经 `scanPlainSources()` 的水位线与 `event_id` 幂等），
+  //   于是「来源」这个维度会有一半的数据没法追溯是怎么来的。
+  //   护栏：**显式**非 DSH 来源的记录被拒绝 —— 那种记录必须走采集路径
+  //   （`ingest()` / `ingestPlainSources()`），不能在这里被悄悄写成默认的 'dsh'。
+  //   `undefined` 放行：那是「老种子数据 / 测试夹具」的写法。
+  const foreign = records.find((rec) => rec.source !== undefined && rec.source !== 'dsh')
+  if (foreign !== undefined) {
+    throw new Error(
+      `insertRecords 只用于本地/上报库的种子数据（不含 source 列）；` +
+        `来源 ${foreign.source} 的记录请走采集路径 ingest() / ingestPlainSources()`,
+    )
+  }
   const insert = db.prepare(
     `INSERT OR IGNORE INTO ${EVENT_TABLE}
      (event_id, session_id, seq, ts, provider, model, cwd,
@@ -805,7 +824,10 @@ export async function insertAttributedRecordsInTransaction(
     const values: AttributedValues = [rec.event_id, rec.session_id, rec.seq, rec.ts,
       rec.provider, rec.model, rec.cwd, ...identity,
       rec.input_tokens, rec.output_tokens, rec.cache_read_tokens, rec.cache_write_tokens,
-      rec.reasoning_tokens, rec.turn, rec.step, ...attribution]
+      rec.reasoning_tokens, rec.turn, rec.step, ...attribution,
+      // ★ v9：来源。缺省（老客户端 / 本地造数）按 `dsh` 落库 —— v9 之前只有
+      //   DSH 上报过，所以这是**事实**而不是猜测；显式写 NULL 会被 NOT NULL 拒掉。
+      rec.source ?? PORTAL_SOURCE_DEFAULT]
     // 字符串按 UTF-8 字节计算，额外预留占位符和协议开销；只保留当前块的绑定值。
     const rowBytes = values.reduce<number>((sum, value) =>
       sum + (typeof value === 'string' ? Buffer.byteLength(value, 'utf8') : 8) + 24, 0)
@@ -825,7 +847,9 @@ export async function insertAttributedRecordsInTransaction(
 type AttributedValues = (string | number | null | undefined)[]
 const ATTRIBUTED_COLUMNS = ['event_id', 'session_id', 'seq', 'ts', 'provider', 'model', 'cwd',
   'user_id', 'user_name', 'group_name', 'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens',
-  'reasoning_tokens', 'turn', 'step', 'member_id', 'report_token_id', 'received_at_ms']
+  'reasoning_tokens', 'turn', 'step', 'member_id', 'report_token_id', 'received_at_ms',
+  // ★ v9：来源列在**最后**（列序与受控定义无关，这样加列不必重排既有绑定值）。
+  'source']
 // SQLite 每条最多 840 个参数（低于旧版 999），MySQL 最多 4,200（低于 65,535）。
 // 512 KiB 是批量目标而不是新接收上限：原协议允许的单条大记录独立写入，绝不截断。
 const ATTRIBUTED_BATCH_BYTES = 512 * 1024

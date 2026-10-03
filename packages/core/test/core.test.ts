@@ -80,6 +80,8 @@ function makeRecord(overrides: RecordOverrides = {}): UsageRecord {
     reasoningTokens: overrides.reasoning ?? 0,
   })
   return {
+    // 夹具缺省按 DSH 造数（历史上只有这一个来源）；来源相关的用例显式传 source。
+    source: 'dsh',
     eventId: overrides.eventId ?? 'sess:1',
     sessionId: overrides.sessionId ?? 'sess',
     seq: overrides.seq ?? 1,

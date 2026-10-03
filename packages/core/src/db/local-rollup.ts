@@ -140,6 +140,21 @@ function sync(db: Database): void {
   } finally { insert.finalize() }
 }
 
+/**
+ * 这个维度能不能从**汇总表**读。
+ *
+ * 🚨 汇总表的 cell 主键是 `(hour, session_id, provider, model, cwd)` —— **没有来源**。
+ *   拿它去算「按来源分组」只会得到一个 undefined 的来源段（实测键长成
+ *   `undefined/openai/gpt-5.5`），既不是报错也不是正确数字。
+ *   所以来源相关的维度**一律回落到 `usage_event` 上的精确查询**。
+ *
+ * ⚠️ 这与门户库 `portal.ts` 里那个「能否只按时间窗查汇总」的判定是**同一类陷阱**：
+ *   汇总/物化表里没有某个维度时，查询层必须显式绕开它，否则筛选或分组被静默忽略。
+ */
+export function rollupSupportsDimension(dim: GroupDimension): boolean {
+  return dim !== 'source' && dim !== 'source-provider-model'
+}
+
 /** 一次查询共用同一份已过滤的压缩行；总计、精确会话去重、分组和趋势不再读原始表。 */
 export class LocalRollupSnapshot {
   readonly counts = emptyCounts()

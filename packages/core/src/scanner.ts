@@ -9,6 +9,8 @@ import type { Dirent, Stats } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 import { decodeFramedZstd, decodeFramedZstdFrom, parseJsonl } from './decode.js'
+import { requireSource } from './sources/registry.js'
+import type { SourceRoot } from './sources/types.js'
 import {
   addCounts,
   emptyCounts,
@@ -149,6 +151,8 @@ async function listSessionFilesInRoot(sessionsRoot: string, options: { strictErr
 
       for (const entry of selectSessionLogFiles(entries)) {
         out.push({
+          // ← 这是 DSH 的列举实现（历史上只有来源），Codex 等由各自的适配器负责。
+          source: 'dsh',
           sessionId,
           cwd: null,
           createdAt: null,
@@ -187,7 +191,7 @@ export function sessionFilesFromPaths(sessionsRoot: SessionsRootInput, paths: re
     if (parts === undefined || !entry?.startsWith('session') || !entry.endsWith('.jsonl.zstd')) {
       throw new Error(`变更日志路径不属于会话目录结构：${path}`)
     }
-    files.set(filePath, { sessionId: sessionId!, projectDir: projectDir!, filePath, cwd: null, createdAt: null })
+    files.set(filePath, { source: 'dsh', sessionId: sessionId!, projectDir: projectDir!, filePath, cwd: null, createdAt: null })
   }
   return [...files.values()]
 }
@@ -282,12 +286,12 @@ export async function scanSessionFile(
 }
 
 /** 跨事件行累积的解析状态（`cwd` 来自 `session` 首行，供后续事件继承）。 */
-interface ParseState {
+export interface ParseState {
   cwd: string | null
 }
 
 /** 帧不等于 JSONL 行：保留跨帧的尾行，其余文本解析完立即释放。 */
-function eventCollector(meta: SessionMeta, state: ParseState, diagnostics: ScanDiagnostics, records: UsageRecord[]) {
+export function eventCollector(meta: SessionMeta, state: ParseState, diagnostics: ScanDiagnostics, records: UsageRecord[]) {
   let pending = ''
   return {
     push(chunk: string) {
@@ -392,7 +396,11 @@ function collectEvents(
     })
 
     records.push({
+      // ⚠️ DSH 的幂等键**不带来源前缀**：它是上报库的主键，改它等于让服务端
+      //   把历史事件当成新事件再插一遍（全量补报时数字翻倍，且不报错）。
+      //   来源由 `source` 列承载，主键不该承担这件事。
       eventId: `${meta.sessionId}:${seq}`,
+      source: 'dsh',
       sessionId: meta.sessionId,
       seq,
       time,
@@ -500,13 +508,223 @@ export async function scanAll(
 ): Promise<{ records: UsageRecord[]; sessions: SessionMeta[]; diagnostics: ScanDiagnostics }> {
   const diagnostics = emptyDiagnostics()
   const files = await listSessionFiles(sessionsRoot)
+  return scanFiles(files, options, diagnostics)
+}
+
+/**
+ * 按**来源适配器**列举一组根下的会话文件。
+ *
+ * 与 `listSessionFiles` 的关系：那个是 DSH 的列举实现（历史上只有来源），
+ * 这个是「任意来源」的列举 —— 每个根交给它自己的适配器，本函数只负责
+ * **顺序确定**与**按文件路径去重**（同一份日志被两个根列出两次时只读一次）。
+ *
+ * ⚠️ 刻意**不按 sessionId 去重**：DSH 的一个会话可能被拆成多个
+ * `session*.jsonl.zstd`（格式分段），按会话去重会**静默丢掉**那些分段。
+ * 副本（Codex 的 `archived_sessions/`、互为镜像的两个 home）由
+ * `event_id` 主键去重吸收，根序保证「先到者胜」可复现 —— 与多 home 的既有语义完全一致。
+ */
+export async function listSourceFiles(
+  roots: readonly SourceRoot[],
+  options: { strictErrors?: boolean } = {},
+): Promise<SessionMeta[]> {
+  const merged = new Map<string, SessionMeta>()
+  for (const root of roots) {
+    const adapter = requireSource(root.source)
+    for (const meta of await adapter.list(root, options)) {
+      if (!merged.has(meta.filePath)) merged.set(meta.filePath, meta)
+    }
+  }
+  return [...merged.values()]
+}
+
+/** 扫描一组**带来源**的根（任意来源混合），返回全部计费记录。 */
+export async function scanAllSources(
+  roots: readonly SourceRoot[],
+  options: ScanOptions = {},
+): Promise<{ records: UsageRecord[]; sessions: SessionMeta[]; diagnostics: ScanDiagnostics }> {
+  const diagnostics = emptyDiagnostics()
+  const files = await listSourceFiles(roots)
+  return scanFiles(files, options, diagnostics)
+}
+
+/**
+ * 文件 `stat` 的并发度（纯文本来源的 L1 判定要按文件数走一遍）。
+ *
+ * 实测（本机 1,512 个文件 / Windows + Bun）：串行 **123ms** → 并发 32 **35ms**
+ * → 并发 128 **14ms**。取 32 是**刻意的折中**：再往上收益递减，而每个并发项都占一个
+ * 文件句柄 —— 热态取数**每次请求都会跑一遍**，不值得为了 20ms 去试探 fd 上限。
+ */
+const STAT_CONCURRENCY = 32
+
+/** 有界并发映射；结果顺序与输入一致（顺序决定「先到者胜」，不能乱）。 */
+export async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length)
+  let next = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const index = next++
+      if (index >= items.length) return
+      out[index] = await fn(items[index]!)
+    }
+  })
+  await Promise.all(workers)
+  return out
+}
+
+/** 一个纯文本来源文件在本轮扫描里的结果。 */
+export interface PlainSourceFileResult {
+  meta: SessionMeta
+  /** 当前字节数（L1 水位线写回用）。 */
+  size: number
+  mtimeMs: number
+  /** `true` = 本轮真的解析过它（字节数变过或还没有水位线）。 */
+  changed: boolean
+}
+
+export interface PlainSourceScanOptions {
+  /**
+   * 上次处理时的**字节数**（相等 ⇒ 整个文件跳过，零解析）。
+   *
+   * 缺省（不传）= 没有任何水位线 ⇒ 全部解析。**没有 L2 字节光标**是刻意的：
+   * 这些来源的计费事件有「同一次调用写两条 / 累计快照」的形态，半路续读会丢掉
+   * 那份上下文（见 `db/ingest-plain.ts` 文件头）。代价是「发生变化的文件整份重解析」，
+   * 而幂等由 `event_id` 主键兜住。
+   */
+  sizeOf?: (filePath: string) => number | undefined
+  /** 上次解析出的 cwd（增量块里没有 `session_meta` 时靠它继承项目归属）。 */
+  cwdOf?: (sessionId: string) => string | null | undefined
+  onProgress?: (done: number, total: number, file: string) => void
+}
+
+export interface PlainSourceScanResult {
+  /** 实际存在的根（不存在的那部分在 `missingRoots` 里，绝不静默）。 */
+  presentRoots: SourceRoot[]
+  missingRoots: string[]
+  records: UsageRecord[]
+  files: PlainSourceFileResult[]
+  diagnostics: ScanDiagnostics
+  /** 本轮真的解析过的文件数。 */
+  filesScanned: number
+  /** 因字节数未变而整份跳过的文件数。 */
+  skippedUnchanged: number
+}
+
+/**
+ * 扫描一组**纯文本来源**根，按字节数水位线决定要不要解析。
+ *
+ * ## 为什么单独有一个函数（而不是复用 `scanAllSources`）
+ *
+ * `scanAllSources` 是**全量**扫描（没有任何水位线），用在 `--no-db` 对照与验证脚本里；
+ * 而「入库」与「上报」两条路都需要**增量**语义：没变过的文件一条 JSON 都不解析。
+ * 这个函数就是那条增量语义的**唯一实现**，两条路都走它：
+ *
+ * | 调用方 | `sizeOf` 从哪来 | 解析结果去哪 |
+ * |---|---|---|
+ * | `db/ingest-plain.ts`（本地库 / 本地页 / 插件取数） | `file_watermark.size`（库） | `usage_event` + 水位线 |
+ * | `cli/report.ts`（上报） | `state.json` 的 `files[path].size` | pending → 投递 → `ack` |
+ *
+ * 🚨 两处**不能各写一份**：「什么时候该重解析」「重解析后哪些老记录被主键吸收」
+ *   这些判断一旦分叉，表现是「同一批日志，本地页与上报给出不同条数」而**不报错**。
+ *
+ * 🚨 阶段 2 刻意**串行**：列举顺序决定 `event_id` 冲突时谁先入库（活动副本优先于归档副本），
+ *   并发会把这个顺序变成调度噪声。便宜的是 `stat`（阶段 1，并发），贵的是解析，
+ *   而解析只在文件真的变了时才发生。
+ */
+export async function scanPlainSources(
+  roots: readonly SourceRoot[],
+  options: PlainSourceScanOptions = {},
+): Promise<PlainSourceScanResult> {
+  const diagnostics = emptyDiagnostics()
+  const presentRoots: SourceRoot[] = []
+  const missingRoots: string[] = []
+  for (const root of roots) {
+    if (existsSync(root.path)) presentRoots.push(root)
+    else missingRoots.push(root.path)
+  }
+
+  // ── 列举：只认纯文本来源；DSH 的根混进来要明确报错，而不是静默不统计它 ──
+  const files: SessionMeta[] = []
+  for (const root of presentRoots) {
+    const adapter = requireSource(root.source)
+    if (adapter.encoding !== 'plain-jsonl') {
+      throw new Error(`来源 ${root.source} 不是纯文本来源，请交给 scanAll()：${root.path}`)
+    }
+    for (const meta of await adapter.list(root)) files.push(meta)
+  }
+
+  // ── 阶段 1：并发 stat（纯读，与顺序无关）────────────────────────────
+  const stats = await mapLimit(files, STAT_CONCURRENCY, async (meta) => {
+    try {
+      const info = await stat(meta.filePath)
+      return { meta, size: info.size, mtimeMs: info.mtimeMs }
+    } catch {
+      return { meta, failed: true as const }
+    }
+  })
+
+  // ── 阶段 2：按列举顺序串行折叠 ──────────────────────────────────────
+  const records: UsageRecord[] = []
+  const fileResults: PlainSourceFileResult[] = []
+  let filesScanned = 0
+  let skippedUnchanged = 0
+  let done = 0
+  for (const entry of stats) {
+    const meta = entry.meta
+    const report = () => { done++; options.onProgress?.(done, files.length, meta.filePath) }
+    if ('failed' in entry) {
+      diagnostics.filesFailed++
+      report()
+      continue
+    }
+    const { size, mtimeMs } = entry
+    const previous = options.sizeOf?.(meta.filePath)
+    if (previous !== undefined && previous === size) {
+      skippedUnchanged++
+      fileResults.push({ meta, size, mtimeMs, changed: false })
+      report()
+      continue
+    }
+    const adapter = requireSource(meta.source)
+    let text: string
+    try {
+      text = await readFile(meta.filePath, 'utf8')
+    } catch {
+      diagnostics.filesFailed++
+      report()
+      continue
+    }
+    filesScanned++
+    // 起始 cwd 从水位线继承（增量块里没有 `session_meta` 时靠它保住项目归属）。
+    const inherited = options.cwdOf?.(meta.sessionId)
+    if (meta.cwd === null && inherited !== undefined && inherited !== null) meta.cwd = inherited
+    const folder = adapter.createFolder(meta, diagnostics, records)
+    folder.push(text)
+    folder.finish()
+    fileResults.push({ meta, size, mtimeMs, changed: true })
+    report()
+  }
+
+  return { presentRoots, missingRoots, records, files: fileResults, diagnostics, filesScanned, skippedUnchanged }
+}
+
+/**
+ * 扫一批文件并按 `event_id` 去重、按筛选条件过滤。
+ *
+ * ★ 全量入口（`scanAll` / `scanAllSources`）**共用这一份**去重与筛选逻辑：
+ *   两套实现会随时间漂移，表现是「同一批日志、不同入口给出不同数字」。
+ */
+async function scanFiles(
+  files: readonly SessionMeta[],
+  options: ScanOptions,
+  diagnostics: ScanDiagnostics,
+): Promise<{ records: UsageRecord[]; sessions: SessionMeta[]; diagnostics: ScanDiagnostics }> {
   const sessions: SessionMeta[] = []
   const records: UsageRecord[] = []
   const seenEvents = new Set<string>()
 
   let done = 0
   for (const meta of files) {
-    const result = await scanSessionFile(meta, diagnostics)
+    const result = await scanSourceFile(meta, diagnostics)
     sessions.push(result.meta)
 
     for (const rec of result.records) {
@@ -526,6 +744,39 @@ export async function scanAll(
   }
 
   return { records, sessions, diagnostics }
+}
+
+/**
+ * 按文件的**来源**选择解码与折叠方式。
+ *
+ * - `zstd-frames`（DSH）：走既有的 `scanSessionFile`（分帧解压 + 帧完整性检查）
+ * - `plain-jsonl`（Codex 等）：整文件读文本，交给适配器的折叠器
+ */
+export async function scanSourceFile(
+  meta: SessionMeta,
+  diagnostics: ScanDiagnostics,
+): Promise<SessionScanResult> {
+  const adapter = requireSource(meta.source)
+  if (adapter.encoding === 'zstd-frames') return scanSessionFile(meta, diagnostics)
+
+  const records: UsageRecord[] = []
+  const folder = adapter.createFolder(meta, diagnostics, records)
+  let text: string
+  try {
+    text = await readFile(meta.filePath, 'utf8')
+  } catch {
+    diagnostics.filesFailed++
+    return { meta, records }
+  }
+  diagnostics.filesScanned++
+  // ⚠️ 这里**刻意不**再加 `diagnostics.codexFiles++`：「采到的文件数」是**每个来源
+  //   自己的**计数（Codex / Claude Code / Trae / WorkBuddy 各自的适配器在
+  //   `createFolder()` 里加一次）。加在这里会把它变成「全部纯文本来源的文件数」，
+  //   而本地库路径（`ingestPlainSources`）根本不走这里 ⇒ 同一个字段在两条路径下
+  //   一个偏高、一个恒为 0。
+  folder.push(text)
+  folder.finish()
+  return { meta, records }
 }
 
 // ── 增量扫描 ────────────────────────────────────────────────────────────────

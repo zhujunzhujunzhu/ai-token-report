@@ -48,7 +48,7 @@ function record(index: number, ts: number, overrides: Partial<Record<string, unk
   } as never
 }
 
-async function seed(rows: { ts: number; receivedAtMs: number | null; memberId?: string; provider?: string; model?: string; input?: number }[]) {
+async function seed(rows: { ts: number; receivedAtMs: number | null; memberId?: string; provider?: string; model?: string; input?: number; source?: string }[]) {
   const t = target()
   await preparePortalDatabase(t)
   const store = await openPortalStore(t)
@@ -61,6 +61,8 @@ async function seed(rows: { ts: number; receivedAtMs: number | null; memberId?: 
     await insertAttributedRecords(store, [record(index, row.ts, {
       provider: row.provider ?? 'deepseek-official', model: row.model ?? 'deepseek-v4.1-flash',
       input_tokens: row.input ?? 10,
+      // v9：来源。不传时入库按库内默认值 `dsh` 兜底。
+      ...(row.source !== undefined ? { source: row.source } : {}),
     })], {
       userId: '甲', userName: '甲', memberId: row.memberId ?? MEMBER_ID, receivedAtMs: row.receivedAtMs,
     })
@@ -403,6 +405,74 @@ describe('v8 汇总表：查询路由（快路径与安全阀）', () => {
       const split = [...workday, ...weekend].reduce((sum, entry) => sum + entry.counts.calls, 0)
       expect(split).toBe(total)
       expect(total).toBeGreaterThan(0)
+    } finally { await store.close(); t.dispose() }
+  })
+})
+
+/**
+ * ★ v9 的**来源**维度与汇总表的关系。
+ *
+ * ## 这一组在守什么（`docs/Codex会话采集方案.md` D8 里点名的那条 🚨）
+ *
+ * `usage_rollup_*` 的键是 `(day_key, hour_of_day, member_id, provider, model)` ——
+ * **没有来源列**。而「这批筛选能不能走汇总表」的判定是
+ * `portal.ts` 的 `isTimeWindowOnly()`：它漏掉 `sources` 的后果不是「慢一点」，
+ * 而是带着 `source = ?` 去查汇总表（`no such column`）——
+ * 靠 `try/catch` 退原始表，看起来数字还是对的，但那条路径从此**永远靠异常兜底**，
+ * 「汇总表坏了」与「这个筛选不支持汇总表」变成同一个现象。
+ *
+ * ⚠️ 前提必须是**汇总表真的就绪**（`SUM(usage_rollup_day.calls) == 原始行数`）：
+ *   否则查询层本来就退原始表，这条用例等于什么都没验（`clearRollups()` 的注释里
+ *   记过同一个坑）。
+ */
+describe('★ v9 来源维度与汇总表', () => {
+  test('★ 按来源筛选 / 分组时退原始表：数字必须与原始表一致，且不靠异常兜底', async () => {
+    const now = Date.now()
+    const { t, store } = await seed([
+      { ts: now - 3 * 3600_000, receivedAtMs: now - 3 * 3600_000, provider: 'openai', input: 100, source: 'codex' },
+      { ts: now - 2 * 3600_000, receivedAtMs: now - 2 * 3600_000, provider: 'anthropic', input: 7, source: 'claude-code' },
+      { ts: now - 3600_000, receivedAtMs: now - 3600_000, provider: 'deepseek-official', input: 1, source: 'dsh' },
+    ])
+    try {
+      await syncRollups(store, { now })
+      // ★ 先钉住前提：汇总表覆盖了全部三行。少了这一句，下面验的可能是原始表。
+      const rolled = await store.get<{ c: unknown }>('SELECT SUM(calls) AS c FROM usage_rollup_day')
+      expect(Number(rolled?.c)).toBe(3)
+
+      // ① 按来源筛选：只出该来源的用量（漏判 `isTimeWindowOnly` 时这里会撞 SQL 错，
+      //    或被吞掉后退原始表 —— 数字仍对，但那不是我们想要的路径）。
+      const codex = await openPortalStats(t, { sources: ['codex'] })
+      const codexTotals = await codex.totals()
+      expect(codexTotals.calls).toBe(1)
+      expect(codexTotals.input).toBe(100)
+      // 趋势同样按来源收窄（`#rollupSeries` 也必须判掉）。
+      const codexSeries = await codex.series('day', false)
+      expect(codexSeries.reduce((sum, point) => sum + point.counts.calls, 0)).toBe(1)
+      await codex.close()
+
+      // ② 按来源分组：三个来源各一行，且各来源之和 == 总量。
+      const grouped = await openPortalStats(t, {})
+      const rows = await grouped.groups('source')
+      expect(rows.map((row) => row.key).sort()).toEqual(['claude-code', 'codex', 'dsh'])
+      const total = await grouped.totals()
+      expect(rows.reduce((sum, row) => sum + row.counts.calls, 0)).toBe(total.calls)
+      await grouped.close()
+
+      // ③ 工作时段分布（走 `usage_rollup_hod` 的那条路）也必须按来源收窄。
+      const hours = await openPortalStats(t, { sources: ['claude-code'] })
+      const points = await hours.hourOfDay('all')
+      expect(points.reduce((sum, point) => sum + point.counts.calls, 0)).toBe(1)
+      await hours.close()
+
+      // ④ 不带来源筛选时，汇总表照旧可用：与清表后的原始表逐位相同。
+      const fast = await openPortalStats(t, {})
+      const fastTotals = await fast.totals()
+      await fast.close()
+      await clearRollups(store)
+      const raw = await openPortalStats(t, {})
+      const rawTotals = await raw.totals()
+      await raw.close()
+      expect(JSON.stringify(fastTotals)).toBe(JSON.stringify(rawTotals))
     } finally { await store.close(); t.dispose() }
   })
 })

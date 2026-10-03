@@ -124,11 +124,23 @@ import { emptyCounts } from '../types.js'
  * 「聚合」从 SQL 搬到 JS，收益消失、还多一条容易分叉的路径。
  *
  * 所以带任何维度筛选的请求一律走原始表（它已经正确、也已经有索引）。
+ *
+ * ⚠️ **`source` 是后来才有的维度**（v9 给事实表加了这一列，汇总表**没加**）：
+ *   它不在这张「能不能走汇总表」的判定里的话，按来源取数会带着
+ *   `source = ?` 去查汇总表 —— 那是 `no such column`，也是本仓最不想要的那种
+ *   「靠异常兜底」的路径（见下面那句的注释）。
  */
 function isTimeWindowOnly(filter: QueryFilter): boolean {
   const hasDimension = (filter.providers?.length ?? 0) > 0 || (filter.models?.length ?? 0) > 0
     || (filter.userIds?.length ?? 0) > 0 || (filter.memberIds?.length ?? 0) > 0
     || (filter.legacyUserIds?.length ?? 0) > 0 || (filter.groupIds?.length ?? 0) > 0
+    // 🚨 **来源（v9）必须算进来**：`usage_rollup_*` 的键里**没有来源列**，
+    //   带着 `source = ?` 去查它必然报「no such column」。而这一句的语义是
+    //   「这批筛选条件能不能用汇总表」——漏掉来源的后果不是「慢一点」，
+    //   而是每次按来源取数都先撞一次 SQL 错误（或被 `try/catch` 吞掉后静默退原始表）。
+    //   本仓宁可显式判掉，也不靠异常路径兜底：异常路径会让「汇总表坏了」
+    //   与「这个筛选不支持汇总表」变成同一个现象。
+    || (filter.sources?.length ?? 0) > 0
     || filter.unattributedOnly === true
   return !hasDimension
 }
@@ -257,6 +269,13 @@ export interface PortalRecordRow {
   providerRaw: string
   model: string
   cwd: string | null
+  /**
+   * ★ v9：这条用量是哪个客户端写的（`dsh` / `codex` / `claude-code` / …）。
+   *
+   * ⚠️ 它是**上报当时的原值**，查询期不做任何归一化（与 provider 的展示名刻意不同）：
+   *   来源是受控枚举，`trae` 与 `trae-cn` 是两个独立来源，归一化会把它们混起来。
+   */
+  source: string
   input: number
   output: number
   cacheRead: number
@@ -288,6 +307,8 @@ interface PortalRecordSqlRow {
   provider_norm?: unknown
   model: string
   cwd: string | null
+  /** v9：这条用量是哪个客户端写的（受控枚举原值，查询期不做任何归一化）。 */
+  source: string
   input_tokens: unknown
   output_tokens: unknown
   cache_read_tokens: unknown
@@ -528,6 +549,16 @@ export class PortalStatsSession {
   async #rollupUsable(): Promise<boolean> {
     if (this.#rollupState !== undefined) return this.#rollupState
     this.#rollupState = false
+    // 🚨 **按来源筛选/分组时必须退原始表**：`usage_rollup_*` 的键是
+    //   `(day_key, hour_of_day, member_id, provider, model)` —— **没有来源列**。
+    //   带着 `source = ?` 去查汇总表会撞「no such column」（在 SQLite / MySQL 上
+    //   都一样），而下面那个 try 会把它吞成「汇总表不可用」⇒ 静默退原始表：
+    //   结果**恰好正确**，但每一次来源查询都会先白跑一条注定失败的 SQL。
+    //   所以这里显式判掉，并留下这条注释 —— 否则下一个人会把汇总表当成
+    //   「反正会自动回退」而继续依赖异常路径。
+    //   ⚠️ 这不是缺陷而是取舍：给汇总表加来源维要重建全部汇总行（v9 不做），
+    //   而来源筛选是**少数派查询**，退原始表的代价可以接受（与本地库同一取舍）。
+    if ((this.#filter.sources?.length ?? 0) > 0) return this.#rollupState
     try {
       const { sql, params } = buildWhere(this.#filter, undefined)
       const source = await this.#store.get<{ c: unknown }>(
@@ -1160,7 +1191,7 @@ export class PortalStatsSession {
     const rows = await this.#store.all<PortalRecordSqlRow>(
       // ⚠️ ORDER BY 用 (ts, seq) 而不是 ts：同一毫秒内的多条记录需要有
       //   稳定的次序，否则翻页时会出现「第 2 页重复了第 1 页的最后一行」。
-      `SELECT event_id, session_id, seq, ts, user_id, member_id, user_name, group_name, model, cwd,
+      `SELECT event_id, session_id, seq, ts, user_id, member_id, user_name, group_name, model, cwd, source,
               ${projection.columns},
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
        FROM ${EVENT_TABLE}${sql}
@@ -1200,6 +1231,9 @@ export class PortalStatsSession {
           ...mapRecordProvider(r),
           model: r.model,
           cwd: r.cwd,
+          // ★ v9 来源：明细也要带它 —— 「这条用量是谁写的」在逐条核对时同样要能看见
+          //   （例如「看板上筛了 Codex，但这一行其实是 DSH 的」这种问题只在这里看得出来）。
+          source: r.source,
           input: usage.input,
           output: usage.output,
           cacheRead: usage.cacheRead,

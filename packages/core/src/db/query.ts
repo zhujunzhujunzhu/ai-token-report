@@ -33,7 +33,7 @@ import type { Database, SQLQueryBindings } from './driver.js'
 //   这两条规则（toDayKey / toHourKey / projectName）必须只有一份实现，
 //   否则「SQL 路径」与「内存路径」会算出不同的桶键与项目名。
 import { projectName, toDayKey, toHourKey, type GroupDimension } from '../aggregate.js'
-import { emptyCounts, type TokenCounts } from '../types.js'
+import { emptyCounts, type SessionSource, type TokenCounts } from '../types.js'
 import { EVENT_TABLE } from './schema.js'
 import { SQLITE_DIALECT, type PortalDialect } from './dialect.js'
 import {
@@ -95,6 +95,14 @@ export interface QueryFilter {
    *   本地库路径（`usage.sqlite`）绝不能带上它 —— 一旦带上就是「no such table」。
    */
   groupIds?: string[]
+  /**
+   * 按**来源**筛选（多选，**精确匹配**，多个之间是 OR）。
+   *
+   * ⚠️ 与 provider / model 刻意不同：那两个是子串匹配（「找一类模型」的便利），
+   *   来源是**受控枚举**（`dsh` / `codex` / …），子串匹配会让
+   *   `--source code` 把 `codex` 也捞进来 —— 一个字母之差就是另一个采集方。
+   */
+  sources?: string[]
 }
 
 /** 一条从库里还原出来的原始行（对应 `UsageRecord`，但带 project 键）。 */
@@ -176,6 +184,17 @@ export function buildWhere(
   //   `providerFilterExpression()` 返回裸 `provider`，SQL 与迁移前逐字相同。
   likeAny(providerFilterExpression(normalize, params), filter.providers, 'prov')
   likeAny('model', filter.models, 'model')
+
+  // 来源：精确匹配（受控枚举，不做子串 —— 见 QueryFilter.sources 的注释）。
+  if (filter.sources && filter.sources.length > 0) {
+    const parts: string[] = []
+    filter.sources.forEach((sourceValue, i) => {
+      const key = `$source${i}`
+      parts.push(`source = ${key}`)
+      params[key] = sourceValue
+    })
+    clauses.push(`(${parts.join(' OR ')})`)
+  }
 
   // 归属：精确匹配。`unknown` 走 IS NULL —— 库里未归属的行 user_id 为 NULL，
   // 而不是字符串 'unknown'（本机库的归属三列恒为 NULL，见 schema.ts）。
@@ -319,6 +338,10 @@ function dimensionExpression(
   params?: Record<string, string | number>,
 ): string | null {
   switch (dim) {
+    case 'source':
+      // 来源是受控枚举（dsh / codex / …），**不做归一化**：它的值由采集端决定，
+      // 不是用户可配的显示名（那是 provider 的事）。
+      return 'source'
     case 'provider': {
       if (!hasNormalization(normalize) || !params) return 'provider'
       return coalesceOriginal(providerCaseSql('provider', normalize.map, params, 'gp'), 'provider')
@@ -332,6 +355,14 @@ function dimensionExpression(
       // ★ 先归一化 provider 那一段，再拼接：规则里的 `provider` 只写供应商名，
       //   所以比较也必须发生在单个 provider 上（见 providerModelExpression 的 🚨）。
       return providerModelExpression(dialect, coalesceOriginal(providerCaseSql('provider', normalize.map, params, 'gm'), 'provider'))
+    }
+    case 'source-provider-model': {
+      // 组合维度：`<source>/<provider>/<model>`，与 `aggregate.ts` 的 `groupKey()` 逐字同形
+      //   （两端不一致会让「库查询 == 直扫」这条对照断言失败 —— 它正是为此存在的）。
+      const inner = !hasNormalization(normalize) || !params
+        ? providerModelExpression(dialect)
+        : providerModelExpression(dialect, coalesceOriginal(providerCaseSql('provider', normalize.map, params, 'gs'), 'provider'))
+      return dialect.concat(['source', `'${PROVIDER_MODEL_SEPARATOR_SQL}'`, inner])
     }
     case 'user':
       // ★ 未归属归到 UNATTRIBUTED_USER 这一组，而不是被 GROUP BY 丢进 NULL ——
@@ -1333,6 +1364,8 @@ export function seriesFromRows(
  *   `totalsQuery` / `groupsQuery` / … 那些构建器里，且只有那一份文本。
  */
 export function queryRecords(db: Database, filter: QueryFilter = {}): {
+  /** 来源（DSH / Codex / …）；P2 起由 `usage_event.source` 列给出。 */
+  source: SessionSource
   eventId: string
   sessionId: string
   seq: number
@@ -1355,6 +1388,7 @@ export function queryRecords(db: Database, filter: QueryFilter = {}): {
         provider: string
         model: string
         cwd: string | null
+        source: SessionSource
         input_tokens: number
         output_tokens: number
         cache_read_tokens: number
@@ -1365,7 +1399,7 @@ export function queryRecords(db: Database, filter: QueryFilter = {}): {
       },
       SQLQueryBindings
     >(
-      `SELECT event_id, session_id, seq, ts, provider, model, cwd,
+      `SELECT event_id, session_id, seq, ts, provider, model, cwd, source,
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
               reasoning_tokens, turn, step
        FROM ${EVENT_TABLE}${sql}
@@ -1383,6 +1417,8 @@ export function queryRecords(db: Database, filter: QueryFilter = {}): {
     usage.calls = 1
     usage.total = usage.input + usage.output + usage.cacheRead + usage.cacheWrite
     return {
+      // 来源直接来自列（老库重建时默认 `'dsh'`，那是历史事实）。
+      source: r.source,
       eventId: r.event_id,
       sessionId: r.session_id,
       seq: r.seq,

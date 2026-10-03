@@ -124,6 +124,19 @@ export interface WireTokenRecord {
   cwd: string | null
   turn: number | null
   step: number | null
+  /**
+   * 这条用量是**哪个客户端**写的（`dsh` / `codex` / `claude-code` / `trae` /
+   * `trae-cn` / `workbuddy`）。
+   *
+   * ★ **可选**：v9 之前发布的客户端一个字节都不发这个字段，服务端把它们
+   *   按库内默认值 `dsh` 落库 —— 那不是猜测：v9 之前只有 DSH 上报过
+   *   （`report` 只扫 DSH 的会话根）。
+   * ⚠️ 服务端**不按注册表严格校验**它（只校验形状，见 `schemas.ts`）：
+   *   客户端比服务端新时，严格枚举会让整批上报被拒，而 CLI 会把 pending
+   *   一直重发 —— 采集在那台机器上永久停住。未知值原样入库，并由
+   *   `/api/v1/stats/sources` 一并列出（看板因此看得到也筛得中）。
+   */
+  source?: string
 }
 
 /**
@@ -185,7 +198,7 @@ export interface IngestResponse {
 // ─────────────────────────────────────────────────────────────
 
 /** 分组维度。与 CLI 的 `--by` 选项保持一致。 */
-export type GroupBy = 'provider' | 'model' | 'provider-model' | 'user' | 'group' | 'project' | 'day' | 'hour'
+export type GroupBy = 'provider' | 'model' | 'provider-model' | 'source' | 'user' | 'group' | 'project' | 'day' | 'hour'
 
 /** 时间分桶粒度。 */
 export type Bucket = 'day' | 'hour'
@@ -229,6 +242,16 @@ export interface StatsQuery {
   /** 子串匹配，与 CLI 的 `--provider` 行为一致 */
   provider?: string
   model?: string
+  /**
+   * 按**来源**筛选（多选，OR），例如只看 Codex 与 Claude Code 的用量。
+   *
+   * ★ **精确匹配，不是子串** —— 与 `provider` 刻意相反：来源是受控枚举
+   *   （`dsh` / `codex` / `claude-code` / `trae` / `trae-cn` / `workbuddy`），
+   *   子串匹配会让 `code` 命中 `codex`、`trae` 命中 `trae-cn`，
+   *   而那是两个**独立安装、独立账号**的来源（见 `sources/trae.ts` 文件头）。
+   *   `core/db/query.ts` 的 `buildWhere()` 因此也是 `source = ?` 而不是 LIKE。
+   */
+  sources?: string[]
   /**
    * 按署名过滤，用于「只看某人」。**精确匹配**（不是子串）：
    * 子串匹配会把「张三」和「张三丰」混成一个。
@@ -412,6 +435,17 @@ export interface RecordRow {
    */
   providerRaw?: string
   model: string
+  /**
+   * ★ v9：这条用量是**哪个客户端**写的（`dsh` / `codex` / `claude-code` /
+   * `trae` / `trae-cn` / `workbuddy`）。
+   *
+   * ⚠️ 它是上报当时的**原值**，查询期不做任何归一化（与 `provider` 的展示名刻意相反）：
+   *   来源是受控枚举，`trae` 与 `trae-cn` 是两个独立安装、独立账号的来源，
+   *   归一化会把它们混成一个 —— 那正是本仓在别处花大力气避免的错。
+   * ⚠️ 明细是唯一能逐条核对来源的地方：只看看板的来源汇总时，
+   *   「筛了 Codex 但这一行其实是 DSH」这种问题看不出来。
+   */
+  source: string
   totalTokens: number
   inputTokens: number
   outputTokens: number
@@ -506,6 +540,24 @@ export interface StatsMembersResponse {
 export interface StatsProvidersResponse {
   /** 去重、升序的展示名（多条规则指向同一个名字时只出现一次）。 */
   providers: string[]
+}
+
+/**
+ * 筛选栏要用的**来源**候选项（`GET /api/v1/stats/sources`）。
+ *
+ * ★ 与 {@link StatsProvidersResponse} 的唯一结构差别是**值域受控**：
+ *   来源是受控枚举（`dsh` / `codex` / `claude-code` / `trae` / `trae-cn` /
+ *   `workbuddy`，见 `core/src/sources/registry.ts`），所以候选项 =
+ *   本进程注册的全部来源 **∪** 库里实际出现过的值。前者的作用是
+ *   「本机还没跑过 Codex 时也能筛它、得到如实的 0 行」，后者兜住
+ *   「更新版客户端上报了一个本进程还不认识的来源」—— 只在库里取候选的话，
+ *   那种行在页面上看得到却筛不出来。
+ *
+ * ⚠️ 与供应商候选同样：只回名字、不含任何用量数字，也不跟着数据范围收窄。
+ * ⚠️ 顺序固定（`dsh` 在最前，其余字典序）：下拉项序不该随库里的数据变化。
+ */
+export interface StatsSourcesResponse {
+  sources: string[]
 }
 
 /**
@@ -632,12 +684,30 @@ export interface LocalStatsQuery {
  * 所以 `missingRoots` 必须逐项报出、绝不静默。
  */
 export interface LocalStatsSources {
-  /** 本次统计读的**会话日志根**（绝对路径）。多个 = 多套 DSH 的并集去重。 */
+  /** 本次统计读的**会话日志根**（绝对路径）。多个 = 多来源 / 多套 DSH 的并集去重。 */
   sessionsRoots: string[]
   /** 配了但**不存在**的根：逐项列出，不静默跳过。 */
   missingRoots: string[]
   /** token-report 自己的**数据目录**（身份 / 本地库 / outbox / 补报水位）；与会话日志根无关。 */
   dataDir: string | null
+  /**
+   * ★ 按**来源**分组的根（多客户端：`dsh` / `codex` / …）。
+   *
+   * 为什么不能只给 `sessionsRoots`：多来源之下「读了哪几处」与「这些数字是谁的」
+   * 是两个问题，而扁平的那一组根答不出第二个 —— Codex 的根与 DSH 的根在
+   * 同一个数组里，页面上就只能说一句「N 个会话日志根」。
+   *
+   * ⚠️ **可选**：老服务端不返回它。消费方缺字段时必须退化成旧文案，
+   *   而不是显示一个空的来源列表（那会把「老服务端」说成「没有任何来源」）。
+   */
+  bySource?: Array<{
+    /** 来源 id（受控枚举：`dsh` / `codex` / `claude-code` / `trae` / `trae-cn` / `workbuddy` / …）。 */
+    source: string
+    /** 该来源**存在**的根。 */
+    roots: string[]
+    /** 该来源配了但不存在的根。 */
+    missingRoots: string[]
+  }>
 }
 
 /**

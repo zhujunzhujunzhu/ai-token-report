@@ -8,7 +8,7 @@ import { listSessionFiles, scanAll, scanIncremental, selectSessionLogFiles, SESS
 import { emptyState, stageRecords } from '../src/state.js'
 import { ingest, openDatabaseForIngest, openPortalDb } from '../src/db/ingest.js'
 import { PORTAL_SCHEMA_VERSION } from '../src/db/portal-db.js'
-import { openDb } from '../src/db/schema.js'
+import { DB_SCHEMA_VERSION, openDb } from '../src/db/schema.js'
 import { queryRecords } from '../src/db/query.js'
 import { readLocalRollup } from '../src/db/local-rollup.js'
 import type { Database } from '../src/db/driver.js'
@@ -90,7 +90,10 @@ test('已有旧缓存缺少扫描版本时整库重新派生，schema 仍为 v3�
   await cycle([])
   expect(queryRecords(db).map(row => [row.seq, row.usage.input])).toEqual([[1, 12]])
   expect(readLocalRollup(db).counts.input).toBe(12)
-  expect(db.query<{ user_version: number }>('PRAGMA user_version').get()?.user_version).toBe(3)
+  // ⚠️ 这里断言的是**本地库**的 schema 版本，必须跟常量走：写死数字会让
+  //   每次升版本（例如 P2 加 `source` 列）都要来改一遍测试，而漏改的表现
+  //   只是「这条断言失败」——反而掩盖了它真正想验的事（重建后版本被正确写入）。
+  expect(db.query<{ user_version: number }>('PRAGMA user_version').get()?.user_version).toBe(DB_SCHEMA_VERSION)
   expect(db.query<{ revision: number }>('SELECT revision FROM local_scan_meta WHERE id = 1').get()?.revision).toBe(SESSION_SCAN_REVISION)
   expect((await cycle()).bytesRead).toBe(0)
 })
