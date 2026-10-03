@@ -45,6 +45,7 @@ import {
   type SessionsRootInput,
 } from '@ai-token-report/core'
 import { openStats, type StatsSession } from '@ai-token-report/core/db'
+import type { SourceRoot } from '@ai-token-report/core'
 // ★ 费用聚合与离线单价快照：本地路径的价只能来自 `pricing.json`（或内置种子价），
 //   因为员工机器上没有 `model_price` 表，而且必须断网可用。
 //   折叠与格式化全部复用这些函数，本文件**不写任何金额算术**。
@@ -125,10 +126,22 @@ export class CoreStatsProvider implements StatsProvider {
   readonly #sessionsRoot: SessionsRootInput
   readonly #dbPath: string
 
-  constructor(sessionsRoot: SessionsRootInput, dbPath: string) {
+  constructor(
+    sessionsRoot: SessionsRootInput,
+    dbPath: string,
+    /**
+     * 带来源的根（多客户端）。缺省 = 只按 `sessionsRoot`（老调用方 / 测试）。
+     * `missing` 也要传进来：它只含**存在**的根，缺失的那部分不在 `roots` 里，
+     * 不报出来就会变成「加了 --codex-home 页面没变化」而查不出原因。
+     */
+    sourceRoots?: { roots: readonly SourceRoot[]; missing: readonly SourceRoot[] },
+  ) {
     this.#sessionsRoot = sessionsRoot
     this.#dbPath = dbPath
+    this.#sourceRoots = sourceRoots
   }
+
+  readonly #sourceRoots?: { roots: readonly SourceRoot[]; missing: readonly SourceRoot[] }
 
   async open(opts: {
     period?: string
@@ -138,6 +151,14 @@ export class CoreStatsProvider implements StatsProvider {
     return openStats({
       sessionsRoot: this.#sessionsRoot,
       dbPath: this.#dbPath,
+      ...(this.#sourceRoots !== undefined && this.#sourceRoots.roots.length > 0
+        ? {
+          sourceRoots: this.#sourceRoots.roots,
+          ...(this.#sourceRoots.missing.length > 0
+            ? { missingRoots: this.#sourceRoots.missing.map((root) => root.path) }
+            : {}),
+        }
+        : {}),
       ...(opts.period ? { period: opts.period } : {}),
       providers: opts.providers,
       models: opts.models,
@@ -217,11 +238,27 @@ export class LocalStatsRouter {
    * 注入式 `StatsProvider`（测试）可能不提供这两个字段，缺省成空数组而不是崩。
    */
   #sources(session: StatsSession): LocalStatsSources {
+    // ★ 按来源分组（多客户端）：扁平的那组根答不出「这些数字是谁的」。
+    //   未提供 `sourceRoots` 的会话（老注入式 provider）**不带** `bySource`
+    //   —— 消费方缺字段时退化成旧文案，而不是显示一个空的来源列表。
+    const typed = session.sourceRoots ?? []
+    const bySource = typed.length === 0
+      ? undefined
+      : [...new Set(typed.map((root) => root.source))].sort().map((source) => ({
+        source,
+        // ⚠️ **次要副本也要列**（活动 + 归档）：滤掉它们会让这里的根数与扁平的
+        //   `sessionsRoots` 对不上（一个说 2、另一个说 3），页面上两行自相矛盾。
+        //   「哪些是次要副本」由 `sourceRoots[].secondary` 表达，不靠这里省略。
+        roots: typed.filter((root) => root.source === source).map((root) => root.path),
+        missingRoots: session.missingRoots.filter((path) =>
+          typed.some((root) => root.source === source && root.path === path)),
+      }))
     return {
       // readonly → 可变数组：跨进程契约里必须是普通数组（两侧都能改，不共享引用）
       sessionsRoots: [...(session.sessionsRoots ?? [])],
       missingRoots: [...(session.missingRoots ?? [])],
       dataDir: this.#dataDir,
+      ...(bySource !== undefined ? { bySource } : {}),
     }
   }
 

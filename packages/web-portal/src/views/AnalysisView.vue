@@ -15,12 +15,29 @@ import {
 } from 'element-plus'
 import { computed } from 'vue'
 import { useDashboardStore, type TrendMetric, type TrendStack } from '../stores/dashboard.js'
-import { BREAKDOWN_TABS } from '../types/portal.js'
+import { BREAKDOWN_TABS, sourceLabel } from '../types/portal.js'
 import { formatBucket, formatCount } from '../utils/format.js'
 import { COST_LABEL, costText, costTickFormatter } from '../utils/cost.js'
 import TrendChart from '../components/TrendChart.vue'
 import BreakdownTable from '../components/BreakdownTable.vue'
+import type { BreakdownRow } from '@ai-token-report/shared'
 const dashboard = useDashboardStore()
+/**
+ * 分布表第一列的表头与行名。
+ *
+ * ★ `by=source` 的键是**受控枚举原值**（`dsh` / `codex` / …），页面把它翻成
+ *   展示名（`DSH` / `Codex` …）**只为好看** —— 筛选与查询用的始终是原值。
+ * ⚠️ 认不出来的值原样显示（见 `types/portal.ts` 的 `sourceLabel`）：
+ *   把它显示成「其他」会让两台不同的客户端看起来是同一个。
+ * ⚠️ 其余维度沿用原键：`provider` / `model` / `project` 都是**数据里的名字**，
+ *   页面没有资格替它们改名（供应商展示名已经由服务端归一化好了）。
+ */
+const breakdownDimensionLabel = computed(() =>
+  dashboard.breakdownBy === 'source' ? '来源' : '维度',
+)
+const breakdownRowLabel = computed(() =>
+  dashboard.breakdownBy === 'source' ? (row: BreakdownRow) => sourceLabel(row.key) : undefined,
+)
 /** 趋势点（同一份数组同时喂给标签与数值，保证两个序列**按下标对齐**）。 */
 const seriesPoints = computed(() => dashboard.series?.points ?? [])
 const chartLabels = computed(() =>
@@ -177,6 +194,10 @@ const onStack = (value: string | number | boolean | undefined): void =>
         :name="tab.value"
         :label="tab.label"
     /></el-tabs>
-    <BreakdownTable :rows="dashboard.breakdown?.rows ?? []" />
+    <BreakdownTable
+      :rows="dashboard.breakdown?.rows ?? []"
+      :dimension-label="breakdownDimensionLabel"
+      :label-of="breakdownRowLabel"
+    />
   </el-card>
 </template>

@@ -1231,3 +1231,151 @@ describe('★ 趋势分层（按用户 / 按模型）', () => {
     expectStackSumsToTotals(body)
   })
 })
+
+
+/**
+ * ★ 来源维度（v9）：`by=source` / `?source=` / `/api/v1/stats/sources`。
+ *
+ * ## 这一组在守什么
+ *
+ * 1. 🚨 **来源是精确匹配**（受控枚举），与 `provider` 的子串匹配刻意相反：
+ *    子串匹配会让 `trae` 命中 `trae-cn` —— 那是两个独立安装、独立账号的来源。
+ * 2. 🚨 **未注册的来源名一律 400**，绝不静默忽略：静默忽略会让使用者看到
+ *    **全量**数据却以为已经筛过（与 CLI「未注册即报错」同一条教训）。
+ * 3. ★ 候选接口 = 注册表 ∪ 库里出现过的值：前者让「本机还没跑过 Codex」
+ *    也能筛出如实的 0 行，后者兜住「更新版客户端上报了本进程不认识的来源」。
+ * 4. ★ **按来源出数时汇总表必须被绕过**（`usage_rollup_*` 没有来源列）——
+ *    这一条由「同一个库、同一个窗口，带不带汇总表都要给出同一份数字」钉住。
+ */
+describe('★ 来源维度（v9）', () => {
+  test('by=source：按来源分组，且各来源之和等于总量', async () => {
+    await report('tok-admin', [
+      rec('s-dsh', { source: 'dsh' }),
+      rec('s-codex', { seq: 2, source: 'codex', provider: 'openai', model: 'gpt-5-codex' }),
+      rec('s-claude', { seq: 3, source: 'claude-code', provider: 'anthropic', model: 'claude-opus-4-8' }),
+    ])
+    const res = await get('breakdown', { by: 'source', period: 'today' })
+    expect(res.status).toBe(200)
+    const body = res.body as BreakdownResponse
+    expect(body.rows.map((row) => row.key).sort()).toEqual(['claude-code', 'codex', 'dsh'])
+    const sum = body.rows.reduce((total, row) => total + row.totalTokens, 0)
+    const overview = (await get('overview', { period: 'today' })).body as { totalTokens: number }
+    expect(sum).toBe(overview.totalTokens)
+  })
+
+  test('🚨 旧客户端不发 source ⇒ 落成 dsh（历史事实，不是猜测）', async () => {
+    // `rec()` 不带 source 字段：zod 把它归一成 null，入库按库内默认值兜底。
+    await report('tok-admin', [rec('legacy-1')])
+    const res = await get('breakdown', { by: 'source', period: 'today' })
+    const body = res.body as BreakdownResponse
+    expect(body.rows.map((row) => row.key)).toEqual(['dsh'])
+  })
+
+  test('★ ?source= 是按来源筛选（多选 = OR），且是精确匹配', async () => {
+    await report('tok-admin', [
+      rec('f-dsh', { source: 'dsh', input_tokens: 10, output_tokens: 0, cache_read_tokens: 0 }),
+      rec('f-codex', { seq: 2, source: 'codex', input_tokens: 100, output_tokens: 0, cache_read_tokens: 0 }),
+      // `trae` 与 `trae-cn` 是两个来源：子串匹配会把它们混成一个。
+      rec('f-trae', { seq: 3, source: 'trae', input_tokens: 1_000, output_tokens: 0, cache_read_tokens: 0 }),
+      rec('f-traecn', { seq: 4, source: 'trae-cn', input_tokens: 2_000, output_tokens: 0, cache_read_tokens: 0 }),
+    ])
+    const codex = (await get('overview', { period: 'today', source: 'codex' })).body as { totalTokens: number; calls: number }
+    expect(codex.calls).toBe(1)
+    expect(codex.totalTokens).toBe(100)
+    const both = (await get('overview', { period: 'today', source: 'codex,trae' })).body as { calls: number; totalTokens: number }
+    expect(both.calls).toBe(2)
+    expect(both.totalTokens).toBe(1_100)
+    // ★ `trae` 不许把 `trae-cn` 一起捞进来（这正是子串匹配会犯的错）。
+    const traeOnly = (await get('overview', { period: 'today', source: 'trae' })).body as { calls: number; totalTokens: number }
+    expect(traeOnly.calls).toBe(1)
+    expect(traeOnly.totalTokens).toBe(1_000)
+  })
+
+  test('★ 形状非法的来源值回 400（它不可能是来源名，别让人对着 0 行猜）', async () => {
+    for (const bad of ['Codex', 'codex!', 'a b', 'x'.repeat(33)]) {
+      const res = await get('overview', { period: 'today', source: bad })
+      expect(res.status).toBe(400)
+      expect(String((res.body as { reason: string }).reason)).toContain('来源名')
+    }
+  })
+
+  test('★ 形状合法但库里没有这个来源 ⇒ 0 行（与 ?provider=zzz 同一套语义）', async () => {
+    await report('tok-admin', [rec('n-1', { source: 'dsh' })])
+    // 拼错的值**不是**非法参数，只是没有数据 —— 与 provider 的筛选一致。
+    // 🚨 不能把它当 400：库里可能真有本进程不认识的来源（更新版客户端），
+    //    而候选接口会把那种值一并列出来（否则「看得到却筛不出来」）。
+    const res = await get('overview', { period: 'today', source: 'codx' })
+    expect(res.status).toBe(200)
+    expect((res.body as { calls: number }).calls).toBe(0)
+  })
+
+  test('★ 明细行也带来源（逐条核对时看得见），值是上报原值', async () => {
+    await report('tok-admin', [
+      rec('d-1', { source: 'claude-code' }),
+      rec('d-2', { seq: 2, source: 'trae-cn' }),
+    ])
+    const res = await get('records', { period: 'today' })
+    expect(res.status).toBe(200)
+    const body = res.body as { rows: { eventId: string; source?: string }[] }
+    const byId = new Map(body.rows.map((row) => [row.eventId, row.source]))
+    // 原值原样（**不做归一化**）：`trae-cn` 与 `trae` 是两回事。
+    expect(byId.get('d-1')).toBe('claude-code')
+    expect(byId.get('d-2')).toBe('trae-cn')
+  })
+
+  test('★ /api/v1/stats/sources：注册表 ∪ 库里出现过的值，dsh 恒在第一位', async () => {
+    await report('tok-admin', [rec('c-1', { source: 'codex' })])
+    const res = await get('sources')
+    expect(res.status).toBe(200)
+    const body = res.body as { sources: string[] }
+    // 本进程注册的六个来源都在（哪怕这台机器没跑过它们）。
+    for (const id of ['dsh', 'codex', 'claude-code', 'trae', 'trae-cn', 'workbuddy']) {
+      expect(body.sources).toContain(id)
+    }
+    expect(body.sources[0]).toBe('dsh')
+    // 顺序稳定：dsh 之后按字典序。
+    expect(body.sources.slice(1)).toEqual([...body.sources.slice(1)].sort())
+  })
+
+  test('★ 库里出现过的未知来源也会进候选（否则那种行看得到却筛不出来）', async () => {
+    // 直接落库：模拟「更新版客户端上报了一个本进程还不认识的来源」。
+    const db = openPortalDb(dbPath)
+    try {
+      const rows = [
+        {
+          eventId: 'unknown-source-1', sessionId: 'session-x', seq: 1, time: todayAt(11),
+          provider: 'future', model: 'future-model', cwd: null, turn: null, step: null,
+          usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 0, reasoning: 0, total: 6, calls: 1 },
+        },
+      ]
+      insertRecords(db, rows)
+      // `insertRecords` 不接受 source（种子数据），直接 UPDATE 成未知来源值。
+      db.prepare("UPDATE usage_event SET source = 'future-client' WHERE event_id = 'unknown-source-1'").run()
+    } finally {
+      db.close()
+    }
+    const body = (await get('sources')).body as { sources: string[] }
+    expect(body.sources).toContain('future-client')
+    // 而且它**筛得中**（候选与筛选口径一致）。
+    const filtered = (await get('overview', { period: 'today', source: 'future-client' })).body as { calls: number }
+    expect(filtered.calls).toBe(1)
+  })
+})
+
+describe('★ 来源与汇总表（绕过是必需的，不是优化）', () => {
+  test('★ 带来源筛选时不读汇总表：数字与不带汇总表时逐位相同', async () => {
+    await report('tok-admin', [
+      rec('r-dsh', { source: 'dsh', input_tokens: 10, output_tokens: 1, cache_read_tokens: 0 }),
+      rec('r-codex', { seq: 2, source: 'codex', input_tokens: 700, output_tokens: 7, cache_read_tokens: 0 }),
+    ])
+    // 只按来源筛：`usage_rollup_*` 的键里**没有来源列**，查询层必须退原始表
+    // （`PortalStatsSession.#rollupUsable()` 里显式判掉）。不判的话它会在
+    // 「no such column: source」上被 try 吞掉 —— 结果一样但每次白跑一条 SQL。
+    const bySource = (await get('overview', { period: 'today', source: 'codex' })).body as { totalTokens: number; calls: number }
+    expect(bySource.calls).toBe(1)
+    expect(bySource.totalTokens).toBe(707)
+    // 不带来源筛选（可以走汇总表）看总量：708。
+    const all = (await get('overview', { period: 'today' })).body as { totalTokens: number }
+    expect(all.totalTokens).toBe(718)
+  })
+})

@@ -69,7 +69,7 @@ import {
   type PortalTarget,
   type QueryFilter,
 } from '@ai-token-report/core/db'
-import { derive, resolveRange } from '@ai-token-report/core'
+import { derive, registeredSources, resolveRange } from '@ai-token-report/core'
 import {
   cacheHitRate,
   computeTotal,
@@ -95,6 +95,7 @@ import {
   type StatsMembersResponse,
   type StatsPricingResponse,
   type StatsProvidersResponse,
+  type StatsSourcesResponse,
 } from '@ai-token-report/shared'
 
 import type { CredentialStore } from './credentials.js'
@@ -224,6 +225,10 @@ const GROUP_BYS: readonly GroupBy[] = [
   'provider',
   'model',
   'provider-model',
+  // ★ 来源（哪个客户端写的）：受控枚举，`core/db/query.ts` 的
+  //   `dimensionExpression('source')` 直接取列值（不做任何归一化 ——
+  //   来源名是采集端写下的**事实**，不是可配置的展示名）。
+  'source',
   'user',
   // ★ `group` 是**多对多维度**：一条事件计入它的人员所属的每个分组，
   //   所以各分组之和 > 总量是定义（见 core/db/portal.ts 的注释）。
@@ -327,6 +332,9 @@ export class StatsRoute {
     if (sub === 'providers') {
       return await this.#providers('memberId' in auth.viewer ? auth.viewer.memberId : undefined)
     }
+    // ★ 来源候选（`dsh` / `codex` / …）同样是目录：受控枚举 + 库里出现过的值。
+    //   不带时间窗、不带筛选，也不含任何用量数字。
+    if (sub === 'sources') return await this.#sources()
     // ★ 单价只读快照：门是 `cost:read`（不是管理接口那道 `pricing:manage`）。
     //   能看金额的人必须能看到这份金额是按哪份单价算出来的 —— 看不到单价，
     //   他就只能相信这一屏上的数字，而「自建计价 ≠ 财务账单」正是要提醒的。
@@ -680,6 +688,51 @@ export class StatsRoute {
   }
 
   /**
+   * `GET /api/v1/stats/sources` —— 看板的**来源**候选项。
+   *
+   * ★ 与 `/providers` 的唯一区别：来源是**受控枚举**，所以候选项 =
+   *   `registeredSources()`（本进程认识的全部来源）**∪** 库里实际出现过的值。
+   *   前者让「本机还没跑过 Codex」的人也能筛出 0 行（这是**如实**的答案，
+   *   而不是下拉里没有这一项、让人以为平台不支持）；后者兜住
+   *   「更新版客户端上报了一个本进程还不认识的来源」—— 只在库里取候选的话，
+   *   那种行在页面上**看得到却筛不出来**。
+   *
+   * ⚠️ 与 `/providers` 同样：不带时间窗、不带任何筛选、只回名字，
+   *   也**不按数据范围收窄**（来源名不属于任何一个人）。
+   * 🚨 顺序固定（`dsh` 在最前，其余字典序）：下拉的项序不该随库里的数据变化。
+   */
+  async #sources(): Promise<StatsRouteResult> {
+    let store: PortalStore
+    try {
+      store = await openPortalStore(this.#target)
+    } catch (err) {
+      if (this.#identityStore) return { status: 503, body: { ok: false, reason: '统计数据库暂时不可用，请稍后重试' } }
+      return { status: 500, body: { ok: false, reason: `上报库不可用: ${msg(err)}` } }
+    }
+
+    try {
+      const rows = await store.all<{ source: unknown }>(
+        `SELECT DISTINCT source FROM ${EVENT_TABLE} ORDER BY source`,
+      )
+      const names = new Set<string>(registeredSources().map((adapter) => adapter.id))
+      for (const row of rows) {
+        const value = String(row.source ?? '').trim()
+        if (value) names.add(value)
+      }
+      // `dsh` 恒在第一位（面板主体永远是 DSH），其余按字典序。
+      const body: StatsSourcesResponse = {
+        sources: [...names].sort((a, b) => (a === 'dsh' ? -1 : b === 'dsh' ? 1 : a.localeCompare(b))),
+      }
+      return { status: 200, body }
+    } catch (err) {
+      if (this.#identityStore) return { status: 503, body: { ok: false, reason: '统计数据库暂时不可用，请稍后重试' } }
+      return { status: 500, body: { ok: false, reason: `查询失败: ${msg(err)}` } }
+    } finally {
+      await store.close()
+    }
+  }
+
+  /**
    * `GET /api/v1/stats/providers` —— 看板的供应商候选项。
    *
    * ★ 权限是 `stats:read`（与其它看板接口同一道门），**不是** `providers:read`：
@@ -894,6 +947,10 @@ const KNOWN_SUBS: readonly string[] = [
   // ★ 供应商候选项（筛选下拉用）。与分组 / 人员候选同类：它是一份**目录**，
   //   不带时间窗、不带筛选，也不含任何用量数字。
   'providers',
+  // ★ 来源候选项（`dsh` / `codex` / …）。与供应商候选同类，差别只有一条：
+  //   来源是**受控枚举**（由 `registeredSources()` 给出），所以候选项 =
+  //   注册表 ∪ 库里出现过的值 —— 后者兜住「更新版客户端上报了一个本进程还不认识的来源」。
+  'sources',
   'diagnostics',
   // ★ 工作时段分布：按「一天中的第几小时」折叠（不是 `by=hour` 那种带日期的分桶）。
   'hour-of-day',
@@ -994,6 +1051,10 @@ function toRecordRow(row: PortalRecordRow): RecordRow {
     //   多发一个字段只是让每页 JSON 白胖一圈。
     ...(row.providerRaw && row.providerRaw !== row.provider ? { providerRaw: row.providerRaw } : {}),
     model: row.model,
+    // ★ v9 来源：原值原样透传（**不做归一化** —— 来源是受控枚举，
+    //   `trae` 与 `trae-cn` 是两个来源，归一化会把它们混成一个）。
+    //   页面据此显示「这条用量是谁写的」，与看板的来源筛选是同一个值。
+    source: row.source,
     // 口径只经 shared 计算；四项原始用量完整透传。
     totalTokens: computeTotal({ input: row.input, output: row.output, cacheRead: row.cacheRead, cacheWrite: row.cacheWrite, reasoning: 0 }),
     inputTokens: row.input,
@@ -1064,6 +1125,28 @@ function parseWindow(params: URLSearchParams): ParsedWindow | { error: string } 
   //   的既有语义，改成精确匹配会让「页面筛 dashscope 得到 0 条、命令行却有一堆」。
   const providers = [...new Set(splitList(params.getAll('provider').join(',')))]
   const models = splitList(params.get('model'))
+  /**
+   * ★ **来源筛选**：多选（OR）+ **精确匹配**（与 `provider` 的子串语义刻意相反）。
+   *
+   * 来源是受控枚举，子串匹配会让 `code` 命中 `codex`、`trae` 命中 `trae-cn`
+   * （两个独立安装、独立账号的来源，见 `sources/trae.ts`）。
+   * 同时接受重复同名参数与逗号分隔 —— 两种写法在前端都会出现，
+   * 「只认其中一种」的表现是「筛了一个来源却像没筛」。
+   *
+   * ⚠️ **只校验形状，不按注册表做白名单**：值域的真源是**库里的数据**
+   *   （`/api/v1/stats/sources` = 注册表 ∪ 库里出现过的值）。按注册表拒收会让
+   *   「更新版客户端上报了一个本进程还不认识的来源」在页面上**看得到却筛不出来**
+   *   （候选接口列了它、筛选却回 400）。拼错的值（`codx`）得到 0 行 —— 与
+   *   `?provider=zzz` 同一套既有语义：**它不是非法参数，只是没有数据**。
+   *   形状校验仍然保留：超长 / 大写 / 空格会让 `source = ?` 永远匹配不上，
+   *   与其让使用者对着 0 行猜，不如直接告诉他这个值不可能是来源名。
+   */
+  const requestedSources = [...new Set(splitList(params.getAll('source').join(',')))]
+  const malformedSource = requestedSources.find((id) => !/^[a-z0-9][a-z0-9-]{0,31}$/.test(id))
+  if (malformedSource !== undefined) {
+    return { error: `来源名只允许小写字母、数字与连字符（最长 32），收到 "${malformedSource}"` }
+  }
+  const sources = requestedSources
   // ★ 分组筛选：`group_id` 是多选（逗号分隔），与人员一样是**精确匹配**。
   //   同时接受重复的同名参数（`?group_id=a&group_id=b`）—— 两种写法在
   //   真实前端里都会出现，而「只认其中一种」的表现是「筛了一个分组却像没筛」。
@@ -1098,6 +1181,8 @@ function parseWindow(params: URLSearchParams): ParsedWindow | { error: string } 
       ...(untilMs !== undefined ? { untilMs } : {}),
       ...(providers.length > 0 ? { providers } : {}),
       ...(models.length > 0 ? { models } : {}),
+      // ★ 来源是**精确匹配**的列表（`core/db/query.ts` 的 `buildWhere` 用 `source = ?`）。
+      ...(sources.length > 0 ? { sources } : {}),
       ...(users.length > 0 ? { userIds: users } : {}),
       ...(groupIds.length > 0 ? { groupIds } : {}),
       identityView,

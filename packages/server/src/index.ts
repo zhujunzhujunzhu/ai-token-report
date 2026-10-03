@@ -27,7 +27,7 @@
  *   而启动日志里那行「已改用 8788」很容易被忽略。
  */
 
-import { resolvePaths } from '@ai-token-report/core'
+import { resolvePaths, resolveSourceRoots } from '@ai-token-report/core'
 import { backfillRollups, describePortalTarget, openPortalStore, planBunMysqlAuth, portalDbFileName, resolvePortalTarget, preparePortalDatabase, syncRollups, type PortalTarget } from '@ai-token-report/core/db'
 import { join } from 'node:path'
 
@@ -340,7 +340,20 @@ export async function createHandlerFor(options: ServerOptions = {}): Promise<Han
   // 数据源是本地 SQLite 增量库（`core/db`），库不可用时自动降级直扫日志。
   const localStats = options.enableLocalApi
     ? new LocalStatsRouter(
-        new CoreStatsProvider(paths.sessionsRoots, paths.dbPath),
+        // ★ 带来源的根：本地页要能回答「这些数字是谁的」（DSH / Codex / Claude Code …）。
+        //   `resolveSourceRoots()` 只启用**已注册且未被环境开关关闭**的来源，
+        //   所以只用 DSH 的机器行为不变（Codex 由 `DSH_TOKEN_REPORT_CODEX=0` 关掉、
+        //   Claude Code 由 `DSH_TOKEN_REPORT_CLAUDE=0` 关掉）。
+        //
+        // 🚨 `homes` 必须把**调用方给定的** DSH home 传下去：只把 `dshHomes` 喂给
+        //   `resolvePaths()` 而让来源解析走缺省，会让 `web --dsh-home <临时目录>`
+        //   的页面**仍然去读缺省 home** —— 页面数字与同一个进程的 CLI 统计对不上，
+        //   而且它看起来像「口径 bug」，其实是「读了别处的日志」。
+        new CoreStatsProvider(
+          paths.sessionsRoots,
+          paths.dbPath,
+          resolveSourceRoots(options.dshHomes ? { homes: { dsh: options.dshHomes } } : {}),
+        ),
         // ★ 只为了让页面能显示「数据目录在哪」（来源可见性），不参与取数
         { dataDir: paths.dataDir },
       )

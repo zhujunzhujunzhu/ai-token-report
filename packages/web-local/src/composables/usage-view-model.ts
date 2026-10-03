@@ -333,24 +333,49 @@ export function buildUsageSummary(
  * 镜像去重（正常）或那个根根本没读到（bug），而它们的数字看起来一样。
  */
 export function describeSources(sources: LocalStatsSources): string {
+  // ★ 多客户端（DSH / Codex / …）时按来源报 —— 「这些数字是谁的」与「读了哪几处」
+  //   是两个问题，扁平的那组根只能回答后一个。
+  const bySource = sources.bySource ?? []
+  if (bySource.length > 0) {
+    const names = bySource.map((entry) => SOURCE_LABELS[entry.source] ?? entry.source)
+    const rootCount = bySource.reduce((sum, entry) => sum + entry.roots.length, 0)
+    if (bySource.length === 1) {
+      return `数据来源：${names[0]}（${rootCount} 个会话日志根）`
+    }
+    return `数据来源：${names.join(' + ')}，共 ${rootCount} 个会话日志根，按并集统计（同一会话只算一次）`
+  }
+  // 老服务端没有 `bySource`：退化成既有文案，而不是把「缺字段」说成「没有来源」。
   const roots = sources.sessionsRoots
   if (roots.length === 0) return '数据来源：未读到任何会话日志根'
   if (roots.length === 1) return '数据来源：1 个 DSH 的会话日志'
   return `数据来源：${roots.length} 个 DSH 的会话日志，按并集统计（镜像会话自动去重）`
 }
 
+/** 来源 id → 展示名。只影响**排版**，不认识的值原样显示（新来源不改前端也能看出来）。 */
+const SOURCE_LABELS: Record<string, string> = {
+  dsh: 'DSH',
+  codex: 'Codex',
+  'claude-code': 'Claude Code',
+  workbuddy: 'WorkBuddy',
+  // Trae 的两个发行版是**两个来源**，展示名也要能分辨（否则合并统计时分不清谁是谁）。
+  trae: 'Trae',
+  'trae-cn': 'Trae CN',
+}
+
 /**
  * 逐项列出读到的根（鼠标悬停时展示完整路径）。
  *
  * 用换行分隔而不是逗号：路径本身可能含逗号，用逗号会读不出到底是几个根。
+ * 多来源时每组前面标出来源 —— 只列路径的话，Codex 的根与 DSH 的根长得一样。
  */
 export function describeSourcePaths(sources: LocalStatsSources): string {
+  const bySource = sources.bySource ?? []
+  if (bySource.length > 0) {
+    return bySource
+      .map((entry) => `[${SOURCE_LABELS[entry.source] ?? entry.source}]\n${entry.roots.join('\n')}`)
+      .join('\n')
+  }
   return sources.sessionsRoots.join('\n')
-}
-
-/** 缺失的根 —— 有值时页面必须显式告警（绝不静默跳过）。 */
-export function describeMissingRoots(sources: LocalStatsSources): string {
-  return sources.missingRoots.join('、')
 }
 
 /** 趋势用哪个分桶：当天/昨天看小时，更长窗口看天。 */

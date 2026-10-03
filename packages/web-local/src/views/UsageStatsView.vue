@@ -10,11 +10,7 @@ import UsageDetailTable from '@/components/usage/UsageDetailTable.vue'
 import UsageFilterBar from '@/components/usage/UsageFilterBar.vue'
 import UsageMetricGrid from '@/components/usage/UsageMetricGrid.vue'
 import { useUsageStats } from '@/composables/useUsageStats'
-import {
-  describeMissingRoots,
-  describeSourcePaths,
-  describeSources,
-} from '@/composables/usage-view-model'
+import { describeSourcePaths, describeSources } from '@/composables/usage-view-model'
 import UiButton from '@/components/ui/UiButton.vue'
 import { computed } from 'vue'
 
@@ -44,7 +40,16 @@ function totalOfRows(): number {
 //   文案在视图模型里生成，组件只负责排版（与「前端不重算口径」同一条约束）。
 const sourceText = computed(() => describeSources(summary.value.sources))
 const sourcePaths = computed(() => describeSourcePaths(summary.value.sources))
-const missingRoots = computed(() => describeMissingRoots(summary.value.sources))
+// 🚨 这里**刻意不渲染** `sources.missingRoots`（「以下会话日志根不存在，已跳过」那一行）。
+//
+//   原因：来源缺省是**全部已注册来源**（`resolveSourceRoots()`），于是「没装 Trae CN /
+//   没装 Codex」这类**本来就没有**的根每次都会命中，页面只剩噪音 —— 而使用者对它们
+//   什么也做不了（要关掉得改环境变量）。事实本身没丢：`/api/local/*` 照旧逐项下发
+//   `missingRoots`，CLI 每次统计都会在 stderr 逐项打印，`--format json` / `--discover`
+//   也带着它 —— 「配了但读不到」仍然查得出，只是不在**本地页**上喊。
+//
+//   ⚠️ 这条是**刻意的产品决策，不要当成漏渲染补回去**：把整页来源事实压成一行文本，
+//   收益是「一眼看出读了哪几处」，代价就是上面那种每次必现的假警报。
 /**
  * 费用口径那一行（未计价比例 + 单价来源 + 缺哪个价）。
  *
@@ -85,9 +90,6 @@ const costNote = computed(() => summary.value.costNote)
       两者会给不同的金额而都「看起来正常」，所以这一行必须与金额同时在场。
     -->
     <p v-if="costNote" class="usage-page__sources is-cost">{{ costNote }}</p>
-    <p v-if="missingRoots" class="usage-page__sources is-missing" role="status">
-      ⚠ 以下会话日志根不存在，已跳过：{{ missingRoots }}
-    </p>
 
     <MetricGroupSection
       v-for="(group, index) in summary.metricGroups"
@@ -159,10 +161,6 @@ const costNote = computed(() => summary.value.costNote)
   line-height: 1.6;
   color: var(--c-text-muted, #667085);
   word-break: break-all;
-}
-
-.usage-page__sources.is-missing {
-  color: #b42318;
 }
 
 /*

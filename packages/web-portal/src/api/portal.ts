@@ -22,6 +22,7 @@ import type {
   StatsGroupsResponse,
   StatsMembersResponse,
   StatsProvidersResponse,
+  StatsSourcesResponse,
 } from '@ai-token-report/shared'
 
 import { request, type ApiResult } from './request.js'
@@ -59,6 +60,16 @@ export interface PortalFilter {
    */
   providers?: string[]
   model?: string
+  /**
+   * 来源筛选（多选 = OR）：`dsh` / `codex` / `claude-code` / `trae` /
+   * `trae-cn` / `workbuddy`。
+   *
+   * 🚨 与 `providers` 的语义**刻意相反**：来源是**精确匹配**（服务端
+   *   `source = ?`），因为它是受控枚举 —— 子串匹配会让 `trae` 命中 `trae-cn`，
+   *   而那是两个独立安装、独立账号的来源。所以这个下拉**不允许自建值**
+   *   （值域来自 `/api/v1/stats/sources`，不是现敲现用）。
+   */
+  sources?: string[]
   /** 服务端返回的不透明归属键：人员 UUID / legacy:… / unknown。 */
   users?: string[]
   /**
@@ -85,6 +96,12 @@ function toQuery(filter: PortalFilter): string {
   //   而页面没有理由替使用者决定那件事。
   for (const provider of new Set(filter.providers ?? [])) {
     if (provider) params.append('provider', provider)
+  }
+  // 来源是多选：同一参数重复出现，服务端按 OR 展开（协议里的 `sources?: string[]`）。
+  // ⚠️ 与服务端的匹配口径一致（**精确**），所以这里也**不做任何大小写 / 前缀处理**：
+  //   页面把选中的原值原样发出去。
+  for (const source of new Set(filter.sources ?? [])) {
+    if (source) params.append('source', source)
   }
   for (const key of new Set(filter.users ?? [])) {
     if (key === 'unknown') params.set('unattributed', 'true')
@@ -133,6 +150,20 @@ export function fetchMemberOptions(): Promise<ApiResult<StatsMembersResponse>> {
  */
 export function fetchProviderOptions(): Promise<ApiResult<StatsProvidersResponse>> {
   return request<StatsProvidersResponse>('/api/v1/stats/providers')
+}
+
+/**
+ * 来源候选项（`GET /api/v1/stats/sources`）。
+ *
+ * ★ 与供应商候选同类（候选必须完整、不带筛选、只回名字），差别只有一条：
+ *   来源是**受控枚举**，服务端返回的是「本进程注册的全部来源 ∪ 库里出现过的值」，
+ *   所以下拉里会出现本机还没跑过的来源（选中即得 0 行 —— 那是对的答案，
+ *   而不是「下拉里没有这一项」）。
+ * ⚠️ 它**不是** `allow-create` 的自由输入：未知来源在服务端会被 400 拒掉
+ *   （见 `stats-route.ts` 的 `parseWindow`），所以页面不该让人打出任意值。
+ */
+export function fetchSourceOptions(): Promise<ApiResult<StatsSourcesResponse>> {
+  return request<StatsSourcesResponse>('/api/v1/stats/sources')
 }
 
 /** 顶部指标卡片。 */

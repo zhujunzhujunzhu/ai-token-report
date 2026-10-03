@@ -182,18 +182,22 @@ describe('统计状态', () => {
     })
     const dashboard = useDashboardStore()
     await dashboard.activate('overview')
-    // 总览一轮 7 个请求：指标、人员候选（用量）、分组候选、**人员名册**、
-    // **供应商目录**、趋势、分组排行。
+    // 总览一轮 8 个请求：指标、人员候选（用量）、分组候选、**人员名册**、
+    // **供应商目录**、**来源目录**、趋势、分组排行。
     // ★ 分组候选走看板接口 `/api/v1/stats/groups`（`stats:read`），
     //   不是管理接口 `/api/v1/admin/groups`（那是 `groups:read`）。
     // ★ 人员名册同理走 `/api/v1/stats/members`：它是「窗口内没有用量的人」
     //   唯一的来源（只从用量行里取候选时，选了分组下拉会整个空掉）。
     // ★ 供应商目录走 `/api/v1/stats/providers`：下拉要能列出「库里出现过的
     //   供应商名」，而不是只列当前窗口里用过的。
-    expect(urls).toHaveLength(7)
+    // ★ 来源目录走 `/api/v1/stats/sources`：来源是**受控枚举**，
+    //   候选 = 本进程注册的来源 ∪ 库里出现过的值（所以本机没跑过 Codex 时
+    //   下拉里也有 Codex，选中即如实的 0 行）。
+    expect(urls).toHaveLength(8)
     expect(urls.filter((url) => url.pathname.endsWith('/api/v1/stats/groups'))).toHaveLength(1)
     expect(urls.filter((url) => url.pathname.endsWith('/api/v1/stats/members'))).toHaveLength(1)
     expect(urls.filter((url) => url.pathname.endsWith('/api/v1/stats/providers'))).toHaveLength(1)
+    expect(urls.filter((url) => url.pathname.endsWith('/api/v1/stats/sources'))).toHaveLength(1)
     const by = (url: URL, value: string) =>
       url.pathname.endsWith('breakdown') && url.searchParams.get('by') === value
     // ★ 全员排行复用候选请求：`by=user` 只发一次；另一次是分组排行 `by=group`。
@@ -300,28 +304,30 @@ describe('统计状态', () => {
     const breakdown = lastOf((u) => u.pathname.endsWith('breakdown'))
     const records = lastOf((u) => u.pathname.endsWith('records'))
     expect(breakdown?.searchParams.has('member_id')).toBe(false)
-    // ★ 分组 / 人员 / 供应商候选必须始终是完整集合：带上筛选就会让下拉在选中后塌缩成一项。
+    // ★ 分组 / 人员 / 供应商 / 来源候选必须始终是完整集合：带上筛选就会让下拉在选中后塌缩成一项。
     const candidates = urls.filter(
       (u) =>
         u.pathname.endsWith('/api/v1/stats/groups') ||
         u.pathname.endsWith('/api/v1/stats/members') ||
-        u.pathname.endsWith('/api/v1/stats/providers'),
+        u.pathname.endsWith('/api/v1/stats/providers') ||
+        u.pathname.endsWith('/api/v1/stats/sources'),
     )
-    expect(candidates).toHaveLength(9)
+    expect(candidates).toHaveLength(12)
     expect(candidates.every((u) => u.searchParams.size === 0)).toBe(true)
     expect(records?.searchParams.get('member_id')).toBe(
       '00000000-0000-4000-8000-000000000003',
     )
     expect(
       // 候选目录是唯一**完全不带查询参数**的请求：它们只回答「有哪些分组、
-      // 名册上有谁、库里有哪几个供应商」，一旦带上筛选就会自锁定，
+      // 名册上有谁、库里有哪几个供应商 / 来源」，一旦带上筛选就会自锁定，
       // 所以排除在「都带 identity_view」之外。
       urls
         .filter(
           (u) =>
             !u.pathname.endsWith('/api/v1/stats/groups') &&
             !u.pathname.endsWith('/api/v1/stats/members') &&
-            !u.pathname.endsWith('/api/v1/stats/providers'),
+            !u.pathname.endsWith('/api/v1/stats/providers') &&
+            !u.pathname.endsWith('/api/v1/stats/sources'),
         )
         .every((u) => u.searchParams.get('identity_view') === 'member'),
     ).toBe(true)
@@ -486,6 +492,7 @@ describe('统计状态', () => {
       customFrom: '2026-09-20T10:00',
       customTo: '2026-09-20T11:00',
       providers: [],
+      sources: [],
       model: '',
       users: [],
     })
@@ -499,6 +506,7 @@ describe('统计状态', () => {
         customFrom: '',
         customTo: '',
         providers: [],
+        sources: [],
         model: '',
         users: [],
       }).error,

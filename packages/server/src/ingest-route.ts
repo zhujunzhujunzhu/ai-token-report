@@ -280,7 +280,12 @@ export function parseIngestPayload(value: unknown): ParseIngestPayloadResult {
  */
 export function parseIngestRecord(value: unknown): IngestRecord | null {
   const parsed = ingestRecordSchema.safeParse(value)
-  return parsed.success ? parsed.data : null
+  if (!parsed.success) return null
+  // ★ `source` 的「没给」在契约里是**字段缺席**（`source?: string`），而 zod 的
+  //   归一化结果用 `null` 表达它 —— 在边界翻译一次，不让 `null` 流进入库路径
+  //   （那里是 `rec.source ?? 'dsh'`，显式 null 会被 NOT NULL 拒掉）。
+  const { source, ...rest } = parsed.data
+  return source === null ? rest : { ...rest, source }
 }
 
 /**

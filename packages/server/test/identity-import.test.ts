@@ -70,7 +70,14 @@ describe('显式凭证导入命令', () => {
   test('真实 v3 库明确拒绝，不隐式迁移、不改历史', async () => {
     const { target, file } = await fixture(false)
     const db = openDb(target.sqlitePath)
-    try { ensureSchema(db) } finally { db.close() }
+    try {
+      ensureSchema(db)
+      // ⚠️ 这里要的是「portal v3 老库」这个**标记**，与本地库的 `DB_SCHEMA_VERSION`
+      //   （会随本地库结构变）没有任何关系。显式写 3，不要依赖 `ensureSchema()` 顺手写下的值 ——
+      //   后者一升版本（加 `source` 列就是），这个夹具就不再是「v3 老库」，
+      //   而表现只是「这条用例失败」，根因完全在别处。
+      db.exec('PRAGMA user_version=3')
+    } finally { db.close() }
     const before = readFileSync(target.sqlitePath)
     expect(run(target, file).status).toBe(1)
     expect(readFileSync(target.sqlitePath)).toEqual(before)

@@ -19,6 +19,7 @@ import {
   fetchMemberOptions,
   fetchOverview,
   fetchProviderOptions,
+  fetchSourceOptions,
   fetchRecords,
   fetchSeries,
   type PortalFilter,
@@ -63,6 +64,16 @@ export interface DashboardFilters {
    *   完全不在任何目录里 —— 那是合法的筛选条件，不是脏数据。
    */
   providers: string[]
+  /**
+   * 来源筛选（多选 = OR）：`dsh` / `codex` / `claude-code` / `trae` /
+   * `trae-cn` / `workbuddy`。
+   *
+   * 🚨 与 `providers` 的语义**刻意相反**：服务端对来源是**精确匹配**
+   *   （`source = ?`），因为它是受控枚举 —— 子串匹配会让 `trae` 命中 `trae-cn`。
+   *   所以值的来源只能是目录（`/api/v1/stats/sources`），**不允许自建**
+   *   （与分组 / 人员同样是「有候选项约束」的维度）。
+   */
+  sources: string[]
   model: string
   users: string[]
   /**
@@ -86,6 +97,7 @@ export const PAGE_SIZE = 20
 const initialFilters = (): DashboardFilters => ({
   period: 'last7d',
   providers: [],
+  sources: [],
   model: '',
   users: [],
   groups: [],
@@ -102,6 +114,9 @@ export function buildFilter(input: DashboardFilters): {
   const filter: PortalFilter = {
     // 供应商是多选 OR：去重 + 去空，语义原样交给服务端（仍是子串匹配）。
     providers: [...new Set(input.providers.map((name) => name.trim()).filter(Boolean))],
+    // ★ 来源是多选 OR（见 `PortalFilter.sources`）：**精确匹配**，所以这里
+    //   只去重、不 trim 成别的值 —— 服务端按原值比，页面改一个字符就筛不到。
+    sources: [...new Set(input.sources.map((name) => name.trim()).filter(Boolean))],
     model: input.model.trim(),
     // 分组是多选 OR（见 PortalFilter.groups）：这里只做去重，不改变语义。
     groups: [...new Set(input.groups)],
@@ -181,6 +196,15 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
    *   回落成「只有使用者自建的项 + 现敲现用」。
    */
   const providerOptions = ref<string[]>([])
+  /**
+   * 来源目录（`GET /api/v1/stats/sources`，`stats:read`）。
+   *
+   * ★ 它带回「本进程注册的全部来源 ∪ 库里出现过的值」：所以本机还没跑过
+   *   Codex 时，下拉里也有 Codex（选中即 0 行 —— 那是如实的答案）。
+   * ⚠️ 与供应商目录同样是**候选来源**、不是数字来源：请求失败不能拖垮看板，
+   *   回落成「没有候选」——此时筛选栏里那一项不出现（而不是画一个空下拉）。
+   */
+  const sourceOptions = ref<string[]>([])
   /**
    * 使用者自建的供应商名（**只存在本机浏览器**，见 `utils/providerCatalog.ts`）。
    *
@@ -376,7 +400,10 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     // ★ 供应商目录：同样是**不带任何筛选**的完整集合（否则选中一项后下拉会塌缩）。
     //   它只喂候选，不参与任何数字；失败也不能拖垮整页。
     const providerCandidates = fetchProviderOptions()
-    const [ov, opts, gopts, mo, pv, se, rank, groupRank, bd, rec, diag] =
+    // ★ 来源目录：同样是**不带任何筛选**的完整集合（受控枚举 ∪ 库里出现过的值）。
+    //   只喂候选，不参与任何数字；失败也不能拖垮整页。
+    const sourceCandidates = fetchSourceOptions()
+    const [ov, opts, gopts, mo, pv, sv, se, rank, groupRank, bd, rec, diag] =
       await Promise.all([
         fetchOverview(filter),
         // ★ 候选不能带人员筛选，否则选择一个人后再也选不到其他人。
@@ -384,6 +411,7 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
         groupCandidates,
         memberCandidates,
         providerCandidates,
+        sourceCandidates,
         active === 'overview' || active === 'analysis'
           ? fetchSeries(filter, granularity.value, trendStackParam.value)
           : null,
@@ -434,6 +462,12 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
       handleFailure(pv)
       return
     }
+    // ★ 来源目录同款：候选失败只影响那个下拉，不影响任何数字。
+    //   ⚠️ 401 仍要让会话过期。
+    if (!sv.ok && sv.status === 401) {
+      handleFailure(sv)
+      return
+    }
     if (ov.ok) overview.value = ov.data
     if (opts.ok) usageUsers.value = opts.data.rows
     // ★ 先分组目录后人员名册：人员选项的展示名要用分组 ID 翻名字，
@@ -441,6 +475,7 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     if (gopts.ok) groupOptions.value = gopts.data.groups ?? []
     if (mo.ok) memberDirectory.value = mo.data.members ?? []
     if (pv.ok) providerOptions.value = pv.data.providers ?? []
+    if (sv.ok) sourceOptions.value = sv.data.sources ?? []
     if (se?.ok) series.value = se.data
     if (rank?.ok) ranking.value = rank.data.rows
     if (groupRank?.ok) groupRanking.value = groupRank.data.rows
@@ -637,6 +672,7 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
       memberDirectory.value = []
       groupOptions.value = []
       providerOptions.value = []
+      sourceOptions.value = []
       // ⚠️ 自定义供应商**刻意不清**：它是「这台机器上的使用习惯」，
       //   与登录身份 / 数据范围无关（退出登录后重进，候选应该还在）。
       filters.value = initialFilters()
@@ -670,6 +706,7 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     groupOptions,
     providerOptions,
     providerChoices,
+    sourceOptions,
     customProviders,
     breakdown,
     diagnostics,

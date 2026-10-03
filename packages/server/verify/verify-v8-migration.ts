@@ -1,5 +1,5 @@
 /**
- * v7 → v8 迁移与**回滚**的专项验证（真 MySQL + 真 SQLite）。
+ * v7 → v8（→ 当前版本）迁移与**回滚**的专项验证（真 MySQL + 真 SQLite）。
  *
  * ```bash
  * bun run packages/server/verify/verify-v8-migration.ts
@@ -15,7 +15,12 @@
  *    线上那个 v7 库会**拒绝启动**（`bun run typecheck` 与 SQLite 单测都看不出来）。
  * 2. **迁移只增表**：`usage_event` 的事件指纹必须逐位不变。
  * 3. **回滚路径真的能用**：删掉四张表 ⇒ 库变成 `legacy`（结构是 v7，可再迁回来）
- *    ⇒ 再迁一次又回到 v8。这决定了「上线后发现不对能不能退」。
+ *    ⇒ 再迁一次又回到当前版本。这决定了「上线后发现不对能不能退」。
+ *
+ * ⚠️ **版本断言一律对着 `PORTAL_SCHEMA_VERSION`，绝不写死 8**：v9 落地时这里曾把
+ *   `version === 8` 写死，于是「迁移明明成功、版本已经是 9」被判成失败 ——
+ *   一条会因为**加了新版本**而误报的断言，比没有断言更糟。这条链现在天然覆盖
+ *   `v7 → v8 → v9` 的连续升级（以及两轮回滚-再迁移）。
  */
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
@@ -28,6 +33,8 @@ import {
   migratePortalDatabase,
   openPortalStore,
   preparePortalDatabase,
+  PORTAL_SCHEMA_VERSION,
+  PORTAL_SOURCE_COLUMN,
   PORTAL_V8_TABLES,
   portalSchemaChecksumV7,
   type PortalTarget,
@@ -56,12 +63,31 @@ async function fingerprint(target: PortalTarget): Promise<string> {
   } finally { await store.close() }
 }
 
+/**
+ * `usage_event.source` 必须**恰好一份**（v9 的加列在多次迁移、多轮回滚之后
+ * 都不许重复添加 —— 重复列的表现是「这条断言失败」，而不是某个查询悄悄错）。
+ */
+async function hasSingleSourceColumn(target: PortalTarget): Promise<boolean> {
+  const store = await openRawPortalStore(target)
+  try {
+    const columns = store.kind === 'sqlite'
+      ? await store.all<{ name: string }>('PRAGMA table_info(usage_event)')
+      : await store.all<{ name: string }>(
+        "SELECT column_name AS name FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='usage_event'")
+    return columns.filter(column => column.name === PORTAL_SOURCE_COLUMN).length === 1
+  } finally { await store.close() }
+}
+
 /** 把一个 v8 库降级成 v7 形态：删掉四张汇总表 + v8 账本行 + 版本标记。 */
 async function downgradeToV7(target: PortalTarget): Promise<void> {
   const store = await openRawPortalStore(target)
   try {
     for (const table of PORTAL_V8_TABLES) await store.exec(`DROP TABLE ${table}`)
-    await store.exec('DELETE FROM portal_schema_migrations WHERE version = 8')
+    // 🚨 **删掉「v7 以上」的全部账本行**（不是只删 v8 那一行）。
+    //   只删 v8 时：当前版本是 v9，那条 v9 账本行还留着 ⇒ 判定逻辑里的 `current` 仍为真
+    //   ⇒ 库被判成 `unsupported`（而不是 `legacy`），整条回滚路径当场失效。
+    //   实测（2026-10-03，v9 落地后首次跑本脚本）：`{"status":"unsupported","version":7}`。
+    await store.exec('DELETE FROM portal_schema_migrations WHERE version > 7')
     // 🚨 **版本标记也必须一起退回去**：SQLite 是 `PRAGMA user_version`、
     //   MySQL 是 `portal_meta.schema_version`。只删账本行而留着版本 8，
     //   `readPortalState()` 会得到「version=8 但没有 v8 账本行」⇒ `unsupported`
@@ -102,7 +128,7 @@ console.log('\n【SQLite】')
     check('降级后确实没有 v8 的表', !downgraded.tables.includes('usage_rollup_day'))
 
     const migrated = await migratePortalDatabase(target)
-    check('v7 → v8 迁移成功', migrated.status === 'current' && migrated.version === 8, JSON.stringify({ status: migrated.status, version: migrated.version }))
+    check('v7 → v8 → 当前版本 迁移成功', migrated.status === 'current' && migrated.version === PORTAL_SCHEMA_VERSION, JSON.stringify({ status: migrated.status, version: migrated.version }))
     check('迁移后四张 v8 表都在', PORTAL_V8_TABLES.every(table => migrated.tables.includes(table)))
     check('★ 迁移只增表：事件指纹逐位不变', (await fingerprint(target)) === before)
     const after = await openPortalStore(target)
@@ -110,13 +136,18 @@ console.log('\n【SQLite】')
       const row = await after.get<{ c: number }>('SELECT COUNT(*) AS c FROM usage_rollup_day')
       check('迁移建的是空表（灌历史归 syncRollups）', Number(row?.c) === 0)
     } finally { await after.close() }
+    // ★ v9 的幂等护栏在这条链上也会被压到：降级只删了 v8 的四张表，
+    //   而 `usage_event.source` 早在建库时就有了 ⇒ 再迁一次时
+    //   `upgradeV8ToV9` 面对的是「列已存在」的库，必须照常收尾（不能重复加列）。
+    check('★ 迁移链跑完仍是当前版本（v9 的加列幂等）', (await inspectPortalDatabase(target)).version === PORTAL_SCHEMA_VERSION)
+    check('★ 库里的 source 列只有一份', await hasSingleSourceColumn(target))
 
     // 回滚：再删一次四张表 → 又能被认成 legacy 并再迁回来
     await downgradeToV7(target)
     const again = await inspectPortalDatabase(target)
     check('★ 回滚（删四张表）后仍可再迁回来', again.status === 'legacy')
     const remigrated = await migratePortalDatabase(target)
-    check('再迁一次又回到 v8', remigrated.status === 'current' && remigrated.version === 8)
+    check('再迁一次又回到当前版本', remigrated.status === 'current' && remigrated.version === PORTAL_SCHEMA_VERSION)
     check('★ 回滚-再迁移两轮之后事件指纹仍然不变', (await fingerprint(target)) === before)
   } finally { rmSync(dir, { recursive: true, force: true }) }
 }
@@ -145,9 +176,10 @@ if (!mysqlUrl) {
     check('MySQL：降级后被认成 v7 的可迁移起点', downgraded.status === 'legacy', JSON.stringify({ status: downgraded.status, version: downgraded.version }))
 
     const migrated = await migratePortalDatabase(target)
-    check('MySQL：v7 → v8 迁移成功', migrated.status === 'current' && migrated.version === 8, JSON.stringify({ status: migrated.status, version: migrated.version }))
+    check('MySQL：v7 → v8 → 当前版本 迁移成功', migrated.status === 'current' && migrated.version === PORTAL_SCHEMA_VERSION, JSON.stringify({ status: migrated.status, version: migrated.version }))
     check('MySQL：四张 v8 表都在', PORTAL_V8_TABLES.every(table => migrated.tables.includes(table)))
     check('★ MySQL：迁移只增表，事件指纹逐位不变', (await fingerprint(target)) === before)
+    check('★ MySQL：v9 的 source 列只有一份（加列幂等）', await hasSingleSourceColumn(target))
     // MySQL 侧的索引核对最容易漏（受控 DDL 里 `CREATE INDEX` 是独立语句）
     const after = await openPortalStore(target)
     try {

@@ -34,6 +34,7 @@ import {
   TIME_RANGES,
   CUSTOM_PERIOD,
   periodReadyForQuery,
+  sourceLabel,
 } from '../types/portal.js'
 const dashboard = useDashboardStore()
 /** 身份只用来决定「画不画人员下拉」（数据范围由服务端强制，见模板里的说明）。 */
@@ -43,6 +44,7 @@ const draft = reactive({
   users: [...dashboard.filters.users],
   groups: [...dashboard.filters.groups],
   providers: [...dashboard.filters.providers],
+  sources: [...dashboard.filters.sources],
 })
 watch(
   () => dashboard.filters,
@@ -52,6 +54,7 @@ watch(
       users: [...value.users],
       groups: [...value.groups],
       providers: [...value.providers],
+      sources: [...value.sources],
     }),
 )
 let selectTimer: ReturnType<typeof setTimeout> | undefined
@@ -75,11 +78,12 @@ function applySelectsSoon(): void {
   selectTimer = setTimeout(() => void apply(), 250)
 }
 async function reset(): Promise<void> {
-  // ★ 分组 / 人员 / 厂商是三个独立维度，重置必须**都**清空 ——
+  // ★ 分组 / 人员 / 厂商 / 来源是四个独立维度，重置必须**都**清空 ——
   //   漏掉一个就会留下「看不见的筛选」，数字对不上却找不到原因。
   Object.assign(draft, {
     ...dashboard.filters,
     providers: [],
+    sources: [],
     model: '',
     users: [],
     groups: [],
@@ -232,6 +236,37 @@ onUnmounted(() => clearTimeout(selectTimer))
             >清除</el-button
           ></span
         >
+      </el-form-item>
+      <!--
+        来源：多选（OR）+ 可搜索，**不可新建**。
+
+        ★ 候选 = `GET /api/v1/stats/sources`（本进程注册的全部来源 ∪ 库里出现过的值）。
+          所以本机还没跑过 Codex 时，下拉里也有 Codex —— 选中会得到 0 行，
+          那是对的答案，而不是「下拉里没有这一项」。
+        🚨 与厂商**刻意不同**：服务端对来源是**精确匹配**（受控枚举），
+          所以这里没有 `allow-create`：现敲一个 `codex ` (带空格) 或 `codx`
+          只会得到一句 400，而使用者会以为「筛了但没数据」。
+        ⚠️ 展示名（`DSH` / `Claude Code` …）只用于显示，发出去的是原值 ——
+          服务端按原值精确比，页面翻译过再发就筛不到了。
+      -->
+      <el-form-item label="来源"
+        ><el-select
+          v-model="draft.sources"
+          multiple
+          filterable
+          clearable
+          collapse-tags
+          collapse-tags-tooltip
+          :reserve-keyword="false"
+          placeholder="全部来源"
+          aria-label="来源筛选"
+          data-testid="source-filter"
+          @change="applySelectsSoon"
+          ><el-option
+            v-for="source in dashboard.sourceOptions"
+            :key="source"
+            :value="source"
+            :label="sourceLabel(source)" /></el-select>
       </el-form-item>
       <el-form-item label="模型"
         ><el-input

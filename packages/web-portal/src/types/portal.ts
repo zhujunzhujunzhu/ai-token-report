@@ -78,8 +78,34 @@ export const BREAKDOWN_TABS: { value: GroupBy; label: string }[] = [
   { value: 'provider-model', label: '厂商 / 模型' },
   { value: 'model', label: '模型' },
   { value: 'provider', label: '厂商' },
+  // ★ 来源（哪个客户端写的）：精确等值维度（不是「展开」语义），所以和上面几个
+  //   等值维度同处一栏。它的值是受控枚举，服务端不做任何归一化。
+  { value: 'source', label: '来源' },
   { value: 'project', label: '项目' },
 ]
+
+/**
+ * 来源的**展示名**。
+ *
+ * ★ 只影响展示：筛选与分组用的始终是 `dsh` / `codex` / … 这些原值
+ *   （服务端按 `source = ?` 精确匹配，页面不做任何翻译后再发出去）。
+ * ⚠️ **认不出来的值原样显示**：库里可能存着一个本进程还不认识的来源
+ *   （客户端比服务端新，见 `StatsSourcesResponse`），把未知值显示成
+ *   「其他」会让两种不同的来源看起来是同一个 —— 而它们其实是两台不同的客户端。
+ */
+export const SOURCE_LABELS: Record<string, string> = {
+  dsh: 'DSH',
+  codex: 'Codex',
+  'claude-code': 'Claude Code',
+  trae: 'Trae',
+  'trae-cn': 'Trae CN',
+  workbuddy: 'WorkBuddy',
+}
+
+/** 来源原值 → 展示名（未知值原样返回）。 */
+export function sourceLabel(value: string): string {
+  return SOURCE_LABELS[value] ?? value
+}
 
 /** 明细表的列定义。 */
 export interface DetailColumn {
@@ -94,6 +120,9 @@ export const RECORD_COLUMNS: DetailColumn[] = [
   { key: 'userId', title: '署名', numeric: false },
   { key: 'provider', title: '厂商', numeric: false },
   { key: 'model', title: '模型', numeric: false },
+  // ★ 来源（v9）：明细也带它 —— 逐条核对时「这条用量是谁写的」必须看得见
+  //   （只看看板汇总的话，「筛了 Codex 但这一行其实是 DSH」看不出来）。
+  { key: 'source', title: '来源', numeric: false },
   { key: 'calls', title: '调用', numeric: true },
   { key: 'inputTokens', title: '未缓存输入', numeric: true },
   { key: 'outputTokens', title: '输出', numeric: true },

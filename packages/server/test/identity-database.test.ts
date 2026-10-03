@@ -466,6 +466,10 @@ describe('数据库权威身份', () => {
     const dir = mkdtempSync(join(tmpdir(), 'atr-identity-db-')); roots.push(dir)
     const target = { sqlitePath: join(dir, 'legacy.sqlite') }, db = openDb(target.sqlitePath)
     ensureSchema(db)
+    // ⚠️ 「v3 副本」是 **portal** 的版本号（迁移入口据此判 legacy），与本地库的
+    //   `DB_SCHEMA_VERSION` 无关。必须显式写死 3：否则本地库一升版本（加 `source` 列时就是），
+    //   这个夹具就不再是 v3 起点，而表现只是「这条迁移用例失败」。
+    db.exec('PRAGMA user_version=3')
     // ⚠️ 这里是**迁移前**的 v3 副本：那时快照列还叫 `dept`（v5 才改名 `group_name`）。
     //   所以下面这条 INSERT 用旧列名，而迁移之后的 SELECT 用新列名 —— 同一份测试里
     //   出现两个名字是对的，判断依据是「这句 SQL 跑在迁移前还是迁移后」。

@@ -11,7 +11,7 @@ import { computed } from 'vue'
 import type { RecordRow, StatsGroupOption } from '@ai-token-report/shared'
 import { formatCount, formatDateTime } from '../utils/format.js'
 import { UNPRICED_TEXT, currencyText } from '../utils/cost.js'
-import { recordGroupNames, userLabel } from '../types/portal.js'
+import { recordGroupNames, sourceLabel, userLabel } from '../types/portal.js'
 const props = defineProps<{
   rows: RecordRow[]
   total: number
@@ -102,6 +102,16 @@ const rowRecord = (row: unknown): RecordRow => row as RecordRow
       min-width="180"
       show-overflow-tooltip
     />
+    <!--
+      ★ 来源（v9）：明细逐条显示「这条用量是哪个客户端写的」。
+        它是上报原值（受控枚举），这里只把展示名译出来（`DSH` / `Codex` …）——
+        ⚠️ 认不出来的值**原样显示**：库里可能有一个本进程还不认识的来源
+        （客户端比服务端新），把它显示成「其他」会让两个不同的客户端看起来是同一个。
+      筛选与查询用的始终是原值（`row.source`），页面不翻译后再发出去。
+    -->
+    <el-table-column label="来源" min-width="110" show-overflow-tooltip>
+      <template #default="{ row }">{{ sourceLabel(row.source) }}</template>
+    </el-table-column>
     <el-table-column label="未缓存输入" min-width="130" align="right"
       ><template #default="{ row }">{{
         formatCount(row.inputTokens)
