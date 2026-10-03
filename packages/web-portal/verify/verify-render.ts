@@ -629,15 +629,23 @@ try {
     groupsHtml.includes('一名成员可同时属于多个分组') &&
     groupsHtml.includes('用量会按其所属的每个分组统计'))
   const providersHtml = await render('/src/views/ProvidersView.vue')
-  check('供应商归一化独立展示规则列表、搜索、作用范围与新增入口',
-    ['供应商归一化', '规则列表', '搜索供应商或归一化名', '全部作用范围', '添加规则'].every((label) => providersHtml.includes(label)))
+  // ⚠️ 文案一律按**当前源码**写（与上面管理页标题同一条纪律）：v12 起这一页同时管
+  //   供应商与模型，标题、搜索框与「未配置者保持原值」都改成了覆盖两个维度的说法。
+  //   按旧文案断言会让「页面已经改对了」变成假失败 —— 而照抄当前文案仍然证明页面真的写出来了。
+  check('供应商模型归一化独立展示规则列表、搜索、作用范围与新增入口',
+    ['供应商模型归一化', '规则列表', '搜索原始名或归一化名', '全部作用范围', '添加规则'].every((label) => providersHtml.includes(label)))
   // ★ 这一页最容易配错的两件事必须写在页面上，而不是只写在代码注释里：
   //   ① 原始名是大小写敏感的精确匹配（写错就静默不命中）；
-  //   ② 没配规则的供应商保持原始名（归一化不是「统一改名」）。
-  check('供应商归一化写明匹配规则与「未配置者保持原值」',
+  //   ② 没配规则的项保持原始名（归一化不是「统一改名」）。
+  check('供应商模型归一化写明匹配规则与「未配置者保持原值」',
     providersHtml.includes('一字不差') &&
-    providersHtml.includes('没有配规则的供应商保持自己的原始名') &&
+    providersHtml.includes('没有配规则的项保持自己的原始名') &&
     providersHtml.includes('明细里始终同时显示原值'))
+  // ★ v12 扩到模型维度后的两条新语义也必须写在页面上（不看代码猜不到）：
+  //   ① 一条规则只折叠一个维度（想两个都改就配两条）；② 模型规则的「限定供应商」留空 = 任意供应商。
+  check('★ v12：写明「一条规则只折叠一个维度」与「限定供应商留空 = 任意供应商」',
+    providersHtml.includes('一条规则只折叠一个维度') &&
+    providersHtml.includes('限定供应商') && providersHtml.includes('任意供应商'))
   check('供应商归一化不混排人员或分组列表', !providersHtml.includes('人员列表') && !providersHtml.includes('分组列表'))
   const projectsHtml = await render('/src/views/ProjectsView.vue')
   check('项目归一化独立展示规则列表、搜索、作用范围与新增入口',
