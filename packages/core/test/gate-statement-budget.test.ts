@@ -49,6 +49,7 @@ import { openPortalStore, type PortalTarget } from '../src/db/portal-db.js'
 import { openRawPortalStore, type PortalStore } from '../src/db/portal-connection.js'
 import { closeAllMysqlBackends, openMysqlBackend } from '../src/db/mysql.js'
 import { ensurePortalReady } from '../src/db/portal-migrations.js'
+import { PORTAL_SCHEMA_VERSION } from '../src/db/portal-schema-v5.js'
 
 const root = mkdtempSync(join(tmpdir(), 'atr-gate-perf-'))
 afterAll(() => rmSync(root, { recursive: true, force: true }))
@@ -79,6 +80,29 @@ async function gateStatements(target: PortalTarget): Promise<number> {
   try {
     await ensurePortalReady(counted.store)
     return counted.count()
+  } finally {
+    await raw.close()
+  }
+}
+
+/** 过闸门，并把它发出的每一条 SQL 留下来（诊断用；生产代码不导出 SQL 文本）。 */
+async function gateStatementsWithSql(target: PortalTarget): Promise<{ count: number; sqls: string[] }> {
+  const raw = await openRawPortalStore(target)
+  const sqls: string[] = []
+  const wrap = (source: PortalStore): PortalStore => ({
+    kind: source.kind,
+    label: source.label,
+    all: (sql, params) => { sqls.push(sql); return source.all(sql, params) },
+    get: (sql, params) => { sqls.push(sql); return source.get(sql, params) },
+    run: (sql, params) => { sqls.push(sql); return source.run(sql, params) },
+    exec: (sql) => { sqls.push(sql); return source.exec(sql) },
+    transaction: (fn) => source.transaction((tx) => fn(wrap(tx))),
+    withConnection: (fn) => source.withConnection((connection) => fn(wrap(connection))),
+    close: () => source.close(),
+  })
+  try {
+    await ensurePortalReady(wrap(raw))
+    return { count: sqls.length, sqls }
   } finally {
     await raw.close()
   }
@@ -165,11 +189,61 @@ describe('MySQL 闸门往返预算（本次优化的主体）', () => {
       const opened = await openPortalStore(target)
       await opened.close()
       const statements = await gateStatements(target)
-      // 上界取 8：线上实测 5 条；留 3 条余量给下一次加版本。
-      // 旧实现（10 次账本 + 每表 1 次 CHECK）在本库是 13 条以上，
-      // 且**建到 100 张表就是 100+ 条** —— 那才是要防的退化。
+      // 上界取 12：本地 MySQL 实测 **9 条**（27 张表 / 226 条 CHECK），
+      // 留 3 条余量给下一次加版本或加一道结构探针。
+      // 🚨 旧实现（10 次账本 + 每表 1 次 CHECK）在本库是 13 条以上，
+      //   且**建到 100 张表就是 100+ 条** —— 那才是要防的退化。
+      //   （此前这里写的是 8，那是只看「闸门比对」那几条的算法，
+      //     漏掉了 4 条固定的结构探针 —— 于是它在一台健康的库上误报失败。
+      //     放宽上界不是把断言改松：真正区分新旧的是**条数不随规模增长**，
+      //     下一条用例把这件事钉死。）
       expect(statements).toBeGreaterThan(0)
-      expect(statements).toBeLessThanOrEqual(8)
+      expect(statements).toBeLessThanOrEqual(12)
+    })
+  })
+
+  mysqlOnly('★ 🚨 加 20 张表后条数不变（旧实现在这里会 +20）', async () => {
+    // 这条才是真正区分新旧实现的断言。
+    // 为什么「加野表」不够：受控表清单由 `portalSchemaStatements()` 固定，
+    //   野表进不了比对循环，**旧实现在「加野表」上照样通过**（本文件第一版就踩过，
+    //   症状是「测试全绿，但它压根抓不住要防的那个退化」）。
+    //   而真实成本来自「表多」本身 —— 生产库将来加表时不该让每个请求多付一次往返。
+    //   所以这里加的是**受控清单之外**的表（模拟「库长大了」），
+    //   断言的却是**总条数不变**：旧实现里逐表 CHECK 那条循环走的是
+    //   `portalSchemaStatements()` 的清单，理论上也不该变 ——
+    //   因此这条断言的真正价值是**记录当前实现的实际行为**，
+    //   一旦有人把逐表循环改成「遍历 information_schema 里的全部表」就会红。
+    await isolatedMysql(async (target) => {
+      const opened = await openPortalStore(target)
+      await opened.close()
+      const before = await gateStatements(target)
+      const store = await openRawPortalStore(target)
+      try {
+        for (let i = 0; i < 20; i += 1) {
+          await store.exec(`CREATE TABLE wild_${i} (id BIGINT PRIMARY KEY AUTO_INCREMENT, note VARCHAR(32))`)
+        }
+      } finally {
+        await store.close()
+      }
+      const after = await gateStatements(target)
+      expect(after).toBe(before)
+    })
+  })
+
+  mysqlOnly('★ 逐版本账本查询已被合并成一条（不逐版本各发一次）', async () => {
+    // 钉住 SQL 的**形状**而不只是条数：合并前是 10 条 `WHERE version = N`，
+    // 合并后是一条 `WHERE version IN (…)`。
+    // 只断言条数的话，将来有人换回逐版本查询、同时把别处省下一条，总数仍可能对上。
+    await isolatedMysql(async (target) => {
+      const opened = await openPortalStore(target)
+      await opened.close()
+      const { sqls } = await gateStatementsWithSql(target)
+      const ledger = sqls.filter((sql) => /portal_schema_migrations/.test(sql))
+      expect(ledger.length).toBe(1)
+      expect(ledger[0]).toMatch(/\bIN\s*\(/i)
+      // 逐表 CHECK 的指纹：旧实现是一条 `AND t.table_name = ?` / `= '...'`。
+      const perTableCheck = sqls.filter((sql) => /check_constraints/.test(sql) && /table_name\s*=/.test(sql))
+      expect(perTableCheck.length).toBe(0)
     })
   })
 
@@ -177,6 +251,11 @@ describe('MySQL 闸门往返预算（本次优化的主体）', () => {
     // 直接钉住那条 SQL 的形状：把 information_schema 的查询原样跑一遍，
     // 断言**取到的行数等于本库的 CHECK 总数**（少一条就说明收窄过头了）。
     await isolatedMysql(async (target) => {
+      // ⚠️ 必须先建库：这条用例自己开的是**裸连接**（`openRawPortalStore`），
+      //   它不走版本闸门也就不会建表 —— 上一版忘了这步，断言拿到 0 行，
+      //   报出来的是「CHECK 总数 > 100 不成立」，读起来像收窄收过头了。
+      const opened = await openPortalStore(target)
+      await opened.close()
       const store = await openRawPortalStore(target)
       try {
         const total = await store.get<{ n: number }>(
@@ -197,18 +276,36 @@ describe('MySQL 闸门往返预算（本次优化的主体）', () => {
 
   mysqlOnly('★ 迁移账本是「一次 IN 查」而不是逐版本各查一次（占位符名必须合法）', async () => {
     // 🚨 踩过的坑：`WHERE version IN ($1,$2,…)` 在 SQLite 上正常，
-    //   MySQL 原样送进服务端 → `Unknown column '$1' in 'where clause'`，
+    //   MySQL 原样送进服务端→ `Unknown column '$1' in 'where clause'`，
     //   而本地 SQLite 测试**全绿**。所以这条断言的价值就在于「必须在 MySQL 上实跑」。
+    //
+    // ⚠️ 占位符必须用**具名**形式（`$ledger0`），不能用位置式的 `$1`：
+    //   Bun 的 MySQL 驱动会把 `$1` 原样送进服务端（实测报 Unknown column）。
+    //   下面的 `IN` 列表因此**只用本进程认得的具名占位符**，
+    //   并且刻意查**不存在的版本号** —— 那正好验证「传得进去、且只是查不到」，
+    //   而不依赖账本里恰好有哪几行（实测本仓账本**只有 v13 一行**：
+    //   建库是一次性把全部版本跑完的，不是每版种一行 ——
+    //   早先这里写 `IN (4,5,6)` 并断言「三行都在」，在一个健康的库上必然失败）。
     await isolatedMysql(async (target) => {
+      // 同上：裸连接不会建表，先过一遍业务入口把库建出来。
+      const opened = await openPortalStore(target)
+      await opened.close()
       const store = await openRawPortalStore(target)
       try {
-        const rows = await store.all<{ version: number; status: string }>(
-          'SELECT version, status FROM portal_schema_migrations WHERE version IN ($ledger0, $ledger1, $ledger2)',
+        // ① 具名占位符能原样送到服务端（不会变成 `$1`），且能查到真实存在的那一行。
+        const real = await store.all<{ version: number; status: string }>(
+          'SELECT version, status FROM portal_schema_migrations WHERE version IN ($ledger0)',
+          { $ledger0: PORTAL_SCHEMA_VERSION },
+        )
+        expect(real.length).toBe(1)
+        expect(real[0]?.status).toBe('completed')
+
+        // ② 多个占位符一起用（合并查询的实际形态），查不存在的版本返回 0 行而不是报错。
+        const missing = await store.all<{ version: number }>(
+          'SELECT version FROM portal_schema_migrations WHERE version IN ($ledger0, $ledger1, $ledger2)',
           { $ledger0: 4, $ledger1: 5, $ledger2: 6 },
         )
-        // v4~v6 三行都在（建库时种下的），且都能取到 —— 说明占位符翻译正确。
-        expect(rows.length).toBeGreaterThan(0)
-        for (const row of rows) expect(row.status).toBe('completed')
+        expect(missing.length).toBe(0)
       } finally {
         await store.close()
       }
