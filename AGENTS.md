@@ -191,6 +191,29 @@ bun run deploy:server:apply      # 真部署：备份 → 切换 → 重启 → 
 #    否则**上传之前**就拒绝 —— 线上 atr_user 口令 32 字符，切错会 errno 1045。
 #    规则在 scripts/deploy-plan.mjs，由 packages/server/test/deploy-plan.test.ts（10 项）钉住。
 
+# ★ 线上项目归一化规则（看板「项目」维度怎么折叠 cwd；改规则 / 核对看板项目行数时用）
+#   写数据走管理接口（不直接改库：全局规则的「同前缀唯一」只有应用层在保证）；
+#   读现有规则走 HEX（`--batch` 会把 Windows 路径的 `\` 转义成 `\\`，不 HEX 就每条都判成新建）。
+#   ⚠️ 权限：管理接口要 `projects:manage`（看板查询读规则表走 `stats:read`，不经这里）。
+bun scripts/online-project-rules.mjs rules                        # 线上现有规则（只读）
+bun scripts/online-project-rules.mjs plan  --file <rules.json>     # 只算「新建 / 覆盖 / 无变化」
+bun scripts/online-project-rules.mjs apply --file <rules.json>     # 真写入（幂等；--dry-run 只打印请求体）
+bun scripts/online-project-rules.mjs prune --file <rules.json>     # 删掉「不在目录里」的旧规则（默认演练，--yes 才真删）
+bun scripts/online-project-rules.mjs verify --from 0               # 读看板 by=project，核对行数与项目名
+bun test packages/server/test/online-project-rules-plan.test.ts    # 11 项：匹配模式 / 前缀归一化 / 校验 / 计划 / HEX
+#   ⚠️ 必须用 `bun` 跑（不是 node）：ssh-exec.mjs 的 which('plink') 依赖完整 PATH，
+#     受限环境里 node 会 spawn 失败并误报「既没有免密 ssh，也没找到 plink」。
+#   ★ prefix 有**两种写法**（靠「含不含路径分隔符」区分，不加列）：
+#       仓库名（`suit-g92-parent`，不含分隔符）⇒ 匹配 cwd 的**任一路径段逐字全等**，
+#         一条覆盖该仓库在任意磁盘 / 父目录下的所有子目录（线上实测 10 个项目 31 条 → 14 条）；
+#       路径前缀（`D:\Coding\suit-g92-parent`）⇒ 整条路径前缀，按分隔符边界，**只在该位置生效**。
+#     优先级：路径模式 > 仓库名模式；同类型内最具体者胜出。段是**全等不是前缀**
+#     （`skills-cli` 不吃 `skills-cli-old`）、**逐字区分大小写**（不折叠）。
+#   🚨 裸盘符 `D:` 被服务端拒：它就是 `D:\a\proj` 的第一段，一条 `D:` 吃整个盘。
+#   🚨 改了 project-alias.ts 的匹配语义 ⇒ **先部署再改规则**，否则新规则一条都不生效
+#     （`rules` 看起来正常、看板毫无变化）。切换顺序见 skill §1.3。
+#   📖 .agents/skills/online-project-rules/SKILL.md（含实测记录与「留待确认」清单）
+
 # DSH 插件：构建 + 五层验证（从内到外逐层接近真实，改插件后全跑）
 bun run --filter '@ai-token-report/dsh-plugin' build
 bun run packages/dsh-plugin/verify/verify-plugin.ts         # 真 HTTP 往返 + 面板改会话日志根的就地生效（70 项）
@@ -253,6 +276,8 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
 | **DSH Desktop 桌面端安装**（命令行步骤 / peer 版本窗口 / 验收 / 回滚） | `docs/桌面端安装交付清单.md` + `packages/dsh-plugin/README.md` |
 | **server 层分层 / 要不要引入第三方库** | `docs/server架构重构方案.md` + `.agents/skills/repo-conventions/SKILL.md` |
 | **部门上报库接 MySQL（方言坑 / 部署 / 备份）** | `docs/mysql上报库.md` |
+| **线上模型单价**（补价 / 改价 / 核对看板金额；含官方价目在哪查、验证码与 Cookie Path 两个坑） | `.agents/skills/online-model-pricing/SKILL.md` + `scripts/online-pricing.mjs`（操作台）+ `scripts/online-pricing-plan.mjs`（纯逻辑，被 `server/test/online-pricing-plan.test.ts` 钉住） |
+| **线上项目归一化规则**（把线上 cwd 折成项目名；含「仓库名 vs 路径前缀双模匹配」「先部署再改规则」「读现有规则必须走 HEX」「全局规则唯一靠应用层」四个坑） | `.agents/skills/online-project-rules/SKILL.md` + `scripts/online-project-rules.mjs`（操作台，`rules`/`plan`/`apply`/`prune`/`verify`）+ `scripts/online-project-rules-plan.mjs`（纯逻辑，被 `server/test/online-project-rules-plan.test.ts` 钉住）。匹配语义的**唯一实现**在 `packages/core/src/db/project-alias.ts`（改它要跑 core 整包 + http-contract）。远端登录/写入**复用** `online-pricing-plan.mjs` 的 `REMOTE_APPLY_SOURCE`（把 `CONFIG.endpoint` 与逐行 `CONFIG.rows[].method` 参数化）—— 改那一段要两个单测一起跑 |
 | **Portal v9 部署 / v4→v5→v6→v7→v8→v9 显式迁移 / 身份导入** | `docs/数据库部署与迁移.md` + `docs/数据库重设计.md` + `docs/汇总表设计规格.md`（v8） |
 | **供应商 / 模型归一化（查询期口径 / 按查看者解析 / 一条规则只折叠一个维度）** | `packages/core/src/db/provider-alias.ts` + `portal-schema-v12.ts` + `docs/数据库重设计.md` §4.3.1 + `core/test/provider-alias.test.ts` + **`server/test/model-alias.test.ts`**。`provider_alias.model IS NULL` = 供应商规则，非 NULL = 模型规则（**不加 `target` 列** —— 多一列只会多出一个必然漂移的字段）；模型规则的 `provider` 可以是 `'*'`（= `ANY_PROVIDER`，与模型单价的「不限供应商基础价」同一个字面量）。🚨 唯一索引必须是 **`(member_id, provider, model)`**（v12 换的）：不换则「`dashscope` 供应商规则」与「`dashscope`+`qwen-max` 模型规则」是同一个键，第二条写不进去。🚨 MySQL 换索引**不能先 DROP**（`member_id` 上有外键，errno 1553）⇒ 走「临时名建新 → 删旧 → 改名回」 |
 | **项目归一化（目录前缀 / 最长优先 / 未命中回落 `projectName()`）** | `packages/core/src/db/project-alias.ts` + `docs/数据库重设计.md` §4.3.1.1 + `core/test/project-alias.test.ts`。🚨 前缀**必须按路径分隔符边界**判定（裸 `startsWith` 会让一条规则吃掉邻居项目）；`project` 维度的分布表与金额列共用 `PortalStatsSession.#projectOf()`；目录候选 `/api/v1/stats/projects` **跟着数据范围收窄**，且**不能**走 `openPortalStats()`（会撞 `assertLegacyIdentityView()` 的 409） |
