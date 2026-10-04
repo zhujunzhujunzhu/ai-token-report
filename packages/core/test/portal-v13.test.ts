@@ -50,6 +50,7 @@ import {
   portalSchemaChecksum,
   portalSchemaChecksumV11,
   portalSchemaChecksumV12,
+  portalSchemaChecksumV13,
   portalSchemaStatements,
   portalV13Statements,
 } from '../src/db/portal-schema-v5.js'
@@ -244,14 +245,22 @@ describe('v13：受控定义与摘要的关系（静态护栏，不需要数据�
     expect(PORTAL_V13_PERMISSION_SQL.some(candidate => candidate.includes('INSERT INTO permissions'))).toBe(false)
   })
 
-  test('★ 纯权限版本：当前摘要与冻结的 v12 摘要此刻相同，但两者都与 v11 不同', () => {
+  test('★ 纯权限版本：v13 冻结摘要 === v12 摘要，且当前摘要已因 v14 而不同', () => {
     for (const kind of ['sqlite', 'mysql'] as const) {
       // 冻结的 v11 摘要必须与 v12 不同（否则 v11 库会被误判成 current）。
       expect(portalSchemaChecksumV12(kind)).not.toBe(portalSchemaChecksumV11(kind))
-      // v13 没有任何 DDL ⇒ 它发布那一刻的结构摘要就是 v12 那一份。
-      // ⚠️ 将来某一版真的加了 DDL 时，这条要改成对着 PORTAL_SCHEMA_VERSION 判断
-      //   （本仓的规矩：不写死版本号，避免下次加版本时这里误报）。
-      if (PORTAL_SCHEMA_VERSION === 13) expect(portalSchemaChecksum(kind)).toBe(portalSchemaChecksumV12(kind))
+      // 🚨 v13 没有任何 DDL ⇒ **它发布那一刻**的结构摘要就是 v12 那一份，
+      //   这条断言正是「纯权限版本不留痕」的证据，且它**永不失效**：
+      //   被比较的是两个**冻结**的函数，与当前版本号无关。
+      //   （上一版这里写的是 `if (PORTAL_SCHEMA_VERSION === 13) expect(portalSchemaChecksum(kind))
+      //     .toBe(portalSchemaChecksumV12(kind))` —— 那个写法在 v14 加了 DDL 之后
+      //     立刻变成一个**类型层面的死分支**（`14` 与 `13` 无交集，tsc 报 TS2367），
+      //     恰好在「需要改的那一刻」报了错。冻结摘要之间的比较不该依赖当前版本号。）
+      expect(portalSchemaChecksumV13(kind)).toBe(portalSchemaChecksumV12(kind))
+      // 而 v14 加了 DDL ⇒ 当前摘要必须**已经**与 v13 的不同，
+      // 否则 v13 库（线上库升级后的形态）会被判成 current，
+      // 而它的目录里没有 `idx_usage_event_source` ⇒ 闸门形同虚设。
+      expect(portalSchemaChecksum(kind)).not.toBe(portalSchemaChecksumV13(kind))
     }
   })
 })

@@ -84,6 +84,7 @@ import {
   portalV12ReplaceProviderAliasIndex,
 } from './portal-schema-v12.js'
 import { portalV13Statements } from './portal-schema-v13.js'
+import { portalV14ChecksumInput, portalV14Statements } from './portal-schema-v14.js'
 
 // 交付面：调用方（迁移器 / 汇总构建 / 测试）一律从本模块取，
 // 不必知道 v8 / v9 / v10 的实现住在独立文件里 —— 与 v6 / v7 的导出方式保持一致。
@@ -107,6 +108,13 @@ export {
 } from './portal-schema-v11.js'
 export { portalV13Statements, PORTAL_V13_PERMISSION_SQL } from './portal-schema-v13.js'
 export {
+  portalSourceIndex,
+  portalV14ChecksumInput,
+  portalV14Statements,
+  PORTAL_SOURCE_INDEX,
+  PORTAL_SOURCE_INDEX_COLUMNS,
+} from './portal-schema-v14.js'
+export {
   portalProviderAliasUniqueIndex,
   portalProviderAliasTemporaryIndex,
   portalV12AddColumnStatement,
@@ -123,13 +131,23 @@ export {
 /**
  * 上报库**当前**结构版本。
  *
+ * ★ 13 → 14（2026-10-04）：v14 给 `usage_event.source` 建**单列**索引。
+ *   起因是线上实测：`SELECT DISTINCT source`（筛选栏那个下拉框，
+ *   `GET /api/v1/stats/sources`，**不带任何筛选**）在 19.7 万行上是
+ *   `type=ALL / rows=224453 / Using temporary; Using filesort`，
+ *   656 次调用累计 **120.1 秒**、单次最大 0.5 秒 —— 慢查询日志里的**第一名**。
+ *   加索引后走 **loose index scan**（`Using index for group-by`），
+ *   20 万行实测 13ms → 0~1ms、扫描行数 224453 → 4（与表多大无关）。
+ *   只有一个 DDL、不动任何数据 ⇒ 不需要备份证明、不需要比对事件指纹。
+ *   完整推导与「为什么不能加第二列」写在 `portal-schema-v14.ts` 的文件头。
+ *
  * ★ 12 → 13（2026-10）：v13 是**纯权限版本** —— 把 `cost:read` 授予内置 `member`
  *   角色（appKey 的范围在 2026-10 加了 `cost:read`，而「凭证能做什么 = 角色权限 ∩
  *   凭证 scopes」，不给这一条授权，普通成员连一条 appKey 都签不出来）。
- *   **没有任何 DDL**，所以 {@link portalSchemaChecksum} 的算式不变；
+ *   **没有任何 DDL**，所以 v13 那一版的 {@link portalSchemaChecksum} 算式不变；
  *   理由与放开的口径写在 `portal-schema-v13.ts` 的文件头。
  */
-export const PORTAL_SCHEMA_VERSION = 13
+export const PORTAL_SCHEMA_VERSION = 14
 export const PORTAL_SQLITE_V5_SQL = `-- 数据库 v5：分组（多对多）+ 权限码 groups:*。
 -- 不执行 ALTER/DROP，不修改本地 usage.sqlite 的 schema v3。
 -- 部署前必须另行实现带备份、版本闸门与恢复点的生产迁移。
@@ -1035,7 +1053,7 @@ export function portalSchemaStatements(kind: PortalBackendKind): string[] {
   const statements = base.map(statement => statement.startsWith('CREATE TABLE usage_event (')
     ? portalV9UsageEventStatement(kind, statement)
     : statement)
-  const all = [...statements, ...portalV6Statements(kind), ...portalV7Statements(kind), ...portalV8Statements(kind), ...portalV11Statements(kind), ...portalV13Statements()]
+  const all = [...statements, ...portalV6Statements(kind), ...portalV7Statements(kind), ...portalV8Statements(kind), ...portalV11Statements(kind), ...portalV13Statements(), ...portalV14Statements()]
   // ★ v10：`model_price` 多五列闲时价。⚠️ 它**必须在合并之后**再拼：
   //   这张表来自 v7 的追加常量（那段文本已冻结、一个字都不许改），
   //   在 `base` 上找 `CREATE TABLE model_price (` 是找不到的 —— 找不到就不会拼，
@@ -1067,10 +1085,37 @@ export function portalSchemaStatements(kind: PortalBackendKind): string[] {
  * ⚠️ 摘要只覆盖 **DDL 文本**，不含权限行：权限是数据而不是结构，
  *   把它算进摘要会让「手工补了一条角色权限」把库判成「结构不符」。
  *   ★ v13 正是**纯权限版本**（把 `cost:read` 授予内置 `member` 角色、没有任何 DDL），
- *     所以这里的算式**一个字都不动** —— 但它自己的受控摘要仍要冻结成
+ *     所以它对这里的算式**一个字都不影响** —— 但它自己的受控摘要仍要冻结成
  *     {@link portalSchemaChecksumV12}，将来某一版真的加了 DDL 才不会把 v12 库判成不支持。
+ * ★ v14 **加了 DDL**（`usage_event.source` 的单列索引），所以这里必须算进去。
+ *   不算的后果不是「慢」而是「危险」：已经迁到 v13 的库（线上库升级后的形态）
+ *   账本里记的是 v13 摘要，而 {@link portalSchemaChecksum} 返回 v14 摘要 ——
+ *   永远对不上 ⇒ 它从「可迁移的起点」变成 `unsupported`，
+ *   **服务端拒绝启动**，而 v14 只是一个索引。
  */
 export function portalSchemaChecksum(kind: PortalBackendKind): string {
+  const source = kind === 'mysql' ? PORTAL_MYSQL_V5_SQL : PORTAL_SQLITE_V5_SQL
+  const additions = kind === 'mysql'
+    ? `${PORTAL_MYSQL_V6_ADDITIONS}\n${PORTAL_MYSQL_V7_ADDITIONS}\n${PORTAL_MYSQL_V8_ADDITIONS}\n${portalV9ChecksumInput(kind)}\n${portalV10ChecksumInput(kind)}\n${portalV11ChecksumInput(kind)}\n${portalV12ChecksumInput(kind)}\n${portalV14ChecksumInput(kind)}`
+    : `${PORTAL_SQLITE_V6_ADDITIONS}\n${PORTAL_SQLITE_V7_ADDITIONS}\n${PORTAL_SQLITE_V8_ADDITIONS}\n${portalV9ChecksumInput(kind)}\n${portalV10ChecksumInput(kind)}\n${portalV11ChecksumInput(kind)}\n${portalV12ChecksumInput(kind)}\n${portalV14ChecksumInput(kind)}`
+  return createHash('sha256').update(`${source}\n${additions}`).digest('hex')
+}
+/**
+ * ★ **已发布的 v13 摘要，冻结于此**（= v5 文本 + v6 ~ v12，**不含 v14**）。
+ *
+ * 作用与 {@link portalSchemaChecksumV12} 完全一样：让**已经迁到 v13 的库**
+ *   （线上库升级后的形态）仍然被判成 `legacy` =「结构是上一版、完整、可迁移」。
+ *   不冻结的后果同样致命：那些库的账本里记的是 v13 摘要，
+ *   而 {@link portalSchemaChecksum} 现在返回 v14 摘要 —— 永远对不上，
+ *   于是从「可迁移的起点」变成 `unsupported`（服务端拒绝启动、迁移脚本也拒绝接手），
+ *   而 v14 只是一个索引。
+ *
+ * ⚠️ v13 本身**没有任何 DDL**，所以本函数与 {@link portalSchemaChecksumV12}
+ *   算出的值**逐字相同** —— 这不是复制粘贴的疏漏，而是「纯权限版本不留痕」
+ *   这件事的必然结果。两者必须各写一份而不是让 v13 转发到 v12：
+ *   将来 v12 的文本若因任何原因变化，v13 那一版冻结的值必须**纹丝不动**。
+ */
+export function portalSchemaChecksumV13(kind: PortalBackendKind): string {
   const source = kind === 'mysql' ? PORTAL_MYSQL_V5_SQL : PORTAL_SQLITE_V5_SQL
   const additions = kind === 'mysql'
     ? `${PORTAL_MYSQL_V6_ADDITIONS}\n${PORTAL_MYSQL_V7_ADDITIONS}\n${PORTAL_MYSQL_V8_ADDITIONS}\n${portalV9ChecksumInput(kind)}\n${portalV10ChecksumInput(kind)}\n${portalV11ChecksumInput(kind)}\n${portalV12ChecksumInput(kind)}`

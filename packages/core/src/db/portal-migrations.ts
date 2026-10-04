@@ -23,7 +23,7 @@ import { existsSync, readFileSync, mkdirSync, statSync, writeFileSync } from 'no
 import { dirname, resolve } from 'node:path'
 import type { Database } from './driver.js'
 import { describePortalTarget, openRawPortalStore, type PortalStore, type PortalTarget } from './portal-connection.js'
-import { PORTAL_SCHEMA_VERSION, PORTAL_SQLITE_INGEST_SQL, PORTAL_MYSQL_INGEST_SQL, portalSchemaChecksum, portalSchemaChecksumV6, portalSchemaChecksumV7, portalSchemaChecksumV8, portalSchemaChecksumV9, portalSchemaChecksumV10, portalSchemaChecksumV11, portalSchemaChecksumV12, portalSchemaStatements, portalV6Statements, portalV6TableStatement, portalV7Statements, portalV7TableStatement, portalV8Statements, portalV8TableStatement, PORTAL_V8_TABLES, PORTAL_SOURCE_COLUMN, portalV9AddColumnStatement, portalV10AddColumnStatements, PORTAL_OFFPEAK_SCHEDULE_COLUMN, portalV11Statements, portalV11TableStatement, portalV13Statements, PROJECT_ALIAS_TABLE, portalV12AddColumnStatement, portalV12ReplaceProviderAliasIndex, portalProviderAliasTemporaryIndex, portalProviderAliasUniqueIndex, PORTAL_MODEL_COLUMN, PORTAL_PROVIDER_ALIAS_TEMP_INDEX, PORTAL_PROVIDER_ALIAS_UNIQUE_COLUMNS, PORTAL_PROVIDER_ALIAS_UNIQUE_INDEX } from './portal-schema-v5.js'
+import { PORTAL_SCHEMA_VERSION, PORTAL_SQLITE_INGEST_SQL, PORTAL_MYSQL_INGEST_SQL, portalSchemaChecksum, portalSchemaChecksumV6, portalSchemaChecksumV7, portalSchemaChecksumV8, portalSchemaChecksumV9, portalSchemaChecksumV10, portalSchemaChecksumV11, portalSchemaChecksumV12, portalSchemaChecksumV13, portalSchemaStatements, portalV6Statements, portalV6TableStatement, portalV7Statements, portalV7TableStatement, portalV8Statements, portalV8TableStatement, PORTAL_V8_TABLES, PORTAL_SOURCE_COLUMN, portalV9AddColumnStatement, portalV10AddColumnStatements, PORTAL_OFFPEAK_SCHEDULE_COLUMN, portalV11Statements, portalV11TableStatement, portalV13Statements, portalSourceIndex, PORTAL_SOURCE_INDEX, PORTAL_SOURCE_INDEX_COLUMNS, PROJECT_ALIAS_TABLE, portalV12AddColumnStatement, portalV12ReplaceProviderAliasIndex, portalProviderAliasTemporaryIndex, portalProviderAliasUniqueIndex, PORTAL_MODEL_COLUMN, PORTAL_PROVIDER_ALIAS_TEMP_INDEX, PORTAL_PROVIDER_ALIAS_UNIQUE_COLUMNS, PORTAL_PROVIDER_ALIAS_UNIQUE_INDEX } from './portal-schema-v5.js'
 import { PORTAL_SQLITE_V4_INGEST_SQL, PORTAL_MYSQL_V4_INGEST_SQL, portalSchemaChecksumV4, portalSchemaStatementsV4 } from './portal-schema-v4.js'
 import { checkExpressions, sameChecks, normalizeTrigger } from './portal-catalog.js'
 
@@ -101,14 +101,23 @@ const V11_VERSION = 11
  */
 const V12_VERSION = 12
 /**
- * ★ 闸门需要逐个判定的**全部**账本版本（v4 基线 + v5~v12 过渡 + v13 当前）。
+ * v13 的**结构**版本号（= v12，因为 v13 没有任何 DDL）。
  *
- * ⚠️ 升 v14 时**必须**把 v13 加进来，否则「v13 库升不上去」：
+ * ★ 与 v7~v12 同理：v14 的账本行是当前版本，而 v13 行必须能被认出来 ——
+ *   那是「这个库是完整的上一版、可以原地升 v14」的证据。
+ *   少了这一行，已经迁到 v13 的库（**线上库升级后的形态**）会变成 `unsupported`
+ *   （服务端拒绝启动），而 v14 只是一个索引。
+ */
+const V13_VERSION = 13
+/**
+ * ★ 闸门需要逐个判定的**全部**账本版本（v4 基线 + v5~v13 过渡 + v14 当前）。
+ *
+ * ⚠️ 升 v15 时**必须**把 v14 加进来，否则「v14 库升不上去」：
  *   漏一个版本的表现不是报错，而是那个版本被静默判成 `unsupported`
  *   —— 服务端拒绝启动，而错误文案说的是「状态 unsupported」，不说是谁漏了。
- *   与其靠人记得改这里，不如让测试对着版本号范围断言（见 `portal-v13.test.ts`）。
+ *   与其靠人记得改这里，不如让测试对着版本号范围断言（见 `portal-v14.test.ts`）。
  */
-const LEDGER_VERSIONS: readonly number[] = [BASELINE_VERSION, V5_VERSION, V6_VERSION, V7_VERSION, V8_VERSION, V9_VERSION, V10_VERSION, V11_VERSION, V12_VERSION, PORTAL_SCHEMA_VERSION]
+const LEDGER_VERSIONS: readonly number[] = [BASELINE_VERSION, V5_VERSION, V6_VERSION, V7_VERSION, V8_VERSION, V9_VERSION, V10_VERSION, V11_VERSION, V12_VERSION, V13_VERSION, PORTAL_SCHEMA_VERSION]
 type SchemaVersion = 4 | 5
 
 export interface PortalInspection {
@@ -222,6 +231,7 @@ async function readPortalState(store: PortalStore): Promise<Omit<PortalInspectio
   const v10Row = rowOf(V10_VERSION)
   const v11Row = rowOf(V11_VERSION)
   const v12Row = rowOf(V12_VERSION)
+  const v13Row = rowOf(V13_VERSION)
   let status: PortalInspection['status'] = 'unsupported'
   if (tables.length === 0 && version === 0) status = 'empty'
   else if (version === 0 && tables.length === 1 && tables[0] === 'portal_schema_migrations' && !current && !baseline) status = 'incomplete'
@@ -273,8 +283,14 @@ async function readPortalState(store: PortalStore): Promise<Omit<PortalInspectio
   //   理由与 v6~v11 完全一致（手工改过结构的库不许冒充「只差一次追加迁移」）。
   //   而 v13 是**纯权限版本**（无 DDL），所以 v12 库正是「结构完整、可原地升 v13」的起点。
   else if (version === V12_VERSION && v12Row?.status === 'completed' && v12Row.checksum === portalSchemaChecksumV12(store.kind) && !current) status = 'legacy'
+  // ★ v13：结构 = v12（v13 没有任何 DDL），但受控 DDL 已经追加了
+  //   `idx_usage_event_source`。额外比对**冻结的 v13 摘要** ——
+  //   ⚠️ 它与 `portalSchemaChecksumV12()` 逐字相同（纯权限版本不留痕），
+  //     所以这一条**看起来**与上面那条同形，但它们判的是**不同的版本号**，
+  //     少一条就会让 v13 库（线上库升级后的形态）变成 unsupported。
+  else if (version === V13_VERSION && v13Row?.status === 'completed' && v13Row.checksum === portalSchemaChecksumV13(store.kind) && !current) status = 'legacy'
   // v5/v6/v7/v8/v9/v10/v11/v12 账本存在但 checksum 不符（程序换了 SQL 或库被改过）会落到 'unsupported'，绝不冒充 current。
-  return { kind: store.kind, label: store.label, version, status, tables, migration: current ?? v12Row ?? v11Row ?? v10Row ?? v9Row ?? v8Row ?? v7Row ?? v6Row ?? v5Row ?? baseline }
+  return { kind: store.kind, label: store.label, version, status, tables, migration: current ?? v13Row ?? v12Row ?? v11Row ?? v10Row ?? v9Row ?? v8Row ?? v7Row ?? v6Row ?? v5Row ?? baseline }
 }
 async function inspectStore(store: PortalStore): Promise<PortalInspection> {
   const state = await readPortalState(store)
@@ -594,6 +610,22 @@ async function verifyCurrentMysql(store: PortalStore): Promise<void> {
     "SELECT collation_name AS collation_name FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='usage_event' AND column_name='event_id'",
   )
   if (collation?.collation_name !== 'utf8mb4_0900_bin') throw gate('usage_event.event_id 必须使用精确 NO PAD 比较，拒绝可能错误去重的表。')
+
+  // ★ v14：`usage_event(source)` **普通索引**的逐列核对。
+  //   🚨 上面那条 `uniqueRows` 查询带了 `AND non_unique=0`，所以普通索引**根本不在
+  //     那份目录里** —— 而本版唯一的 DDL 就是这样一个普通索引。
+  //     不单独核对的后果不是「闸门放行坏库」那么简单：索引缺失时
+  //     `SELECT DISTINCT source` 会退成全表扫描（线上实测 13ms → 0ms 的收益归零），
+  //     而**闸门会照样放行** —— 一次部署「成功」却毫无收益，且没有任何报错。
+  //   这一条也顺带钉住「同名但列不同」（`ensureIndex()` 建的是单列，
+  //   而如果有人把它改成 `(source, ts)`，loose index scan 就失效了 —— 文件头有推导）。
+  const sourceIndexColumns = await store.all<{ col: string }>(
+    'SELECT column_name AS col FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name=\'usage_event\' AND index_name=$index ORDER BY seq_in_index',
+    { $index: PORTAL_SOURCE_INDEX },
+  )
+  if (sourceIndexColumns.map(row => row.col).join(',') !== PORTAL_SOURCE_INDEX_COLUMNS) {
+    throw gate(`索引 ${PORTAL_SOURCE_INDEX} 缺失或列组合不是 (${PORTAL_SOURCE_INDEX_COLUMNS})；没有它来源候选查询会退化成全表扫描。`)
+  }
 }
 
 /** 唯一约束比对（原 `verifyTable` 的 MySQL 分支，逐表版本）。 */
@@ -1096,6 +1128,9 @@ async function upgradeV4ToV5(store: PortalStore, target: PortalTarget, options: 
     //   （v7 之前）会在老库上直接 `FOREIGN KEY constraint failed`，
     //   而错误信息完全不提「是权限行还没建」。
     await upgradeV12ToV13(store)
+    // ★ v14：**建索引**（`usage_event(source)`），它不改任何数据 ——
+    //   所以放在事件指纹终检之前是安全的（指纹必然不变，那一步只是照例跑一遍）。
+    await upgradeV13ToV14(store)
     const final = await historyFingerprint(store, 'group_name')
     if (checkpoint.historyHash && (final.hash !== checkpoint.historyHash || final.count !== checkpoint.historyCount)) {
       throw gate('迁移前后原始事件不一致，拒绝标记完成。')
@@ -1425,6 +1460,34 @@ async function upgradeV11ToV12(store: PortalStore): Promise<void> {
 async function upgradeV12ToV13(store: PortalStore): Promise<void> {
   if (!(await tablesOf(store)).includes('role_permissions')) return
   for (const sql of portalV13Statements()) await store.exec(sql)
+}
+
+/**
+ * v13 → v14：**只建一个索引** —— `usage_event(source)`。
+ *
+ * ## 为什么它排在 v13 权限步骤**之后**
+ *
+ * 顺序在这一版无关紧要（一个插 `role_permissions`、一个建索引，互不相干）。
+ * 但把它排在后面有个实际好处：`upgradeV12ToV13()` 是**幂等且极便宜**的一步，
+ * 先跑它意味着「如果 v13 那步在这个库上因为历史原因失败」，
+ * 报错会指向真正的问题，而不是被一个建索引的 DDL 失败盖住。
+ *
+ * ## 幂等
+ *
+ * `ensureIndex()` 先查目录再决定建不建，所以重复执行安全；
+ * 它还会**逐列比对**已存在的索引 —— 同名但列不同则直接 `gate()` 拒绝，
+ * 不会把一个错的索引当成对的（这正是 `CREATE INDEX IF NOT EXISTS` 做不到的）。
+ *
+ * ## 🚨 它不该、也没有改变任何数据
+ *
+ * 因此这一版**不需要备份证明、不需要比对事件指纹**（`upgradeV6ToV7` 那条
+ * 「事件指纹逐位不变」的检查在这里是空转）。而回退位就是「删掉这个索引」：
+ * 查询层在索引缺失时自动退全表扫描，**正确性完全不受影响**，
+ * 变的只是那个候选下拉框从 0~1ms 变回 13ms。
+ */
+async function upgradeV13ToV14(store: PortalStore): Promise<void> {
+  if (!(await tablesOf(store)).includes('usage_event')) return
+  await ensureIndex(store, portalSourceIndex(), true)
 }
 
 /**

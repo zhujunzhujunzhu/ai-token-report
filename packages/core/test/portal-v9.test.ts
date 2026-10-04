@@ -100,9 +100,30 @@ async function createV8(target: PortalTarget, events: { eventId: string; provide
   await preparePortalDatabase(target)
   const store = await openRawPortalStore(target)
   try {
-    // 1) 先把当版（v9）的库建成，再**摘掉** v9 那一列 —— 这样得到的是一份
+    // 1) 先把当版的库建成，再**摘掉** v9 那一列 —— 这样得到的是一份
     //    结构与真实 v8 完全一致的库（列序、约束、索引都由同一条 DDL 产出），
     //    而不是手抄一份容易漂移的 v8 DDL。
+    //
+    // 🚨 **v14 起必须先删掉 `idx_usage_event_source`**（2026-10-04 踩到）：
+    //   两个后端都拦「删掉仍有索引的列」，但**报错完全不同**：
+    //     · SQLite：`error in index idx_usage_event_source after drop column:
+    //       no such column: source`（errno 1）—— 它**不会**顺手清索引；
+    //     · MySQL：errno 1091（Can't DROP 'source'; check that it exists）。
+    //   而**两条 `DROP INDEX` 的语法本身也不一样**，这是本条用例真正的坑：
+    //     · SQLite：`DROP INDEX IF EXISTS <名>`
+    //     · MySQL：**没有** `IF EXISTS`，且必须带 `ON <表>`
+    //       （`DROP INDEX IF EXISTS x` 直接 errno 1064 语法错 —— 实测踩过）。
+    //   所以这里按 `store.kind` 分派，两边各自用本后端的合法写法。
+    //   ⚠️ v9 迁移本身只**加**列、从不删列，这一步纯粹是为了「造出一份真 v8 库」。
+    if (store.kind === 'sqlite') {
+      await store.exec('DROP INDEX IF EXISTS idx_usage_event_source')
+    } else {
+      // MySQL 侧先查存在性（`DROP INDEX` 没有 IF EXISTS，索引不存在会 errno 1091）。
+      const present = await store.all<{ name: string }>(
+        'SELECT index_name AS name FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name=\'usage_event\' AND index_name=\'idx_usage_event_source\'',
+      )
+      if (present.length > 0) await store.exec('DROP INDEX idx_usage_event_source ON usage_event')
+    }
     await store.exec(`ALTER TABLE usage_event DROP COLUMN ${PORTAL_SOURCE_COLUMN}`)
     for (const event of events) {
       await store.run(
