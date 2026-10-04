@@ -14,11 +14,11 @@
  * 它与管理接口 `/api/v1/admin/pricing`（门是 `pricing:manage`）是两条接口两道门：
  * 那条是**配置**，这条是「看数据时的解释材料」。
  *
- * 🚨 **appKey（插件 / CLI 上报用的那把）按设计拿不到 `cost:read`** ——
- *   它的范围被服务端固定为 `usage:write` + `stats:read`（`APP_KEY_SCOPES`），
- *   请求体里给不出更宽的范围。所以这条路必须用后台账号签发的、带 `cost:read`
- *   的凭证；拿 appKey 来试只会得到 403，而 403 的信息量必须足够大，
- *   否则使用者会以为是「服务端没装好」。
+ * 🚨 2026-10 起 **appKey（插件 / CLI 上报用的那把）也带 `cost:read`** ——
+ *   插件面板要按**线上那份价**算金额，而它手上只有 appKey（见 `APP_KEY_SCOPES`）。
+ *   所以这条命令用 appKey 也跑得通。仍然推荐用后台账号**专用只读凭证**
+ *   （范围最小、可单独吊销、不影响上报）；改价仍然是 `pricing:manage` 的事。
+ *   403 的信息量必须足够大 —— 否则使用者会以为是「服务端没装好」。
  *
  * ## 为什么不在这里校验字段
  *
@@ -48,18 +48,16 @@ export const PRICING_SYNC_USAGE = `
 
 参数:
   --portal <url>   部门服务端**根地址**（如 http://host:8787），与 web 的 --portal 同一个语义
-  --token <t>      后台账号签发的、带 cost:read 的凭证；**不接受 appKey**
+  --token <t>      带 cost:read 的凭证：appKey（插件 / CLI 上报用的那把）**也带这个范围**，
+                   或用后台账号签发的专用只读凭证
   --data-dir <p>   数据目录（快照缺省落在 <data-dir>/pricing.json）
   --pricing-file <p>  指定快照文件路径（覆盖上面的缺省）
 
 说明:
   拉取 GET <portal>/api/v1/stats/pricing，把返回的单价写成一份本地快照；
   之后 CLI 的 --cost、本地页与插件宿主都按这份快照算金额（与看板同源）。
-  没有快照时它们会退回内置种子价（只覆盖 deepseek-official 几个模型）并显式告警。
-
-  🚨 appKey（插件 / CLI 上报用的那把）范围固定为 usage:write + stats:read，
-     按设计拿不到 cost:read。用后台账号签发一份带 cost:read 的凭证，或从别的
-     机器手工拷贝一份 pricing.json 到数据目录。
+  ★ 没有快照时它们**一位金额都不显示**（如实标成「未计价」）——
+    本仓不再有任何内置价目表，所以绝不会有「没配也能出一个数」的情况。
 `.trim()
 
 export interface PricingSyncOptions {
@@ -189,9 +187,9 @@ export async function syncPricing(
         message:
           `这份凭证没有 cost:read 权限（HTTP 403）。${tail}\n` +
           '  单价快照走 GET /api/v1/stats/pricing，门是 cost:read。\n' +
-          '  🚨 appKey（插件 / CLI 上报用的那把）范围固定为 usage:write + stats:read，\n' +
-          '     按设计拿不到 cost:read —— 换 appKey 重试不会有任何变化。\n' +
-          '  改用后台账号签发、并带 cost:read 的凭证；\n' +
+          '  appKey（插件 / CLI 上报用的那把）**带这个范围**，所以它本该能过；\n' +
+          '  拿到 403 多半是这把 key 签发于更早的版本 —— 让管理员重签一把。\n' +
+          '  也可以用后台账号签发、并带 cost:read 的凭证；\n' +
           `  或从别的机器手工拷贝一份 pricing.json 到数据目录。`,
       }
     }
@@ -228,7 +226,7 @@ export async function syncPricing(
 
   // ★ 写盘前用**读取方的那一个解析器**回读一遍：字段缺失 / 类型不对会让整份快照在
   //   `parsePricingSnapshot()` 那里被整份拒绝，而那时同步已经报过成功 ——
-  //   使用者会以为金额已与看板对齐，实际按内置种子价在算（最难排查的一种）。
+  //   使用者会以为金额已与看板对齐，实际一位金额都算不出来（最难排查的一种）。
   //   这里刻意不复刻校验规则，只复用同一个函数。
   if (parsePricingSnapshot(JSON.stringify(snapshot)) === null) {
     return {
@@ -266,18 +264,21 @@ export async function syncPricing(
   if (prices.length === 0) {
     warnings.push(
       '服务端当前一条单价都没配：这份快照是空的，本地金额会**全部**显示为「未计价」' +
-        '（与看板一致，刻意不退回内置价 —— 那会让两个形态给出不同的金额）。',
+        '（与看板一致 —— 一条价都没有就是没有金额，本仓不再有任何内置价目表）。',
     )
   }
   // 落盘后再确认一次「本地真的能按它算」：写入是原子替换，但路径可能被换成不可读的
   // 位置（权限、目录而非文件）。同步报成功而本地读不到，是这条链路上最坏的结果。
   const verify = loadLocalPricing({ file: path })
-  if (verify.provenance.pricingSource !== 'snapshot') {
+  // ⚠️ 空快照读回来是 `'none'`（一条价都没有 = 没有金额），那是**预期**，不是失败。
+  const verified = verify.provenance.pricingSource === 'snapshot'
+    || (verify.provenance.pricingSource === 'none' && prices.length === 0 && verify.path === path)
+  if (!verified) {
     return {
       ok: false,
       code: 1,
       message:
-        `快照已写入但读不回来（${path}），本地金额仍会按内置价算。\n` +
+        `快照已写入但读不回来（${path}），本地一位金额都算不出来。\n` +
         `  回读结果: ${verify.note ?? '来源不是 snapshot'}`,
     }
   }

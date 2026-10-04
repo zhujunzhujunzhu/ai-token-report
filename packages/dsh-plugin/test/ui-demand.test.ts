@@ -22,7 +22,7 @@ function result(query: UsageQuery = {}): UsageResult {
     cost: {
       costs: [], pricedTokens: 0, unpricedTokens: 10_000_000_000, totalTokens: 10_000_000_000,
       pricedRate: 0, unpricedRate: 1,
-      pricing: { pricingSource: 'builtin', pricingSyncedAt: null },
+      pricing: { pricingSource: 'none', pricingSyncedAt: null },
       unpricedTargets: ['p/m'], note: null,
     },
     groups: query.summaryOnly ? [] : dims.map(by => ({ by, rowCount: allRows.length,

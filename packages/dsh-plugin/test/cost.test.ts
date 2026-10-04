@@ -74,7 +74,7 @@ function writeSessions(home: string, specs: EventSpec[], sessionId = 'session-co
   return sessionsRoot
 }
 
-/** 写一份单价快照（`pricing.json`）—— 快照优先，读到了它就不会退回内置种子价。 */
+/** 写一份单价快照（`pricing.json`）—— 快照优先；没有快照就是「没有价」（`'none'`）。 */
 function writePricing(
   home: string,
   prices: { provider: string; model: string; input: number; output: number; cacheRead: number; cacheWrite: number; currency?: string }[],
@@ -304,28 +304,30 @@ describe('★ 金额口径：逐条取价、多币种、未计价', () => {
       expect(result.cost.pricedTokens).toBe(0)
       expect(result.cost.unpricedTokens).toBe(4700)
       expect(result.cost.unpricedTargets).toEqual(['dashscope/a', 'dashscope/b', 'other/c'])
-      // 退回内置种子价时必须说明原因：使用者拿着与看板不一致的金额去对账是最坏的结果
-      expect(result.cost.pricing.pricingSource).toBe('builtin')
-      expect(result.cost.note).toContain('内置种子价')
+      // ★ 2026-10 起**不再有内置种子价兜底**：一条价都没有就是「没有价」——
+      //   金额一位都不显示，并把「怎么才能有价」写进 note。
+      expect(result.cost.pricing.pricingSource).toBe('none')
+      expect(result.cost.note).toContain('没有可用的单价')
 
       const text = formatUsage(result)
       expect(text).toContain('费用（估算）  未计价')
       expect(text).not.toContain('¥0.00')
       expect(text).toContain('未计价      100.0%')
-      expect(text).toContain('单价来源    内置种子价估算')
+      expect(text).toContain('单价来源    未配单价（没有可用的单价，不显示金额）')
       expect(text).toContain('还没配单价')
     } finally {
       rmSync(home, { recursive: true, force: true })
     }
   })
 
-  test('坏掉的快照整份拒收并告警，不半信半疑地按内置价算', async () => {
+  test('坏掉的快照整份拒收并告警，绝不拿别的价顶上', async () => {
     const home = mkdtempSync(join(tmpdir(), 'atr-cost-broken-'))
     try {
       const sessionsRoot = writeSessions(home, SPECS)
       writeFileSync(join(home, 'pricing.json'), '{ 这不是 JSON')
       const result = await executeQuery(contextOf(home, sessionsRoot), {})
-      expect(result.cost.pricing.pricingSource).toBe('builtin')
+      // 拒收 ⇒ 没有价（不是退回某个兜底价），并且说明怎么修
+      expect(result.cost.pricing.pricingSource).toBe('none')
       expect(result.cost.note).toContain('解析失败')
       // 告警里必须点出「重新同步」，否则使用者只知道金额不对、不知道怎么办
       expect(result.cost.note).toContain('pricing sync')

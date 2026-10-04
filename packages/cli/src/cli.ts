@@ -120,8 +120,9 @@ ai-token-report —— AI token 用量统计
   --cost           把金额一并算出来。**默认关**：不开时输出里一位金额都没有。
                    金额是**估算，不是财务账单** —— 它按单价表逐条事件现算，
                    不含折扣 / 预付 / 赠送额度，因此不会等于财务对账的数字。
-                   单价来自 <data-dir>/pricing.json 快照；没有快照时退回内置
-                   种子价并**显式告警**（内置价只覆盖 deepseek-official 几个模型）。
+                   单价来自 <data-dir>/pricing.json 快照，用
+                   'ai-token-report pricing sync' 从部门服务端拉。**没有快照时
+                   一位金额都不显示**（如实标成「未计价」）—— 本仓没有内置价目表。
                    未配单价的用量一律计入「未计价」，绝不当作 0 元。
   --pricing-file <p>  指定单价快照文件（默认 <data-dir>/pricing.json）
 
@@ -175,11 +176,11 @@ ai-token-report —— AI token 用量统计
   ai-token-report pricing sync --portal <url> --token <token>
 
   --portal <url>   部门服务端**根地址**（如 http://host:8787），与 web 的 --portal 同一语义
-  --token <t>      后台账号签发的、带 cost:read 的凭证；**不接受 appKey**
+  --token <t>      带 cost:read 的凭证：appKey（插件 / CLI 上报用的那把）也带这个范围，
+                   或后台账号签发的专用只读凭证
 
-  拉取 GET <portal>/api/v1/stats/pricing（门是 cost:read）。appKey（插件 / CLI
-  上报用的那把）范围固定为 usage:write + stats:read，按设计拿不到 cost:read ——
-  用后台账号签发一份带 cost:read 的凭证，或从别的机器手工拷贝 pricing.json 过来。
+  拉取 GET <portal>/api/v1/stats/pricing（门是 cost:read）。appKey 从 2026-10 起
+  也带 cost:read（插件面板要按线上那份价算金额），所以它也能跑这条命令。
   失败分类: 缺参数 / 地址非法 → 退出码 2；401 / 403 / 网络或响应异常 → 1
 
 其他:

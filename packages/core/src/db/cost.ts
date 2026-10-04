@@ -6,7 +6,7 @@
  * | 路径 | 价从哪来 | 怎么算 |
  * |---|---|---|
  * | 部门看板（`portal.ts`） | `model_price` 表，由 SQL `LEFT JOIN` 按 `price_id` 分组 | JS 侧 `costMicroOf()` |
- * | 本地页 / CLI（本文件） | `pricing.json` 快照，没有就退回内置种子价 | JS 侧逐条事件解析 |
+ * | 本地页 / CLI / 插件（本文件） | `pricing.json` 快照；没有就是**没有价**（`'none'`） | JS 侧逐条事件解析 |
  *
  * 本地路径**没有** `model_price` 表（员工机器上只有一份可重建的 `usage.sqlite`，
  * 而且它必须能在断网时工作），所以价只能来自一份文件；而「四类分价相乘、
@@ -25,7 +25,6 @@ import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileS
 import { dirname, join } from 'node:path'
 import {
   ANY_PROVIDER,
-  BUILTIN_PRICES,
   costMicroOf,
   isAnyProvider,
   parsePricingSnapshot,
@@ -62,7 +61,6 @@ export const MAX_UNPRICED_TARGETS = 20
 
 /** 单价快照的文件名（放在**数据目录**里：它是配置，不进可重建的 `usage.sqlite`）。 */
 export const PRICING_FILE_NAME = 'pricing.json'
-const BUILTIN_PRICING_ORIGIN = 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing'
 
 /**
  * 按「事件发生时刻」取价的函数。
@@ -233,8 +231,8 @@ export interface LocalPricing {
   /**
    * 非空 = **这一份价不是同步来的快照**，以及为什么。
    *
-   * 🚨 必须显示给使用者：退回内置价会让金额与看板**不一致**，
-   *   而两者都「看起来正常」。静默退回等于让使用者拿着两个数去对账。
+   * 🚨 必须显示给使用者：来源不同的两份价会给出两个**都「看起来正常」**的金额，
+   *   静默降级等于让使用者拿着两个数去对账。
    */
   note: string | null
   /** 快照文件路径；没有数据目录、也没显式给文件时为 `null`。 */
@@ -252,51 +250,54 @@ export function resolvePricingPath(opts: {
 }
 
 /**
- * 读一份价：**快照优先，没有就退回内置种子价**（并说明原因）。
+ * 读一份价：**只有快照这一条路**，读不到就是「没有价」。
  *
- * 内置价刻意保留为兜底：CLI 必须能在断网、也没同步过的机器上回答「大概花了多少」。
- * 但它的名字必须出现在 `note` 里 —— 内置价只覆盖 deepseek-official 几个模型，
- * 内部网关的模型一条都不在表里，那部分会整个落进 `unpricedTokens`。
+ * ★ 2026-10 起**不再有内置种子价兜底**（理由写在 `shared/price.ts` 文件尾）：
+ *   兜底那一步会把「一条价都没配」伪装成一个看起来正常的金额，而它既不是看板的数、
+ *   也不是账单的数。现在读不到就给**空价表** + `pricingSource: 'none'` + 一句原因，
+ *   由展示层决定**整块不出现**（空价表算出来的全是「未计价」，渲染出去就是「没花钱」）。
  */
 export function loadLocalPricing(opts: {
   dataDir?: string | null
   file?: string | null
 }): LocalPricing {
   const path = resolvePricingPath(opts)
-  const builtin = (note: string): LocalPricing => ({
-    prices: BUILTIN_PRICES,
-    provenance: {
-      pricingSource: 'builtin',
-      pricingSyncedAt: null,
-      pricingOrigin: BUILTIN_PRICING_ORIGIN,
-    },
+  const absent = (note: string): LocalPricing => ({
+    prices: [],
+    provenance: { pricingSource: 'none', pricingSyncedAt: null, pricingOrigin: null },
     note,
     path,
   })
 
   if (path === null) {
-    return builtin('没有数据目录，也没有指定单价快照：按内置种子价估算')
+    return absent('没有数据目录，也没有指定单价快照：没有可用的单价，不显示金额')
   }
   if (!existsSync(path)) {
-    return builtin(`还没有同步过单价快照（${path}）：按内置种子价估算`)
+    return absent(`还没有同步过单价快照（${path}）：没有可用的单价，不显示金额`)
   }
 
   let text: string
   try {
     text = readFileSync(path, 'utf8')
   } catch (err) {
-    return builtin(
-      `读取单价快照失败（${path}：${err instanceof Error ? err.message : String(err)}）：按内置种子价估算`,
+    return absent(
+      `读取单价快照失败（${path}：${err instanceof Error ? err.message : String(err)}）：没有可用的单价，不显示金额`,
     )
   }
   const snapshot = parsePricingSnapshot(text)
   if (snapshot === null) {
-    // ★ 整份拒绝，不做部分接受：半份单价表会让费用看起来正常却按内置价算，
+    // ★ 整份拒绝，不做部分接受：半份单价表会让费用看起来正常却只算了一部分，
     //   而 `pricingSyncedAt` 还显示着同步成功 —— 那是最难排查的一种。
-    return builtin(
-      `单价快照解析失败（${path}）：按内置种子价估算；` +
-        '请重新执行 `ai-token-report pricing sync`，否则金额会与看板不一致',
+    return absent(
+      `单价快照解析失败（${path}）：没有可用的单价，不显示金额；` +
+        '请重新执行 `ai-token-report pricing sync`',
     )
+  }
+  // ★ 空快照与「没有快照」在展示上是**同一件事**：一条价都没有 = 没有金额。
+  //   区分它们只会让每个消费方各写一遍「这算不算没有价」，而漏掉一处就是
+  //   把一份空价表渲染成「没花钱」。
+  if (snapshot.prices.length === 0) {
+    return absent(`单价快照里一条价都没有（${path}）：没有可用的单价，不显示金额`)
   }
   return {
     prices: snapshot.prices,
@@ -315,7 +316,7 @@ export function loadLocalPricing(opts: {
  *
  * ★ 原子替换（先写 `.tmp` 再 `rename`）：这个文件正被本地页 / CLI 读取，
  *   直接覆写会让一次读取读到**半份 JSON** —— 而 `parsePricingSnapshot()` 对
- *   半份的处理是整份拒绝，于是使用者会看到「内置种子价」这种莫名其妙的降级，
+ *   半份的处理是整份拒绝，于是使用者会看到「没有可用的单价」这种莫名其妙的降级，
  *   而真正的原因只是一次并发读。
  *
  * ⚠️ 排序后再写：让两次同步同一份单价得到**逐字节相同**的文件，

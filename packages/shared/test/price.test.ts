@@ -13,7 +13,6 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   ANY_PROVIDER,
-  BUILTIN_PRICES,
   MAX_MICRO_PER_KTOK,
   MAX_SAFE_BILLABLE_TOKENS,
   cacheSavingMicro,
@@ -40,6 +39,8 @@ import {
   type ModelPrice,
   type PriceRates,
 } from '../src/price.js'
+/** 命名空间导入：用来钉「本仓不得再有内置价目表」这条（见文件末尾的 ★ 断言）。 */
+import * as priceModule from '../src/price.js'
 
 /** 实测样本：dashscope 全量汇总（`docs/口径实测结论.md` §2.2）。 */
 const DASHSCOPE_USAGE: BillableUsage = {
@@ -53,9 +54,8 @@ const DASHSCOPE_USAGE: BillableUsage = {
  * DeepSeek Flash 高峰档单价，直接由官方「每 1M token 美元价」换算：
  * cache hit $0.006 / cache miss $0.3 / output $1.2 → 6 / 300 / 1200 微元每千。
  *
- * ⚠️ 这里刻意留 USD：内置种子价已经是人民币（见 §内置种子价 的测试），
- *   而「多币种各自累加、绝不相加」这条口径**必须有不止一个币种**才验得出来 ——
- *   拿 CNY 当这个夹具会让那几条断言退化成同币种自比。
+ * ⚠️ 这里刻意留 USD：夹具里**必须不止一个币种**，否则「多币种各自累加、绝不相加」
+ *   那条口径验不出来 —— 拿 CNY 当这个夹具会让那几条断言退化成同币种自比。
  *   人民币那侧的实测金额由下面 `CNY_FLASH` 提供（同一条官方价的人民币档）。
  */
 const FLASH: ModelPrice = {
@@ -120,9 +120,10 @@ describe('单类 token 计价', () => {
   })
 
   test('★ 本部门真实量级（23.9 亿 token × 最贵单价）离边界很远', () => {
-    const maxBuiltin = Math.max(...BUILTIN_PRICES.map((p) => p.outputMicroPerKtok))
+    // 最贵单价不再来自内置价目表（已删），而是**录入路径的上限** ——
+    // 这才是「真实录入」能碰到的最坏情况，比任何一份具体价目表都严格。
     expect(2_392_609_771).toBeLessThan(MAX_SAFE_BILLABLE_TOKENS)
-    expect(Number.isSafeInteger(costMicroForTokens(2_392_609_771, maxBuiltin))).toBe(true)
+    expect(Number.isSafeInteger(costMicroForTokens(2_392_609_771, MAX_MICRO_PER_KTOK))).toBe(true)
   })
 
   test('★ 越过安全量级时抛错，而不是返回一个已经丢精度的钱数', () => {
@@ -401,21 +402,7 @@ describe('闲时配置校验（半套配置必须被拒）', () => {
   })
 })
 
-describe('内置种子价：两档都在（v10）', () => {
-  test('★ deepseek-official 的每一行都带 `deepseek-cn` 时段与「高峰价一半」的空闲价', () => {
-    for (const price of BUILTIN_PRICES) {
-      expect(price.provider).toBe('deepseek-official')
-      expect(price.offpeakSchedule).toBe('deepseek-cn')
-      const offpeak = price.offpeakRates
-      expect(offpeak, `${price.model} 缺闲时档`).toBeTruthy()
-      // 官方口径：空闲时段价格为高峰时段价格的一半（四类各自减半）
-      expect(offpeak!.inputMicroPerKtok * 2).toBe(price.inputMicroPerKtok)
-      expect(offpeak!.outputMicroPerKtok * 2).toBe(price.outputMicroPerKtok)
-      expect(offpeak!.cacheReadMicroPerKtok * 2).toBe(price.cacheReadMicroPerKtok)
-      expect(offpeak!.cacheWriteMicroPerKtok).toBe(price.cacheWriteMicroPerKtok)
-    }
-  })
-
+describe('闲时时段表（deepseek-cn）', () => {
   test('★ 时段的节假日表覆盖到期日必须写出来（过期会静默按高峰计）', () => {
     const schedule = findPriceSchedule('deepseek-cn')
     expect(schedule).not.toBeNull()
@@ -652,50 +639,13 @@ describe('线上单价 → 内存形态（映射只有一份）', () => {
   })
 })
 
-describe('内置种子价', () => {
-  test('每一条都是合法单价与合法币种', () => {
-    for (const price of BUILTIN_PRICES) {
-      expect(isValidPriceRates(price)).toBe(true)
-      expect(normalizeCurrency(price.currency)).toBe(price.currency)
-      expect(price.provider).not.toBe('')
-      expect(price.model).not.toBe('')
-    }
-  })
-
-  test('暂无相互冲突的行', () => {
-    for (const [index, price] of BUILTIN_PRICES.entries()) {
-      expect(findPriceConflicts(BUILTIN_PRICES.slice(0, index), price)).toHaveLength(0)
-    }
-  })
-
-  test('★ 刻意不收录 dashscope：它是转售/汇总账单口径，拿官方零售价套上去更糟', () => {
-    // 留空会进 `unpricedTokens`（页面显式说「这部分没算钱」），
-    // 而套一个官方零售价会给出一个「看起来像官方价、其实不是自己付的钱」的数字。
-    expect(BUILTIN_PRICES.some((p) => p.provider === 'dashscope')).toBe(false)
-  })
-
-  test('★ 种子价是人民币官方高峰价（元 / 百万 token × 1000 = 微元 / 千 token）', () => {
-    // 逐条钉死：种子价是「首次部署立刻有数」的起点，被谁顺手改成美元或空闲档都不该无声通过。
-    const seed = (model: string): ModelPrice => {
-      const found = BUILTIN_PRICES.find((p) => p.model === model)
-      expect(found).toBeDefined()
-      return found!
-    }
-    for (const model of ['deepseek-flash', 'deepseek-v4.1-flash', 'deepseek-v4-pro']) {
-      expect(seed(model).currency).toBe('CNY')
-    }
-    // Flash：缓存命中 ¥0.04 / 未命中 ¥2 / 输出 ¥8
-    expect(seed('deepseek-flash')).toMatchObject({
-      cacheReadMicroPerKtok: 40, inputMicroPerKtok: 2_000, outputMicroPerKtok: 8_000, cacheWriteMicroPerKtok: 0,
-    })
-    expect(seed('deepseek-v4.1-flash')).toMatchObject({
-      cacheReadMicroPerKtok: 40, inputMicroPerKtok: 2_000, outputMicroPerKtok: 8_000, cacheWriteMicroPerKtok: 0,
-    })
-    // Pro：缓存命中 ¥0.30 / 未命中 ¥9 / 输出 ¥27
-    expect(seed('deepseek-v4-pro')).toMatchObject({
-      cacheReadMicroPerKtok: 300, inputMicroPerKtok: 9_000, outputMicroPerKtok: 27_000, cacheWriteMicroPerKtok: 0,
-    })
-    // 与页面呈现口径一致：2000 微元/千 显示成 `¥2 / 百万 token`
-    expect(formatUnitPriceMicro(seed('deepseek-flash').inputMicroPerKtok, 'CNY')).toBe('¥2 / 百万 token')
+describe('★ 本仓不得再有内置价目表', () => {
+  test('`BUILTIN_PRICES` 已删除，且不得换个名字加回来', () => {
+    // 它只覆盖 `deepseek-official` 的三个模型名，算出来的金额「看起来正常」，
+    // 却既不是看板的数也不是账单的数 —— 2026-10 删除。
+    // 要价目表请走 `model_price` 表（`db`）或 `pricing.json` 快照（`snapshot`）；
+    // 两者都没有就是 `pricingSource === 'none'`，展示层一位金额都不渲染。
+    expect('BUILTIN_PRICES' in priceModule).toBe(false)
+    expect(Object.keys(priceModule).filter((key) => /PRICES$|^SEED/i.test(key))).toEqual([])
   })
 })

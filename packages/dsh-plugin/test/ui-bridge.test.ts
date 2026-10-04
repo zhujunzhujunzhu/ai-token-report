@@ -41,7 +41,7 @@ function sampleCost(overrides: Partial<UsageResult['cost']> = {}): UsageResult['
     totalTokens: 0,
     pricedRate: 0,
     unpricedRate: 0,
-    pricing: { pricingSource: 'builtin', pricingSyncedAt: null },
+    pricing: { pricingSource: 'none', pricingSyncedAt: null },
     unpricedTargets: [],
     note: null,
     ...overrides,
@@ -231,22 +231,22 @@ describe('★ 金额：只下发宿主格式化好的串，且「未计价」绝
     expect(payload.groups[0]?.rows[0]?.cost).toBe('¥1.00*')
   })
 
-  test('退回内置种子价时 note 明说「可能与看板不同」，并原样带上宿主的解释', () => {
+  test('读不到可用单价时 note 明说「可能与看板不同」，并原样带上宿主的解释', () => {
     const payload = toUiPayload(sampleResult({
-      cost: sampleCost({ note: '还没有同步过单价快照（/x/pricing.json）：按内置种子价估算' }),
+      cost: sampleCost({ note: '还没有同步过单价快照（/x/pricing.json）：没有可用的单价，不显示金额' }),
     }), 'today')
-    expect(payload.cost?.note).toContain('内置种子价')
+    expect(payload.cost?.note).toContain('没有可用的单价')
     expect(payload.cost?.note).toContain('可能与看板不同')
     // ★ 宿主那句解释必须**原样**出现：它带着可执行的动作（去同步哪份快照），
-    //   自己另写一句「内置种子价」会把动作吃掉。
+    //   自己另写一句（哪怕听起来更友好）会把动作吃掉。
     expect(payload.cost?.note).toContain('还没有同步过单价快照（/x/pricing.json）')
   })
 
   test('快照坏了这种「有动作」的原因也要一路带到面板上', () => {
     const payload = toUiPayload(sampleResult({
       cost: sampleCost({
-        pricing: { pricingSource: 'builtin', pricingSyncedAt: null },
-        note: '单价快照解析失败（…/pricing.json）：按内置种子价估算，请重新 pricing sync',
+        pricing: { pricingSource: 'none', pricingSyncedAt: null },
+        note: '单价快照解析失败（…/pricing.json）：没有可用的单价，不显示金额；请重新执行 `ai-token-report pricing sync`',
       }),
     }), 'today')
     expect(payload.cost?.note).toContain('解析失败')

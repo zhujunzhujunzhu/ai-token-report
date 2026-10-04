@@ -211,38 +211,42 @@ describe('离线单价快照', () => {
     return mkdtempSync(join(tmpdir(), 'atr-pricing-'))
   }
 
-  test('没有数据目录：退回内置价，并说明是按内置价算的', () => {
+  test('★ 没有数据目录：就是「没有价」（`none`），不给任何兜底价', () => {
     const pricing = loadLocalPricing({})
     expect(pricing.provenance).toEqual({
-      pricingSource: 'builtin',
+      pricingSource: 'none',
       pricingSyncedAt: null,
-      pricingOrigin: 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing',
+      pricingOrigin: null,
     })
-    expect(pricing.prices.length).toBeGreaterThan(0)
-    expect(pricing.note).toContain('内置种子价')
+    // 🚨 空价表是**刻意的**：2026-10 起本仓不再内置任何价目表（`BUILTIN_PRICES` 已删），
+    //   所以这里绝不能再冒出一份「看起来正常」的价 —— 那正是被删掉的那个东西。
+    expect(pricing.prices).toEqual([])
+    expect(pricing.note).toContain('没有可用的单价')
     expect(pricing.path).toBeNull()
   })
 
-  test('快照不存在：退回内置价，且 note 里给出要同步的文件路径', () => {
+  test('快照不存在：没有价，且 note 里给出要同步的文件路径', () => {
     const dir = scratch()
     try {
       const pricing = loadLocalPricing({ dataDir: dir })
-      expect(pricing.provenance.pricingSource).toBe('builtin')
+      expect(pricing.provenance.pricingSource).toBe('none')
+      expect(pricing.prices).toEqual([])
       expect(pricing.note).toContain(join(dir, PRICING_FILE_NAME))
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
   })
 
-  test('★ 快照坏掉：整份拒绝 + 明确说「金额会与看板不一致、请重新同步」', () => {
+  test('★ 快照坏掉：整份拒绝 + 明确给出「重新 pricing sync」这个动作', () => {
     const dir = scratch()
     try {
       writeFileSync(join(dir, PRICING_FILE_NAME), '{ 这不是 JSON', 'utf8')
       const pricing = loadLocalPricing({ dataDir: dir })
-      expect(pricing.provenance.pricingSource).toBe('builtin')
+      expect(pricing.provenance.pricingSource).toBe('none')
+      expect(pricing.prices).toEqual([])
       expect(pricing.note).toContain('解析失败')
       expect(pricing.note).toContain('pricing sync')
-      expect(pricing.note).toContain('与看板不一致')
+      expect(pricing.note).toContain('不显示金额')
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -263,7 +267,9 @@ describe('离线单价快照', () => {
         }),
         'utf8',
       )
-      expect(loadLocalPricing({ dataDir: dir }).provenance.pricingSource).toBe('builtin')
+      const pricing = loadLocalPricing({ dataDir: dir })
+      expect(pricing.provenance.pricingSource).toBe('none')
+      expect(pricing.prices).toEqual([])
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

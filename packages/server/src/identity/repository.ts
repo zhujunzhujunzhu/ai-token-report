@@ -3,7 +3,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { openPortalStore, PORTAL_SCHEMA_VERSION, aliasNameError, providerNameError, modelNameError, ANY_PROVIDER, projectAliasNameError, projectPrefixError, normalizeProjectPrefix, type PortalProviderAlias, type PortalProjectAlias, type PortalStore, type PortalTarget } from '@ai-token-report/core/db'
 import { hashPassword, normalizeUsername, passwordError, usernameError } from '../auth/password.js'
 import type { CredentialInput } from '../credentials.js'
-import { APP_KEY_LABEL, APP_KEY_SCOPES, BUILTIN_PRICES, findPriceConflicts, isAnyProvider, isValidPriceRates, normalizeCurrency, offpeakConfigError, MAX_MICRO_PER_KTOK, type ModelPrice, type PortalAppKeyEntry, type PortalAppKeyOwner, type PortalMember, type PortalMemberGroupRef, type PortalRole, type PortalGroup, type PortalReportToken, type PortalAuditResponse, type PortalStorageResponse, type PortalLegacyAttribution, type PortalModelPrice, type PriceRates } from '@ai-token-report/shared'
+import { APP_KEY_LABEL, APP_KEY_SCOPES, findPriceConflicts, isAnyProvider, isValidPriceRates, normalizeCurrency, offpeakConfigError, MAX_MICRO_PER_KTOK, type ModelPrice, type PortalAppKeyEntry, type PortalAppKeyOwner, type PortalMember, type PortalMemberGroupRef, type PortalRole, type PortalGroup, type PortalReportToken, type PortalAuditResponse, type PortalStorageResponse, type PortalLegacyAttribution, type PortalModelPrice, type PriceRates } from '@ai-token-report/shared'
 import { ADMIN_ROLE_ID, MEMBER_ROLE_ID, DEFAULT_SCOPES, RECOVERY_PERMISSIONS, PERMISSIONS, IdentityError, requirePermission, subset, str, num, textField, nullableTextField, idField, intField, nullableIntField, listField, displayName, roleCode, type Principal, type Row, type MutationInput } from './types.js'
 // ★ 单价的两种行映射都在这个模块里（`repository.ts` 与 `stats-route.ts` 共用一份）。
 import { modelPriceFromRow, priceShapeFromRow } from './model-price-row.js'
@@ -1354,54 +1354,6 @@ export class IdentityRepository {
       if (!row) throw new IdentityError(404, '单价不存在')
       await tx.run('DELETE FROM model_price WHERE price_id = $id', { $id: id })
       return { ok: true as const, deleted: id }
-    })
-  }
-
-  /**
-   * 用内置种子价初始化单价表。
-   *
-   * ★ **只在表为空时放行**：它存在的意义是「刚部署完、一条价都没有」那一步。
-   *   允许它对非空表执行，等于把「覆盖我调好的价」做成一个按钮 ——
-   *   而使用者点它的时候，多半以为自己在做别的事。
-   * 🚨 种子价是**内置常量**（`BUILTIN_PRICES`），不是抓来的现价：
-   *   它只是让人不必从零开始填，**必须逐条核对后再用**。
-   *   这也是「自建计价永远不等于财务账单」那条的第一道提醒。
-   */
-  async seedModelPrices(actor: Principal, input: MutationInput) {
-    if (input.confirm !== true) throw new IdentityError(400, '需要显式确认（confirm: true）才能写入种子价')
-    return this.mutate(actor, 'pricing:manage', 'model_price.seed', 'model_price', null, async (tx) => {
-      const existing = num((await tx.get<Row>('SELECT COUNT(*) AS c FROM model_price')) ?? {}, 'c')
-      if (existing > 0) throw new IdentityError(409, `单价表里已经有 ${existing} 条，不能再用种子价初始化；请逐条修改或删除后再试`)
-      const now = this.now()
-      for (const price of BUILTIN_PRICES) {
-        // ★ 闲时档（v10）也一起落库：内置种子价里带了官方空闲档（高峰价的一半），
-        //   不写就等于把「官方两档价」静默降级成单一价 —— 空闲时段的费用会虚高一倍。
-        const offpeak = price.offpeakRates ?? null
-        await tx.run(
-          `INSERT INTO model_price (price_id,provider,model,currency,input_micro_per_ktok,output_micro_per_ktok,
-             cache_read_micro_per_ktok,cache_write_micro_per_ktok,offpeak_schedule,
-             offpeak_input_micro_per_ktok,offpeak_output_micro_per_ktok,
-             offpeak_cache_read_micro_per_ktok,offpeak_cache_write_micro_per_ktok,
-             effective_from_ms,effective_to_ms,note,created_at_ms,updated_at_ms)
-           VALUES ($id,$provider,$model,$currency,$input,$output,$cacheRead,$cacheWrite,$opSchedule,
-             $opInput,$opOutput,$opCacheRead,$opCacheWrite,$from,$to,$note,$now,$now)`,
-          {
-            $id: randomUUID(), $provider: price.provider, $model: price.model, $currency: price.currency,
-            $input: price.inputMicroPerKtok, $output: price.outputMicroPerKtok,
-            $cacheRead: price.cacheReadMicroPerKtok, $cacheWrite: price.cacheWriteMicroPerKtok,
-            $opSchedule: offpeak === null ? null : (price.offpeakSchedule ?? null),
-            $opInput: offpeak?.inputMicroPerKtok ?? null, $opOutput: offpeak?.outputMicroPerKtok ?? null,
-            $opCacheRead: offpeak?.cacheReadMicroPerKtok ?? null, $opCacheWrite: offpeak?.cacheWriteMicroPerKtok ?? null,
-            $from: price.effectiveFromMs, $to: price.effectiveToMs,
-            // ⚠️ 给种子行打上来源标记：页面要能一眼分出「内置种子价」与「人工调过的价」，
-            //   否则使用者会把一屏没核对过的数字当成已经确认过的计价。
-            //   `ModelPrice` 本身没有 `note` 字段（那是库里的列，不是计价形状的一部分），
-            //   所以这里写死一句固定说明。
-            $note: '内置种子价，请核对后再用', $now: now,
-          },
-        )
-      }
-      return { ok: true as const, prices: (await tx.all<Row>('SELECT * FROM model_price ORDER BY provider, model, effective_from_ms')).map(modelPriceFromRow) }
     })
   }
 

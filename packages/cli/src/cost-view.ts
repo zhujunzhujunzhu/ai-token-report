@@ -32,9 +32,9 @@ import { formatCostSummary, type PricingProvenance } from '@ai-token-report/shar
 /**
  * 一次 `--cost` 的全部中间结果。
  *
- * ★ `pricing` 必须一路带到展示层：同一次查询在「读快照」与「退回内置价」下会给出
- *   **两个不同的金额**，而两者都看起来正常。展示层不写清「这笔钱是按哪份价算的」，
- *   使用者就只能拿着它与看板对账。
+ * ★ `pricing` 必须一路带到展示层：同一次查询在「读快照」与「读不到价（`'none'`）」
+ *   下会给出**两个不同的结果**（前者有金额，后者一位金额都不显示），
+ *   而两者都看起来正常。展示层不写清「这笔钱是按哪份价算的」，使用者就只能拿着它与看板对账。
  */
 export interface CostView {
   pricing: LocalPricing
@@ -53,10 +53,10 @@ export function describeProvenance(provenance: PricingProvenance): string {
         ? '本地单价快照（同步时间未知）'
         : `本地单价快照（同步于 ${fmtTime(at)}）`
     }
-    case 'builtin':
-      // 内置价只覆盖 deepseek-official 几个模型：说清它的边界，否则使用者会以为
-      // 「金额算出来了」=「所有用量都算上了」。
-      return '内置种子价（只覆盖 deepseek-official 几个模型）'
+    case 'none':
+      // 2026-10 起不再有内置种子价兜底：读不到可用单价就是**没有价**，一位金额都不显示。
+      // 措辞要让人立刻明白「不是 0 元，是没配上价」（原因由 `pricing.note` 原样带出）。
+      return '未配单价（没有可用的单价，不显示金额）'
     case 'db':
       // 离线路径不该出现，但列出来是为了「不认识就报错」而不是静默显示成别的来源。
       return '部门服务端数据库单价'
@@ -242,9 +242,8 @@ export function costCsvSections(
 /**
  * `--cost` 的终端小节。
  *
- * ★ 退回内置价（`pricing.note !== null`）时把原因**原样**打出来：内置价只覆盖
- *   deepseek-official 几个模型，退回它会让绝大部分用量整个落进「未计价」，
- *   而金额与看板必然不一致。不告警的话，使用者会拿两个数去对账。
+ * ★ 读不到可用单价（`pricing.note !== null`）时把原因**原样**打出来：没有快照 / 快照坏了 /
+ *   快照里一条价都没有，三种情况都不显示金额。不告警的话，使用者会拿一个空金额去对账。
  * ★ 表格用 `renderTable()` 而不是 `padEnd()`：分组键里有中文（项目名、按天）时
  *   `padEnd` 会按字符数补齐，金额列在中文行上整体错位。
  * ★ 维度标题由调用方给（`labelOf`）：中文标签只有一份（`cli.ts` 的 `dimLabel()`），

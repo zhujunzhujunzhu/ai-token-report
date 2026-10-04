@@ -12,9 +12,11 @@
  *
  * ## 本地页与部门看板的关键差别
  *
- * 看板读库里的 `model_price`，本地页读数据目录下的 `pricing.json` 快照
- * （没有就退回内置种子价）。**两者会给出不同的金额，而都「看起来正常」** ——
+ * 看板读库里的 `model_price`，本地页读数据目录下的 `pricing.json` 快照。
+ * **两者会给出不同的金额，而都「看起来正常」** ——
  * 所以本地页上「按哪份单价算的」这一行比看板还重要。
+ * 没有快照就是**没有金额**（`pricingSource === 'none'`，整块不出现），
+ * 而不是退回某个内置价目表 —— 那种兜底 2026-10 已经删掉了。
  */
 
 import {
@@ -44,8 +46,10 @@ export function provenanceText(provenance: PricingProvenance | null | undefined)
   if (!provenance) return '按本机单价快照估算'
   const origin = provenance.pricingOrigin ? `（来源：${provenance.pricingOrigin}）` : ''
   switch (provenance.pricingSource) {
-    case 'builtin':
-      return `按内置种子价估算${origin}`
+    case 'none':
+      // 一条价都没有：本地页这一侧不会走到这里（没有价时 `cost` 整块不下发），
+      // 但文案仍要有，且**绝不写成「按 0 元算」**。
+      return `没有可用的单价${origin}`
     case 'snapshot':
       return `按本机单价快照估算${provenance.pricingSyncedAt ? `（同步于 ${formatSyncTime(provenance.pricingSyncedAt)}）` : ''}${origin}`
     default:

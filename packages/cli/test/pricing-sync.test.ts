@@ -184,7 +184,7 @@ test('401：明确说凭证无效，且不写任何东西', async () => {
   }
 })
 
-test('403：点名 cost:read，并说清 appKey 按设计拿不到它', async () => {
+test('403：点名 cost:read，并说清这是凭证范围的问题（appKey 本该带它 → 重签）', async () => {
   const portal = servePortal(() => Response.json(
     { ok: false, reason: '当前身份没有查看计价的权限' },
     { status: 403 },
@@ -196,10 +196,12 @@ test('403：点名 cost:read，并说清 appKey 按设计拿不到它', async ()
     ])
     expect(code).toBe(1)
     // 403 最容易被误解成「服务端没装好」：必须把权限名、appKey 的固定范围、
-    // 以及两条可行出路都写出来。
+    // 以及可行出路都写出来。
     expect(stderr.includes('cost:read')).toBe(true)
     expect(stderr.includes('appKey')).toBe(true)
-    expect(stderr.includes('usage:write + stats:read')).toBe(true)
+    // ★ 2026-10 起 appKey **带** cost:read，所以 403 的解释是「这把 key 太老、重签一把」，
+    //   而不是旧文案那句「appKey 按设计拿不到它」。
+    expect(stderr.includes('重签')).toBe(true)
     expect(stderr.includes('/api/v1/stats/pricing')).toBe(true)
     expect(stderr.includes('当前身份没有查看计价的权限')).toBe(true)
     expect(stderr.includes('pricing.json')).toBe(true)
@@ -327,11 +329,12 @@ test('服务端一条价都没配：写空快照并**显式告警**，而不是�
     expect(code).toBe(0)
     expect(stdout.includes('条数 0')).toBe(true)
     expect(stdout.includes('一条单价都没配')).toBe(true)
-    // ★ 空快照**不等于**「没有快照」：退回内置价会让本机与看板给出两个不同的金额，
-    //   而空单价表与看板是**一致**的（两边都全未计价）。
+    // ★ 空快照读回来是 `'none'`（一条价都没有 = 没有金额）—— 这是**预期**，不是失败：
+    //   它让本机与看板给出同一个结论（两边都全未计价），而旧的内置价兜底会让两边不一致。
     const loaded = loadLocalPricing({ dataDir: fx.dataDir })
-    expect(loaded.provenance.pricingSource).toBe('snapshot')
+    expect(loaded.provenance.pricingSource).toBe('none')
     expect(loaded.prices).toEqual([])
+    expect(loaded.note).toContain('一条价都没有')
   } finally {
     portal.stop()
     fx.cleanup()

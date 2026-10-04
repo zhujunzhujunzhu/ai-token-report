@@ -292,16 +292,17 @@ test('--cost：CSV 用整数微元、未计价单列一节，绝不写成 amount
   }
 })
 
-test('没有快照时退回内置种子价，并把原因与「不是账单」打成显式告警', async () => {
+test('没有快照时就是没有价（`none`），并把原因与「不是账单」打成显式告警', async () => {
   const fx = setup()
   try {
     const { stdout, code } = await fx.run(['--by', 'provider', '--cost'])
     expect(code).toBe(0)
-    expect(stdout.includes('单价来源: 内置种子价')).toBe(true)
-    // 🚨 必须显式告警：退回内置价会让金额与看板不一致，而两者都「看起来正常」。
+    // ★ 2026-10 起不再有内置种子价兜底：读不到可用单价就是「没有价」，一位金额都不显示。
+    expect(stdout.includes('单价来源: 未配单价（没有可用的单价，不显示金额）')).toBe(true)
+    // 🚨 必须显式告警：没有告警的话，一条金额都没有会被读成「这个月没花钱」。
     expect(stdout.includes('⚠ 还没有同步过单价快照')).toBe(true)
     expect(stdout.includes('单价快照解析失败')).toBe(false)
-    // 内置价只覆盖 deepseek-official：本例两个 provider 一条都配不上 → 全部未计价
+    // 一条价都没有 → 全部用量落进「未计价」，而不是 0 元
     expect(stdout.includes('未计价 100.0%（4,600 Token）')).toBe(true)
     expect(stdout.includes('合计: 未计价')).toBe(true)
     expect(stdout.includes('未配单价: free/free-model、paid/paid-model')).toBe(true)
@@ -317,12 +318,12 @@ test('快照坏掉时整份拒绝并说明原因，绝不半份生效', async ()
     const { stdout, code } = await fx.run(['--format', 'json', '--by', 'provider', '--cost'])
     expect(code).toBe(0)
     const cost = JSON.parse(stdout).cost
-    // 半份单价表会让费用看起来正常却按内置价算，而 pricingSyncedAt 还显示同步成功 ——
-    // 那是最难排查的一种，所以解析失败一律整份拒绝。
+    // 半份单价表会让费用看起来是按某个价算的，而 pricingSyncedAt 还显示同步成功 ——
+    // 那是最难排查的一种，所以解析失败一律整份拒绝：结果是「没有价」（`none` + 空价表）。
     expect(cost.pricing).toEqual({
-      pricingSource: 'builtin',
+      pricingSource: 'none',
       pricingSyncedAt: null,
-      pricingOrigin: 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing',
+      pricingOrigin: null,
     })
     expect(cost.totals.costs).toEqual([])
     expect(cost.totals.unpricedTokens).toBe(PAID_TOKENS + FREE_TOKENS)

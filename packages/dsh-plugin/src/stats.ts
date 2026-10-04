@@ -138,8 +138,11 @@ export interface UsageGroupRow {
 /**
  * 一次统计的金额：整体汇总 + **这份钱是按哪份单价算的**。
  *
- * `note` 非空 = 这一份价不是同步来的快照（例如退回内置种子价）——
+ * `note` 非空 = 这一份价**不是**同步来的快照（没有快照 / 快照坏了 / 快照里一条价都没有）——
  * 必须显示给使用者：两个都「看起来正常」的金额拿去对账是最坏的结果。
+ *
+ * ★ 2026-10 起**不再有内置种子价兜底**：读不到可用单价就是 `pricingSource: 'none'` +
+ *   空价表，展示层**一位金额都不显示**（详见 `shared/price.ts` 文件尾的三条理由）。
  */
 export interface UsageCost extends CostTotalsWithTargets {
   note: string | null
@@ -324,7 +327,10 @@ export async function executeQuery(ctx: StatsContext, query: UsageQuery, options
 
     // ── 金额 ───────────────────────────────────────────────────────
     //
-    // ★ 价从**本机数据目录**里的快照来（没有就退回内置种子价，并把原因写进 note）。
+    // ★ 价从**本机数据目录**里的快照来；读不到就是**没有价**（`pricingSource: 'none'`，
+    //   空价表 ⇒ 一位金额都不显示），原因由 `note` 如实带出去。
+    //   2026-10 起不再有内置种子价兜底 —— 那个兜底会让面板显示一个看起来正常、
+    //   但与部门看板不同的金额。
     //   插件读的是本机自己的价，所以面板上的金额与部门看板可能不同 ——
     //   这一点必须由 `pricing` 与 `note` 如实带出去，绝不假装两者同源。
     //
@@ -490,7 +496,8 @@ export function formatUsage(result: UsageResult, options: { maskUser?: boolean }
  * 三条不准省：
  * 1. 一条价都没配上时金额写 **未计价**（绝不是 `¥0.00`）；
  * 2. `unpricedRate` 永远显式给出 —— 「未定价」看起来像「省了钱」；
- * 3. 退回内置种子价时把 `note` 抬头显示 —— 否则使用者拿着与看板不一致的金额去对账。
+ * 3. 读不到可用单价时（`pricingSource === 'none'`）把 `note` 抬头显示 ——
+ *    否则使用者拿着与看板不一致的金额去对账。
  */
 function costLines(cost: UsageCost, n: (v: number) => string): string[] {
   const lines: string[] = []
@@ -552,8 +559,9 @@ function pricingSourceLabel(cost: UsageCost): string {
       }）`
     case 'db':
       return '服务端单价表'
-    case 'builtin':
-      return '内置种子价估算（本机还没同步过快照）'
+    case 'none':
+      // ★ 没有价就是没有价：这里的措辞要让人立刻明白「不是 0 元，是没配上价」。
+      return '未配单价（没有可用的单价，不显示金额）'
   }
 }
 

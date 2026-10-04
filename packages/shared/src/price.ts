@@ -136,8 +136,14 @@ export interface PriceRates {
   cacheWriteMicroPerKtok: MicroPerKtok
 }
 
-/** 单价的来源，必须随费用一起展示 —— 见 §「单价来源」下方注释。 */
-export type PricingSource = 'db' | 'snapshot' | 'builtin'
+/**
+ * 单价的来源，必须随费用一起展示 —— 见 §「单价来源」下方注释。
+ *
+ * ★ **没有 `'builtin'`**：本仓不再有任何内置 / 种子价目表（2026-10 去掉）。
+ *   一条价都没有时是 `'none'`，此时**一位金额都不渲染** ——
+ *   空价表照样能「算出」一个数（全是未计价），而它在屏幕上与「花得很少」长得一样。
+ */
+export type PricingSource = 'db' | 'snapshot' | 'none'
 
 /**
  * 单价来源元信息。
@@ -148,13 +154,13 @@ export type PricingSource = 'db' | 'snapshot' | 'builtin'
  */
 export interface PricingProvenance {
   pricingSource: PricingSource
-  /** 快照同步时刻；`db` / `builtin` 为 `null`。 */
+  /** 快照同步时刻；`db` / `none` 为 `null`。 */
   pricingSyncedAt: number | null
   /**
    * 这份单价的人可核对来源。
    *
    * - `snapshot`：通常是同步快照时的部门服务端地址；
-   * - `builtin`：内置种子价的官方定价页；
+   * - `none`：`null`（一条价都没有，谈不上来源）；
    * - `db`：`null`（来源就是服务端数据库本身）。
    *
    * ★ 这是给展示层回答「这份钱按哪来的价算」用的，不参与任何匹配或计价逻辑。
@@ -921,91 +927,23 @@ export function parsePricingSnapshot(text: string): PricingSnapshot | null {
 }
 
 // ---------------------------------------------------------------------------
-// 内置种子价
+// 单价从哪来（★ 这里曾经是「内置种子价」—— 已删除，不要加回来）
 // ---------------------------------------------------------------------------
 
 /**
- * 内置种子价 —— **只是首次部署的起点，不是权威**。权威是数据库 `model_price` 表。
+ * 本文件只定义**怎么算**与**怎么解析价**，不提供任何价目表。
  *
- * ## 来源与快照说明
+ * ★ **内置种子价（`BUILTIN_PRICES`）2026-10 已删除**，三条理由：
  *
- * 取自 DeepSeek 官方定价页（https://api-docs.deepseek.com/zh-cn/quick_start/pricing）的
- * 人民币报价 —— 官方原页的单位就是「元 / 百万 tokens」，
- * 与库里的「整数微元/千 token」正好差 1000 倍（见 {@link MicroPerKtok}）。
- * 官方原价目只有「cache hit / cache miss / output」三档，与这里的四类分价同构。
+ * 1. 它只覆盖 `deepseek-official` 的三个模型名，而真实用量大多落在 `dashscope` /
+ *    内部网关上 —— 于是它给出一个「看起来正常」的金额（本机实测未计价 82%），
+ *    使用者会拿它去对账。
+ * 2. 单价是**管理员的决定**，不是本仓的默认值：官方零售价 ≠ 本部门的结算价
+ *    （转售 / 折扣 / 汇总账单都不在单价里）。
+ * 3. 「一条价都没配」必须是**看得见**的：现在的语义是 `pricingSource === 'none'`
+ *    + 空价表，展示层一位金额都不渲染（见 `PricingSource` 的注释）。
  *
- * | 模型 | 档 | 缓存命中 | 缓存未命中 | 输出 |
- * |---|---|---|---|---|
- * | `deepseek-flash` / `deepseek-v4.1-flash` | 高峰 | ¥0.04 | ¥2 | ¥8 |
- * | 同上 | 空闲 | ¥0.02 | ¥1 | ¥4 |
- * | `deepseek-v4-pro` | 高峰 | ¥0.30 | ¥9 | ¥27 |
- * | 同上 | 空闲 | ¥0.15 | ¥4.5 | ¥13.5 |
- *
- * ★ **两档都收**（v10 起）：空闲档是高峰档的一半，时段表是 {@link PRICE_SCHEDULES}
- *   里的 `deepseek-cn`（北京时间周一至周五 09:00–12:00 / 14:00–18:00 为高峰，
- *   其余含周末与**法定节假日**全天为空闲）。
- *   ⚠️ 节假日表**逐年维护**（`PriceSchedule.holidaysThrough` 写明了覆盖到哪天）：
- *   表过期之后，落在工作日高峰窗里的节假日会按高峰计 —— 费用偏高，页面会提示。
- *
- * ## ⚠️ 一处刻意的口径简化，管理员必须知道
- *
- * **`effectiveFromMs = 0`（视作自始生效）。** 内置种子只是让首次部署立刻有数；
- * 管理员应在单价管理页按**真实生效日**修正，否则历史费用会按今天的价重算。
- *
- * ## 刻意不收录的
- *
- * `dashscope`（数字集团网关）与各内部网关的模型**不在此表**：
- * 这些网关的结算价是另一套口径（转售、折扣、汇总账单），拿官方零售价套上去
- * 会给出一个「看起来像官方价、其实不是自己付的钱」的数字 —— 那比留空更糟。
- * 留空会进 `unpricedTokens`，由页面显式告诉使用者「这部分没算钱」。
- * ★ 需要的话由管理员在单价页配一条 `'*'` 的**基础价**（那是人的决定，不是内置默认）。
+ * ⇒ 价的唯一真源有两个：服务端 `model_price` 表（`db`），以及从它同步下来的
+ *   `pricing.json` 快照（`snapshot`）。两者都没有就是 `none`。
+ *   补价走单价管理页，或 `scripts/online-pricing.mjs`（线上操作台）。
  */
-export const BUILTIN_PRICES: readonly ModelPrice[] = [
-  {
-    provider: 'deepseek-official',
-    // ⚠️ `deepseek-flash` 与 `deepseek-v4.1-flash` 是**两条价**：官方明说旧模型名
-    //    `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp` 仍可调用并按 Flash 价计费，
-    //    而单价必须在**上报原值**上精确匹配（不做子串），所以别名要各配一行。
-    model: 'deepseek-v4.1-flash',
-    currency: 'CNY',
-    // 缓存命中 ¥0.04/百万、缓存未命中 ¥2/百万、输出 ¥8/百万（高峰档）
-    cacheReadMicroPerKtok: 40,
-    inputMicroPerKtok: 2000,
-    outputMicroPerKtok: 8000,
-    // DeepSeek 不单列缓存写入价：写入按 cache miss 输入计价。
-    cacheWriteMicroPerKtok: 0,
-    effectiveFromMs: 0,
-    effectiveToMs: null,
-    // 空闲档 = 高峰档的一半（缓存命中 ¥0.02 / 未命中 ¥1 / 输出 ¥4）
-    offpeakRates: { cacheReadMicroPerKtok: 20, inputMicroPerKtok: 1000, outputMicroPerKtok: 4000, cacheWriteMicroPerKtok: 0 },
-    offpeakSchedule: 'deepseek-cn',
-  },
-  {
-    provider: 'deepseek-official',
-    model: 'deepseek-flash',
-    currency: 'CNY',
-    cacheReadMicroPerKtok: 40,
-    inputMicroPerKtok: 2000,
-    outputMicroPerKtok: 8000,
-    cacheWriteMicroPerKtok: 0,
-    effectiveFromMs: 0,
-    effectiveToMs: null,
-    offpeakRates: { cacheReadMicroPerKtok: 20, inputMicroPerKtok: 1000, outputMicroPerKtok: 4000, cacheWriteMicroPerKtok: 0 },
-    offpeakSchedule: 'deepseek-cn',
-  },
-  {
-    provider: 'deepseek-official',
-    model: 'deepseek-v4-pro',
-    currency: 'CNY',
-    // 缓存命中 ¥0.30/百万、缓存未命中 ¥9/百万、输出 ¥27/百万（高峰档）
-    cacheReadMicroPerKtok: 300,
-    inputMicroPerKtok: 9000,
-    outputMicroPerKtok: 27000,
-    cacheWriteMicroPerKtok: 0,
-    effectiveFromMs: 0,
-    effectiveToMs: null,
-    // 空闲档 = 高峰档的一半（缓存命中 ¥0.15 / 未命中 ¥4.5 / 输出 ¥13.5）
-    offpeakRates: { cacheReadMicroPerKtok: 150, inputMicroPerKtok: 4500, outputMicroPerKtok: 13500, cacheWriteMicroPerKtok: 0 },
-    offpeakSchedule: 'deepseek-cn',
-  },
-]

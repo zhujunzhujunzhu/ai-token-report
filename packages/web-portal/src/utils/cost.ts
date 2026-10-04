@@ -81,8 +81,10 @@ export function provenanceText(provenance: PricingProvenance | null | undefined)
   switch (provenance.pricingSource) {
     case 'snapshot':
       return '按本地单价快照现算'
-    case 'builtin':
-      return '按内置种子价现算'
+    case 'none':
+      // 一条价都没有：看板这一侧不会出现（服务端有价才有 `cost` 字段），
+      // 但离线形态会 —— 说「没有可用的单价」，绝不写成「按 0 元算」。
+      return '没有可用的单价'
     default:
       return '按服务端数据库中的单价现算'
   }

@@ -124,7 +124,8 @@ describe('未计价的措辞', () => {
   test('单价来源三种取值都有人话（缺字段时不许渲染成空）', () => {
     expect(provenanceText({ pricingSource: 'db', pricingSyncedAt: null })).toBe('按服务端数据库中的单价现算')
     expect(provenanceText({ pricingSource: 'snapshot', pricingSyncedAt: 1 })).toBe('按本地单价快照现算')
-    expect(provenanceText({ pricingSource: 'builtin', pricingSyncedAt: null })).toBe('按内置种子价现算')
+    // 'none' = 一条价都没有。文案必须说「没有可用的单价」，绝不写成「按 0 元算」。
+    expect(provenanceText({ pricingSource: 'none', pricingSyncedAt: null })).toBe('没有可用的单价')
     expect(provenanceText(null)).toBe('按服务端数据库中的单价现算')
   })
 

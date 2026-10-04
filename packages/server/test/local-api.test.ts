@@ -631,20 +631,20 @@ describe('本地金额（估算）', () => {
     }
   }
 
-  test('没有单价快照时退回内置种子价，并如实标注来源（绝不假装是按快照算的）', async () => {
+  test('没有单价快照时就是没有价（`none`），并如实标注来源（绝不假装是按快照算的）', async () => {
     writeCostSession()
     const res = await costRouter().overview(params({ period: 'today' }))
     expect(res.status).toBe(200)
     const cost = (res.body as unknown as CostBody).cost
 
     expect(cost.pricing).toEqual({
-      pricingSource: 'builtin',
+      pricingSource: 'none',
       pricingSyncedAt: null,
-      // 价目出处：内置价就是 DeepSeek 官方定价页 —— 它与来源一起下发，人才能去核对这份价。
-      pricingOrigin: 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing',
+      // 没有价就没有出处：2026-10 起不再有内置种子价，`pricingOrigin` 只能是 null。
+      pricingOrigin: null,
     })
-    // 内置价只覆盖 deepseek-official 的几个模型，dashscope/m-1 一条都不在表里
-    // → 全部用量都是「未计价」，而不是 0 元。
+    // 一条价都没有 → 全部用量都是「未计价」，而不是 0 元
+    // （也不再有一个内置价把它算成钱，那正是与看板对不上账的来源）。
     expect(cost.costs).toEqual([])
     expect(cost.unpricedTokens).toBe(2060)
     expect(cost.pricedTokens).toBe(0)
