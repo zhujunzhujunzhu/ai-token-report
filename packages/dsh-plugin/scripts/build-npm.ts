@@ -259,7 +259,7 @@ process.stdout.write(
   `✅ 已生成 ${PACKAGE_NAME}@${VERSION}\n` +
     `   目录    ${distDir}\n` +
     `   宿主半  index.js（${(hostSize / 1024).toFixed(1)} KB，零运行时依赖）\n` +
-    `   浏览器半 client.js（${(clientSize / 1024).toFixed(1)} KB，id 已改为发布名）\n` +
+    `   浏览器半 client.js（${(clientSize / 1024).toFixed(1)} KB，信封 id 与包名一致：构建期断言过）\n` +
     `   文件数  ${files.length}\n` +
     `   发布    bun run publish:plugin（完整验证后发布）\n` +
     `   快速发布 bun run publish:plugin:quick（只验本包产物 + tarball 真启动，跳过全仓验证）\n`,

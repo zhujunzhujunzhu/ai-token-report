@@ -1,8 +1,9 @@
 {
   "name": "dsh-plugin-token-report",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "private": false,
   "type": "module",
+  "license": "MIT",
   "description": "DSH 插件：实时上报 token 用量 + 在 DSH 界面里直接看本机用量",
   "main": "lib/index.js",
   "exports": {

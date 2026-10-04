@@ -30,7 +30,7 @@ dsh plugin --profile web add dsh-plugin-token-report@latest
 | 项 | 要求 |
 |---|---|
 | DSH 宿主 | **`0.1.7-rc.2` 或更高、`0.3.0` 之前**（本插件已在 `0.1.7-rc.2` 与 `0.2.0-rc.2` 上实测启动） |
-| 宿主模块 | 与宿主同代（`@deepseek-ai/cordis ~4.0.4`）。**不要把 0.1.5 / 0.1.6 的 telemetry 与 0.1.7 及以后的宿主混装** —— 旧版会把合法会话日志误报为损坏 |
+| 宿主模块 | 与宿主同代（`@deepseek-ai/cordis ~4.0.4`）。插件只吃宿主的**会话事件流**（`@deepseek-ai/dsh-session`）—— 0.9.0 起**不再依赖** `@deepseek-ai/dsh-session-telemetry` |
 | Node.js | **≥ 22.15.0** |
 | profile | 需要 `web` profile（界面面板与 `/api` 数据通道在那里；headless profile 下只有上报与工具） |
 
@@ -148,7 +148,7 @@ node $desktopDsh plugin --profile web add dsh-plugin-token-report@latest
 
 # 本地 tarball：未发布的版本 / 离线分发。
 #   ★ 路径用正斜杠，反斜杠会报 ERR_UNSUPPORTED_ESM_URL_SCHEME；下面的版本号按实际 tarball 替换。
-node $desktopDsh plugin --profile web add file:D:/path/to/dsh-plugin-token-report-0.8.0.tgz
+node $desktopDsh plugin --profile web add file:D:/path/to/dsh-plugin-token-report-0.9.0.tgz
 ```
 
 `add` 会自动在 `profiles/web/package.json` 的 `dsh.profile.bundles` 里登记包名；**不要再手动 `insert`**。
@@ -158,7 +158,7 @@ node $desktopDsh plugin --profile web add file:D:/path/to/dsh-plugin-token-repor
 **⑤ 核对**（只读，不起服务）：
 
 ```powershell
-node $desktopDsh plugin --profile web list              # 本机实测：dsh-plugin-token-report@0.8.0
+node $desktopDsh plugin --profile web list              # 本机实测：dsh-plugin-token-report@0.9.0
 node $desktopDsh --profile web --dump-config | Select-String token-report
 ```
 
@@ -380,7 +380,8 @@ DSH 升级会保留旧格式日志作为备份；同一会话存在多个规范�
 
 | 版本 | 使用者能感知的变动 |
 |---|---|
-| **0.8.0** | ★ **统计与上报范围都改成「本机全部已注册来源」**（Codex / Claude Code / Trae / WorkBuddy 缺省就一起算、也一起报）；面板里可改「会话日志根」（保存即生效）；README 补齐 DSH Desktop 的安装步骤。旧的 `extraSources` 配置项**已废弃**（写了会在启动日志里告警） |
+| **0.9.0** | ★ **不再与官方 OTel 后端互斥**：插件不再注册 `sessionTelemetry` 服务（改订阅宿主会话事件流），装了它不必再停用 `session-telemetry-otel`；`cordis.patch.yml` 里那两行可以删掉。包名与发布名统一为 `dsh-plugin-token-report`（旧仓内名 `@ai-token-report/dsh-plugin` 仍会被修复工具清理）。peer 去掉 `@deepseek-ai/dsh-session-telemetry` |
+| 0.8.0 | ★ **统计与上报范围都改成「本机全部已注册来源」**（Codex / Claude Code / Trae / WorkBuddy 缺省就一起算、也一起报）；面板里可改「会话日志根」（保存即生效）；README 补齐 DSH Desktop 的安装步骤。旧的 `extraSources` 配置项**已废弃**（写了会在启动日志里告警） |
 | 0.7.0 | `peerDependencies` 从精确 `0.1.7-rc.2` 放宽成兼容窗口 `>=0.1.7-rc.2 <0.3.0-0` —— 宿主小版本升级不必再等插件跟进 |
 | 0.6.0 | ★ **数据目录搬到 `~/.ai-token-report`**（升级要手动搬一次家，见下一节）；面板里可改面板位置；**保存即生效**，不必重启；面板开始展示费用（估算） |
 | 0.4.0 | 随包提供离线修复工具 `repair-profile.mjs`（清理 `duplicate loader entry id`；开发期写作 0.3.1，npm 上没有这个版本） |
