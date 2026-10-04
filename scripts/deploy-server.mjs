@@ -30,7 +30,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { delimiter, dirname, join, resolve } from 'node:path'
+import { basename, delimiter, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
@@ -111,14 +111,17 @@ const reportPath = join(output, 'report.json')
 const save = () => writeFileSync(reportPath, JSON.stringify(report, null, 2) + '\n')
 
 /** 同时落盘与透传的子进程执行；构建与验证的输出要能在终端实时看到。 */
-function runStep(label, command, args, extraEnv = {}) {
+function runStep(label, command, args, extraEnv = {}, stepCwd = root) {
   const index = String(report.steps.length + 1).padStart(2, '0')
   const logPath = join(output, `${index}-${label}.log`)
   console.log(`\n[${index}] ${label}\n    $ ${command} ${args.join(' ')}`)
   const started = Date.now()
   return new Promise((done, fail) => {
     const child = spawn(command, args, {
-      cwd: root, env: { ...process.env, ...extraEnv }, stdio: ['ignore', 'pipe', 'pipe'], shell: false,
+      // ⚠️ `cwd` 是**可传**的（打包那一步必须用它，见那里的注释）：
+      //   少数命令（GNU tar）会把「看起来像 `host:path` 的绝对路径」当成远程规范，
+      //   只有改成「切目录 + 相对文件名」才在两个平台上都走本地分支。
+      cwd: stepCwd, env: { ...process.env, ...extraEnv }, stdio: ['ignore', 'pipe', 'pipe'], shell: false,
     })
     writeFileSync(logPath, '')
     const pipe = (chunk) => { process.stdout.write(chunk); appendFileSync(logPath, chunk) }
@@ -134,6 +137,11 @@ function runStep(label, command, args, extraEnv = {}) {
       done(undefined)
     })
   })
+}
+
+/** 与 {@link runStep} 相同，但**换一个工作目录**（打包 tarball 用）。 */
+function runStepIn(label, command, args, cwd) {
+  return runStep(label, command, args, {}, cwd)
 }
 
 // ---------- 本机工具链 ----------
@@ -338,10 +346,23 @@ try {
 
   // 打包：一次一个 tar，传的与解的就是同一份字节
   // ★ 文件名自带 stamp：pscp 不能重命名，本地就按远端期望的名字产出，省掉一次远程 mv
+  //
+  // 🚨 **Windows 上必须给 tar 换工作目录 + 相对路径，不能给绝对路径**（2026-10-04 踩到）：
+  //   GNU tar 的 `-f` 参数走的是「`host:path` = 从远端主机读文件」的老约定，
+  //   于是 `D:\Coding_agent\...\x.tgz` 被它解析成「主机 `D`、路径 `\Coding_agent\...`」，
+  //   报 `Cannot connect to D: resolve failed` + `Broken pipe`。
+  //   POSIX 路径（`/data/...`）不含冒号所以没事 —— **这个 bug 只在 Windows 上出现**，
+  //   而症状（连不上主机）与人名无关、读起来像网络问题，会把人带偏。
+  //   修法：`cwd` 切到产物目录、只传**相对文件名**。相对路径不含冒号，
+  //   两个平台都落在同一条「本地文件」分支上。
   const serverTarball = join(output, `atr-deploy-${stamp}-server.tgz`)
   const portalTarball = join(output, `atr-deploy-${stamp}-portal.tgz`)
   for (const [label, source, tarball] of [['server', serverDist, serverTarball], ['portal', portalDist, portalTarball]]) {
-    await runStep(`打包 ${label} 产物`, 'tar', ['-czf', tarball, '-C', source, '.'])
+    const relative = basename(tarball)
+    // ⚠️ 先确认产物目录真的存在：`-C` 指向不存在的目录时 tar 会在**别的**阶段失败，
+    //   报错与真正的原因（目录拼错）无关。
+    if (!existsSync(dirname(tarball))) throw new Error(`产物目录不存在：${dirname(tarball)}`)
+    await runStepIn(`打包 ${label} 产物`, 'tar', ['-czf', relative, '-C', source, '.'], dirname(tarball))
     report.artifacts.push({ target: label, file: tarball, sha256: sha256(tarball), bytes: readFileSync(tarball).length })
   }
   save()
