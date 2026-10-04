@@ -58,7 +58,7 @@ import {
   portalTokenExpirySchema,
   portalSetProviderAliasSchema, portalProviderAliasIdSchema, portalProviderAliasStatusSchema,
   portalSetProjectAliasSchema, portalProjectAliasIdSchema, portalProjectAliasStatusSchema,
-  portalSetModelPriceSchema, portalModelPriceIdSchema, portalSeedModelPricesSchema,
+  portalSetModelPriceSchema, portalModelPriceIdSchema,
 } from '@ai-token-report/shared/schemas'
 
 import type { CredentialStore } from './credentials.js'
@@ -275,7 +275,6 @@ export class DatabaseAdminRoute {
       'GET pricing': 'pricing:manage',
       'POST pricing': 'pricing:manage',
       'POST pricing/delete': 'pricing:manage',
-      'POST pricing/seed': 'pricing:manage',
     }
     const permission = permissions[key]
     if (!permission) return { status: 404, body: { ok: false, reason: '未找到管理接口' } }
@@ -347,7 +346,6 @@ export class DatabaseAdminRoute {
         case 'GET pricing': return ok(await r.listModelPrices(actor))
         case 'POST pricing': return mutate(parsePortalBody(portalSetModelPriceSchema, body), input => r.setModelPrice(actor, input))
         case 'POST pricing/delete': return mutate(parsePortalBody(portalModelPriceIdSchema, body), input => r.deleteModelPrice(actor, input))
-        case 'POST pricing/seed': return mutate(parsePortalBody(portalSeedModelPricesSchema, body), input => r.seedModelPrices(actor, input))
         default: return { status: 404, body: { ok: false, reason: '未找到管理接口' } }
       }
     } catch (err) {

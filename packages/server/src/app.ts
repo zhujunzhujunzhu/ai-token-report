@@ -347,10 +347,10 @@ export function createApp(deps: AppDeps): Hono {
       // v11 项目归一化规则：与供应商归一化逐条同形（读在 GET 那一组里）。
       // ★ 同上：注册是**枚举**的，漏一条的表现是 404。
       'project-aliases', 'project-aliases/delete', 'project-aliases/status',
-      // v7 模型单价：三条写路径（设置 / 删除 / 种子初始化）。
+      // v7 模型单价：两条写路径（设置 / 删除）。
       // ★ 同样必须逐条列出 —— 注册是**枚举**的，漏一条的表现是 404，
       //   而 `http-contract.test.ts` 里那条 405 + Allow 断言正是为了钉住这一点。
-      'pricing', 'pricing/delete', 'pricing/seed',
+      'pricing', 'pricing/delete',
     ]) app.post(`/api/v1/admin/${path}`, c => dispatch(c, path))
   } else if (deps.adminRoute) {
   const legacyAdmin = deps.adminRoute

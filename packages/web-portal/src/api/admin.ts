@@ -15,7 +15,7 @@ import type {
   PortalProjectAliasListResponse, PortalProjectAliasResult,
   PortalSetProjectAliasRequest, PortalProjectAliasIdRequest, PortalProjectAliasStatusRequest,
   PortalModelPriceListResponse, PortalModelPriceResult,
-  PortalSetModelPriceRequest, PortalModelPriceIdRequest, PortalSeedModelPricesRequest,
+  PortalSetModelPriceRequest, PortalModelPriceIdRequest,
 } from '@ai-token-report/shared'
 import { post, request } from './request.js'
 
@@ -159,5 +159,3 @@ export const deleteProjectAlias = (input: PortalProjectAliasIdRequest) => post<P
 export const fetchModelPrices = () => request<PortalModelPriceListResponse>(root + '/pricing')
 export const setModelPrice = (input: PortalSetModelPriceRequest) => post<PortalModelPriceResult>(root + '/pricing', input)
 export const deleteModelPrice = (input: PortalModelPriceIdRequest) => post<PortalMutationResult>(root + '/pricing/delete', input)
-/** 只在单价表**为空**时能成功；非空时服务端回 409 并说明已有多少条。 */
-export const seedModelPrices = (input: PortalSeedModelPricesRequest) => post<PortalModelPriceListResponse>(root + '/pricing/seed', input)

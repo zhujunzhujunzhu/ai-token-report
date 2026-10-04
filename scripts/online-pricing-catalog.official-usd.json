@@ -1,0 +1,37 @@
+{
+  "_comment": [
+    "官方直连口径 —— 这些 provider 是厂商自己的端点，账单是**真美元**，所以币种记 USD。",
+    "单位是「美元 / 百万 token」（= 微元/千 token ÷ 1000），数值就是官方价目表上的原值，不做任何换算。",
+    "",
+    "★ 为什么要跟「中继」分开：中继（deeprouter / custom / szjt 这些）按 **¥1 = $1** 记账（见 relay-cny.json），",
+    "  官方是**真美元**。两者数值常常一模一样，但币种不同 —— 合成一种币种会让看板显示一个既不等于",
+    "  人民币支出、也不等于美元支出的数。分开记之后，看板按币种分别累加（绝不跨币种相加）。",
+    "",
+    "★ 官方套餐（订阅制）的说明：本部门相当一部分用量走的是官方**订阅套餐**，不是按量计费，",
+    "  所以这里的「金额」是**按 API 挂牌价折算的等价成本**，用来跟套餐费做对比 —— 它不是真实账单。",
+    "",
+    "provider 归属（改口径就改这里，一行一个）：",
+    "  官方（USD）：openai / anthropic / dashscope / cc-switch-official",
+    "  中继（CNY，¥1=$1）：custom / deeprouter / tokenrun / szjt / workbuddy / qwen-token-plan-cn 与其余一切（走基础价 '*'）",
+    "  ⚠️ cc-switch-official 归到官方是**推断**（名字与来源都是 cc-switch 的官方通道）：",
+    "     若它其实是某个中继，把它这几行的 provider 改成 '*' 再 apply 一次即可（同键 upsert）。"
+  ],
+  "asOf": "2026-10-04",
+  "source": "https://developers.openai.com/api/docs/pricing.md + https://platform.claude.com/docs/en/about-claude/pricing.md + https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+  "currency": "USD",
+  "rows": [
+    { "provider": "openai", "model": "gpt-5.6-sol", "input": 4.0, "output": 20.0, "cacheRead": 0.4, "cacheWrite": 5.0, "note": "OpenAI 官方标准价（≤272K 上下文）；促销价至少到 2026-11-21" },
+    { "provider": "openai", "model": "gpt-5.5", "input": 5.0, "output": 30.0, "cacheRead": 0.5, "cacheWrite": 0.0, "note": "OpenAI 官方标准价（<272K）；官方未单列缓存写价" },
+    { "provider": "openai", "model": "gpt-5.4", "input": 2.5, "output": 15.0, "cacheRead": 0.25, "cacheWrite": 0.0, "note": "OpenAI 官方标准价（<272K）；官方未单列缓存写价" },
+    { "provider": "openai", "model": "gpt-6-astra", "input": 10.0, "output": 50.0, "cacheRead": 1.0, "cacheWrite": 12.5, "note": "OpenAI 官方标准价（≤272K）" },
+    { "provider": "openai", "model": "gpt-5.6-terra", "input": 2.0, "output": 12.0, "cacheRead": 0.2, "cacheWrite": 2.5, "note": "OpenAI 官方标准价（≤272K）" },
+    { "provider": "openai", "model": "gpt-5.6-luna", "input": 0.2, "output": 1.2, "cacheRead": 0.02, "cacheWrite": 0.25, "note": "OpenAI 官方标准价（≤272K）" },
+    { "provider": "openai", "model": "gpt-5.3-codex-spark", "input": 1.75, "output": 14.0, "cacheRead": 0.175, "cacheWrite": 0.0, "note": "★近似：官方价目表没有 spark 变体，按 gpt-5.3-codex（$1.75/$14、缓存读 0.1×）折算" },
+    { "provider": "cc-switch-official", "model": "gpt-5.6-sol", "input": 4.0, "output": 20.0, "cacheRead": 0.4, "cacheWrite": 5.0, "note": "同 openai 官方标准价（cc-switch 的官方通道）" },
+    { "provider": "cc-switch-official", "model": "gpt-6-astra", "input": 10.0, "output": 50.0, "cacheRead": 1.0, "cacheWrite": 12.5, "note": "同 openai 官方标准价（cc-switch 的官方通道）" },
+    { "provider": "anthropic", "model": "claude-opus-4-8", "input": 5.0, "output": 25.0, "cacheRead": 0.5, "cacheWrite": 10.0, "note": "Anthropic 官方价目（$5/$25，缓存读 0.1×）；缓存写取 1h 档 $10（本机实测 100% 是 1h 缓存写）" },
+    { "provider": "anthropic", "model": "claude-sonnet-4-6", "input": 3.0, "output": 15.0, "cacheRead": 0.3, "cacheWrite": 6.0, "note": "Anthropic 官方价目（$3/$15，缓存读 0.1×）；缓存写取 1h 档 $6" },
+    { "provider": "anthropic", "model": "claude-opus-4-7", "input": 5.0, "output": 25.0, "cacheRead": 0.5, "cacheWrite": 10.0, "note": "Anthropic 官方价目（$5/$25，缓存读 0.1×）；缓存写取 1h 档 $10" },
+    { "provider": "dashscope", "model": "qwen3.6-plus", "input": 0.276, "output": 1.651, "cacheRead": 0.0276, "cacheWrite": 0.345, "note": "阿里云百炼官方价（Global，0<Token≤256K）；上下文缓存按官方规则 命中 10% × 输入、显式创建 125% × 输入" }
+  ]
+}

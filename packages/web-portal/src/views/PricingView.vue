@@ -49,7 +49,7 @@
  *    手动切回的「全部币种」反复改掉。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
-import { Delete, Edit, Plus, Refresh, Search, MagicStick } from '@element-plus/icons-vue'
+import { Delete, Edit, Plus, Refresh, Search } from '@element-plus/icons-vue'
 import {
   ElAlert, ElButton, ElCard, ElDatePicker, ElDialog, ElEmpty, ElForm, ElFormItem, ElInput,
   ElMessage, ElMessageBox, ElOption, ElSelect, ElSkeleton, ElSwitch, ElTable, ElTableColumn, ElTag,
@@ -340,26 +340,6 @@ async function remove(row: PortalModelPrice): Promise<void> {
   await load()
 }
 
-/** 用内置种子价初始化 —— 只在**一条价都没有**时可用，避免把已调好的价覆盖掉。 */
-async function seed(): Promise<void> {
-  if (busy.value) return
-  try {
-    await ElMessageBox.confirm(
-      '种子价是**内置的参考值**，不一定等于你的实际结算价 —— 它只是让你不必从零开始填。'
-      + '写入后请逐条核对。这个操作只在单价表为空时可用。',
-      '用内置种子价初始化',
-      { type: 'warning', confirmButtonText: '写入并逐条核对', cancelButtonText: '取消' },
-    )
-  } catch { return }
-  busy.value = true
-  const result = await api.seedModelPrices({ confirm: true })
-  busy.value = false
-  if (result.status === 401) { session.expire('登录已失效，请重新登录'); return }
-  if (!result.ok) { error.value = result.reason ?? '初始化失败'; return }
-  ElMessage.success('已写入内置种子价，请逐条核对后再用于正式统计')
-  await load()
-}
-
 onMounted(() => { void load() })
 </script>
 
@@ -370,18 +350,19 @@ onMounted(() => { void load() })
         <div class="eyebrow">MODEL PRICING</div>
         <h1>模型单价</h1>
         <p>
-          费用按「<strong>供应商 + 模型</strong>」精确匹配单价后现场计算：四类 token 各乘各自的价
-          （<code>输入 / 输出 / 缓存读 / 缓存写</code>），再按<strong>事件发生时刻</strong>选用当时生效的那条价，
-          并区分<strong>高峰 / 闲时</strong>两档。同一供应商下不同模型可以各不相同 —— 旗舰与轻量模型的价差常常在 10 倍以上。
+          费用按「<strong>供应商 + 模型</strong>」精确匹配单价后现场计算：<strong>四类 token 各乘各自的价</strong>
+          （<code>输入 / 输出 / 缓存读 / 缓存写</code>），按<strong>事件发生时刻</strong>取当时生效的那条价，
+          分<strong>高峰 / 闲时</strong>两档（闲时价是同一行的另一套四个数，不是乘折扣系数）；
+          同一供应商下不同模型可以各不相同。
         </p>
         <p class="muted">
-          没有为某个供应商单独配价时，会落到那条<strong>不限供应商的基础价</strong>（用于同一个模型被多个网关转售的情形）。
-          库里<strong>只存单价、绝不存金额</strong>：所以改价、补历史价都是即时生效的，
-          而历史用量一个字节都不会被动。这也意味着<strong>未配单价的用量是「未计价」，不是 0 元</strong>。
+          没有为某个供应商单独配价时会落到那条<strong>不限供应商的基础价</strong>（兜底价）。
+          库里只存单价、不存金额，改价即时生效而历史用量一个字节都不会被动；
+          没配单价的用量是「<strong>未计价</strong>」，不是 0 元。
+          多币种各自累加，绝不换算也绝不相加；自建计价永远不会等于财务账单（折扣、预付、赠送额度不在单价里）。
         </p>
       </div>
       <div class="heading-actions">
-        <el-button v-if="canManage && !prices.length" :icon="MagicStick" :disabled="busy || loading" @click="seed">用内置种子价初始化</el-button>
         <el-button v-if="canManage" type="primary" :icon="Plus" :disabled="busy" @click="openForm()">新增单价</el-button>
       </div>
     </div>
@@ -392,8 +373,9 @@ onMounted(() => { void load() })
           <div>
             <h2>计价目录</h2>
             <p>
-              按供应商分组，每个模型各有一条或多条<strong>生效区间</strong>。
-              区间不得重叠 —— 重叠会让「某一时刻该用哪个价」变成读取顺序问题，服务端会直接拒绝并说明撞上了哪一条。
+              单价按「<strong>货币单位 / 百万 token</strong>」录入，库里存<strong>整数微元</strong>（1 微 = 0.000001 货币单位）：
+              填 2 就是每百万 token 2 元。每个模型各有一条或多条<strong>生效区间</strong>，
+              区间不得重叠 —— 服务端会直接拒绝并说明撞上了哪一条。
             </p>
           </div>
           <el-button :icon="Refresh" :loading="loading" :disabled="busy" @click="load">刷新</el-button>
@@ -473,43 +455,7 @@ onMounted(() => { void load() })
       </el-empty>
       <el-empty v-else description="还没有任何单价：费用统计会把全部用量标成「未计价」，而不是 0 元">
         <el-button v-if="canManage" type="primary" :icon="Plus" :disabled="busy" @click="openForm()">新增第一条单价</el-button>
-        <el-button v-if="canManage" :icon="MagicStick" :disabled="busy" @click="seed">用内置种子价初始化</el-button>
       </el-empty>
-    </el-card>
-    <el-card shadow="never">
-      <template #header><h2>这一页的几件事，值得先知道</h2></template>
-      <ul class="muted">
-        <li>
-          <strong>单价是「货币单位 / 百万 token」</strong>（与各家价目表同一单位），
-          库里存成整数微元（1 微 = 0.000001 货币单位）：
-          <code>2</code> 表示每百万 token 2 元，缓存读 <code>0.2</code> 就是每百万 token 0.2 元。
-        </li>
-        <li>
-          <strong>四类必须分开填</strong>：缓存读价通常比输入价便宜一个数量级，
-          而它占总用量的 94% 以上。把四类合成一个价，等于让绝大部分用量算错。
-        </li>
-        <li>
-          <strong>改价 = 新增一条生效区间</strong>：从某一天起用新价，就把旧价的「生效终点」设在那一天。
-          直接改旧价会让<strong>历史费用一起变</strong>——虽然用量没变，但金额会重算。
-        </li>
-        <li>
-          <strong>不限供应商的那条是兜底价</strong>：只有当某个供应商<strong>没有</strong>自己的同名模型价时才用它。
-          给某个网关单独配一条即可覆盖它，两条可以共存 —— 专属价优先，且一条事件只会被算一次。
-        </li>
-        <li>
-          <strong>闲时（低谷）价是同一行的另一套四个数</strong>：高峰与闲时各自成组、绝不「乘一个折扣系数」
-          （缓存读与输入价的比值在不同档上未必相同）。时段表定义在 <code>shared/price.ts</code> 里，
-          全平台只有一份；**法定节假日表需要逐年补**，页面会在时段说明里写明覆盖到哪天。
-        </li>
-        <li>
-          <strong>多币种各自累加，绝不换算也绝不相加</strong>：页面用 <code>+</code> 连接不同币种的金额。
-          汇率是随时间变的外部事实，烧进结果里等于给历史数字埋雷。
-        </li>
-        <li>
-          <strong>自建计价永远不会等于财务账单</strong>：折扣、预付、赠送额度都不在单价里。
-          对账用专门的月度对账脚本，账单金额不进页面。
-        </li>
-      </ul>
     </el-card>
     <el-dialog v-model="showForm" :title="selected ? '编辑单价' : '新增单价'" width="min(760px, 94vw)" destroy-on-close :close-on-click-modal="false" :show-close="!busy" :close-on-press-escape="!busy">
       <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
@@ -575,6 +521,9 @@ onMounted(() => { void load() })
             <el-date-picker v-model="draft.to" type="datetime" value-format="YYYY-MM-DDTHH:mm" format="YYYY-MM-DD HH:mm" placeholder="留空 = 至今有效" aria-label="生效终点" />
           </el-form-item>
         </div>
+        <p class="muted">
+          从某天起改用新价：把旧价的<strong>生效终点</strong>设到那天，再新增一条 —— 直接改旧价会让历史费用一起重算。
+        </p>
         <el-card shadow="never" class="offpeak-card">
           <template #header>
             <div class="panel-heading">
