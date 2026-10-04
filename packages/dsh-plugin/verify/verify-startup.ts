@@ -52,6 +52,19 @@ try {
   //   于是下面「5000 条 / 475000」的固定期望值会与真实用量混在一起 ——
   //   在装了 DSH 的机器上必失败、在干净 CI 上反而通过。
   env.DSH_TOKEN_REPORT_DSH_HOMES = scratchDshHomes(home)
+  // ★ 关掉「非 DSH 来源」（Codex / Claude Code / Trae / WorkBuddy）。0.8.0 起它们
+  //   缺省就一起统计，而本脚本断言的是**绝对条数**（5000 次调用）—— 不关的话，
+  //   本机真实用量会混进来（本机实测多出 635 次调用：装了别的客户端就必失败，
+  //   干净 CI 上反而通过）。与 `scripts/test-preload.ts` 做的是同一件事。
+  //   ⚠️ 必须写在上面那条 delete 循环**之后** —— 它会清掉所有 `DSH_TOKEN_REPORT_*`。
+  for (const key of [
+    'DSH_TOKEN_REPORT_DISCOVER',
+    'DSH_TOKEN_REPORT_CODEX',
+    'DSH_TOKEN_REPORT_CLAUDE',
+    'DSH_TOKEN_REPORT_TRAE',
+    'DSH_TOKEN_REPORT_TRAE_CN',
+    'DSH_TOKEN_REPORT_WORKBUDDY',
+  ]) env[key] = '0'
   const start = performance.now()
   // 直接运行 dsh 的 CLI 入口，绕开 Windows 包管理器 shim，确保 finally 只终止本次宿主。
   child = Bun.spawn([node, dsh, '--profile', 'web', '--no-open', '--port', '0'], { cwd: home, env, stdout: 'pipe', stderr: 'pipe' })
