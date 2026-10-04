@@ -30,6 +30,7 @@ import { projectName } from '../src/aggregate.js'
 import {
   distinctCwdsQuery,
   insertAttributedRecords,
+  isProjectPathRule,
   loadProjectAliases,
   normalizeProjectPrefix,
   openPortalStats,
@@ -38,8 +39,10 @@ import {
   projectAliasNameError,
   projectAliasesToMap,
   projectNormalizer,
+  projectPathSegments,
   projectPrefixError,
   projectPrefixMatches,
+  projectRepoNameMatches,
   type IngestRecord,
   type PortalTarget,
   type ProjectAliasRule,
@@ -247,6 +250,174 @@ describe('项目归一化：规则映射与优先级', () => {
 })
 
 // ─────────────────────────────────────────────────────────────
+// 两种写法：仓库名（任一路径段全等）与路径前缀（含分隔符）
+// ─────────────────────────────────────────────────────────────
+
+describe('项目归一化：仓库名模式（不关心磁盘与父目录）', () => {
+  test('★ 一条仓库名规则覆盖它在任意磁盘、任意父目录下的所有子目录', () => {
+    const normalize = projectNormalizer(projectAliasesToMap([rule('suit-g92-parent', '甬舟G92项目')]))
+    // 三个不同盘 / 不同父目录 —— 这是路径前缀模式下要写三条规则的情形
+    expect(normalize.resolve('D:\\Coding\\suit-g92-parent')).toBe('甬舟G92项目')
+    expect(normalize.resolve('D:\\Coding_agent\\suit-g92-parent')).toBe('甬舟G92项目')
+    expect(normalize.resolve('F:\\vue_code\\suit-g92-parent')).toBe('甬舟G92项目')
+    // ★ 子目录也算：上报的 cwd 常常就停在子目录（真实数据里大部分如此），
+    //   只比「最后一段」会漏掉子目录里发生的全部用量。
+    expect(normalize.resolve('D:\\Coding\\suit-g92-parent\\suit-g92-frontend')).toBe('甬舟G92项目')
+    expect(normalize.resolve('F:\\vue_code\\suit-g92-parent\\a\\b\\c')).toBe('甬舟G92项目')
+    // POSIX 路径同样成立（客户端可能是 macOS / Linux）
+    expect(normalize.resolve('/home/panwenjun/work/suit-g92-parent')).toBe('甬舟G92项目')
+    // 盘符大小写不同**不影响**仓库名匹配 —— 盘符压根不参与比较
+    expect(normalize.resolve('d:\\Coding\\suit-g92-parent')).toBe('甬舟G92项目')
+  })
+
+  test('🚨 段名全等，不是段名前缀：不吃掉名字相近的兄弟仓库', () => {
+    const normalize = projectNormalizer(projectAliasesToMap([rule('skills-cli', '技能仓库')]))
+    expect(normalize.resolve('D:\\Coding_agent\\skills-cli')).toBe('技能仓库')
+    // ⚠️ 这三个都是**别的**仓库。若用「段名前缀」匹配，它们会被悄悄并进来 ——
+    //   页面上只是「技能仓库的数字偏大」，没有任何报错。
+    expect(normalize.resolve('D:\\Coding_agent\\skills-cli-old')).toBe('skills-cli-old')
+    expect(normalize.resolve('D:\\Coding_agent\\skills-cli-next')).toBe('skills-cli-next')
+    expect(normalize.resolve('D:\\Coding_agent\\suit-skills-cli')).toBe('suit-skills-cli')
+  })
+
+  test('🚨 逐字比较，区分大小写（不在匹配里折叠大小写）', () => {
+    const normalize = projectNormalizer(projectAliasesToMap([rule('Foo', 'F 项目')]))
+    expect(normalize.resolve('D:\\a\\Foo')).toBe('F 项目')
+    // 大小写不同 ⇒ 未命中，回落旧口径。这条是**刻意**的：
+    // 把大小写折叠会在区分大小写的文件系统上把两个不同目录悄悄并起来。
+    expect(normalize.resolve('D:\\a\\foo')).toBe('foo')
+  })
+
+  test('父目录里的同名段也会命中（段是「路径中任一段」，不是只有仓库根那层）', () => {
+    const normalize = projectNormalizer(projectAliasesToMap([rule('work', '工作区')]))
+    expect(normalize.resolve('D:\\Coding\\work\\proj')).toBe('工作区')
+    expect(normalize.resolve('D:\\work')).toBe('工作区')
+  })
+
+  test('未命中的目录仍然回落旧口径（不会因为多了一种模式而改变默认行为）', () => {
+    const normalize = projectNormalizer(projectAliasesToMap([rule('suit-g92-parent', 'P')]))
+    expect(normalize.resolve('D:\\Coding\\presales-kb-parent')).toBe('presales-kb-parent')
+    expect(normalize.apply('D:\\Coding\\presales-kb-parent')).toBeUndefined()
+  })
+})
+
+describe('项目归一化：两种模式的共存与优先级', () => {
+  test('🚨 路径前缀规则优先于仓库名规则（哪怕前缀更短）', () => {
+    const normalize = projectNormalizer(projectAliasesToMap([
+      rule('proj', '仓库名口径'),          // 短，但它是仓库名模式
+      rule('D:\\temp\\proj', '路径口径'),   // 长，且它是路径模式
+    ]))
+    // 路径模式是「显式限定了位置」的一次陈述，比「到处都叫这个名字」更具体
+    expect(normalize.resolve('D:\\temp\\proj\\src')).toBe('路径口径')
+    // 没被路径规则覆盖的位置，仍然走仓库名规则
+    expect(normalize.resolve('D:\\other\\proj')).toBe('仓库名口径')
+  })
+
+  test('同一模式内最具体者胜出（路径模式比长度、仓库名模式比段长）', () => {
+    const pathNormalizer = projectNormalizer(projectAliasesToMap([
+      rule('D:\\work', '宽'),
+      rule('D:\\work\\proj', '窄'),
+    ]))
+    expect(pathNormalizer.resolve('D:\\work\\proj\\src')).toBe('窄')
+    expect(pathNormalizer.resolve('D:\\work\\other')).toBe('宽')
+
+    const nameNormalizer = projectNormalizer(projectAliasesToMap([
+      rule('proj', '短名'),
+      rule('proj-long', '长名'),
+    ]))
+    // 两个仓库名都出现在同一条路径里时，更长的那个赢
+    expect(nameNormalizer.resolve('D:\\a\\proj-long')).toBe('长名')
+    expect(nameNormalizer.resolve('D:\\a\\proj')).toBe('短名')
+  })
+
+  test('排序与数据库返回顺序无关（同一套规则两次解析必然一致）', () => {
+    const build = () => projectNormalizer(projectAliasesToMap([
+      rule('proj', '仓库名'),
+      rule('D:\\work', '路径宽'),
+      rule('D:\\work\\proj', '路径窄'),
+    ]))
+    expect(build().pairs.map(([p]) => p)).toEqual(build().pairs.map(([p]) => p))
+    // 路径模式全部排在仓库名模式之前
+    expect(build().pairs.map(([p]) => p)).toEqual(['D:\\work\\proj', 'D:\\work', 'proj'])
+  })
+
+  test('人员规则覆盖全局规则在两种模式下都成立', () => {
+    const normalize = projectNormalizer(projectAliasesToMap([
+      rule('proj', '部门口径'),
+      rule('proj', '我的口径', 'member-1'),
+      rule('D:\\temp\\proj', '部门路径口径'),
+      rule('D:\\temp\\proj', '我的路径口径', 'member-1'),
+    ]))
+    expect(normalize.resolve('D:\\a\\proj')).toBe('我的口径')
+    expect(normalize.resolve('D:\\temp\\proj\\x')).toBe('我的路径口径')
+  })
+
+  test('向后兼容：只有路径规则时，行为与引入仓库名模式之前逐字一致', () => {
+    const normalize = projectNormalizer(projectAliasesToMap([
+      rule('D:\\a\\proj', '我的项目'),
+      rule('D:\\a', '上一级'),
+    ]))
+    expect(normalize.resolve('D:\\a\\proj\\src')).toBe('我的项目')
+    expect(normalize.resolve('D:\\a\\other')).toBe('上一级')
+    // 🚨 关键回归：路径规则**不会**去匹配别的位置的同名目录
+    //   （引入仓库名模式后如果判据写错，这里会静默命中 —— 那是最危险的回归）
+    expect(normalize.resolve('F:\\x\\proj')).toBe('proj')
+    expect(normalize.resolve('F:\\x\\a\\proj')).toBe('proj')
+  })
+})
+
+describe('项目归一化：模式判定与校验', () => {
+  test('含路径分隔符 ⇒ 路径模式；裸目录名 ⇒ 仓库名模式', () => {
+    expect(isProjectPathRule('D:\\work\\proj')).toBe(true)
+    expect(isProjectPathRule('D:/work/proj')).toBe(true)
+    expect(isProjectPathRule('D:\\work\\proj\\')).toBe(true)
+    expect(isProjectPathRule('/home/x/proj')).toBe(true)
+    expect(isProjectPathRule('suit-g92-parent')).toBe(false)
+    expect(isProjectPathRule('proj')).toBe(false)
+    // ⚠️ `C:` 含冒号但**不含分隔符** ⇒ 是仓库名模式（且会被校验拒掉，见下）
+    expect(isProjectPathRule('C:')).toBe(false)
+  })
+
+  test('路径切段：滤掉空段（绝对路径的前导斜杠、尾部斜杠都不产出空段）', () => {
+    expect(projectPathSegments('D:\\a\\proj')).toEqual(['D:', 'a', 'proj'])
+    expect(projectPathSegments('D:\\a\\proj\\')).toEqual(['D:', 'a', 'proj'])
+    expect(projectPathSegments('/home/x/proj')).toEqual(['home', 'x', 'proj'])
+    expect(projectPathSegments('D:\\a\\proj\\\\src\\\\')).toEqual(['D:', 'a', 'proj', 'src'])
+    expect(projectPathSegments('')).toEqual([])
+    expect(projectPathSegments('/')).toEqual([])
+  })
+
+  test('仓库名匹配函数本身：全等、不区分它在第几段', () => {
+    expect(projectRepoNameMatches('proj', 'D:\\a\\proj')).toBe(true)
+    expect(projectRepoNameMatches('proj', 'D:\\a\\proj\\src\\deep')).toBe(true)
+    expect(projectRepoNameMatches('proj', 'D:\\proj-other')).toBe(false)
+    // ⚠️ `D:` 真的**就是**路径的一段（`['D:', 'a', 'proj']`）——
+    //   所以配一条 `D:` 会吃掉整个盘。这正是校验层要拒掉它的理由，
+    //   而「段匹配只认目录名、不认盘符」是一个危险的误解。
+    expect(projectRepoNameMatches('D:', 'D:\\a\\proj')).toBe(true)
+    expect(projectPathSegments('D:\\a\\proj')[0]).toBe('D:')
+  })
+
+  test('🚨 校验：裸盘符被拒（它会匹配该磁盘下的所有目录）', () => {
+    expect(projectPrefixError('D:')).toContain('盘符')
+    expect(projectPrefixError('c:')).toContain('盘符')
+    // ⚠️ `D:\`（带尾分隔符）必须放行：它含分隔符 ⇒ 路径模式，本意就是「D 盘下的东西」
+    expect(projectPrefixError('D:\\')).toBeNull()
+    expect(projectPrefixError('D:\\work')).toBeNull()
+  })
+
+  test('校验：两种模式的合法值都放行，原有约束一个都不松', () => {
+    expect(projectPrefixError('suit-g92-parent')).toBeNull()
+    expect(projectPrefixError('D:\\work\\proj')).toBeNull()
+    expect(projectPrefixError('')).toContain('不能为空')
+    expect(projectPrefixError(' a')).toContain('首尾')
+    expect(projectPrefixError('/')).toContain('文件系统根')
+    expect(projectPrefixError('a\u0000b')).toContain('不可见字符')
+    expect(projectPrefixError('x'.repeat(513))).toContain('不能超过')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────
 // 使用者输入的校验
 // ─────────────────────────────────────────────────────────────
 
@@ -258,22 +429,22 @@ describe('项目归一化：输入校验', () => {
     expect(projectPrefixError('D:\\a\\proj\\')).toBeNull()
   })
 
-  test('目录前缀：空的、文件系统根、首尾空格、不可见字符、超长一律拒掉', () => {
-    expect(projectPrefixError('')).toBe('目录前缀不能为空')
-    expect(projectPrefixError(123)).toBe('目录前缀需要是字符串')
+  test('匹配值：空的、文件系统根、首尾空格、不可见字符、超长一律拒掉', () => {
+    expect(projectPrefixError('')).toBe('匹配值不能为空')
+    expect(projectPrefixError(123)).toBe('匹配值需要是字符串')
     // ★ 根目录会把**所有** POSIX 路径折成一个项目 —— 它必然是误配。
     //   ⚠️ `///` 与 `/` 归一化之后是同一个前缀，所以判据必须在归一化之后取。
-    expect(projectPrefixError('/')).toBe('目录前缀不能是文件系统根目录（它会匹配所有路径）')
-    expect(projectPrefixError('///')).toBe('目录前缀不能是文件系统根目录（它会匹配所有路径）')
-    expect(projectPrefixError('\\')).toBe('目录前缀不能是文件系统根目录（它会匹配所有路径）')
+    expect(projectPrefixError('/')).toBe('匹配值不能是文件系统根目录（它会匹配所有路径）')
+    expect(projectPrefixError('///')).toBe('匹配值不能是文件系统根目录（它会匹配所有路径）')
+    expect(projectPrefixError('\\')).toBe('匹配值不能是文件系统根目录（它会匹配所有路径）')
     // 而盘符根（`D:\` → `D:`）刻意放行：那是「D 盘下的东西」，不是「一切」。
     expect(projectPrefixError('D:\\')).toBeNull()
     // 首尾空格：`'D:\a '` 与 `'D:\a'` 在 `startsWith` 里是两个前缀，页面上看不出差别。
-    expect(projectPrefixError(' D:\\a')).toBe('目录前缀首尾不能是空格')
-    expect(projectPrefixError('D:\\a ')).toBe('目录前缀首尾不能是空格')
-    expect(projectPrefixError('D:\\a\u00a0')).toBe('目录前缀不能包含空格以外的空白或不可见字符')
-    expect(projectPrefixError('D:\\a\u200b')).toBe('目录前缀不能包含空格以外的空白或不可见字符')
-    expect(projectPrefixError('D:\\' + 'x'.repeat(600))).toBe('目录前缀不能超过 512 个字符')
+    expect(projectPrefixError(' D:\\a')).toBe('匹配值首尾不能是空格')
+    expect(projectPrefixError('D:\\a ')).toBe('匹配值首尾不能是空格')
+    expect(projectPrefixError('D:\\a\u00a0')).toBe('匹配值不能包含空格以外的空白或不可见字符')
+    expect(projectPrefixError('D:\\a\u200b')).toBe('匹配值不能包含空格以外的空白或不可见字符')
+    expect(projectPrefixError('D:\\' + 'x'.repeat(600))).toBe('匹配值不能超过 512 个字符')
   })
 
   test('归一化名：允许中文与 `/`（项目名里带斜杠不会与任何拼接键歧义）', () => {

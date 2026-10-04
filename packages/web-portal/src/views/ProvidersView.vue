@@ -196,11 +196,14 @@ onMounted(() => { void load() })
         <div class="eyebrow">PROVIDER &amp; MODEL NORMALIZATION</div>
         <h1>供应商模型归一化</h1>
         <p>
-          把上报里出现的多个<strong>供应商名</strong>或<strong>模型名</strong>折叠成同一个展示名
-          （例如 <code>dashscope</code> 与 <code>bailian</code> 都记成 <code>bailian-tpp</code>；
-          <code>qwen-max</code> 与 <code>Qwen-Max</code> 都记成 <code>通义千问-Max</code>），
+          把上报里出现的多个<strong>供应商名</strong>或<strong>模型名</strong>折叠成同一个展示名，
           这样按供应商 / 模型看用量时才不会一个东西散成好几行。
-          <strong>没有配规则的项保持自己的原始名</strong>；明细里始终同时显示原值，方便核对规则配得对不对。
+          <strong>一条规则只折叠一个维度</strong>（两个都要改就配两条）；原始名是<strong>一字不差</strong>的精确匹配，
+          写错大小写或多一个空格都不会命中；模型规则的「限定供应商」<strong>留空 = 任意供应商</strong>。
+        </p>
+        <p class="muted">
+          <strong>没有配规则的项保持自己的原始名</strong>，明细里始终同时显示原值；
+          费用按原始供应商与模型计价，改名不影响金额。
         </p>
       </div>
       <el-button v-if="canManage" type="primary" :icon="Plus" :disabled="busy" @click="open()">添加规则</el-button>
@@ -259,18 +262,6 @@ onMounted(() => { void load() })
           </template>
         </el-table-column>
       </el-table>
-    </el-card>
-    <el-card shadow="never">
-      <template #header><h2>怎么配才对</h2></template>
-      <ul class="muted">
-        <li>原始名要<strong>一字不差</strong>：匹配是大小写敏感的精确比较，写错大小写或结尾多一个空格都会静默不命中。</li>
-        <li><strong>一条规则只折叠一个维度</strong>：要同时改供应商与模型的展示名，就配两条规则。</li>
-        <li>模型规则的「限定供应商」留空表示<strong>任意供应商</strong>（显示为 <code>*</code>）；填真实供应商名则只在那家内匹配。</li>
-        <li>归一化名允许中文（例如 <code>阿里百炼</code>、<code>通义千问-Max</code>），但不能包含 <code>/</code> —— 它会被当成 provider 与 model 的分隔符。</li>
-        <li>没配规则的项保持原始名，所以只配你真正想折叠的那几个。</li>
-        <li>要确认某个东西到底上报成了什么，去「调用明细」页看模型与供应商那两列原始值。</li>
-        <li>费用按<strong>原始</strong>供应商与模型计价，改名不会影响金额。</li>
-      </ul>
     </el-card>
     <el-dialog v-model="showForm" :title="selected ? '编辑规则' : '添加规则'" width="min(520px, 94vw)" destroy-on-close :close-on-click-modal="false" :show-close="!busy" :close-on-press-escape="!busy">
       <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />

@@ -14,21 +14,28 @@
  *
  * | | 供应商归一化 | 项目归一化（本页） |
  * |---|---|---|
- * | 匹配 | 原始名**精确**（一字不差） | 原始 cwd **前缀**（按路径分隔符边界） |
- * | 多条命中 | 同一原始名只有一条规则 | **最长前缀优先**；同长时人员规则覆盖全局 |
+ * | 匹配 | 原始名**精确**（一字不差） | 原始 cwd 的**仓库名**（任一路径段）或**路径前缀** |
+ * | 多条命中 | 同一原始名只有一条规则 | **路径前缀规则优先**；同类型内最具体者胜出 |
  *
- * 所以本页**不会**出现「一个目录一行」的提示：一条 `D:\a\proj` 的规则本来就该
- * 覆盖它下面的所有子目录 —— 那正是这个功能的目的。
+ * 所以本页**不会**出现「一个目录一行」的提示：一条 `suit-g92-parent` 的规则本来就该
+ * 覆盖它在任意磁盘下的所有子目录 —— 那正是这个功能的目的。
  *
- * ## 为什么前缀要「选」而不是「填」
+ * ## 为什么这一页主推「填仓库名」而不是「填完整路径」
  *
- * 目录前缀是这一页最容易配错的东西：敲错一个字符（或大小写不同）＝ 规则
- * **静默不命中**，而页面上完全看不出来。所以前缀输入框是一个
+ * 路径前缀模式下同一个仓库要**每种位置各配一条**：换盘、换父目录、换盘符大小写
+ * （不同客户端写 `cwd` 的方式不同）。线上实测一个仓库要 3~6 条，漏掉一个变体就
+ * **静默不命中**（页面上完全看不出来，只表现为「那个项目用量偏小」）。
+ * 填仓库名把这三类差异一次消掉：一条规则管所有位置。
+ *
+ * ## 为什么匹配值要「选」而不是「填」
+ *
+ * 匹配值是这一页最容易配错的东西：敲错一个字符（或大小写不同）＝ 规则
+ * **静默不命中**，而页面上完全看不出来。所以输入框是一个
  * **可搜索的下拉**，候选项来自 `/api/v1/stats/projects`（库里真实出现过的 cwd）；
  * 也允许自己敲（那个接口需要 `stats:read`，拿不到就只剩手填，表单里会说明）。
  *
  * 🚨 归一化按**查看者**生效：全局规则对所有人生效；人员规则只对那个人生效。
- *   同一条目录上前者被后者压住（跨作用范围时仍然是**更长的前缀**优先）。
+ *   同一条目录上前者被后者压住（跨作用范围时仍然是**更具体者**优先）。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { Delete, Plus, Refresh, Search } from '@element-plus/icons-vue'
@@ -148,7 +155,7 @@ async function remove(entry: PortalProjectAlias): Promise<void> {
   if (busy.value) return
   try {
     await ElMessageBox.confirm(
-      `删除后 ${entry.prefix} 下的用量会回到「目录最后一段」的旧口径。历史用量不会被改动 —— 归一化只作用在查询上。`,
+      `删除后 ${entry.prefix} 命中的那些目录会回到「目录最后一段」的旧口径。历史用量不会被改动 —— 归一化只作用在查询上。`,
       `删除规则 · ${entry.prefix}`,
       { type: 'warning', confirmButtonText: '删除规则', cancelButtonText: '取消' },
     )
@@ -175,12 +182,9 @@ onMounted(() => { void load() })
         <div class="eyebrow">PROJECT NORMALIZATION</div>
         <h1>项目归一化</h1>
         <p>
-          把上报里散开的多个工作目录折叠成同一个项目名。上报的 <code>cwd</code> 是具体目录，
-          所以一个项目天然散成好几行（仓库根、<code>packages/core</code>、
-          <code>packages/web-local</code> 各占一行）；配一条<strong>目录前缀</strong>规则，
-          它们就会一起记到同一个项目名下，按项目看用量时才不会散开。
-          <strong>没有配规则的目录保持原样</strong>——仍然按「目录最后一段」显示，
-          这一页改的只是分组时用哪个名字。
+          把上报里散开的多个工作目录折叠成同一个项目名：配一条<strong>仓库名</strong>规则，
+          仓库根与各子目录就一起记到同一个项目名下。
+          <strong>没有配规则的目录保持原样</strong>（仍按「目录最后一段」显示）。
         </p>
       </div>
       <el-button v-if="canManage" type="primary" :icon="Plus" :disabled="busy" @click="open()">添加规则</el-button>
@@ -191,13 +195,17 @@ onMounted(() => { void load() })
         <div class="panel-heading">
           <div>
             <h2>规则列表</h2>
-            <p>全局规则对所有人生效；人员规则只对该人员生效。多条规则命中同一个目录时，<strong>前缀最长的胜出</strong>。</p>
+            <p>
+              全局规则对所有人生效，人员规则只对该人员生效。多条命中同一目录时<strong>路径前缀规则优先于仓库名规则</strong>，
+              同类里<strong>前缀最长的胜出</strong>。前缀按<strong>路径分隔符边界</strong>判定、<strong>区分大小写</strong>，
+              两端的尾部分隔符会被自动去掉；<strong>没有配规则的目录仍然按「目录最后一段」显示</strong>。
+            </p>
           </div>
           <el-button :icon="Refresh" :loading="loading" :disabled="busy" @click="load">刷新</el-button>
         </div>
       </template>
       <div class="member-filters">
-        <el-input v-model="search" :prefix-icon="Search" clearable placeholder="搜索目录前缀或项目名" aria-label="搜索规则" />
+        <el-input v-model="search" :prefix-icon="Search" clearable placeholder="搜索仓库名或项目名" aria-label="搜索规则" />
         <el-select v-model="scopeFilter" clearable placeholder="全部作用范围" aria-label="筛选作用范围">
           <el-option label="全局" value="global" /><el-option label="按人员" value="member" />
         </el-select>
@@ -211,7 +219,7 @@ onMounted(() => { void load() })
             <span v-if="row.member_name" class="muted"> {{ row.member_name }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="原始目录前缀" min-width="260">
+        <el-table-column label="仓库名 / 目录前缀" min-width="260">
           <template #default="{ row }"><code>{{ row.prefix }}</code></template>
         </el-table-column>
         <el-table-column label="归一化后的项目" min-width="180">
@@ -230,32 +238,6 @@ onMounted(() => { void load() })
         </el-table-column>
       </el-table>
     </el-card>
-    <el-card shadow="never">
-      <template #header><h2>怎么配才对</h2></template>
-      <ul class="muted">
-        <li>
-          匹配的是 <strong>原始 <code>cwd</code> 的目录前缀</strong>，而且按<strong>路径分隔符边界</strong>判定：
-          一条 <code>D:\work\proj</code> 会命中 <code>D:\work\proj</code> 与 <code>D:\work\proj\src</code>，
-          但<strong>不会</strong>命中 <code>D:\work\proj-other</code>。所以只配项目根目录就够了，不用为每个子目录各配一条。
-        </li>
-        <li>
-          匹配是<strong>区分大小写</strong>的逐字比较：<code>D:\work</code> 与 <code>d:\work</code> 是两个前缀。
-          Windows 上它们指向同一个目录，但把「大小写不敏感」做进匹配会在区分大小写的文件系统上
-          把两个不同目录悄悄并起来 —— 所以请从下拉里选，或从明细页复制。
-        </li>
-        <li>
-          规则两端的<strong>尾部路径分隔符会被自动去掉</strong>：<code>D:\work\proj\</code> 与
-          <code>D:\work\proj</code> 是同一条规则，不会因为多写一个斜杠而静默不命中。
-        </li>
-        <li>
-          多条规则命中同一个目录时<strong>前缀最长的胜出</strong>；长度相同时，人员规则覆盖全局规则。
-          这让「部门把 <code>D:\work</code> 归成「工作」，而我把 <code>D:\work\proj</code> 单独归成「我的项目」」成立。
-        </li>
-        <li>归一化后的项目名允许中文（例如 <code>AI Token 用量平台</code>），也允许 <code>/</code>。</li>
-        <li>没有配规则的目录仍然按「目录最后一段」显示，所以只配你真正想折叠的那几个。</li>
-        <li>要看某个目录到底上报成了什么，去「调用明细」页看 <code>cwd</code> 那一列原始值；配完去「用量分析」按<strong>项目</strong>分组核对。</li>
-      </ul>
-    </el-card>
     <el-dialog v-model="showForm" :title="selected ? '编辑规则' : '添加规则'" width="min(560px, 94vw)" destroy-on-close :close-on-click-modal="false" :show-close="!busy" :close-on-press-escape="!busy">
       <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
       <el-form ref="form" :model="draft" :rules="rules" label-position="top" :disabled="busy" @submit.prevent="save">
@@ -272,11 +254,13 @@ onMounted(() => { void load() })
           </el-select>
           <p v-if="!people.length" class="muted">读不到人员名单（需要 <code>members:read</code>），暂时只能配置全局规则。</p>
         </el-form-item>
-        <el-form-item label="原始目录前缀" prop="prefix">
+        <el-form-item label="仓库名 / 目录前缀" prop="prefix">
           <!--
             ★ `filterable` + `allow-create`：优先让人**从真实 cwd 里选**
               （敲错一个字符的规则会静默不命中），同时保底能自己填
               （接口要 `stats:read`，而且规则可能指向一个当下还没数据的目录）。
+              ⚠️ 候选项是**完整路径**，但这一栏**不需要**照抄完整路径 ——
+                 填仓库目录名（如 `suit-g92-parent`）就能覆盖它出现在任何位置的情况。
           -->
           <el-select
             v-model="draft.prefix"
@@ -284,16 +268,18 @@ onMounted(() => { void load() })
             allow-create
             default-first-option
             clearable
-            placeholder="从下拉里选，或直接输入目录前缀"
-            aria-label="原始目录前缀"
+            placeholder="填仓库名（如 suit-g92-parent），或从下拉里选完整路径"
+            aria-label="仓库名或目录前缀"
           >
             <el-option v-for="dir in cwds" :key="dir" :label="dir" :value="dir" />
           </el-select>
           <p class="muted">
-            必须与上报的 <code>cwd</code> <strong>逐字一致</strong>（区分大小写）。尾部的
-            <code>\</code> 或 <code>/</code> 会被自动去掉。
-            <template v-if="catalogLoaded">库里目前出现过 {{ cwds.length }} 个目录，已在上面列出。</template>
-            <template v-else>读不到目录候选（需要 <code>stats:read</code>），请手动填写。</template>
+            <strong>只填仓库目录名就够了</strong>（不带 <code>\</code> 和 <code>/</code>）——
+            它会匹配该仓库在任意磁盘、任意父目录下的所有子目录。
+            需要<strong>限定位置</strong>时才填完整路径，那种写法按路径前缀匹配。
+            尾部的 <code>\</code> 或 <code>/</code> 会被自动去掉。
+            <template v-if="catalogLoaded">库里目前出现过 {{ cwds.length }} 个目录，可从上面选。</template>
+            <template v-else>读不到目录候选（需要 <code>stats:read</code>），请手动填写仓库名。</template>
           </p>
         </el-form-item>
         <el-form-item label="归一化后的项目名" prop="alias">

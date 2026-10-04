@@ -30,6 +30,33 @@
  *    「越具体的目录越优先」是前缀规则唯一说得通的语义；而同一条目录上
  *    我自己的名字覆盖部门的，与 `provider_alias` 的「人员规则逐条覆盖全局」同源。
  *
+ * ## ★★ 两种规则写法：仓库名（推荐）与路径前缀
+ *
+ * 同一个 `prefix` 列承载**两种**语义，靠「有没有路径分隔符」区分 ——
+ * 不加列是因为规则表已经在线上，加一列就要走一次迁移 + 双写期。
+ *
+ * | 写法 | 例 | 命中范围 | 什么时候用 |
+ * |---|---|---|---|
+ * | **仓库名**（不含分隔符） | `suit-g92-parent` | cwd 的**任一路径段**逐字等于它 | **绝大多数情况**：不关心仓库在哪个盘、挂在哪个父目录下 |
+ * | **路径前缀**（含分隔符） | `D:\Coding\suit-g92-parent` | 整条路径前缀（按分隔符边界） | 需要把同名仓库**限定在某几个位置**时 |
+ *
+ * ### 为什么仓库名模式是默认的推荐写法
+ *
+ * 路径前缀模式下，同一个仓库要**每种位置各配一条**：换盘（`D:` / `F:`）、
+ * 换父目录（`Coding` / `Coding_agent` / `vue_code`）、换大小写（`D:\` / `d:\`，
+ * 不同客户端写 `cwd` 的方式不同）—— 线上实测一个仓库要 3~6 条规则，
+ * 漏掉一个变体就**静默不命中**（页面上完全看不出来，只表现为「那个项目用量偏小」）。
+ * 仓库名模式把这三类差异全部消掉：**一条规则管所有位置**。
+ *
+ * ### 为什么仓库名模式**逐字**比较（不做大小写折叠）
+ *
+ * 仓库名逐字比较看起来吃亏（`Foo` 与 `foo` 要两条），但把「大小写不敏感」
+ * 做进匹配会在区分大小写的文件系统上把两个不同目录悄悄并起来 ——
+ * 那个方向的错误**页面上看不出来**。而漏配一个变体的后果是**可见的**
+ * （用量偏小、去明细页一看就知道少了一个目录）。
+ * 真实数据里仓库名的大小写变体只有盘符（`D:` / `d:`），而盘符在仓库名模式下
+ * 本来就不参与匹配（只比段名），所以**这条约束在仓库名模式下几乎不产生代价**。
+ *
  * ## 🚨 归一化只在**上报库**这条路径上生效
  *
  * 本机库（`usage.sqlite`）没有 `project_alias` 表，也没有 `resolve` ——
@@ -76,16 +103,19 @@ export interface ProjectAliasRule {
  */
 export type ProjectAliasMap = ReadonlyMap<string, string>
 
-/** 归一化的执行体：映射表 + 前缀匹配。 */
+/** 归一化的执行体：映射表 + 匹配。 */
 export interface ProjectNormalizer {
-  /** 原始前缀 → 项目名的映射表。键已归一化（尾部路径分隔符去掉）。 */
+  /** 原始规则值 → 项目名的映射表。键已归一化（尾部路径分隔符去掉）。 */
   readonly map: ProjectAliasMap
   /**
-   * 规则列表，按「前缀由长到短、同长按字符序」的**稳定顺序**。
+   * 规则列表，按**匹配优先级**的**稳定顺序**排列。
    *
    * ★ 保留它而不是只留一个 Map：这个顺序就是**匹配优先级**，
    *   也是页面上「哪条规则压住了哪条」的唯一依据。顺序只取决于规则**集合**，
    *   与数据库返回行的顺序无关 —— 同一个库、同一套规则，两次解析必然一致。
+   *
+   * 排序键（从主到次）：① 路径模式先于仓库名模式；② 同一模式内长度降序；
+   * ③ 同长度按字符序。① 的理由见 {@link projectNormalizer}。
    */
   readonly pairs: readonly (readonly [string, string])[]
   /** 规则条数。0 表示没有配置，所有调用点都应退回纯 `projectName()`。 */
@@ -98,6 +128,24 @@ export interface ProjectNormalizer {
 
 /** 路径分隔符：Windows 用 `\`，POSIX 用 `/`。两种都出现过的上报是常态。 */
 const SEPARATORS = new Set(['/', '\\'])
+
+/**
+ * 规则是**路径前缀**（含分隔符）还是**仓库名**（裸目录名）？
+ *
+ * ★ 判据是「含不含路径分隔符」，不是「含不含盘符」也不是长度：
+ *   仓库名本身就是一段不含分隔符的字符串，而路径前缀一定带分隔符 ——
+ *   `suit-g92-parent` 与 `D:\Coding\suit-g92-parent` 因此能被无歧义地分开，
+ *   不需要给表加一列（规则表已经在线上，加列要付一次迁移与双写的代价）。
+ *
+ * ⚠️ POSIX 的绝对路径 `/home/x/proj` 含分隔符 ⇒ 走路径模式；
+ *   而 `/proj` 这种「以分隔符开头的单段」也是路径模式（它的本意就是路径），
+ *   要配仓库名请写 `proj` 不带前导斜杠 —— 前导斜杠会让它退回路径模式，
+ *   而 `/proj` 作为前缀只匹配字面量 `/proj` 开头的路径，**大概率一条都不命中**。
+ */
+export function isProjectPathRule(value: string): boolean {
+  for (const char of value) if (SEPARATORS.has(char)) return true
+  return false
+}
 
 /**
  * 去掉**尾部**的路径分隔符。
@@ -129,6 +177,46 @@ export function projectPrefixMatches(prefix: string, cwd: string): boolean {
   if (cwd.length === prefix.length) return true
   if (SEPARATORS.has(prefix[prefix.length - 1]!)) return true
   return SEPARATORS.has(cwd[prefix.length]!)
+}
+
+/**
+ * 把 cwd 切成路径段（去掉尾部空段）。
+ *
+ * ⚠️ 不能用 `split(/[\\/]+/)` 就完事：尾部有分隔符时会多出一个空段，
+ *   而空段会被一条「空仓库名」规则命中 —— `projectPrefixError` 已经拒了空规则，
+ *   但这里仍要保证不产出空段（防御 `projectName()` 之外的第二条切分实现）。
+ */
+export function projectPathSegments(cwd: string): string[] {
+  const normalized = normalizeProjectPrefix(cwd)
+  if (normalized === '') return []
+  const parts = normalized.split(/[\\/]+/)
+  // 首段为空 ⇒ 绝对路径以分隔符开头（`/home/x`），那一段不是目录名。
+  return parts.filter((part) => part !== '')
+}
+
+/**
+ * 仓库名匹配：**cwd 的任一路径段**逐字等于规则值。
+ *
+ * ## 为什么是「任一段」而不是「最后一段」
+ *
+ * 上报的 cwd 常常停在**子目录**（`D:\Coding\presales-kb-parent\presales-kb-backend`），
+ * 只比最后一段会漏掉子目录里发生的用量 —— 而那正是这个功能要折叠的东西。
+ * 比「任一段」则仓库根与其所有子目录天然命中同一条规则。
+ *
+ * ## 为什么是**全等**而不是「段名前缀」
+ *
+ * 段名前缀会让 `skills-cli` 命中 `skills-cli-old`、`skills-cli-next` ——
+ * 那是两个不同的仓库，被悄悄并到一起且页面上看不出来。
+ * 全等的代价是「同名前缀的兄弟仓库要各配一条」，那个代价是**可见的**
+ * （它们仍然各自占一行，去明细页一看就明白），方向上更安全。
+ *
+ * ⚠️ 大小写逐字比较：见文件头「为什么仓库名模式逐字比较」那一节。
+ */
+export function projectRepoNameMatches(name: string, cwd: string): boolean {
+  for (const segment of projectPathSegments(cwd)) {
+    if (segment === name) return true
+  }
+  return false
 }
 
 /**
@@ -166,15 +254,31 @@ export function projectAliasesToMap(rules: readonly ProjectAliasRule[]): Project
  *   折叠掉可以让「没配规则」这条路径与迁移前**逐字节相同**。
  */
 export function projectNormalizer(map: ProjectAliasMap): ProjectNormalizer {
-  // ⚠️ 顺序固定成「长度降序、同长按字符序」而不是 Map 的插入序：
+  // ⚠️ 顺序固定成「路径模式优先、组内长度降序、同长按字符序」而不是 Map 的插入序：
   //   它既是匹配优先级，也是排查时逐字比对的依据 —— 插入序取决于数据库的
   //   `ORDER BY`，让「同一个库两次解析给出不同项目名」成为可能。
-  const pairs = [...map.entries()].sort(([a], [b]) => (b.length - a.length) || (a < b ? -1 : a > b ? 1 : 0))
+  //
+  // ★ 为什么路径模式排在仓库名模式**前面**（哪怕路径前缀比仓库名短）：
+  //   路径模式是使用者**显式限定了位置**的规则（「就管 D:\Coding 下那个」），
+  //   仓库名模式是「到处都叫这个名字的都算」。前者是更具体的一次陈述，
+  //   让它压住后者，语义上与「最长前缀优先」同源（都是「更具体/更受限的赢」）。
+  //   反过来（仓库名模式优先）会让一条 `D:\temp\foo` 永远打不过任意位置的 `foo`，
+  //   「限定位置」这个能力就没了 —— 而它正是路径模式继续存在的理由。
+  const pairs = [...map.entries()].sort(([a], [b]) => {
+    const mode = (isProjectPathRule(b) ? 1 : 0) - (isProjectPathRule(a) ? 1 : 0)
+    if (mode !== 0) return mode
+    return (b.length - a.length) || (a < b ? -1 : a > b ? 1 : 0)
+  })
   const apply = (cwd: string | null): string | undefined => {
     if (cwd === null || cwd === '') return undefined
     const value = normalizeProjectPrefix(cwd)
     for (const [prefix, alias] of pairs) {
-      if (projectPrefixMatches(prefix, value)) return alias
+      // ⚠️ 每次匹配都重判一次模式（`isProjectPathRule`）而不是预先分两组：
+      //   规则数是几十条量级，每条一次 O(len) 扫描换来的是「只有一份匹配代码」，
+      //   而两份实现分叉出不同结果的风险（最长前缀优先在两组里各写一遍）更高。
+      if (isProjectPathRule(prefix) ? projectPrefixMatches(prefix, value) : projectRepoNameMatches(prefix, value)) {
+        return alias
+      }
     }
     return undefined
   }
@@ -276,34 +380,46 @@ const PREFIX_MAX_LENGTH = PROJECT_PREFIX_MAX_LENGTH
 const ALIAS_MAX_LENGTH = PROJECT_ALIAS_MAX_LENGTH
 
 /**
- * 校验一个**原始 cwd 前缀**。
+ * 校验一条规则的**匹配值**（仓库名或路径前缀）。
  *
  * 返回 `null` 表示合法，否则返回给使用者看的原因 —— 与 `providerNameError()`
  * 同一风格：抛错由调用方决定（这里是仓储，会抛 `IdentityError`）。
  *
- * ⚠️ 大小写**不做归一化、也不提示**：`D:\a` 与 `d:\a` 在 `=`/`startsWith`
- *   比较里是两个前缀。Windows 上它们指向同一个目录，但把「大小写不敏感」
- *   做进匹配会在区分大小写的文件系统上把两个不同目录悄悄并起来 ——
- *   那个方向的错误没有页面能看出来。所以这里只做**尾部分隔符**归一化
- *   （那一处两种解释都指向同一个目录），并在页面上把「逐字一致」说清楚。
+ * ## 两种写法的校验差别（只有一条，但很要紧）
+ *
+ * **仓库名模式**（不含分隔符）下，盘符是**危险的**：`D:` 本身**就是** `D:\a\proj`
+ * 的第一段（`projectPathSegments` 产出 `['D:', 'a', 'proj']`），所以一条 `D:`
+ * 会命中**该磁盘下的每一个目录** —— 等于把整个盘折成一个项目。
+ * 这与拒绝文件系统根是同一条理由（都会把「所有东西」折成一行），所以直接拒掉。
+ *
+ * ⚠️ 但 `D:\` （带尾分隔符）**放行**：它含分隔符 ⇒ 走路径模式，
+ *   本意就是「D 盘下的东西」，是一个真实的边界。
+ *
+ * **大小写**一律不做归一化、也不提示：见文件头「为什么仓库名模式逐字比较」。
+ *   尾部分隔符归一化是例外（那一处两种解释都指向同一个目录）。
  *
  * ⚠️ 也不做全角 / Unicode 归一化：路径就是路径，用户是从目录选择器或
  *   明细页复制的。任何「看起来一样、字节不同」的改写都会让规则静默不命中。
  */
 export function projectPrefixError(value: unknown): string | null {
-  if (typeof value !== 'string') return '目录前缀需要是字符串'
-  if (!value) return '目录前缀不能为空'
-  if (value.length > PREFIX_MAX_LENGTH) return `目录前缀不能超过 ${PREFIX_MAX_LENGTH} 个字符`
-  if (INVISIBLE_CHARACTERS.test(value)) return '目录前缀不能包含空格以外的空白或不可见字符'
-  if (/^ | $/.test(value)) return '目录前缀首尾不能是空格'
+  if (typeof value !== 'string') return '匹配值需要是字符串'
+  if (!value) return '匹配值不能为空'
+  if (value.length > PREFIX_MAX_LENGTH) return `匹配值不能超过 ${PREFIX_MAX_LENGTH} 个字符`
+  if (INVISIBLE_CHARACTERS.test(value)) return '匹配值不能包含空格以外的空白或不可见字符'
+  if (/^ | $/.test(value)) return '匹配值首尾不能是空格'
+  const normalized = normalizeProjectPrefix(value)
   // ★ 拒绝**文件系统根**：`/`（以及 `///` 这类等价写法）会命中**所有** POSIX 路径，
   //   把所有项目折成一行 —— 它必然是误配，而不是使用者的本意。
   //   ⚠️ 用归一化之后的形态判断：`///` 与 `/` 是同一个前缀，只判字面量会漏掉前者。
   //   ⚠️ `D:\`（→ `D:`）刻意**放行**：那是「D 盘下的东西」，是一个真实的边界，
   //      虽然不常用，但它不像根那样会把整个世界折成一个项目。
-  const normalized = normalizeProjectPrefix(value)
   if (normalized === '/' || normalized === '\\') {
-    return '目录前缀不能是文件系统根目录（它会匹配所有路径）'
+    return '匹配值不能是文件系统根目录（它会匹配所有路径）'
+  }
+  // 仓库名模式下裸写盘符（`D:` / `c:`）会命中该磁盘下的**每一个**目录 ——
+  // 与文件系统根同一种危险，早一步拦掉好过让人配完在页面上发现「整个盘不见了」。
+  if (!isProjectPathRule(value) && /^[A-Za-z]:$/.test(value)) {
+    return '仓库名不能是盘符（如 D:），那会匹配该磁盘下的所有目录。请写仓库目录名（如 suit-g92-parent），它会匹配该仓库在任意磁盘、任意父目录下的所有子目录'
   }
   return null
 }
@@ -342,7 +458,12 @@ export interface PortalProjectAlias {
   member_id: string | null
   /** 人员显示名（全局规则为 `null`）。列表页直接展示，不再回查人员表。 */
   member_name: string | null
-  /** 匹配的原始 cwd 前缀（尾部路径分隔符已归一化后存库）。 */
+  /**
+   * 匹配值（尾部路径分隔符已归一化后存库）。
+   *
+   * **含分隔符 = 路径前缀**（限定位置），**不含分隔符 = 仓库名**（任意位置）。
+   * 见文件头「两种规则写法」那一节。
+   */
   prefix: string
   /** 归一化后的项目名。 */
   alias: string
