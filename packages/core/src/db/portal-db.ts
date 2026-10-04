@@ -1,7 +1,8 @@
 /** 上报库 v5 门面：业务入口强制版本闸门，旧库只能通过显式迁移保留历史升级。 */
 import type { Database } from './driver.js'
-import { openRawPortalSqlite, openRawPortalStore, type PortalTarget, type PortalStore } from './portal-connection.js'
-import { ensurePortalReady, ensurePortalSqliteReady } from './portal-migrations.js'
+import { openRawPortalSqlite, type PortalTarget, type PortalStore } from './portal-connection.js'
+import { openScopedPortalStore } from './portal-scope.js'
+import { ensurePortalSqliteReady } from './portal-migrations.js'
 export { resolvePortalTarget, describePortalTarget, redactMysqlUrl } from './portal-connection.js'
 export type { PortalTarget, PortalStore } from './portal-connection.js'
 export { portalDialect } from './dialect.js'
@@ -18,6 +19,11 @@ export { PORTAL_V8_TABLES, ROLLUP_HOUR_RETAIN_DAYS, rollupTimezoneKey } from './
 export { portalSchemaChecksumV7 } from './portal-schema-v5.js'
 export { inspectPortalDatabase, migratePortalDatabase, preparePortalDatabase } from './portal-migrations.js'
 export type { PortalInspection, PortalMigrationOptions } from './portal-migrations.js'
+// ★ 请求作用域（性能）：一次 HTTP 请求里 `openPortalStore()` 可能被调 2~4 次
+//   （鉴权一次 + 业务一次 + 归一化规则若干），每次都重跑一遍版本闸门。
+//   `withPortalStoreScope()` 让它们复用同一个已过闸门的 store。
+//   ⚠️ 它**不是** TTL 缓存：作用域 = 一个请求，改结构后下一个请求立刻拒绝。
+export { withPortalStoreScope, inPortalStoreScope } from './portal-scope.js'
 
 /** 同步入口只兼容测试/已有造数调用；不会迁移旧 v3。 */
 export function openPortalSqlite(path: string): Database {
@@ -26,8 +32,13 @@ export function openPortalSqlite(path: string): Database {
   catch (error) { try { db.close() } catch { /* 保留原始错误 */ } throw error }
 }
 
+/**
+ * 业务入口：开库 + 强制版本闸门。
+ *
+ * ★ 若当前处在 `withPortalStoreScope()` 里，复用作用域内那个**已过闸门**的
+ *   store（见 `portal-scope.ts`：一个请求要开 2~4 次库，每次重跑闸门是纯浪费）。
+ *   **没有作用域时行为与引入它之前逐字相同** —— CLI / 单测 / 迁移器都不开作用域。
+ */
 export async function openPortalStore(target: PortalTarget): Promise<PortalStore> {
-  const store = await openRawPortalStore(target)
-  try { await ensurePortalReady(store); return store }
-  catch (error) { await store.close(); throw error }
+  return await openScopedPortalStore(target)
 }

@@ -43,7 +43,7 @@
  */
 
 import { Hono, type Context, type MiddlewareHandler } from 'hono'
-import { PORTAL_SCHEMA_VERSION } from '@ai-token-report/core/db'
+import { PORTAL_SCHEMA_VERSION, withPortalStoreScope } from '@ai-token-report/core/db'
 import { compress } from 'hono/compress'
 import { etag } from 'hono/etag'
 import { logger } from 'hono/logger'
@@ -157,6 +157,13 @@ export function createApp(deps: AppDeps): Hono {
   }
 
   // ── 中间件：顺序即语义 ──────────────────────────────────────────
+  // 0) ★ 上报库请求作用域（性能）。**必须最先注册** —— 它要在下面每一个
+  //    会开库的环节（鉴权 / 看板取数 / 上报写入）之前就建立起来。
+  //    作用域内多次 `openPortalStore()` 复用同一个已过闸门的 store：
+  //    线上实测一次请求要开 2~4 次库，每次都重跑一遍 schema 闸门
+  //    （见 `docs/性能探索-线上-2026-10-04.md`）。
+  //    ⚠️ 它不是 TTL 缓存：作用域就是一个请求，改结构后下一个请求立刻拒绝。
+  app.use('*', async (_c, next) => await withPortalStoreScope(next))
   // 1) request-id 最先：后面所有日志与错误都带上它
   app.use('*', requestId())
   // 2) 访问日志必须包住 405 中间件：它在返回时把 404 改成 405，
