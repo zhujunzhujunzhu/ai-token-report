@@ -1,6 +1,6 @@
 /** 显式上报库迁移入口；默认 inspect，不触碰本地 usage.sqlite。 */
 import { resolve } from 'node:path'
-import { inspectPortalDatabase, migratePortalDatabase, describePortalTarget, closeAllMysqlBackends, PORTAL_SCHEMA_VERSION, type PortalMigrationOptions } from '@ai-token-report/core/db'
+import { inspectPortalDatabase, migratePortalDatabase, preparePortalDatabase, describePortalTarget, closeAllMysqlBackends, PORTAL_SCHEMA_VERSION, type PortalMigrationOptions } from '@ai-token-report/core/db'
 
 const args = process.argv.slice(2)
 const command = args.shift() ?? 'inspect'
@@ -12,7 +12,7 @@ function option(name: string): string | undefined {
   return value
 }
 async function main(): Promise<void> {
-  if (!['inspect','migrate','resume'].includes(command)) throw new Error(`用法：migrate-db.ts inspect|migrate|resume --db <portal.sqlite>；MySQL 使用 ATR_MYSQL_URL。旧库迁移必须 --confirm-offline。上报库当前版本是 v${PORTAL_SCHEMA_VERSION}：v4 是冻结基线，v3 库先迁到 v4，再依次走 v5→…→v${PORTAL_SCHEMA_VERSION}，任何一步都不改写事件原值。`)
+  if (!['inspect','migrate','resume','gate'].includes(command)) throw new Error(`用法：migrate-db.ts inspect|migrate|resume|gate --db <portal.sqlite>；MySQL 使用 ATR_MYSQL_URL。旧库迁移必须 --confirm-offline。上报库当前版本是 v${PORTAL_SCHEMA_VERSION}：v4 是冻结基线，v3 库先迁到 v4，再依次走 v5→…→v${PORTAL_SCHEMA_VERSION}，任何一步都不改写事件原值。`)
   const db = option('--db')
   const mysqlUrl = process.env.ATR_MYSQL_URL
   if (!db && !mysqlUrl) throw new Error('必须显式指定 --db 或 ATR_MYSQL_URL，防止误迁移默认库。')
@@ -24,6 +24,16 @@ async function main(): Promise<void> {
     const confirmedTarget = option('--backup-target')
     if (backup && sha256 && confirmedTarget) options.mysqlBackupProof = { path: backup, sha256, target: confirmedTarget }
   } else if (backup) options.sqliteBackupPath = backup
+  // ★ `gate` 走**业务热路径真正用的那道闸门**（`ensurePortalReady`：逐表比对列 / 唯一 /
+  //   外键 / CHECK / 排序规则 + 扫全历史引用），而 `inspect` 只读版本与账本。
+  //   两者判定的**不是同一件事** —— 一个库可以 `inspect: current` 而 `gate` 拒绝
+  //   （结构被手工改过、账本没动）。所以「线上库结构是否真的完好」只能问 gate。
+  if (command === 'gate') {
+    const started = Date.now()
+    const inspection = await preparePortalDatabase(target)
+    console.log(JSON.stringify({ ...inspection, gate: 'passed', elapsed_ms: Date.now() - started }, null, 2))
+    return
+  }
   const result = command === 'inspect' ? await inspectPortalDatabase(target) : await migratePortalDatabase(target, options)
   console.log(JSON.stringify(result, null, 2))
   if (command === 'inspect' && result.status === 'legacy') {

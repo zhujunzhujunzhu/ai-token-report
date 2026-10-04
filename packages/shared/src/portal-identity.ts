@@ -131,12 +131,13 @@ export interface PortalReportToken {
 }
 
 /**
- * ★ appKey（插件/CLI 上报凭证）的权限**只有这两个接口**。
+ * ★ appKey（插件 / CLI 上报凭证）的权限**只有这三个接口族**。
  *
  * | scope | 对应接口 | 用途 |
  * |---|---|---|
  * | `usage:write` | `POST /api/v1/token-usage` | 上报用量 |
  * | `stats:read` | `GET /api/v1/stats/*` | 获取统计信息 |
+ * | `cost:read` | `GET /api/v1/stats/pricing` | 读**只读单价快照**，好让本机算出的金额与看板同源 |
  *
  * 🚨 **常量而不是 UI 选项**：签发端点按它写库，页面拿它展示。
  *   若把范围交给请求体，就等于「页面写对了才有权限限制」——
@@ -145,8 +146,15 @@ export interface PortalReportToken {
  * ⚠️ 刻意**不含** `identity:read`：appKey 的用途就是上报与取数，
  *   而 `/api/v1/identity/verify` 的校验同时接受 `usage:write`
  *   （见服务端 `verifyIdentity`），所以插件只填 appKey 也能拿到自己的署名。
+ *
+ * ★ `cost:read` 是 2026-10 加进来的（此前刻意不加），原因变了：
+ *   面板 / CLI 要按**线上那份价**算金额，而 appKey 是它们手上唯一的凭证。
+ *   它带来的是**单价目录**（`model_price` 一行行价，不含任何用量），
+ *   加上原本就有的 `stats:read`，持有的仍然是「自己那份用量 + 全员价目表」。
+ *   ⚠️ 它**不是** `pricing:manage`：改价、看配置面 `/api/v1/admin/pricing*` 仍然要
+ *   后台账号的角色。
  */
-export const APP_KEY_SCOPES = ['usage:write', 'stats:read'] as const
+export const APP_KEY_SCOPES = ['usage:write', 'stats:read', 'cost:read'] as const
 
 /** appKey 在凭证列表里的缺省用途标签。 */
 export const APP_KEY_LABEL = '上报 appKey'
@@ -615,13 +623,6 @@ export interface PortalModelPriceIdRequest {
   price_id: string
 }
 
-/**
- * 用内置种子价初始化**空**的单价表。
- *
- * ★ 只在表为空时放行：它存在的意义是「刚部署完，一个价都没有」那一步。
- *   允许它对非空表执行，就等于把「覆盖我调好的价」做成一个按钮 ——
- *   而使用者点它的时候，多半以为自己在做别的事。
- */
-export interface PortalSeedModelPricesRequest {
-  confirm?: boolean
-}
+// ★ 这里曾经有 `PortalSeedModelPricesRequest`（「用内置种子价初始化」的请求体）。
+//   2026-10 随内置价目表一起删除：一条价都没有的库就是**没有金额**，
+//   要从零开始填请走单价管理页，或 `scripts/online-pricing.mjs`。

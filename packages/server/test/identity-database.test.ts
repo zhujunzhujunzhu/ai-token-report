@@ -661,29 +661,13 @@ describe('数据库权威身份', () => {
       await expect(r.deleteModelPrice(admin, { price_id: created.price_id })).rejects.toMatchObject({ status: 404 })
     })
 
-    test('★ 种子价只在空表时能写入：非空时回 409（否则它就是一个「覆盖我调好的价」的按钮）', async () => {
-      const { repository: r, admin } = await fixture()
-      const seeded = await r.seedModelPrices(admin, { confirm: true })
-      expect(seeded.prices.length).toBeGreaterThan(0)
-      // 内置种子价必须带来源标记，页面才分得出「没核对过的参考值」。
-      expect(seeded.prices.every((p) => (p.note ?? '').includes('种子价'))).toBe(true)
-      await expect(r.seedModelPrices(admin, { confirm: true })).rejects.toMatchObject({ status: 409 })
-      expect((await r.listModelPrices(admin)).prices.length).toBe(seeded.prices.length)
-    })
-
-    test('种子价必须显式确认（缺 confirm 就是 400，不能靠一个空 body 改数据）', async () => {
-      const { repository: r, admin } = await fixture()
-      await expect(r.seedModelPrices(admin, {})).rejects.toMatchObject({ status: 400 })
-      expect((await r.listModelPrices(admin)).prices.length).toBe(0)
-    })
-
     test('★ 单价的增删改全部进审计（改计价必须能查出是谁改的）', async () => {
       const { repository: r, admin } = await fixture()
       const created = (await r.setModelPrice(admin, price())).price
+      await r.setModelPrice(admin, { ...price(), price_id: created.price_id, input_micro_per_ktok: 3_000 })
       await r.deleteModelPrice(admin, { price_id: created.price_id })
-      await r.seedModelPrices(admin, { confirm: true })
       const actions = (await r.listAudit(admin, { target_type: 'model_price' })).rows.map((e) => e.action).sort()
-      expect(actions).toEqual(['model_price.delete', 'model_price.seed', 'model_price.set'])
+      expect(actions).toEqual(['model_price.delete', 'model_price.set', 'model_price.set'])
     })
 
     test('🚨 权限：`pricing:manage` 与普通成员无关，连读单价都要被拒（403）', async () => {
@@ -694,7 +678,6 @@ describe('数据库权威身份', () => {
       const actor = (await r.resolveBearer(token.token_secret))!
       await expect(r.listModelPrices(actor)).rejects.toMatchObject({ status: 403 })
       await expect(r.setModelPrice(actor, price())).rejects.toMatchObject({ status: 403 })
-      await expect(r.seedModelPrices(actor, { confirm: true })).rejects.toMatchObject({ status: 403 })
       expect(actor.permissions).not.toContain('pricing:manage')
       // `cost:read`（能看金额）与 `pricing:manage`（能改计价）是**两件事**：
       // 普通成员两个都没有，而它们不会因为「能看数」就自动带上「能改价」。

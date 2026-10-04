@@ -23,7 +23,7 @@ import { existsSync, readFileSync, mkdirSync, statSync, writeFileSync } from 'no
 import { dirname, resolve } from 'node:path'
 import type { Database } from './driver.js'
 import { describePortalTarget, openRawPortalStore, type PortalStore, type PortalTarget } from './portal-connection.js'
-import { PORTAL_SCHEMA_VERSION, PORTAL_SQLITE_INGEST_SQL, PORTAL_MYSQL_INGEST_SQL, portalSchemaChecksum, portalSchemaChecksumV6, portalSchemaChecksumV7, portalSchemaChecksumV8, portalSchemaChecksumV9, portalSchemaChecksumV10, portalSchemaChecksumV11, portalSchemaStatements, portalV6Statements, portalV6TableStatement, portalV7Statements, portalV7TableStatement, portalV8Statements, portalV8TableStatement, PORTAL_V8_TABLES, PORTAL_SOURCE_COLUMN, portalV9AddColumnStatement, portalV10AddColumnStatements, PORTAL_OFFPEAK_SCHEDULE_COLUMN, portalV11Statements, portalV11TableStatement, PROJECT_ALIAS_TABLE, portalV12AddColumnStatement, portalV12ReplaceProviderAliasIndex, portalProviderAliasTemporaryIndex, portalProviderAliasUniqueIndex, PORTAL_MODEL_COLUMN, PORTAL_PROVIDER_ALIAS_TEMP_INDEX, PORTAL_PROVIDER_ALIAS_UNIQUE_COLUMNS, PORTAL_PROVIDER_ALIAS_UNIQUE_INDEX } from './portal-schema-v5.js'
+import { PORTAL_SCHEMA_VERSION, PORTAL_SQLITE_INGEST_SQL, PORTAL_MYSQL_INGEST_SQL, portalSchemaChecksum, portalSchemaChecksumV6, portalSchemaChecksumV7, portalSchemaChecksumV8, portalSchemaChecksumV9, portalSchemaChecksumV10, portalSchemaChecksumV11, portalSchemaChecksumV12, portalSchemaStatements, portalV6Statements, portalV6TableStatement, portalV7Statements, portalV7TableStatement, portalV8Statements, portalV8TableStatement, PORTAL_V8_TABLES, PORTAL_SOURCE_COLUMN, portalV9AddColumnStatement, portalV10AddColumnStatements, PORTAL_OFFPEAK_SCHEDULE_COLUMN, portalV11Statements, portalV11TableStatement, portalV13Statements, PROJECT_ALIAS_TABLE, portalV12AddColumnStatement, portalV12ReplaceProviderAliasIndex, portalProviderAliasTemporaryIndex, portalProviderAliasUniqueIndex, PORTAL_MODEL_COLUMN, PORTAL_PROVIDER_ALIAS_TEMP_INDEX, PORTAL_PROVIDER_ALIAS_UNIQUE_COLUMNS, PORTAL_PROVIDER_ALIAS_UNIQUE_INDEX } from './portal-schema-v5.js'
 import { PORTAL_SQLITE_V4_INGEST_SQL, PORTAL_MYSQL_V4_INGEST_SQL, portalSchemaChecksumV4, portalSchemaStatementsV4 } from './portal-schema-v4.js'
 import { checkExpressions, sameChecks, normalizeTrigger } from './portal-catalog.js'
 
@@ -90,6 +90,25 @@ const V10_VERSION = 10
  *   而 v12 只是给 `provider_alias` 加一列 + 换一次唯一索引就能升上去。
  */
 const V11_VERSION = 11
+/**
+ * v12 的**结构**版本号（= v11 + `provider_alias.model` 与三列唯一索引）。
+ *
+ * ★ 与 v7~v11 同理：v13 的账本行是当前版本，而 v12 行必须能被认出来 ——
+ *   那是「这个库是完整的上一版、可以原地升 v13」的证据。
+ *   少了这一行，已经迁到 v12 的库会变成 `unsupported`（服务端拒绝启动），
+ *   而 v13 **连 DDL 都没有**（只是把 `cost:read` 授给内置 `member` 角色，
+ *   好让普通成员签得出 appKey）—— 一条权限关系而已，却被判成不可迁移。
+ */
+const V12_VERSION = 12
+/**
+ * ★ 闸门需要逐个判定的**全部**账本版本（v4 基线 + v5~v12 过渡 + v13 当前）。
+ *
+ * ⚠️ 升 v14 时**必须**把 v13 加进来，否则「v13 库升不上去」：
+ *   漏一个版本的表现不是报错，而是那个版本被静默判成 `unsupported`
+ *   —— 服务端拒绝启动，而错误文案说的是「状态 unsupported」，不说是谁漏了。
+ *   与其靠人记得改这里，不如让测试对着版本号范围断言（见 `portal-v13.test.ts`）。
+ */
+const LEDGER_VERSIONS: readonly number[] = [BASELINE_VERSION, V5_VERSION, V6_VERSION, V7_VERSION, V8_VERSION, V9_VERSION, V10_VERSION, V11_VERSION, V12_VERSION, PORTAL_SCHEMA_VERSION]
 type SchemaVersion = 4 | 5
 
 export interface PortalInspection {
@@ -137,13 +156,55 @@ async function migrationRow(store: PortalStore, tables: string[], version: numbe
   if (!tables.includes('portal_schema_migrations')) return null
   return await store.get<MigrationRow>('SELECT version,checksum,status,last_completed_step,checkpoint_json FROM portal_schema_migrations WHERE version=$version', { $version: version })
 }
+/**
+ * ★ 一次性读回**全部**版本账本行（v4~v12 一次查完），替代逐版本 `migrationRow()`。
+ *
+ * ## 为什么可以这样改（语义不变）
+ *
+ * 原来 `readPortalState()` 为了判「这一版账本在不在、checksum 对不对」，
+ * 逐个版本各发一条 `SELECT ... WHERE version=$v`，**9 个版本就是 9 次往返**。
+ * 但这些行全都来自**同一张只有十几行的小表**，一次 `IN` 查询拿回的就是同一份事实 ——
+ * 改动只影响「怎么取」，不影响「比什么」。
+ *
+ * 线上实测（MySQL 8，`117.72.173.21`）：逐版本 9 次 **138ms**，
+ * 一次 IN 查 **16ms**；**往返 9→1**。这条在业务热路径上每个 API 请求都要付一次。
+ *
+ * ⚠️ 刻意**不缓存**这张表：闸门的存在理由就是「运行中改结构立刻拒绝」
+ *   （见 `ensurePortalReady` 的 🚨），缓存会让它在一个 TTL 窗口内被放行。
+ *   这里的收益来自「少发语句」，不是「少读数据」。
+ */
+async function migrationLedger(store: PortalStore, tables: string[]): Promise<Map<number, MigrationRow>> {
+  if (!tables.includes('portal_schema_migrations')) return new Map()
+  // ⚠️ 占位符名**必须以字母或下划线开头**（`$v4` 而不是 `$4`）。
+  //   `mysql.ts` 的翻译正则是 `\$([A-Za-z_][A-Za-z0-9_]*)` —— `$1` 这类位置写法
+  //   在 SQLite 上正常、在 MySQL 上原样送进服务端，报 **`Unknown column '$1' in
+  //   'where clause'`**。而这类分叉只有真 MySQL 才暴露（SQLite 全绿）。
+  //   同一个 `$name` 出现多次时驱动会各补一个值，这里每个版本只出现一次。
+  const params: Record<string, unknown> = {}
+  const placeholders = LEDGER_VERSIONS.map((version, index) => {
+    const name = `$ledger${index}`
+    params[name] = version
+    return name
+  })
+  const rows = await store.all<MigrationRow>(
+    `SELECT version,checksum,status,last_completed_step,checkpoint_json FROM portal_schema_migrations
+     WHERE version IN (${placeholders.join(',')})`,
+    params,
+  )
+  const ledger = new Map<number, MigrationRow>()
+  for (const row of rows) ledger.set(Number(row.version), row)
+  return ledger
+}
 async function readPortalState(store: PortalStore): Promise<Omit<PortalInspection, 'eventCount'>> {
   const tables = await tablesOf(store)
   const version = store.kind === 'sqlite'
     ? Number((await store.get<{ user_version: number }>('PRAGMA user_version'))?.user_version ?? 0)
     : tables.includes('portal_meta') ? Number((await store.get<{ schema_version: number }>('SELECT schema_version FROM portal_meta WHERE id=1'))?.schema_version ?? 0) : 0
-  const current = await migrationRow(store, tables, PORTAL_SCHEMA_VERSION)
-  const baseline = await migrationRow(store, tables, BASELINE_VERSION)
+  // ★ 一次读完全部版本账本，而不是逐版本各查一次（见 `migrationLedger` 的注释）。
+  const ledger = await migrationLedger(store, tables)
+  const rowOf = (v: number): MigrationRow | null => ledger.get(v) ?? null
+  const current = rowOf(PORTAL_SCHEMA_VERSION)
+  const baseline = rowOf(BASELINE_VERSION)
   /**
    * v5 账本行是否存在且完整。
    *
@@ -153,13 +214,14 @@ async function readPortalState(store: PortalStore): Promise<Omit<PortalInspectio
    *   `historyFingerprint('dept')` 抛 `Unknown column 'dept'`，此后每次 resume
    *   都失败。v5 账本行一旦存在，基线步骤就早已过去。
    */
-  const v5Row = await migrationRow(store, tables, V5_VERSION)
-  const v6Row = await migrationRow(store, tables, V6_VERSION)
-  const v7Row = await migrationRow(store, tables, V7_VERSION)
-  const v8Row = await migrationRow(store, tables, V8_VERSION)
-  const v9Row = await migrationRow(store, tables, V9_VERSION)
-  const v10Row = await migrationRow(store, tables, V10_VERSION)
-  const v11Row = await migrationRow(store, tables, V11_VERSION)
+  const v5Row = rowOf(V5_VERSION)
+  const v6Row = rowOf(V6_VERSION)
+  const v7Row = rowOf(V7_VERSION)
+  const v8Row = rowOf(V8_VERSION)
+  const v9Row = rowOf(V9_VERSION)
+  const v10Row = rowOf(V10_VERSION)
+  const v11Row = rowOf(V11_VERSION)
+  const v12Row = rowOf(V12_VERSION)
   let status: PortalInspection['status'] = 'unsupported'
   if (tables.length === 0 && version === 0) status = 'empty'
   else if (version === 0 && tables.length === 1 && tables[0] === 'portal_schema_migrations' && !current && !baseline) status = 'incomplete'
@@ -207,8 +269,12 @@ async function readPortalState(store: PortalStore): Promise<Omit<PortalInspectio
   //   少了它，一个被手工改过结构的 v11 库会冒充成「只差一次追加迁移」，
   //   而 v12 会给它加列换索引 —— 手工改动会被一路带上去，且没有任何一步报错。
   else if (version === V11_VERSION && v11Row?.status === 'completed' && v11Row.checksum === portalSchemaChecksumV11(store.kind) && !current) status = 'legacy'
-  // v5/v6/v7/v8/v9/v10/v11 账本存在但 checksum 不符（程序换了 SQL 或库被改过）会落到 'unsupported'，绝不冒充 current。
-  return { kind: store.kind, label: store.label, version, status, tables, migration: current ?? v11Row ?? v10Row ?? v9Row ?? v8Row ?? v7Row ?? v6Row ?? v5Row ?? baseline }
+  // ★ v12：结构 = v11 + `provider_alias.model` 与三列唯一索引。额外比对**冻结的 v12 摘要**，
+  //   理由与 v6~v11 完全一致（手工改过结构的库不许冒充「只差一次追加迁移」）。
+  //   而 v13 是**纯权限版本**（无 DDL），所以 v12 库正是「结构完整、可原地升 v13」的起点。
+  else if (version === V12_VERSION && v12Row?.status === 'completed' && v12Row.checksum === portalSchemaChecksumV12(store.kind) && !current) status = 'legacy'
+  // v5/v6/v7/v8/v9/v10/v11/v12 账本存在但 checksum 不符（程序换了 SQL 或库被改过）会落到 'unsupported'，绝不冒充 current。
+  return { kind: store.kind, label: store.label, version, status, tables, migration: current ?? v12Row ?? v11Row ?? v10Row ?? v9Row ?? v8Row ?? v7Row ?? v6Row ?? v5Row ?? baseline }
 }
 async function inspectStore(store: PortalStore): Promise<PortalInspection> {
   const state = await readPortalState(store)
@@ -467,18 +533,20 @@ async function verifyCurrentMysql(store: PortalStore): Promise<void> {
   const foreignRows = await store.all<{ table: string; name: string; col: string; ref_table: string; ref_col: string; delete_rule: string; update_rule: string }>(
     'SELECT k.table_name AS `table`, k.constraint_name AS name, k.column_name AS col, k.referenced_table_name AS ref_table, k.referenced_column_name AS ref_col, r.delete_rule AS delete_rule, r.update_rule AS update_rule FROM information_schema.key_column_usage k JOIN information_schema.referential_constraints r ON r.constraint_schema=k.constraint_schema AND r.constraint_name=k.constraint_name WHERE k.table_schema=DATABASE() ORDER BY k.table_name, k.constraint_name, k.ordinal_position',
   )
-  // 🚨 CHECK 的 JOIN **必须带 `TABLE_NAME` 条件**：本机实测同一实例里
-  //   `information_schema.check_constraints` 有 170 行，不带表名条件时
-  //   MySQL 要把每行的 `CHECK_CLAUSE` 文本（含正则表达式）都取出来比较，
-  //   单这一条就是 **48ms**（比其余 7 条加起来还慢 10 倍）；
-  //   带上表名条件后是 1ms 量级。20 张表各查一次仍然比全库一次快。
-  const checkRows: { table: string; expression: string; enforced: string }[] = []
-  for (const table of tableSql.keys()) {
-    checkRows.push(...await store.all<{ table: string; expression: string; enforced: string }>(
-      "SELECT t.table_name AS `table`, c.check_clause AS expression, t.enforced AS enforced FROM information_schema.table_constraints t JOIN information_schema.check_constraints c ON c.constraint_schema=t.constraint_schema AND c.constraint_name=t.constraint_name WHERE t.table_schema=DATABASE() AND t.table_name=$table AND t.constraint_type='CHECK'",
-      { $table: table },
-    ))
-  }
+  // 🚨 CHECK 必须**收窄到本库的 constraint_schema**。
+  //   `information_schema.check_constraints` 是**实例级**的：本机实测同一实例有 226 行，
+  //   其中其它 schema 的 CHECK 文本也带正则表达式，不收窄时 MySQL 要把它们全取出来比较。
+  //   加上 `c.constraint_schema=DATABASE()` 后只比较本库的约束。
+  //
+  // ★ 这里**刻意用「全库一条」而不是「每表一条」**（v12 及以前是每表一轮）：
+  //   两者取到的是同一份事实（`table_constraints` 与 `check_constraints` 的连接键
+  //   就是 `constraint_schema` + `constraint_name`，`table_name` 只是个过滤条件），
+  //   差别只在往返次数。线上实测（19→27 张表）：
+  //   逐表 27 次 **446ms**、全库一条 **185ms**，**往返 27→1**。
+  //   闸门在业务热路径上每个 API 请求都要付一次，这个线性项是每请求固定开销的主因。
+  const checkRows = await store.all<{ table: string; expression: string; enforced: string }>(
+    "SELECT t.table_name AS `table`, c.check_clause AS expression, t.enforced AS enforced FROM information_schema.table_constraints t JOIN information_schema.check_constraints c ON c.constraint_schema=t.constraint_schema AND c.constraint_name=t.constraint_name WHERE t.table_schema=DATABASE() AND t.constraint_type='CHECK' AND c.constraint_schema=DATABASE() ORDER BY t.table_name, t.constraint_name",
+  )
 
   const groupBy = <Row extends { table: string }>(rows: readonly Row[]): Map<string, Row[]> => {
     const grouped = new Map<string, Row[]>()
@@ -1022,6 +1090,12 @@ async function upgradeV4ToV5(store: PortalStore, target: PortalTarget, options: 
         throw gate('迁移前后原始事件不一致，拒绝标记完成。')
       }
     }
+    // 🚨 v13 **必须排在最后**（v7 之后、v5 重建之后）：它给内置 `member` 角色补一条
+    //   `role_permissions`，而 `permission_id` 上有指向 `permissions` 的外键 ——
+    //   那行 `cost:read`（`…114`）是 **v7** 才插进去的。排在 v12 那一步后面
+    //   （v7 之前）会在老库上直接 `FOREIGN KEY constraint failed`，
+    //   而错误信息完全不提「是权限行还没建」。
+    await upgradeV12ToV13(store)
     const final = await historyFingerprint(store, 'group_name')
     if (checkpoint.historyHash && (final.hash !== checkpoint.historyHash || final.count !== checkpoint.historyCount)) {
       throw gate('迁移前后原始事件不一致，拒绝标记完成。')
@@ -1335,6 +1409,22 @@ async function upgradeV11ToV12(store: PortalStore): Promise<void> {
   // ── 唯一索引：`(member_id, provider)` → `(member_id, provider, model)` ──
   await replaceProviderAliasUniqueIndex(store)
   await verifyTable(store, 'provider_alias', tableStatement(store.kind, 'provider_alias'))
+}
+
+/**
+ * v12 → v13：**只动数据** —— 把 `cost:read` 授予内置 `member` 角色。
+ *
+ * 这一版没有任何 DDL，理由写在 `portal-schema-v13.ts` 的文件头
+ * （appKey 的固定范围 2026-10 起含 `cost:read`，而「凭证能做什么 = 角色权限 ∩
+ * 凭证 scopes」，内置 `member` 角色没有它 ⇒ 普通成员一条 appKey 都签不出来）。
+ *
+ * ⚠️ 幂等由 SQL 自身保证（`WHERE NOT EXISTS`），所以 resume 重跑安全；
+ *   这里**没有** `verifyTable()` 可核对 —— 本版本不动结构，
+ *   受控摘要也因此与 v12 逐字相同（见 `portalSchemaChecksumV12()`）。
+ */
+async function upgradeV12ToV13(store: PortalStore): Promise<void> {
+  if (!(await tablesOf(store)).includes('role_permissions')) return
+  for (const sql of portalV13Statements()) await store.exec(sql)
 }
 
 /**

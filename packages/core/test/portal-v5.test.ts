@@ -306,10 +306,13 @@ test('SQLite v6 库是可迁移起点：只追加 model_price 与两条权限码
     expect(await after.get<{ name: string }>("SELECT name FROM sqlite_master WHERE type='table' AND name='model_price'")).toEqual({ name: 'model_price' })
     // ★ 唯一索引必须在位 —— 这正是迁移路径曾经整个漏掉的东西（见 `isCreateIndex()`）。
     expect((await after.all<{ name: string; unique: number; origin: string }>('PRAGMA index_list(model_price)')).filter(row => row.origin === 'c').map(row => `${row.name}:${row.unique}`).sort()).toEqual(['idx_model_price_span:1', 'idx_model_price_target:0'])
-    // 两条权限码补齐，且只授给内置管理员角色（普通成员不该默认可见金额）。
+    // 两条权限码补齐；`pricing:manage` 只授给内置管理员，而 `cost:read` 自 **v13** 起
+    // **也**授给内置 `member` —— appKey 的固定范围含 `cost:read`，而「一份凭证能做什么
+    // = 角色权限 ∩ 凭证 scopes」，不授这一条，普通成员连一条 appKey 都签不出来。
     expect(await after.all<{ code: string }>("SELECT code FROM permissions WHERE code LIKE 'cost:%' OR code LIKE 'pricing:%' ORDER BY code")).toEqual([{ code: 'cost:read' }, { code: 'pricing:manage' }])
-    expect(await after.all<{ role_id: string; permission_id: string }>("SELECT role_id,permission_id FROM role_permissions WHERE permission_id IN ('00000000-0000-4000-8000-000000000114','00000000-0000-4000-8000-000000000115') ORDER BY permission_id")).toEqual([
+    expect(await after.all<{ role_id: string; permission_id: string }>("SELECT role_id,permission_id FROM role_permissions WHERE permission_id IN ('00000000-0000-4000-8000-000000000114','00000000-0000-4000-8000-000000000115') ORDER BY permission_id,role_id")).toEqual([
       { role_id: '00000000-0000-4000-8000-000000000001', permission_id: '00000000-0000-4000-8000-000000000114' },
+      { role_id: '00000000-0000-4000-8000-000000000002', permission_id: '00000000-0000-4000-8000-000000000114' },
       { role_id: '00000000-0000-4000-8000-000000000001', permission_id: '00000000-0000-4000-8000-000000000115' },
     ])
     // 账本：一条未完成的都不许有，v6 那一行的 checksum 必须**仍是冻结的 v6 摘要**

@@ -158,11 +158,11 @@ try {
   equal((await request(a, 'stats/overview?member_id=' + first.member_id)).status, 400, '新筛选不能隐式切换旧视图')
   equal((await request(a, 'stats/overview?identity_view=member&user=同名成员')).status, 400, '旧筛选不能混入新视图')
   equal((await request(a, 'stats/overview?identity_view=member&legacy_user=legacy:_w')).status, 400, '损坏UTF8历史键拒绝')
-  // ── ★ appKey：插件面板只填 baseUrl + appKey，权限只有「上报 + 获取统计」 ──
+  // ── ★ appKey：插件面板只填 baseUrl + appKey，权限固定为「上报 + 获取统计 + 单价目录」 ──
   const appKeyMember = (await request(a, 'admin/members', adminToken, { name: 'appKey 成员', role_ids: [memberRole], group_ids: [group.group_id] })).data.member
   const appKeyIssue = await request(a, 'admin/members/appkey', adminToken, { member_id: appKeyMember.member_id })
   equal(appKeyIssue.status, 200, 'appKey 发放成功')
-  equal(appKeyIssue.data.token.scopes, ['stats:read', 'usage:write'], 'appKey 权限恰好是上报与取数两项')
+  equal(appKeyIssue.data.token.scopes, ['cost:read', 'stats:read', 'usage:write'], 'appKey 权限恰好是上报、取数与单价目录三项')
   equal(appKeyIssue.data.token.label, '上报 appKey', 'appKey 有固定的用途标签')
   equal((await request(a, 'admin/members/appkey', adminToken, { member_id: appKeyMember.member_id, scopes: ['members:manage'] })).status, 400, 'appKey 不接受更宽的权限范围')
   const appKeySecret = appKeyIssue.data.token_secret
@@ -178,7 +178,7 @@ try {
   equal(appKeyList.status, 200, 'appKey 列表可读')
   const listed = appKeyList.data.appkeys.find((entry: any) => entry.token.token_id === appKeyIssue.data.token.token_id)
   equal([listed.member.member_id, listed.member.name, listed.member.groups.map((item: any) => item.name)], [appKeyMember.member_id, 'appKey 成员', ['研发组']], '列表按人员关系带出归属与分组')
-  equal(listed.token.scopes, ['stats:read', 'usage:write'], '列表带出固定两项权限')
+  equal(listed.token.scopes, ['cost:read', 'stats:read', 'usage:write'], '列表带出固定三项权限')
   assert(!JSON.stringify(appKeyList).includes(appKeySecret)); checks++
   equal((await request(a, 'admin/appkeys', null)).status, 401, '未认证不能读凭证列表')
   equal((await request(b, 'admin/appkeys', appKeySecret)).status, 403, 'appKey 不能读凭证列表')
@@ -457,9 +457,10 @@ try {
   const snapshotRow = (await request(a, 'stats/pricing', adminToken)).data.prices.find((p: any) => p.model === 'offpeak-ok')
   equal(snapshotRow.offpeak_schedule, 'deepseek-cn', '只读单价快照带上闲时时段表')
   equal(snapshotRow.offpeak_cache_read_micro_per_ktok, 20, '只读单价快照带上闲时缓存读价')
-  // 种子价只在空表时能写 —— 非空时必须挡住「一键覆盖我调好的价」。
-  equal((await request(a, 'admin/pricing/seed', adminToken, { confirm: true })).status, 409, '单价表非空时种子初始化回 409')
-  equal((await request(a, 'admin/pricing/seed', adminToken, {})).status, 400, '种子初始化必须显式确认')
+  // ★ 种子初始化接口已随内置价目表一起删除（2026-10）：一条价都没有的库就是「没有金额」，
+  //   不再有一个「一键写入参考价」的入口。这里钉住它真的没了（404），而不是被换了个路径。
+  equal((await request(a, 'admin/pricing/seed', adminToken, { confirm: true })).status, 404, '种子初始化接口已删除')
+  equal((await request(a, 'admin/pricing/seed', adminToken, {})).status, 404, '种子初始化接口已删除（缺 confirm 也是 404）')
   // ★ 改动计价**不得**改写任何用量数字：这正是「只存单价、绝不存金额」的收益。
   equal(JSON.stringify((await request(a, 'stats/overview?identity_view=member')).data), overviewBefore, '写单价前后，看板用量数字逐字不变')
   const priceId = (await request(a, 'admin/pricing')).data.prices.find((p: any) => p.model === 'deepseek-v4.1-flash').price_id
