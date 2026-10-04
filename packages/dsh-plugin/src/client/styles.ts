@@ -21,7 +21,7 @@
 /** `<style>` 标签的身份。同时用于去重与调试时定位来源。 */
 import calendarCss from 'react-day-picker/style.css' with { type: 'text' }
 
-export const STYLE_TAG_ID = '@ai-token-report/dsh-plugin/client.css'
+export const STYLE_TAG_ID = 'dsh-plugin-token-report/client.css'
 
 export const CSS = calendarCss.replaceAll('.rdp-', '.atr-rdp-') + `
 /* ★ 用量条的宽度必须自己减掉两侧的 --dsh-composer-side-clearance。
@@ -312,7 +312,7 @@ export function installStyles(doc: Document | undefined = globalThis.document): 
   if (existing !== null) return () => {}
 
   const tag = doc.createElement('style')
-  tag.dataset['plugin'] = '@ai-token-report/dsh-plugin'
+  tag.dataset['plugin'] = 'dsh-plugin-token-report'
   tag.dataset['pluginCss'] = STYLE_TAG_ID
   tag.textContent = CSS
   doc.head.appendChild(tag)

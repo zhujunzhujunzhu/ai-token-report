@@ -2,7 +2,7 @@
  * 构建插件的浏览器半 → `lib/client.js`。
  *
  * ```bash
- * bun run --filter '@ai-token-report/dsh-plugin' build:client
+ * bun run --filter 'dsh-plugin-token-report' build:client
  * ```
  *
  * ## 为什么要一个脚本，而不是一行 `bun build`
@@ -12,7 +12,7 @@
  *
  * ```js
  * window.__ModuleLoader__.load({
- *   id: "@ai-token-report/dsh-plugin",
+ *   id: "dsh-plugin-token-report",
  *   factory: (require) => {   // ← 整个 CJS 产物必须在这个函数**里面**
  *     var module = { exports: {} }; var exports = module.exports;
  *     ...bun build 产出的 CJS...
@@ -42,8 +42,8 @@
 import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
-/** 插件在 DSH 客户端模块图里的 id。用**包名本身**。 */
-const CLIENT_ID = '@ai-token-report/dsh-plugin'
+/** 插件在 DSH 客户端模块图里的 id。用**包名本身**（= 发布名，两者已统一）。 */
+const CLIENT_ID = 'dsh-plugin-token-report'
 
 /**
  * DSH 前端预置的模块表（`PLATFORM_MODULES`）。

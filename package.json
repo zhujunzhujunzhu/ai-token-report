@@ -23,11 +23,11 @@
     "build": "bun run build:local && bun run build:portal",
 
     "build:npm:cli": "bun run --filter '@ai-token-report/web-local' build && bun run --filter '@ai-token-report/cli' build:npm",
-    "build:npm:plugin": "bun run --filter '@ai-token-report/dsh-plugin' build:npm",
+    "build:npm:plugin": "bun run --filter 'dsh-plugin-token-report' build:npm",
     "build:npm": "bun run build:npm:cli && bun run build:npm:plugin",
 
     "verify:npm:cli": "bun run --filter '@ai-token-report/cli' verify:npm",
-    "verify:npm:plugin": "bun run --filter '@ai-token-report/dsh-plugin' verify:npm",
+    "verify:npm:plugin": "bun run --filter 'dsh-plugin-token-report' verify:npm",
     "verify:npm": "bun run verify:npm:cli && bun run verify:npm:plugin",
 
     "publish:cli:dry": "bun run scripts/release.ts cli --dry-run",

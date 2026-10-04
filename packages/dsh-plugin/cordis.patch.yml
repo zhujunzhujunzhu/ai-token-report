@@ -8,4 +8,4 @@
 # 按 id 覆盖（patch 的 config 是整体替换，不是深合并）。
 - insert:
     - id: token-report
-      name: '@ai-token-report/dsh-plugin'
+      name: 'dsh-plugin-token-report'

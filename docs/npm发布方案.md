@@ -42,10 +42,10 @@ workspace 里的包名可以原封不动。
 
 | 好处 | 说明 |
 |---|---|
-| **零改名** | `@ai-token-report/*` 在仓内 100+ 处引用、11 条 `tsconfig.paths` **一处都不用动** |
+| **零改名** | `@ai-token-report/*` 在仓内 100+ 处引用、11 条 `tsconfig.paths` **一处都不用动**（插件包 0.9.0 起是唯一例外：它改名成了发布名，见下一行） |
 | **零运行时依赖** | `bun build` 把 `core` / `shared` 内联，发布清单里**没有 `dependencies`** |
 | **绕开 private 与 `workspace:*`** | 那两个包是 `private: true`、从未发布；若直接发 workspace 包，`workspace:*` 会被改写成指向它们的版本号 → 同事安装期 **404** |
-| **发布名与 dev 名解耦** | 仓库里叫 `@ai-token-report/dsh-plugin`（`tsconfig` / workspace 解析依赖它），npm 上叫 `dsh-plugin-token-report`；映射只发生在构建脚本一处 |
+| **包名与发布名一致（插件）** | 0.9.0 起 `packages/dsh-plugin` 的 `name` 就是发布名 `dsh-plugin-token-report`。**不能解耦**：插件市场的 npm 映射读的正是仓内 `package.json` 的 `name`，不一致就拿不到映射，一键安装会退化成源码安装（而本仓源码依赖 `workspace:*`，装不上）。CLI 包名与发布名则仍解耦（见 §1） |
 
 ⚠️ 代价（要知情）：`shared` / `core` **没有作为独立包发布**，所以其它团队插件
 目前**不能** `import` 本仓的类型与口径函数。见 §5。
@@ -55,15 +55,15 @@ workspace 里的包名可以原封不动。
 ## 2. 插件发布管线（已落地）
 
 ```bash
-bun run --filter '@ai-token-report/dsh-plugin' build:npm    # → packages/dsh-plugin/dist
-bun run --filter '@ai-token-report/dsh-plugin' verify:npm   # ★ 发布前必跑
+bun run --filter 'dsh-plugin-token-report' build:npm    # → packages/dsh-plugin/dist
+bun run --filter 'dsh-plugin-token-report' verify:npm   # ★ 发布前必跑
 npm publish packages/dsh-plugin/dist
 ```
 
 **根目录快捷方式**（与外层 `package.json` 的 scripts 一一对应，免记 `--filter`）：
 
 ```bash
-bun run build:npm:plugin      # = --filter '@ai-token-report/dsh-plugin' build:npm
+bun run build:npm:plugin      # = --filter 'dsh-plugin-token-report' build:npm
 bun run verify:npm:plugin     # ★ 发布前必跑
 bun run publish:plugin:dry    # 只打包断言 tarball，不发布
 bun run publish:plugin:next   # 发 --tag next（首版就走这个）
@@ -93,7 +93,7 @@ packages/dsh-plugin/dist/
 | 约束 | 违反的后果 | 谁兜住 |
 |---|---|---|
 | `cordis.patch.yml` 的 `name` 必须是**发布名** | DSH 启动报「找不到模块」。DSH loader 拿这个字符串去 `import()` | 脚本**生成**该文件；`verify:npm` 断言 |
-| 浏览器半信封 `id` 必须等于**发布名** | 「面板静默消失」，**不报错**。`build-client.ts` 用的是 workspace 名（开发直挂时正确），故在打包时改写一次 | `verify:npm` 断言 |
+| 浏览器半信封 `id` 必须等于**发布名** | 「面板静默消失」，**不报错**。`build-client.ts` 直接写包名；`build-npm.ts` **只断言不改写**（旧实现会顺手替换，反而掩盖 `CLIENT_ID` 写错） | `verify:npm` 断言 |
 | 宿主半不得有顶层 `bun:` / workspace 包 import | Node 加载即崩，而**所有 Bun 下的测试依然全绿** | 构建脚本 + `verify:npm` 双重断言 |
 
 > 第三条对应 AGENTS.md 的两条铁律（不要 external `@ai-token-report/*`、

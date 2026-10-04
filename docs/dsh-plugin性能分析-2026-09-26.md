@@ -41,7 +41,7 @@ Windows、Node 22.21.1、Bun 1.4.2；同一台机器及同一批原始 SQLite �
 长期复现入口（先构建插件）：
 
 ```bash
-bun run --filter @ai-token-report/dsh-plugin build
+bun run --filter dsh-plugin-token-report build
 bun run packages/dsh-plugin/verify/verify-performance.ts
 bun run packages/dsh-plugin/verify/verify-performance.ts --records 100000 --sessions 100000
 ```

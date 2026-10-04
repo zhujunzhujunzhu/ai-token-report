@@ -35,7 +35,7 @@
  * （Windows 的 junction，无需管理员）复刻那个布局。
  *
  * 前置条件：本机有真 Node（可用 `ATR_NODE_BIN` 指定）。
- * 用法：`bun run --filter '@ai-token-report/dsh-plugin' verify:npm`
+ * 用法：`bun run --filter 'dsh-plugin-token-report' verify:npm`
  * 退出码：`0` 全部通过；`1` 任一检查失败。
  */
 

@@ -79,7 +79,7 @@ check(
 )
 
 if (clientPath === undefined || !existsSync(clientPath)) {
-  console.log('\n❌ 产物不存在，先跑：bun run --filter @ai-token-report/dsh-plugin build')
+  console.log('\n❌ 产物不存在，先跑：bun run --filter dsh-plugin-token-report build')
   process.exitCode = 1
   process.exit()
 }

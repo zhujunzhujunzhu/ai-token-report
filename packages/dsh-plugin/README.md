@@ -63,7 +63,7 @@ dsh plugin --profile web add dsh-plugin-token-report@latest
 dsh plugin --profile web add dsh-plugin-token-report@latest
 ```
 
-`dsh plugin add` 会自动在 `~/.dsh/profiles/web/package.json` 的 `dsh.profile.bundles` 中登记发布包。检查它只出现一次，且没有旧源码包 `@ai-token-report/dsh-plugin`；**不要再手动 insert 插件**。正常列表例如：
+`dsh plugin add` 会自动在 `~/.dsh/profiles/web/package.json` 的 `dsh.profile.bundles` 中登记发布包。检查它只出现一次，且没有 0.9.0 之前的旧仓内源码包名 `@ai-token-report/dsh-plugin`（那个名字现在只用于清理历史装机）；**不要再手动 insert 插件**。正常列表例如：
 
 ```json
 {
@@ -194,7 +194,7 @@ node $desktopDsh --profile web --dump-config | Select-String token-report
 1. 🚨 **版本窗口**：当前 `peerDependencies` 是 `>=0.1.7-rc.2 <0.3.0-0`，**放宽后的窗口从 `0.7.0` 起就在 npm 上**（`0.6.0` 及更早那一版钉的是精确 `0.1.7-rc.2`）。宿主启动时由 `dsh-app-boot` 的 `evaluatePluginCompatibility` 逐个 peer 做 `semver.satisfies(runtime, range, { includePrerelease: true })`，**任一不满足就跳过整个 bundle** —— 日志只有一行 `skipping profile bundle …`，表现是「面板不见了 + 一条也不上报」，**不是报错**。所以：
    - Desktop 自带的 `0.1.7-rc.2`（以及 `0.2.x`）都在窗口内，**装 `@latest` 即可，不需要为了拿放宽窗口去手工打 tarball**（tarball 只在「装未发布版本」时才用得上）。
    - 反过来，Desktop 升到 `0.3.0` 及以后会被跳过。那时要么等插件放宽并复验，要么用宿主自己的 `allow-version … --accept-risk` 强制放行（**自担风险，不等于已验证**）。
-2. **不要把仓内源码包 `@ai-token-report/dsh-plugin` 装进 Desktop**：它的 `main` 指向 `src/index.ts`，而宿主跑在 **Node**（只有 Bun 直接吃 ts），加载即失败。桌面端要用构建产物、tarball 或发布包。
+2. **不要把仓内源码目录装进 Desktop**：发布包是**构建产物**（`index.js` / `client.js`），而仓内目录要先 `bun run --filter dsh-plugin-token-report build`、且依赖写的是 `workspace:*`（指向两个从未发布的私有包）。宿主跑在 **Node** 上、也不会替你构建，所以桌面端只用发布包或 tarball。
 3. **升级 / 卸载走同一条路，不要只手改 `package.json`**：一旦 Desktop 的 generation 迁移成功，插件会被搬进不可变的 `.generations/live/<...>`，那时只有重新 `add` 才换得了版本（`plugin remove` 会走 Desktop 的 generation 下线流程）。
 
 ## 第一次使用
@@ -465,7 +465,7 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 | 升级后面板要求重新署名 / 数字少了一块 | 数据目录换了位置，旧目录要搬一次家 —— 见上方「0.6.0 数据目录位置变更」 |
 
 源码、开发文档与构建方式见 [GitHub 仓库](https://github.com/zhujunzhujunzhu/ai-token-report/tree/main/packages/dsh-plugin)
-（仓内开发包名是 `@ai-token-report/dsh-plugin`，npm 上的发布名是 `dsh-plugin-token-report`）。
+（0.9.0 起仓内包名与 npm 发布名**是同一个**：`dsh-plugin-token-report` —— 插件市场的 npm 映射就是按仓内 `package.json` 的 `name` 去找包的）。
 
 <!-- DEVELOPMENT-DOCS -->
 
@@ -473,7 +473,7 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 
 ## 开发与部署参考（仓内包）
 
-以下章节针对源码直挂与二次开发，示例里的 `@ai-token-report/dsh-plugin` 是仓内包名。通过 npm 安装时使用上方的 `dsh-plugin-token-report` 安装步骤。
+以下章节针对源码直挂与二次开发，示例里的 `dsh-plugin-token-report` 既是仓内包名也是发布名（0.9.0 之前仓内叫 `@ai-token-report/dsh-plugin`）。通过 npm 安装时使用上方的安装步骤。
 
 装在 DSH 里，**无人值守地**把本机产生的计费级 token 用量实时上报到部门服务端，
 同时给同事一个「问一句就能看到自己用量」的工具，以及一块**在 DSH 界面里
@@ -748,7 +748,7 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 
 ```bash
 bun install
-bun run --filter '@ai-token-report/dsh-plugin' build
+bun run --filter 'dsh-plugin-token-report' build
 # → packages/dsh-plugin/lib/index.js   宿主半（约 212 KB，Node 侧）
 #    packages/dsh-plugin/lib/client.js  浏览器半（约 331 KB，包在 __ModuleLoader__ 信封里）；
 #                                       体积主要是内联的 Chart.js 与 React DayPicker
@@ -781,14 +781,14 @@ bun run --filter '@ai-token-report/dsh-plugin' build
 // ~/.dsh/profiles/web/package.json
 {
   "dependencies": {
-    "@ai-token-report/dsh-plugin": "file:D:/Coding/ai-token-report/packages/dsh-plugin"
+    "dsh-plugin-token-report": "file:D:/Coding/ai-token-report/packages/dsh-plugin"
   },
   "dsh": {
     "profile": {
       "bundles": [
         "@deepseek-ai/dsh-base",
         "@deepseek-ai/dsh-web-app",
-        "@ai-token-report/dsh-plugin"   // ← 加这里
+        "dsh-plugin-token-report"   // ← 加这里
       ],
       "patchReload": "live"
     }
@@ -803,7 +803,7 @@ bun run --filter '@ai-token-report/dsh-plugin' build
 # packages/dsh-plugin/cordis.patch.yml
 - insert:                                  # ← 顶层是数组，元素里才是 insert
     - id: token-report
-      name: '@ai-token-report/dsh-plugin'  # ← 必须是包名本身，loader 拿它去 import
+      name: 'dsh-plugin-token-report'  # ← 必须是包名本身，loader 拿它去 import
 ```
 
 > ⚠️ **三个格式陷阱**（都会让 DSH 起不来，且报错信息不直观）：
@@ -1266,8 +1266,8 @@ inflight-<ts>-<pid>-<seq>.jsonl   ← 已发出但还没收到响应
 
 ```bash
 bun test packages/dsh-plugin            # 369 个用例（fold / config / outbox / reporter / runtime / settings / 上报实录 / 界面）
-bun run --filter '@ai-token-report/dsh-plugin' typecheck
-bun run --filter '@ai-token-report/dsh-plugin' build
+bun run --filter 'dsh-plugin-token-report' typecheck
+bun run --filter 'dsh-plugin-token-report' build
 ```
 
 五层验证脚本，**从内到外逐层接近真实**：
@@ -1423,7 +1423,7 @@ bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| `cannot resolve profile bundle "@ai-token-report/dsh-plugin"` | `dsh.profile.bundles` 加了，但 profile 的 `node_modules` 里解析不到 | 见 §2.3 ③，用 junction 或 `file:` 依赖接上 |
+| `cannot resolve profile bundle "dsh-plugin-token-report"`（0.9.0 前会显示 `"@ai-token-report/dsh-plugin"`） | `dsh.profile.bundles` 加了，但 profile 的 `node_modules` 里解析不到 | 见 §2.3 ③，用 junction 或 `file:` 依赖接上 |
 | `profile bundle ... declares no dsh.bundle in its package.json` | 包的 `package.json` 缺 `dsh.bundle.patch` | 加 `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }` |
 | `overlay ... must be a top-level YAML array of loader patch entries` | `cordis.patch.yml` 顶层写成了 `insert:` 映射 | 顶层必须是数组，`- insert:` 是数组元素 |
 | `service "sessionTelemetry" has been registered at <OpenTelemetrySessionBackend>` | 与官方 OTel 后端冲突 | 见 §2.3 ④，disable 掉 OTel |
@@ -1452,7 +1452,7 @@ bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败
 | 面板显示「响应格式不认识（缺少 totals）」 | 宿主半与浏览器半版本不一致（升级后没重启 DSH） | 重启 DSH；两边都由同一个 `lib/` 提供，重启即可对齐 |
 | 面板数字长时间不动 | 没在干活时数据本来就不变；代次探针每 3 秒问一次，有新采集才会重新取数（真查受宿主 30 秒缓存限制） | 点「刷新」绕过缓存立刻取新值；切回前台标签页也会立刻取一次 |
 | 面板数字 30 秒才跳一次 | **预期行为**：探针采样是 3 秒，但真查询受宿主 30 秒缓存限制（见 §4.3 的实测依据） | 点「刷新」立刻取新值 |
-| DSH 启动报 `client bundle not found` | 改了插件但没重新构建浏览器半 | `bun run --filter '@ai-token-report/dsh-plugin' build` |
+| DSH 启动报 `client bundle not found` | 改了插件但没重新构建浏览器半 | `bun run --filter 'dsh-plugin-token-report' build` |
 
 ### 9.3 宿主环境（本机实测踩到）
 

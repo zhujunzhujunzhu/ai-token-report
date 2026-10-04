@@ -3,8 +3,17 @@
  * 只变换配置数据，不接触身份、日志、数据库或 outbox；冲突配置拒绝猜测。
  */
 export const PUBLISHED_PLUGIN = 'dsh-plugin-token-report'
-export const WORKSPACE_PLUGIN = '@ai-token-report/dsh-plugin'
-const names = new Set([PUBLISHED_PLUGIN, WORKSPACE_PLUGIN])
+/**
+ * 改名之前（≤0.8.x）的仓内源码包名。**发布名与仓内名现在已经是同一个**，
+ * 这个常量只为清理历史装机而存在。
+ *
+ * 🚨 不能因为「改名了」就把它删掉：当年用 junction / `file:` 直挂装过的人，
+ *   profile 的 `dsh.profile.bundles` 与 `dependencies` 里留下的正是这个字符串。
+ *   修复脚本若不认它，就会留下一个**永远解析不到的 bundle 条目**，
+ *   DSH 启动报 `cannot resolve profile bundle` —— 而现场看只有一个陌生包名。
+ */
+export const LEGACY_SOURCE_PLUGIN = '@ai-token-report/dsh-plugin'
+const names = new Set([PUBLISHED_PLUGIN, LEGACY_SOURCE_PLUGIN])
 type Row = Record<string, unknown>
 
 export function repairProfileData(manifest: Row, patches: Row[]): { manifest: Row; patches: Row[] } {
@@ -16,10 +25,10 @@ export function repairProfileData(manifest: Row, patches: Row[]): { manifest: Ro
     throw new Error('profile 缺少合法的 dsh.profile.bundles，拒绝修改')
   }
   if (!bundles.includes(PUBLISHED_PLUGIN)) throw new Error('请先在此 profile 安装 dsh-plugin-token-report')
-  profile!['bundles'] = bundles.filter((b, i) => b !== WORKSPACE_PLUGIN && bundles.indexOf(b) === i)
+  profile!['bundles'] = bundles.filter((b, i) => b !== LEGACY_SOURCE_PLUGIN && bundles.indexOf(b) === i)
   // DSH 每次 plugin add 都会重新登记 dependencies 中的 bundle，旧依赖也须退出。
   const dependencies = next['dependencies'] as Row | undefined
-  if (dependencies) delete dependencies[WORKSPACE_PLUGIN]
+  if (dependencies) delete dependencies[LEGACY_SOURCE_PLUGIN]
   const overrides: Row[] = []
   function isPlugin(row: Row): boolean {
     if (row['id'] === 'token-report' && row['name'] && !names.has(String(row['name']))) {

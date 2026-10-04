@@ -1,11 +1,13 @@
 /** 安装升级必须收敛到一个挂载，同时保留用户配置、其它插件与表达式。 */
 import { expect, test } from 'bun:test'
-import { assertSinglePlugin, repairProfileData, PUBLISHED_PLUGIN, WORKSPACE_PLUGIN } from '../src/profile-repair.js'
+import { assertSinglePlugin, repairProfileData, PUBLISHED_PLUGIN, LEGACY_SOURCE_PLUGIN } from '../src/profile-repair.js'
 
-const manifest = { dsh: { profile: { bundles: ['base', WORKSPACE_PLUGIN, PUBLISHED_PLUGIN, PUBLISHED_PLUGIN] } } }
+// ⚠️ 夹具刻意用**改名前的仓内源码包名**：老装机留下的就是这个字符串，
+//   改名后仍必须被收敛掉，否则 profile 里会留一个解析不到的 bundle 条目。
+const manifest = { dsh: { profile: { bundles: ['base', LEGACY_SOURCE_PLUGIN, PUBLISHED_PLUGIN, PUBLISHED_PLUGIN] } } }
 test('旧手动 insert 转为覆盖，两个包/重复 bundle 收敛且保留配置', () => {
   const config = { appKey: { __jsExpr: 'process.env.APP_KEY' }, ui: { position: 'both' } }
-  const patches = [{ insert: [{ id: 'other', name: 'other' }, { id: 'token-report', name: WORKSPACE_PLUGIN, config }] }]
+  const patches = [{ insert: [{ id: 'other', name: 'other' }, { id: 'token-report', name: LEGACY_SOURCE_PLUGIN, config }] }]
   const fixed = repairProfileData(manifest, patches)
   expect(fixed.manifest).toEqual({ dsh: { profile: { bundles: ['base', PUBLISHED_PLUGIN] } } })
   expect(fixed.patches).toEqual([{ insert: [{ id: 'other', name: 'other' }] }, { id: 'token-report', config }])
@@ -14,7 +16,7 @@ test('旧手动 insert 转为覆盖，两个包/重复 bundle 收敛且保留配
 })
 test('组内重复挂载也会移除，源包名称的覆盖可以继续生效', () => {
   const config = { ui: { position: 'header' } }
-  const fixed = repairProfileData(manifest, [{ insert: [{ id: 'group', group: true, config: [{ id: 'token-report', name: WORKSPACE_PLUGIN }] }] }, { id: 'token-report', name: WORKSPACE_PLUGIN, config }])
+  const fixed = repairProfileData(manifest, [{ insert: [{ id: 'group', group: true, config: [{ id: 'token-report', name: LEGACY_SOURCE_PLUGIN }] }] }, { id: 'token-report', name: LEGACY_SOURCE_PLUGIN, config }])
   expect(fixed.patches.at(-1)).toEqual({ id: 'token-report', config })
 })
 test('冲突配置与被其它包占用的 ID 不允许自动覆盖', () => {

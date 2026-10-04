@@ -2,7 +2,7 @@
  * 可重复的本机面板压力验证：独立临时库 → 已构建插件 → 真实 Node Worker。
  * 默认 100 万事件、1 万连续会话、180 天，四列之和恰好 100 亿 token。
  *
- * 先构建：bun run --filter @ai-token-report/dsh-plugin build
+ * 先构建：bun run --filter dsh-plugin-token-report build
  * 执行：bun run packages/dsh-plugin/verify/verify-performance.ts > performance.json
  * 小样本：追加 --records 10000 --sessions 100
  *

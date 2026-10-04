@@ -18,19 +18,22 @@
  *
  * ## 为什么是「打包 + 独立清单」而不是直接发布 workspace 包
  *
- * 与 `packages/cli/scripts/build-npm.ts` 同源，三条理由：
+ * 与 `packages/cli/scripts/build-npm.ts` 同源，两条理由：
  *
- * 1. **workspace 包发不出去**：`packages/dsh-plugin` 是 `private: true`，
- *    依赖写的是 `workspace:*`。npm 不允许「包名 ≠ manifest name」，
- *    所以想发成 `dsh-plugin-token-report` 就只能另写一份清单 ——
- *    这也正好**避免了一次全仓改名**（`@ai-token-report/*` 有 100+ 处引用）。
+ * 1. **发出去的必须是构建产物**：仓内清单的 `main` 指向 `lib/index.js`（构建
+ *    出来的），宿主跑在 Node 上、也不该在用户机器上跑构建脚本；独立清单把
+ *    `index.js` / `client.js` / 两个 worker 与挂载声明列进 `files`，装完即可用。
  * 2. **`@ai-token-report/{core,shared}` 是 private、从未发布**：
  *    直接发 workspace 包会让 `workspace:*` 被改写成指向未发布包的版本号，
  *    同事 `dsh plugin add` 时拉到 404。独立清单里**没有任何 dependencies**
  *    （它们已被 `bun build` 内联），装完即可用。
- * 3. **发布名与 dev 名不同是常态**：仓库里叫 `@ai-token-report/dsh-plugin`
- *    （`tsconfig` paths、workspace 解析都依赖它），npm 上叫
- *    `dsh-plugin-token-report`。两者的映射只在**本脚本**这一处发生。
+ *
+ * ★ **包名必须与仓内包名一致**（0.9.0 起统一为 `dsh-plugin-token-report`）：
+ *   awesome-dsh-plugin 的 npm 映射（其 `scripts/probe-npm.mjs`）读的正是
+ *   `packages/dsh-plugin/package.json` 的 `name`，再拿这个名字去 registry 找包、
+ *   并要求该包的 `repository` 指回本仓。两者不一致时市场拿不到 npm 映射，
+ *   会把一键安装退化成源码安装（`github:…#path:/packages/dsh-plugin`）——
+ *   而本仓源码包依赖 `workspace:*`，那条路**装不上**。
  *
  * ## 🚨 三条硬约束（写错了同事那边是「装上了但不生效」）
  *
@@ -43,7 +46,7 @@
  * 3. **宿主半不能出现顶层 `bun:` import**。`--target=node` 会把它原样留在
  *    产物顶层，Node 加载即崩。兜底断言见下面第 3 步。
  *
- * 用法：`bun run --filter '@ai-token-report/dsh-plugin' build:npm`
+ * 用法：`bun run --filter 'dsh-plugin-token-report' build:npm`
  */
 
 import { cp, mkdir, readdir, rm, writeFile } from 'node:fs/promises'
@@ -56,12 +59,14 @@ const pkgRoot = resolve(here, '..')
 const libDir = join(pkgRoot, 'lib')
 const distDir = join(pkgRoot, 'dist')
 
-/** 发布用的包名。与 workspace 内的 `@ai-token-report/dsh-plugin` 是两回事。 */
-const PUBLISH_NAME = 'dsh-plugin-token-report'
-/** 开发/直挂时用的 workspace 名 —— 浏览器半信封里现在写的是它。 */
-const WORKSPACE_NAME = '@ai-token-report/dsh-plugin'
-// 发布版本只读包清单，避免源码与发布产物的版本漂移。
-const VERSION = (await Bun.file(join(pkgRoot, 'package.json')).json()).version as string
+// 包名与版本都只读仓内清单：一处真源，源码与发布产物不会漂移。
+// ★ 包名不许在这里另写字面量 —— 它同时是市场找 npm 包的键（见文件头）。
+const sourceManifest = (await Bun.file(join(pkgRoot, 'package.json')).json()) as {
+  name: string
+  version: string
+}
+const PACKAGE_NAME = sourceManifest.name
+const VERSION = sourceManifest.version
 
 function fail(message: string): never {
   process.stderr.write(`❌ ${message}\n`)
@@ -118,23 +123,18 @@ await cp(join(libDir, 'stats-worker.js'), join(distDir, 'stats-worker.js'))
 await cp(join(libDir, 'backfill-worker.js'), join(distDir, 'backfill-worker.js'))
 
 // ── 5. 浏览器半：把信封 id 改成发布名 ───────────────────────────────────
-let clientText = await Bun.file(clientIn).text()
-const clientIdPattern = /id:\s*"([^"]+)",/
-const clientIdMatch = clientText.match(clientIdPattern)
+const clientText = await Bun.file(clientIn).text()
+const clientIdMatch = clientText.match(/id:\s*"([^"]+)",/)
 if (!clientIdMatch) {
   fail('浏览器半里找不到 `id: "..."` 信封字段 —— build-client.ts 的信封格式变了？')
 }
-const currentId = clientIdMatch[1]
-if (currentId === PUBLISH_NAME) {
-  // 已经是对的（例如 build-client.ts 将来直接支持发布名），无需改写
-} else if (currentId === WORKSPACE_NAME) {
-  // ⚠️ 只替换信封里那一个 id，不做全文替换：产物里可能还有别处出现包名
-  //    （例如报错文案），误伤会让排查信息变味。
-  clientText = clientText.replace(clientIdPattern, `id: "${PUBLISH_NAME}",`)
-} else {
+// 🚨 信封 id 必须**已经**等于包名（客户端模块图按包名解析，不一致的表现是
+//   「面板不见了」且**不报错**）。这里刻意不再「顺手改写」：旧实现会把 workspace 名
+//   悄悄替换成发布名，反而掩盖了 build-client.ts 里 CLIENT_ID 写错这种事。
+if (clientIdMatch[1] !== PACKAGE_NAME) {
   fail(
-    `浏览器半信封 id 是 ${JSON.stringify(currentId)}，既不是 workspace 名 ` +
-      `(${WORKSPACE_NAME}) 也不是发布名 (${PUBLISH_NAME}) —— 请确认后更新本脚本。`,
+    `浏览器半信封 id 是 ${JSON.stringify(clientIdMatch[1])}，包名是 ${JSON.stringify(PACKAGE_NAME)}` +
+      ' —— 请把 build-client.ts 的 CLIENT_ID 改成包名（不要在这里改写产物）。',
   )
 }
 await writeFile(join(distDir, 'client.js'), clientText, 'utf8')
@@ -154,13 +154,13 @@ const patch = `# 本文件由 scripts/build-npm.ts 生成 —— 不要手改（
 # DSH loader 拿这个字符串去 import()，所以它必须等于 npm 包名本身。
 - insert:
     - id: token-report
-      name: '${PUBLISH_NAME}'
+      name: '${PACKAGE_NAME}'
 `
 await writeFile(join(distDir, 'cordis.patch.yml'), patch, 'utf8')
 
 // ── 7. 写发布用的 package.json ──────────────────────────────────────────
 const manifest = {
-  name: PUBLISH_NAME,
+  name: PACKAGE_NAME,
   version: VERSION,
   description:
     'DSH 插件：无人值守地把 token 用量实时上报到部门服务端，另提供 token_usage 工具、ctx.tokenReport 服务与界面用量面板。',
@@ -239,10 +239,10 @@ for (const match of publicReadme.matchAll(/!\[([^\]]*)\]\(docs\/screenshots\/([a
   const source = join(pkgRoot, 'docs', 'screenshots', filename!)
   const bytes = Buffer.from(await Bun.file(source).arrayBuffer())
   await cp(source, join(screenshotDir, filename!))
-  onlineReadme = onlineReadme.replace(markdown, `![${alt}](https://cdn.jsdelivr.net/npm/${PUBLISH_NAME}@${VERSION}/screenshots/${filename})`)
+  onlineReadme = onlineReadme.replace(markdown, `![${alt}](https://cdn.jsdelivr.net/npm/${PACKAGE_NAME}@${VERSION}/screenshots/${filename})`)
   offlineReadme = offlineReadme.replace(markdown, `![${alt}](data:image/png;base64,${bytes.toString('base64')})`)
 }
-await writeFile(join(distDir, 'README.md'), onlineReadme + `\n\n单文件离线版（截图以 Base64 内嵌）：[README.offline.md](https://cdn.jsdelivr.net/npm/${PUBLISH_NAME}@${VERSION}/README.offline.md)。\n`, 'utf8')
+await writeFile(join(distDir, 'README.md'), onlineReadme + `\n\n单文件离线版（截图以 Base64 内嵌）：[README.offline.md](https://cdn.jsdelivr.net/npm/${PACKAGE_NAME}@${VERSION}/README.offline.md)。\n`, 'utf8')
 await writeFile(join(distDir, 'README.offline.md'), offlineReadme + '\n', 'utf8')
 
 // ── 9. 报告产物 ─────────────────────────────────────────────────────────
@@ -250,7 +250,7 @@ const hostSize = (await Bun.file(join(distDir, 'index.js')).arrayBuffer()).byteL
 const clientSize = (await Bun.file(join(distDir, 'client.js')).arrayBuffer()).byteLength
 const files = await readdir(distDir, { recursive: true })
 process.stdout.write(
-  `✅ 已生成 ${PUBLISH_NAME}@${VERSION}\n` +
+  `✅ 已生成 ${PACKAGE_NAME}@${VERSION}\n` +
     `   目录    ${distDir}\n` +
     `   宿主半  index.js（${(hostSize / 1024).toFixed(1)} KB，零运行时依赖）\n` +
     `   浏览器半 client.js（${(clientSize / 1024).toFixed(1)} KB，id 已改为发布名）\n` +

@@ -199,7 +199,7 @@ console.log('='.repeat(72))
 // ── 0. 打包产物能否 import ───────────────────────────────────────────────────
 console.log('\n── 0. 打包产物 ──')
 const libPath = join(import.meta.dir, '..', 'lib', 'index.js')
-check('lib/index.js 已构建（先跑 bun run --filter @ai-token-report/dsh-plugin build）', existsSync(libPath))
+check('lib/index.js 已构建（先跑 bun run --filter dsh-plugin-token-report build）', existsSync(libPath))
 if (existsSync(libPath)) {
   const mod = (await import(libPath)) as { default?: { name?: string; apply?: unknown } }
   check('打包产物可被 import', mod.default !== undefined)
