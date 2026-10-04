@@ -577,6 +577,12 @@ code {
   font-size: 12px;
   color: #8997aa;
 }
+/* 竖排标题：标题下面跟一句解释。
+   ⚠️ `.panel-heading` 是 `space-between` 的横排（趋势卡右侧要放控件），
+   解释文案塞进那一行会被拉去右边、与标题并排，读起来像另一张卡片的说明。 */
+.panel-heading-stack {
+  display: block;
+}
 /* 趋势卡片标题右侧的一组控件（指标 / 分层维度 + 跳转链接）。
    允许换行：窄屏下两组单选按钮 + 链接挤在一行会溢出卡片。 */
 .trend-controls {
@@ -791,30 +797,41 @@ code {
   font-size: 11px;
   color: #9aa6b6;
 }
-/* 口径说明是次级信息：淡背景 + 词条式排版，读得到但不抢视线。 */
-.spec-card {
-  background: #fbfcfe;
-}
-.spec-list {
+/* 数据跨度 / 平均每会话事件：贴在时间边界那格下面，同属「时间维度」的信息。 */
+.cadence-grid {
   display: grid;
-  gap: 12px;
-  margin: 14px 0 0;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 14px;
 }
-.spec-list > div {
-  display: grid;
-  grid-template-columns: 92px minmax(0, 1fr);
-  gap: 12px;
-  align-items: baseline;
+.cadence-item {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 14px 16px;
+  border: 1px solid #eef2f8;
+  border-radius: 9px;
+  background: #f9fbfe;
 }
-.spec-list dt {
+.cadence-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
   color: #8290a5;
-  font-size: 12px;
 }
-.spec-list dd {
-  margin: 0;
-  color: #7c8aa0;
-  font-size: 12px;
-  line-height: 1.85;
+.cadence-item strong {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.2px;
+}
+.cadence-item small {
+  font-size: 11px;
+  color: #9aa6b6;
+}
+/* 署名表里的「待确认」标记紧跟名字，不占一列 —— 让分组列保持有宽度。 */
+.reporter-name {
+  margin-right: 8px;
 }
 .member-filters {
   display: flex;
@@ -1361,9 +1378,9 @@ code {
   .boundary-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
-  .spec-list > div {
+  .cadence-grid {
     grid-template-columns: minmax(0, 1fr);
-    gap: 4px;
+    gap: 12px;
   }
   .member-filters .el-input {
     width: 100%;

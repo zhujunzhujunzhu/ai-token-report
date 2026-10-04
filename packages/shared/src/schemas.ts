@@ -423,7 +423,11 @@ export const portalProviderAliasIdSchema = z.strictObject({ alias_id: portalId }
 export const portalProviderAliasStatusSchema = z.strictObject({ alias_id: portalId, enabled: z.boolean() })
 
 /**
- * **原始 cwd 前缀**（项目归一化，v11）。
+ * 项目的**匹配值**（项目归一化，v11）。
+ *
+ * 一个字段承载**两种**写法（见 `core/db/project-alias.ts` 的文件头）：
+ * **含分隔符 = 路径前缀**（限定位置，如 `D:\Coding\suit-g92-parent`），
+ * **不含分隔符 = 仓库名**（任意位置，如 `suit-g92-parent`）。
  *
  * ★ 与 `providerName` 刻意不同，这里有**三条它没有的规矩**：
  *
@@ -439,15 +443,24 @@ export const portalProviderAliasStatusSchema = z.strictObject({ alias_id: portal
  *   匹配时（`project-alias.ts` 的 `normalizeProjectPrefix`）。在这一层改写
  *   使用者的输入，会让「页面上显示的」与「存进库的」不一致而无处对照。
  */
-const projectPrefix = z.string().min(1, { error: '目录前缀不能为空' }).max(512, { error: '目录前缀不能超过 512 个字符' })
-  .refine((value) => !invisibleCharacters.test(value), { error: '目录前缀不能包含空格以外的空白或不可见字符' })
-  .refine((value) => !/^ | $/.test(value), { error: '目录前缀首尾不能是空格' })
+const projectPrefix = z.string().min(1, { error: '匹配值不能为空' }).max(512, { error: '匹配值不能超过 512 个字符' })
+  .refine((value) => !invisibleCharacters.test(value), { error: '匹配值不能包含空格以外的空白或不可见字符' })
+  .refine((value) => !/^ | $/.test(value), { error: '匹配值首尾不能是空格' })
+  // 🚨 仓库名模式下裸写盘符（`D:` / `c:`）会命中该磁盘下的**每一个**目录 ——
+  //   `D:` 本身就是 `D:\a\proj` 的第一段，与文件系统根同一种危险。
+  //   ⚠️ 判据与 `project-alias.ts` 的 `projectPrefixError()` 必须等价：
+  //   那边是「不含分隔符 且 形如单个字母加冒号」，这里用同一条正则。
+  //   ⚠️ `D:\`（带尾分隔符）**必须放行** —— 它含分隔符，走路径模式，
+  //      本意就是「D 盘下的东西」。所以这条只在**不含分隔符**时判。
+  .refine((value) => /^[A-Za-z]:$/.test(value) ? /[\\/]/.test(value) : true, {
+    error: '仓库名不能是盘符（如 D:），那会匹配该磁盘下的所有目录。请写仓库目录名（如 suit-g92-parent），它会匹配该仓库在任意磁盘、任意父目录下的所有子目录',
+  })
   // ★ 文件系统根（`/`、`\`、`///`…）会把**所有**路径折成一个项目，必然是误配。
   //   ⚠️ 判据与 `project-alias.ts` 的 `projectPrefixError()` 必须等价：
   //   那边是「归一化（去尾分隔符）之后是不是恰好一个分隔符」，
   //   而只有「全是分隔符」的字符串才会归一化成那一个字符 —— 所以这条正则是同一件事。
   //   两处判据分叉的表现是「前端放行、服务端 400」，而使用者只看到一次报错。
-  .refine((value) => !/^[\\/]+$/.test(value), { error: '目录前缀不能是文件系统根目录（它会匹配所有路径）' })
+  .refine((value) => !/^[\\/]+$/.test(value), { error: '匹配值不能是文件系统根目录（它会匹配所有路径）' })
 /**
  * 项目归一化后的**展示名**。
  *
@@ -517,13 +530,6 @@ export const portalSetModelPriceSchema = z.strictObject({
   note: z.string().max(255, { error: '备注不能超过 255 个字符' }).nullable().optional(),
 })
 export const portalModelPriceIdSchema = z.strictObject({ price_id: portalId })
-/**
- * 用内置种子价初始化空表。
- *
- * ⚠️ `confirm` 必须是显式 `true`：这是一个会**写库**的动作，
- *   省略字段就执行等于「一个空 body 的 POST 也能改数据」。
- */
-export const portalSeedModelPricesSchema = z.strictObject({ confirm: z.boolean().optional() })
 /**
  * 角色标识。
  *

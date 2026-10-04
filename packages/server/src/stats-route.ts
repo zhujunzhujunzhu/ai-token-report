@@ -75,6 +75,7 @@ import { derive, registeredSources, resolveRange } from '@ai-token-report/core'
 import {
   cacheHitRate,
   computeTotal,
+  deriveMetrics,
   summarizeCosts,
   unattributedRate,
   SERIES_STACK_MERGED_KEY,
@@ -1093,11 +1094,29 @@ async function buildOverview(
  *
  *   这里保留该字段是为了不改动前端契约；页面据此显示「恒等式校验」一栏时，
  *   文案要说的是「结构上恒成立」，而不是「扫了 N 条都没问题」。
+ *
+ * ## 派生指标一律走 `shared/metrics.ts`
+ *
+ * 🚨 本函数**不写任何比率公式**。命中率、杠杆、平均每次调用全部由
+ *   `deriveMetrics()` 算好后透传 —— 在这里再除一遍就是第二个口径实现，
+ *   而它不会报错，只会让「诊断页说 94% 命中、看板说 88% 命中」长期共存。
  */
 async function buildDiagnostics(session: PortalStatsSession): Promise<DiagnosticsResponse> {
   const bounds = await session.timeBounds()
   const total = await session.totals()
   const unattributed = await session.unattributedCalls()
+  const sessions = await session.sessions()
+  const metrics = deriveMetrics(total, total.calls)
+  // ★ 新鲜度以**服务端本次取数时刻**为基准：上报时刻来自服务端，
+  //   拿浏览器时钟去减会把一个健康链路显示成「-3 分钟前」（见
+  //   `formatTimeGap` 的注释）。这里算毫秒差，措辞交给页面。
+  const now = Date.now()
+  const silenceOf = (ts: number | null): number | null => (ts === null ? null : Math.max(0, now - ts))
+
+  const [sources, reporters] = await Promise.all([
+    session.sourceCoverage(),
+    session.reporterCoverage(),
+  ])
 
   return {
     totalEvents: total.calls,
@@ -1108,6 +1127,20 @@ async function buildDiagnostics(session: PortalStatsSession): Promise<Diagnostic
     earliestTs: bounds.earliest,
     latestTs: bounds.latest,
     lastIngestAt: await session.lastIngestAt(),
+
+    totalTokens: total.total,
+    sessions,
+    cacheHitRate: metrics.cacheHitRate,
+    avgTokensPerCall: metrics.avgTokensPerCall,
+    // ⚠️ 跨度 = 「最晚 − 最早」，**不是**窗口长度：客户端补报历史数据时
+    //   事件时间可以远早于筛选窗口，而跨度要如实反映这批数据真实有多宽。
+    spanMs: bounds.earliest !== null && bounds.latest !== null
+      ? bounds.latest - bounds.earliest
+      : null,
+    // ⚠️ 会话数不可加（跨天会话会被算两次），所以这里不做「按天求和」。
+    eventsPerSession: sessions === 0 ? null : total.calls / sessions,
+    sources: sources.map((row) => ({ ...row, silentForMs: silenceOf(row.latestEventTs) })),
+    reporters: reporters.map((row) => ({ ...row, silentForMs: silenceOf(row.latestEventTs) })),
   }
 }
 

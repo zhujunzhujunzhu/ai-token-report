@@ -890,12 +890,13 @@ describe('现状契约：/api/v1/admin/pricing*（模型单价 / v7）', () => {
     expect((await rowsOf('contract-bad')).length).toBe(0)
   })
 
-  test('种子初始化：缺 confirm → 400；单价表非空 → 409', async () => {
-    await write(priceBody({ model: 'contract-seed' }))
-    const noConfirm = await call(dept, 'POST', '/api/v1/admin/pricing/seed', { headers: { ...JSON_HEADERS, ...ADMIN }, body: '{}' })
-    expect(noConfirm.status).toBe(400)
-    const nonEmpty = await call(dept, 'POST', '/api/v1/admin/pricing/seed', { headers: { ...JSON_HEADERS, ...ADMIN }, body: JSON.stringify({ confirm: true }) })
-    expect(nonEmpty.status).toBe(409)
+  test('★ 种子初始化接口已删除：POST /admin/pricing/seed → 404（内置价目表不存在了）', async () => {
+    // 2026-10 起 `BUILTIN_PRICES` 与它背后的 `POST /api/v1/admin/pricing/seed` 一起删除：
+    // 「一条价都没配」必须是**看得见**的空，而不是一个「看起来正常」的默认价。
+    // 这里钉住 404：路由删干净了，而**不是**留下一个还能写库的入口。
+    const r = await call(dept, 'POST', '/api/v1/admin/pricing/seed', { headers: { ...JSON_HEADERS, ...ADMIN }, body: JSON.stringify({ confirm: true }) })
+    expect(r.status).toBe(404)
+    expect((r.body as { ok?: boolean }).ok).toBe(false)
   })
 
   test('删除：200 后这一条就没了，再删一次 404（不静默成功）', async () => {
@@ -914,11 +915,10 @@ describe('现状契约：/api/v1/admin/pricing*（模型单价 / v7）', () => {
     await write(priceBody({ model: 'contract-member' }))
     expect((await call(dept, 'GET', '/api/v1/admin/pricing', { headers: MEMBER })).status).toBe(403)
     expect((await write(priceBody({ model: 'contract-member-2' }), MEMBER)).status).toBe(403)
-    expect((await call(dept, 'POST', '/api/v1/admin/pricing/seed', { headers: { ...JSON_HEADERS, ...MEMBER }, body: JSON.stringify({ confirm: true }) })).status).toBe(403)
   })
 
-  test('GET /admin/pricing/delete 与 /seed → 405 且 Allow 恰好是 POST', async () => {
-    for (const path of ['/api/v1/admin/pricing/delete', '/api/v1/admin/pricing/seed']) {
+  test('GET /admin/pricing/delete → 405 且 Allow 恰好是 POST', async () => {
+    for (const path of ['/api/v1/admin/pricing/delete']) {
       const r = await call(dept, 'GET', path)
       expect(r.status).toBe(405)
       expect(r.allow).toBe('POST')

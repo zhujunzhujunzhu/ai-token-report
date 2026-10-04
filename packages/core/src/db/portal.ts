@@ -357,6 +357,30 @@ interface PortalRecordSqlRow {
   cache_write_tokens: unknown
 }
 
+/** 一个采集来源在当前范围内的覆盖与新鲜度（诊断页）。 */
+export interface PortalSourceCoverageRow {
+  /** 受控枚举原值；库里为 NULL 的历史行折成 `''`。 */
+  source: string
+  calls: number
+  /** 四项之和（库里不存 total 列）。 */
+  totalTokens: number
+  sessions: number
+  earliestEventTs: number | null
+  latestEventTs: number | null
+}
+
+/** 一个署名键（人员 / 待确认历史身份 / 未归属）在当前范围内的覆盖与新鲜度。 */
+export interface PortalReporterCoverageRow {
+  /** 与 `by=user` 的分组键同形（`member_id` / `legacy:…` / `unknown`）。 */
+  key: string
+  label: string
+  attributionStatus: 'member' | 'legacy' | 'unattributed'
+  calls: number
+  totalTokens: number
+  groupNames: string[]
+  latestEventTs: number | null
+}
+
 /**
  * 一个已就绪的上报库统计会话。
  *
@@ -925,6 +949,178 @@ export class PortalStatsSession {
     const q = ingestMomentQuery()
     const row = await this.#store.get<{ last_ingest_ms: unknown }>(q.sql, q.params)
     return numOrNull(row?.last_ingest_ms)
+  }
+
+  /**
+   * 按 `source` 的覆盖与新鲜度（诊断页用）。
+   *
+   * ⚠️ **来源不做归一化**：`trae` 与 `trae-cn` 是两个独立来源，折叠它们
+   *   就会把「一台机器装了新版客户端」显示成「某个来源还在跑」——
+   *   而来源是**受控枚举**（`registeredSources()`），不是可配的展示名。
+   *
+   * ⚠️ **不补零**：注册表里在窗口内没有数据的来源根本不出现。补一排 0
+   *   会让「没人用了这个客户端」与「这个客户端的数据没进来」在页面上
+   *   长得一模一样 —— 而后者才是诊断页要抓的东西。
+   */
+  async sourceCoverage(): Promise<PortalSourceCoverageRow[]> {
+    const { sql, params } = buildWhere(this.#filter, this.#normalize)
+    const rows = await this.#store.all<{
+      source: string | null
+      input: unknown
+      output: unknown
+      cache_read: unknown
+      cache_write: unknown
+      calls: unknown
+      sessions: unknown
+      lo: unknown
+      hi: unknown
+    }>(
+      `SELECT source,
+              SUM(input_tokens)       AS input,
+              SUM(output_tokens)      AS output,
+              SUM(cache_read_tokens)  AS cache_read,
+              SUM(cache_write_tokens) AS cache_write,
+              COUNT(*)                AS calls,
+              COUNT(DISTINCT session_id) AS sessions,
+              MIN(ts)                 AS lo,
+              MAX(ts)                 AS hi
+       FROM ${EVENT_TABLE}${sql}
+       GROUP BY source
+       ORDER BY calls DESC`,
+      params,
+    )
+    return rows.map((row) => {
+      const input = num(row.input)
+      const output = num(row.output)
+      const cacheRead = num(row.cache_read)
+      const cacheWrite = num(row.cache_write)
+      return {
+        // 🚨 NULL 必须折成 ''（**不能**留成 null）：来源是 GROUP BY 的键，
+        //   而分组键在整个契约里都是字符串（`key: string`）。
+        source: row.source ?? '',
+        calls: num(row.calls),
+        // ★ 总量在这里派生：库里不存 total 列（铁律 3）。
+        totalTokens: input + output + cacheRead + cacheWrite,
+        sessions: num(row.sessions),
+        earliestEventTs: numOrNull(row.lo),
+        latestEventTs: numOrNull(row.hi),
+      }
+    })
+  }
+
+  /**
+   * 按署名键的覆盖与新鲜度（诊断页用），按调用条数降序。
+   *
+   * ⚠️ 与 {@link distinctUsers} 的分组口径**必须逐字一致**
+   *   （`member_id` 与「`member_id` 为空时退回 `user_id`」两两分组）：
+   *   卡片上的「署名键组数」与这张表的行数必须是同一个数，
+   *   否则同一个页面里两处数字对不上，而且谁都说不清哪个对。
+   *
+   * ⚠️ 这里的 `legacy:` / `unknown` 键形**逐字复制** {@link memberGroups}：
+   *   人员排行里的「张三」与诊断表里的「张三」必须是同一个键。
+   */
+  async reporterCoverage(limit = 10): Promise<PortalReporterCoverageRow[]> {
+    if (this.#filter.identityView !== 'member') {
+      // 旧视图下只有 `user_id` 一列，键与展示名都退化成它本身。
+      const { sql, params } = buildWhere(this.#filter, this.#normalize)
+      const rows = await this.#store.all<{
+        user_id: string | null
+        user_name: string | null
+        calls: unknown
+        input: unknown
+        output: unknown
+        cache_read: unknown
+        cache_write: unknown
+        hi: unknown
+      }>(
+        `SELECT user_id, MIN(user_name) AS user_name,
+                COUNT(*) AS calls,
+                SUM(input_tokens)       AS input,
+                SUM(output_tokens)      AS output,
+                SUM(cache_read_tokens)  AS cache_read,
+                SUM(cache_write_tokens) AS cache_write,
+                MAX(ts)                 AS hi
+         FROM ${EVENT_TABLE}${sql}
+         GROUP BY user_id
+         ORDER BY calls DESC`,
+        params,
+      )
+      return rows.slice(0, limit).map((row) => {
+        const input = num(row.input)
+        const output = num(row.output)
+        const cacheRead = num(row.cache_read)
+        const cacheWrite = num(row.cache_write)
+        return {
+          key: row.user_id ?? UNATTRIBUTED_USER,
+          label: row.user_id ?? '未归属',
+          attributionStatus: row.user_id ? 'member' : 'unattributed',
+          calls: num(row.calls),
+          totalTokens: input + output + cacheRead + cacheWrite,
+          groupNames: [],
+          latestEventTs: numOrNull(row.hi),
+        }
+      })
+    }
+
+    const { sql, params } = buildWhere(this.#filter, this.#normalize)
+    const rows = await this.#store.all<{
+      member_id: string | null
+      legacy_id: string | null
+      snapshot_name: string | null
+      display_name: string | null
+      calls: unknown
+      input: unknown
+      output: unknown
+      cache_read: unknown
+      cache_write: unknown
+      hi: unknown
+    }>(
+      // 🚨 那条 `(member_id IS NOT NULL OR user_id IS NOT NULL)` 与
+      //   {@link distinctUsers} 的成员分支**逐字相同**，不是顺手加的：
+      //   少了它，未归属行会凑成一条「两列都为 NULL」的假身份，于是这张表的
+      //   行数会比卡片上的「署名键组数」多 1 —— 同一个页面上两个数字对不上，
+      //   而两边看起来都「很合理」。
+      //   ⚠️ 它**不适用于**上面的旧视图分支：那里未归属本就该作为
+      //   `unknown` 那一行出现（与 `groups('user')` 同款），否则
+      //   「有多少数据没署名」在表里就彻底看不见了。
+      `SELECT g.member_id, g.legacy_id, g.snapshot_name, m.display_name,
+              g.calls, g.input, g.output, g.cache_read, g.cache_write, g.hi
+       FROM (
+         SELECT member_id, CASE WHEN member_id IS NULL THEN user_id ELSE NULL END AS legacy_id,
+                MIN(user_name) AS snapshot_name,
+                SUM(input_tokens)       AS input,
+                SUM(output_tokens)      AS output,
+                SUM(cache_read_tokens)  AS cache_read,
+                SUM(cache_write_tokens) AS cache_write,
+                COUNT(*)                AS calls,
+                MAX(ts)                 AS hi
+         FROM ${EVENT_TABLE}${sql}${sql ? ' AND' : ' WHERE'} (member_id IS NOT NULL OR user_id IS NOT NULL)
+         GROUP BY member_id, legacy_id
+       ) AS g LEFT JOIN members m ON m.member_id = g.member_id
+       ORDER BY g.calls DESC`,
+      params,
+    )
+    const page = rows.slice(0, limit)
+    const groups = await this.groupsOf(page.map((row) => row.member_id))
+    return page.map((row) => {
+      const input = num(row.input)
+      const output = num(row.output)
+      const cacheRead = num(row.cache_read)
+      const cacheWrite = num(row.cache_write)
+      const attributionStatus = row.member_id ? 'member' : row.legacy_id !== null ? 'legacy' : 'unattributed'
+      return {
+        key: row.member_id
+          ?? (row.legacy_id !== null ? `legacy:${Buffer.from(row.legacy_id, 'utf8').toString('base64url')}` : UNATTRIBUTED_USER),
+        label: row.member_id
+          ? row.display_name ?? row.snapshot_name ?? '已停用人员'
+          : row.legacy_id !== null ? `历史人员：${row.snapshot_name ?? row.legacy_id}（待确认）` : '未归属',
+        attributionStatus,
+        calls: num(row.calls),
+        totalTokens: input + output + cacheRead + cacheWrite,
+        groupNames: (row.member_id ? groups.get(row.member_id) ?? [] : []).map((group) => group.name),
+        latestEventTs: numOrNull(row.hi),
+      }
+    })
   }
 
   /**

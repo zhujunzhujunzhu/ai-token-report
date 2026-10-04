@@ -33,6 +33,7 @@ import {
 } from '@ai-token-report/shared'
 import type {
   BreakdownResponse,
+  DiagnosticsResponse,
   SeriesResponse,
   StatsMembersResponse,
   StatsProvidersResponse,
@@ -355,7 +356,9 @@ describe('★ 数据范围（非内置管理员只看本人）', () => {
     const role = (await repository.createRole(admin, {
       code: 'roster-lite',
       name: '名册查看者',
-      permission_codes: ['stats:read', 'usage:write', 'members:read'],
+      // ⚠️ 必须带上 `cost:read`：appKey 的固定范围含它，而「一份凭证能做什么 =
+      //   角色权限 ∩ 凭证 scopes」—— 自定义角色少这一项时**连 appKey 都签不出来**。
+      permission_codes: ['stats:read', 'usage:write', 'members:read', 'cost:read'],
     })).role!
     const person = (await repository.createMember(admin, { name: '小运营', role_ids: [role.role_id] })).member!
     const key = (await repository.issueAppKey(admin, { member_id: person.member_id })).token_secret
@@ -701,6 +704,117 @@ describe('采集诊断', () => {
     // 上报接口写下的时刻必须读得回来（看板据此显示「数据多新」）
     expect(typeof b['lastIngestAt']).toBe('number')
     expect(b['lastIngestAt']! > 0).toBe(true)
+  })
+
+  // ── v14：诊断页的规模指标与两张覆盖表 ────────────────────────────
+  test('派生指标走统一口径（total / sessions / 命中率 / 均量）', async () => {
+    await report('tok-zhang', [rec('m-1', { session_id: 's-1' })])
+    await report('tok-li', [rec('m-2', { session_id: 's-2', input_tokens: 0, cache_read_tokens: 0 })])
+    // 两条：1020 + 20 = 1040 total（第二条只把缓存清零，输出仍是 20），
+    // cacheRead 900 → 命中率 900/(900+100)
+    const b = (await get('diagnostics', { period: 'today' })).body as DiagnosticsResponse
+    expect(b.totalEvents).toBe(2)
+    expect(b.totalTokens).toBe(1020 + 20)
+    expect(b.sessions).toBe(2)
+    // ⚠️ 命中率与看板任何一处必须逐位相同：它们来自同一个 shared/metrics.ts。
+    expect(b.cacheHitRate).toBe(cacheHitRate({ input: 100, cacheRead: 900 }))
+    expect(b.avgTokensPerCall).toBe(520)
+    // 会话平均事件数 = 2 / 2
+    expect(b.eventsPerSession).toBe(1)
+    // 跨度 = 最晚 − 最早（两条都落在 todayAt(10)，故为 0）
+    expect(b.spanMs).toBe(0)
+  })
+
+  test('spanMs 取「最晚 − 最早」而不是筛选窗口长度', async () => {
+    await report('tok-zhang', [
+      rec('s-1', { ts: todayAt(8) }),
+      rec('s-2', { seq: 2, ts: todayAt(20) }),
+    ])
+    const b = (await get('diagnostics', { period: 'today' })).body as DiagnosticsResponse
+    expect(b.spanMs).toBe(todayAt(20) - todayAt(8))
+  })
+
+  test('来源覆盖：按来源折叠、按调用降序、且不补齐注册表全集', async () => {
+    await report('tok-zhang', [
+      rec('d-1', { source: 'dsh' }),
+      rec('d-2', { seq: 2, source: 'dsh' }),
+      rec('c-1', { seq: 3, source: 'codex', provider: 'openai', model: 'gpt-5-codex' }),
+    ])
+    const b = (await get('diagnostics', { period: 'today' })).body as DiagnosticsResponse
+    expect(b.sources.map((s) => s.source)).toEqual(['dsh', 'codex'])
+    const dsh = b.sources[0]!
+    expect(dsh.calls).toBe(2)
+    expect(dsh.totalTokens).toBe(2040)
+    expect(dsh.sessions).toBe(1)
+    // ⚠️ claude-code / trae / workbuddy 都在来源枚举里，但这批数据里一条都没有。
+    //   补零会让「没人用」与「没进来」在页面上无法区分。
+    for (const absent of ['claude-code', 'trae', 'trae-cn', 'workbuddy'])
+      expect(b.sources.map((s) => s.source)).not.toContain(absent)
+    // 新鲜度以**服务端取数时刻**为基准 → 一定是数字（不是负数）
+    expect(typeof dsh.silentForMs).toBe('number')
+    expect(dsh.silentForMs! >= 0).toBe(true)
+  })
+
+  test('来源覆盖跟着筛选收窄（分子分母同组条件）', async () => {
+    await report('tok-zhang', [
+      rec('d-1', { source: 'dsh' }),
+      rec('c-1', { seq: 2, source: 'codex' }),
+    ])
+    const all = (await get('diagnostics', { period: 'today' })).body as DiagnosticsResponse
+    const only = (await get('diagnostics', { period: 'today', source: 'codex' }))
+      .body as DiagnosticsResponse
+    expect(only.sources.map((s) => s.source)).toEqual(['codex'])
+    expect(only.totalEvents).toBe(1)
+    expect(all.totalEvents).toBe(2)
+  })
+
+  test('署名覆盖：带分组名与最近事件时刻，且不含未归属', async () => {
+    // ★ 必须带 `identity_view=member`：部门看板的每一次请求都带
+    //   （见 `web-portal/src/api/portal.ts`），这才是生产上真正走的那条路径。
+    //   旧视图下未归属**会**进这张表（与 by=user 同款），那是另一套语义。
+    await report('tok-zhang', [rec('r-zhang', { session_id: 's-zhang' })])
+    await report('tok-li', [rec('r-li', { session_id: 's-li' })])
+    seedUnattributed([
+      { eventId: 'u1', sessionId: 's-u', seq: 1, ts: todayAt(8), input: 1, output: 1, cacheRead: 1 },
+    ])
+    const b = (await get('diagnostics', {
+      period: 'today',
+      identity_view: 'member',
+    })).body as DiagnosticsResponse
+    expect(b.reporters.length).toBe(b.distinctUsers)
+    // ⚠️ 未归属**不进**这张表：它通常比任何单个人的调用都多，
+    //   留着就会把人挤出前 10 名 —— 而这一页最想回答的正是「谁在报」。
+    expect(b.reporters.map((r) => r.attributionStatus)).not.toContain('unattributed')
+    expect(b.reporters.map((r) => r.key)).not.toContain(UNATTRIBUTED_USER)
+    // 未归属仍然出现在卡片上（覆盖率信号不能因为表格排除它就丢掉）
+    expect(b.unattributedEvents).toBe(1)
+    // ⚠️ 这套凭证走的是**旧身份库**（`CredentialStore`），事件上只有
+    //   `user_id` 而没有 `member_id` ⇒ 无从关联分组表 ⇒ `groupNames` 为空数组
+    //   （与人员排行同款：有 member_id 的行才带分组名，见 core/test/portal.test.ts）。
+    //   想验「分组名真的出来了」得走真身份库那条路（真 appKey + member_id）。
+    // 但展示名与归属形态仍要正确：旧身份在成员视图下是「待确认历史身份」
+    const zhangRow = b.reporters.find((r) => r.label.includes('张三'))
+    expect(zhangRow?.groupNames).toEqual([])
+    expect(zhangRow?.attributionStatus).toBe('legacy')
+    expect(zhangRow?.label).toContain('（待确认）')
+  })
+
+  test('旧视图下未归属作为 unknown 那一行出现（与 by=user 同款）', async () => {
+    await report('tok-zhang', [rec('l-zhang')])
+    seedUnattributed([
+      { eventId: 'u1', sessionId: 's-u', seq: 1, ts: todayAt(8), input: 1, output: 1, cacheRead: 1 },
+    ])
+    const b = (await get('diagnostics', { period: 'today' })).body as DiagnosticsResponse
+    expect(b.reporters.map((r) => r.key)).toContain(UNATTRIBUTED_USER)
+    expect(b.reporters.find((r) => r.key === UNATTRIBUTED_USER)?.label).toBe('未归属')
+  })
+
+  test('没有数据时两张覆盖表都是空数组（不是一行 0）', async () => {
+    const b = (await get('diagnostics', { period: 'today' })).body as DiagnosticsResponse
+    expect(b.sources).toEqual([])
+    expect(b.reporters).toEqual([])
+    expect(b.spanMs).toBeNull()
+    expect(b.eventsPerSession).toBeNull()
   })
 })
 
@@ -1141,14 +1255,21 @@ describe('★ 趋势分层（按用户 / 按模型）', () => {
   })
 
   test('★ 没有 cost:read 时分层里连金额都不算（不是算完再丢掉）', async () => {
-    const { repository, zhangKey, send } = await memberWorld()
+    const { repository, admin, zhang, zhangKey, send } = await memberWorld()
     await send(zhangKey, [rec('z1')])
     const route = memberRoute(repository)
-    // appKey 的范围固定是 usage:write + stats:read，**不含** `cost:read`
+    // ★ v13 起内置 `member` 角色带 `cost:read`，所以 **appKey 有金额权限**；
+    //   这一条要验的是「凭证没有 cost:read 时连算都不算」，所以改用一把**窄凭证**
+    //   （scopes 里刻意不放 cost:read —— 它由角色权限交集之后仍然只有两项）。
+    const narrow = (await repository.issueToken(admin, {
+      member_id: zhang.member_id,
+      label: '窄凭证（无 cost:read）',
+      scopes: ['usage:write', 'stats:read'],
+    })).token_secret
     const res = await route.handle(
       'series',
       new URLSearchParams({ bucket: 'day', period: 'today', stack: 'user', identity_view: 'member' }),
-      `Bearer ${zhangKey}`,
+      `Bearer ${narrow}`,
     )
     expect(res.status).toBe(200)
     const body = res.body as SeriesResponse

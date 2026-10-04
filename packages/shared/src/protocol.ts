@@ -652,6 +652,57 @@ export interface IngestQueueStatusResponse {
 }
 
 /**
+ * 采集诊断里的**一个采集来源**（哪个客户端写进来的）。
+ *
+ * ★ 这里的「采集方」= 事件的 `source`（`dsh` / `codex` / `claude-code` / …），
+ *   **不是**人员，也不是供应商。想回答「哪台机器 / 哪个客户端掉线了」时它才是
+ *   那一维；人员维度已经有人员排行了，两者不能互相冒充。
+ *
+ * ⚠️ `latestEventTs`（这个来源**最近一条用量**的时刻）与 `lastIngestAt`（整个库
+ *   最近一次落库的时刻）是两个东西：补报历史数据时，前者可以是上周而后者是刚刚。
+ *   把它们混成一个会得出「某个来源很新鲜」的假结论。
+ */
+export interface DiagnosticsSourceRow {
+  /** 受控枚举值（`source` 列原值，**不做归一化**）。 */
+  source: string
+  /** 该来源的调用条数。 */
+  calls: number
+  /** 该来源的计费总量（**四项之和**，服务端派生，不存库）。 */
+  totalTokens: number
+  /** 去重会话数。 */
+  sessions: number
+  /** 最早 / 最晚事件时间。`latestEventTs` 为 null 表示该来源在范围内没有数据。 */
+  earliestEventTs: number | null
+  latestEventTs: number | null
+  /** 距最近一次事件的间隔（毫秒），以**服务端取数时刻**为基准。 */
+  silentForMs: number | null
+}
+
+/**
+ * 采集诊断里的**采集覆盖**：这份范围内「谁有数据、谁没有」。
+ *
+ * ⚠️ 刻意**不给「应有的人」**：未上报的人是无法从上报库里推出来的
+ *   （本仓铁律「未署名 = 不采集也不上报」，一个人不上报时库里没有任何痕迹）。
+ *   所以这里只报「已入库的人」，「谁没上报」必须去对照人员名册，
+ *   页面**不替服务端猜**一个分母。
+ */
+export interface DiagnosticsAttributionRow {
+  /** 稳定人员 ID，或 `legacy:<base64url>`，或 `unknown`（与 `by=user` 的分组键同形）。 */
+  key: string
+  /** 展示名；未归属为「未归属」，待确认历史身份带「历史人员：」前缀。 */
+  label: string
+  attributionStatus: 'member' | 'legacy' | 'unattributed'
+  calls: number
+  totalTokens: number
+  /** 该人当前所属分组名（多对多，可能为空）。 */
+  groupNames: string[]
+  /** 该人最近一条用量的时刻。 */
+  latestEventTs: number | null
+  /** 距其最近一条用量的间隔（毫秒）；null = 范围内没有任何用量。 */
+  silentForMs: number | null
+}
+
+/**
  * 数据质量诊断。
  *
  * 用于回答「数据是不是少了」这类运维问题 —— 没有这组指标，
@@ -672,6 +723,51 @@ export interface DiagnosticsResponse {
   latestTs: number | null
   /** 最近一次上报时间（用于判断某台机器是否掉线） */
   lastIngestAt: number | null
+
+  // ── 以下为 v14 追加的诊断维度（旧服务端不返回时页面按「缺席」处理）─────
+
+  /**
+   * 计费总量（四项之和）。
+   *
+   * ★ 库里**不存** total 列（铁律 3），这个值由服务端用恒等式派生，
+   *   与看板任何一处的总量必然一致。
+   */
+  totalTokens: number
+  /** 涉及的去重会话数（不可加：跨天会话会被算两次）。 */
+  sessions: number
+  /**
+   * 缓存命中率。
+   *
+   * ★ 口径只由 `shared/metrics.ts` 定义，这里**透传**，页面只格式化。
+   */
+  cacheHitRate: number
+  /**
+   * 平均每次调用的 token 数。
+   *
+   * ⚠️ 它衡量的是**用量密度**（一次调用吃掉多少上下文），不是效率：
+   *   一次长会话里连续几十次调用共享同一段缓存，命中率越高这个数越大。
+   *   页面必须按这个语义措辞，不能写成「每次调用平均消耗」之类的中性话术，
+   *   否则会被读成「用得越来越费」。
+   */
+  avgTokensPerCall: number
+  /** 范围跨度（毫秒）。null = 范围内一条数据都没有。 */
+  spanMs: number | null
+  /** 落库事件里的会话平均事件数。null = 没有事件。 */
+  eventsPerSession: number | null
+  /**
+   * 按来源的覆盖与新鲜度，按调用条数降序。
+   *
+   * ⚠️ 不补零、不预设全集：注册表里的来源在本窗口没有数据时**根本不出现**
+   *   （与 `hour-of-day` 的处理一致）—— 补零会把「没人用」与「没数据」混起来。
+   */
+  sources: DiagnosticsSourceRow[]
+  /**
+   * 按署名键的覆盖与新鲜度，按调用条数降序，取前 10 名。
+   *
+   * ★ 截断发生在**服务端**：页面拿不到第 11 名，也就无从把「还有 3 个来源」
+   *   说成「其余」。要全量明细请去调用明细页按人筛。
+   */
+  reporters: DiagnosticsAttributionRow[]
 }
 
 // ─────────────────────────────────────────────────────────────

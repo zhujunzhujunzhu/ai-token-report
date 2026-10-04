@@ -409,6 +409,218 @@ describe('上报库查询：趋势、明细与诊断', () => {
   })
 })
 
+/**
+ * 诊断页的两张覆盖表（v14）。
+ *
+ * ★ 这两张表回答的是「哪台机器 / 哪个客户端掉线了」，所以「不补零」是它们
+ *   最重要的性质：补一排 0 会让「没人用这个客户端」与「这个客户端的数据
+ *   没进来」在页面上长得一模一样，而后者才是这一页要抓的东西。
+ */
+describe('上报库查询：诊断覆盖表', () => {
+  /** 造一份跨来源、跨人员的素材。 */
+  async function seedCoverage(): Promise<void> {
+    const store = await openPortalStore({ sqlitePath: dbPath })
+    try {
+      await insertAttributedRecords(
+        store,
+        [
+          wireRecord('d:1', { source: 'dsh', session_id: 's-d1', ts: todayAt(9) }),
+          wireRecord('d:2', { source: 'dsh', session_id: 's-d2', ts: todayAt(11) }),
+          // 另一台机器 / 另一个客户端：codex
+          wireRecord('c:1', { source: 'codex', session_id: 's-c1', ts: todayAt(10), input_tokens: 500, cache_read_tokens: 0 }),
+        ],
+        { userId: '张三', userName: '张三' },
+      )
+      await insertAttributedRecords(
+        store,
+        [wireRecord('l:1', { source: 'dsh', session_id: 's-l1', ts: todayAt(8), input_tokens: 40, cache_read_tokens: 0 })],
+        { userId: '李四', userName: '李四' },
+      )
+    } finally {
+      await store.close()
+    }
+  }
+
+  test('sourceCoverage 按来源折叠，四项之和为 totalTokens，且按调用数降序', async () => {
+    await seedCoverage()
+    const rows = await withSession((s) => s.sourceCoverage())
+
+    // ⚠️ 只出现**真的有数据**的来源：注册表里其他来源不补零。
+    expect(rows.map((r) => r.source).sort()).toEqual(['codex', 'dsh'])
+    expect(rows.length).toBe(2)
+
+    const dsh = rows.find((r) => r.source === 'dsh')!
+    expect(dsh.calls).toBe(3)
+    // 总量 = 四项之和（库里不存 total 列）：
+    // d:1 = 100+20+900+0 = 1020，d:2 同，l:1 = 40+20+0+0 = 60
+    expect(dsh.totalTokens).toBe(1020 + 1020 + 60)
+    expect(dsh.sessions).toBe(3)
+    expect(dsh.earliestEventTs).toBe(todayAt(8))
+    expect(dsh.latestEventTs).toBe(todayAt(11))
+
+    const codex = rows.find((r) => r.source === 'codex')!
+    expect(codex.calls).toBe(1)
+    expect(codex.totalTokens).toBe(500 + 20)
+
+    // 按调用条数降序
+    expect(rows[0]!.calls).toBeGreaterThanOrEqual(rows[1]!.calls)
+  })
+
+  test('★ sourceCoverage 不补零：窗口内没有数据的来源根本不出现', async () => {
+    await seedCoverage()
+    const rows = await withSession((s) => s.sourceCoverage())
+    // claude-code / trae / workbuddy 都在来源枚举里，但这批数据里一条都没有。
+    // 补零会让「没人用」与「没进来」无法区分。
+    for (const absent of ['claude-code', 'trae', 'trae-cn', 'workbuddy'])
+      expect(rows.map((r) => r.source)).not.toContain(absent)
+  })
+
+  test('sourceCoverage 跟着筛选收窄（分子分母同组条件）', async () => {
+    await seedCoverage()
+    const all = await withSession((s) => s.sourceCoverage())
+    const dshOnly = await withSession((s) => s.sourceCoverage(), { sources: ['dsh'] })
+    expect(dshOnly.length).toBe(1)
+    expect(dshOnly[0]!.source).toBe('dsh')
+    expect(dshOnly[0]!.calls).toBeLessThan(all.reduce((sum, r) => sum + r.calls, 0))
+  })
+
+  test('reporterCoverage 的分组口径与 distinctUsers **逐字一致**', async () => {
+    // 🚨 卡片上的「署名键组数」与这张表的行数必须是同一个数。
+    //   两者一旦分叉，页面上会出现两个看起来各自正确、却对不上的数字。
+    // ★ 两边必须打**同一组筛选条件**（生产环境永远是 identityView='member'，
+    //   见 `stats-route.ts` 的 parseWindow / applyDataScope）。
+    await seed()
+    const { rows, users } = await withSession(
+      async (s) => ({
+        rows: await s.reporterCoverage(100),
+        users: await s.distinctUsers(),
+      }),
+      { identityView: 'member' },
+    )
+    expect(rows.length).toBe(users)
+    expect(users).toBe(3)
+  })
+
+  test('reporterCoverage 按调用条数降序取前 N 名', async () => {
+    await seed()
+    const all = await withSession((s) => s.reporterCoverage(100), { identityView: 'member' })
+    expect(all.length).toBeGreaterThan(1)
+    for (let i = 1; i < all.length; i++) expect(all[i - 1]!.calls).toBeGreaterThanOrEqual(all[i]!.calls)
+
+    const top1 = await withSession((s) => s.reporterCoverage(1), { identityView: 'member' })
+    expect(top1.length).toBe(1)
+    expect(top1[0]!.calls).toBe(all[0]!.calls)
+  })
+
+  test('reporterCoverage 的键形与 by=user 分组键同形', async () => {
+    await seed()
+    const { rows, byUser } = await withSession(
+      async (s) => ({
+        rows: await s.reporterCoverage(100),
+        byUser: await s.groups('user'),
+      }),
+      { identityView: 'member' },
+    )
+    // 「已署名」的那部分键必须逐字相同 —— 两处「张三」必须指向同一个身份。
+    expect(rows.map((r) => r.key).sort())
+      .toEqual(byUser.map((r) => r.key).filter((k) => k !== UNATTRIBUTED_USER).sort())
+    // ⚠️ 与人员排行的**有意差异**：那里必须留一行 `unknown`，
+    //   否则「有多少数据没署名」在排行里就彻底看不见了；而这张表是「署名覆盖」，
+    //   未归属不进（见下一条）。一处要包含、一处要排除，都是刻意的。
+    expect(byUser.map((r) => r.key)).toContain(UNATTRIBUTED_USER)
+  })
+
+  // 🚨 这条是「署名覆盖表」最重要的性质：服务端按调用条数降序截断到前 10 名，
+  //   而未归属通常比任何**单个人**的调用都多 —— 留着它会把真正的人挤出表外，
+  //   于是这一页最想回答的「谁在报」反而看不见了。
+  test('★ 成员视图下未归属**不进**这张表（否则它会占掉前 10 名、把人挤出去）', async () => {
+    // 🚨 这条与 `distinctUsers` 成员分支的过滤条件逐字对应：
+    //   「署名键组数」数的是「有署名的身份」，未归属**不计入**（见卡片说明）。
+    //   两处口径一旦分叉，同一页面上就会出现两个对不上的数字。
+    await seed()
+    const rows = await withSession((s) => s.reporterCoverage(100), { identityView: 'member' })
+    expect(rows.every((r) => r.attributionStatus !== 'unattributed')).toBe(true)
+    expect(rows.map((r) => r.key)).not.toContain(UNATTRIBUTED_USER)
+    // 三个人都在（张三两条事件合一行）
+    expect(rows.length).toBe(3)
+  })
+
+  test('旧视图下未归属作为 unknown 那一行出现（与 by=user 同款）', async () => {
+    await seed()
+    const rows = await withSession((s) => s.reporterCoverage(100))
+    // ⚠️ 旧视图没有 member_id，未归属若被过滤掉，
+    //   「有多少数据没署名」在这张表里就彻底看不见了。
+    expect(rows.map((r) => r.key)).toContain(UNATTRIBUTED_USER)
+    expect(rows.find((r) => r.key === UNATTRIBUTED_USER)?.label).toBe('未归属')
+  })
+
+  test('reporterCoverage 带上展示名、归属形态与最近事件时刻', async () => {
+    await seed()
+    const rows = await withSession((s) => s.reporterCoverage(100), { identityView: 'member' })
+    // ⚠️ 这批素材是用 `userId` 造的，**没有 member_id**，
+    //   所以成员视图下它们是「待确认历史身份」，展示名带「历史人员：」前缀。
+    const zhang = rows.find((r) => r.key === 'legacy:5byg5LiJ')!
+    expect(zhang.label).toBe('历史人员：张三（待确认）')
+    expect(zhang.attributionStatus).toBe('legacy')
+    // 张三两条事件合一行
+    expect(zhang.calls).toBe(2)
+    expect(zhang.totalTokens).toBe(2040)
+    // 没有 member_id → 无从关联分组（与人员排行的 `groupNames` 同款）
+    expect(zhang.groupNames).toEqual([])
+    expect(zhang.latestEventTs).toBe(todayAt(10))
+  })
+
+  test('有 member_id 的行显示名取自人员表、分组名来自关联表', async () => {
+    // ★ 这条与上一条互补：真实上报里绝大多数行**有** member_id，
+    //   那才是生产上看到的样子（显示名来自 `members.display_name`）。
+    await seed()
+    const memberId = '10000000-0000-4000-8000-000000000031'
+    const groupId = '10000000-0000-4000-8000-000000000041'
+    const store = await openPortalStore({ sqlitePath: dbPath })
+    try {
+      await store.transaction(async (tx) => {
+        await tx.run(
+          "INSERT INTO member_groups (group_id,name,created_at_ms,updated_at_ms) VALUES ($id,'平台组',1,1)",
+          { $id: groupId },
+        )
+        await tx.run(
+          "INSERT INTO members (member_id,display_name,created_at_ms,updated_at_ms) VALUES ($id,'王五',1,1)",
+          { $id: memberId },
+        )
+        await tx.run(
+          'INSERT INTO member_group_assignments (member_id,group_id,created_at_ms) VALUES ($member,$group,1)',
+          { $member: memberId, $group: groupId },
+        )
+      })
+      await insertAttributedRecords(store, [wireRecord('g:9')], {
+        userId: '王五',
+        userName: '王五',
+        groupName: '平台组',
+        memberId,
+      })
+    } finally {
+      await store.close()
+    }
+
+    const rows = await withSession((s) => s.reporterCoverage(100), { identityView: 'member' })
+    const row = rows.find((r) => r.key === memberId)!
+    expect(row.label).toBe('王五')
+    expect(row.attributionStatus).toBe('member')
+    expect(row.groupNames).toEqual(['平台组'])
+    expect(row.calls).toBe(1)
+  })
+
+  test('窗口内一条数据都没有时两张表都是空数组（不是一行 0）', async () => {
+    openPortalDb(dbPath).close()
+    const { sources, reporters } = await withSession(async (s) => ({
+      sources: await s.sourceCoverage(),
+      reporters: await s.reporterCoverage(),
+    }))
+    expect(sources).toEqual([])
+    expect(reporters).toEqual([])
+  })
+})
+
 describe('上报库：绝不自动重建', () => {
   test('schema 版本不符时打开即抛错（不做降级）', async () => {
     const db = openPortalDb(dbPath)

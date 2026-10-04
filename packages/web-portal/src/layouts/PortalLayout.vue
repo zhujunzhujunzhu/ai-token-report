@@ -48,7 +48,6 @@ const navigation = computed(() => [
   { path: '/overview', label: '用量总览', icon: DataAnalysis },
   { path: '/analysis', label: '用量分析', icon: DataLine },
   { path: '/records', label: '调用明细', icon: Document },
-  { path: '/diagnostics', label: '采集诊断', icon: FirstAidKit },
   ...(session.can('members:read')
     ? [{ path: '/members', label: '人员管理', icon: User }]
     : []),
@@ -79,6 +78,10 @@ const navigation = computed(() => [
   ...(session.can('pricing:manage')
     ? [{ path: '/pricing', label: '模型单价', icon: Money }]
     : []),
+  // ★ 采集诊断**刻意排在最后一位**：它是运维自查页面（数据有没有少、哪台机器
+  //   掉线了），不是日常看数用的页面 —— 放在「调用明细」后面会让人误以为它是
+  //   分析流程的一部分，而它每次打开都要先想清楚「我现在是在查数据还是在查链路」。
+  { path: '/diagnostics', label: '采集诊断', icon: FirstAidKit },
 ])
 watch(
   () => route.path,

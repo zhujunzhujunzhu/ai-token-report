@@ -8,7 +8,7 @@ import { renderToString } from 'vue/server-renderer'
 import { createPinia, disposePinia } from 'pinia'
 import { createMemoryHistory } from 'vue-router'
 import { ID_INJECTION_KEY, ZINDEX_INJECTION_KEY } from 'element-plus'
-import type { BreakdownRow, OverviewResponse } from '@ai-token-report/shared'
+import type { BreakdownRow, DiagnosticsResponse, OverviewResponse } from '@ai-token-report/shared'
 const server = await createServer({
   root: process.cwd(),
   server: { middlewareMode: true },
@@ -163,6 +163,29 @@ try {
     navigationHtml.indexOf('分组管理') < navigationHtml.indexOf('供应商模型归一化') &&
     navigationHtml.indexOf('供应商模型归一化') < navigationHtml.indexOf('项目归一化') &&
     navigationHtml.indexOf('项目归一化') < navigationHtml.indexOf('模型单价'))
+  // ★ 采集诊断**排在最后一位**：它是运维自查页，不是日常看数的一环。
+  //   钉住位置是因为「挪到明细后面」与「挪到管理页前面」在页面上都只是排序，
+  //   而这个顺序是产品约定 —— 一旦被随手重排，没人会发现。
+  check('采集诊断排在侧栏最后一位（用量/分析/明细之后，全部管理页之后）',
+    navigationHtml.includes('采集诊断') &&
+    navigationHtml.indexOf('用量总览') < navigationHtml.indexOf('采集诊断') &&
+    navigationHtml.indexOf('用量分析') < navigationHtml.indexOf('采集诊断') &&
+    navigationHtml.indexOf('调用明细') < navigationHtml.indexOf('采集诊断') &&
+    navigationHtml.indexOf('模型单价') < navigationHtml.indexOf('采集诊断'))
+  // ★ 它是**唯一**一个所有身份都看得见的统计页（不需要任何管理权限），
+  //   所以必须出现在「没有任何权限」的成员导航里 —— 钉住这一点才能防止
+  //   将来有人顺手给它加上一道 requiredPermission。
+  {
+    session.identity = { name: '测试成员', username: 'member', role: 'member', permissions: [] }
+    session.generation++
+    const bareLayout = await render('/src/layouts/PortalLayout.vue')
+    const bareNav = bareLayout.match(/<aside\b[\s\S]*?<\/aside>/)?.[0] ?? ''
+    check('无任何权限时采集诊断仍可见（它是统计页，不受管理权限门禁）',
+      bareNav.includes('采集诊断') &&
+      bareNav.indexOf('调用明细') < bareNav.indexOf('采集诊断'))
+    session.identity = { member_id: '00000000-0000-4000-8000-000000000001', name: '测试管理员', username: 'admin', role: 'admin', permissions: ['members:read', 'members:manage', 'groups:read', 'groups:manage', 'roles:read', 'roles:assign', 'tokens:manage', 'providers:read', 'providers:manage', 'projects:read', 'projects:manage', 'cost:read', 'pricing:manage'] }
+    session.generation++
+  }
 
   const dashboard = useDashboardStore(pinia)
   // ⚠️ 留一份**没有 `cost`** 的花生（fixture）：下面验金额时要临时挂上 `cost`
@@ -183,7 +206,7 @@ try {
   }
   dashboard.overview = overviewFixture
   dashboard.series = { bucket: 'day', points: [] }
-  dashboard.diagnostics = {
+  const diagnosticsBase: DiagnosticsResponse = {
     totalEvents: 5,
     unattributedEvents: 1,
     unattributedRate: 0.2,
@@ -193,7 +216,45 @@ try {
     earliestTs: null,
     latestTs: null,
     lastIngestAt: null,
+    // ── v14 追加 ──
+    totalTokens: 21_756,
+    sessions: 3,
+    cacheHitRate: 0.943,
+    avgTokensPerCall: 4351.2,
+    spanMs: 6 * 86_400_000,
+    eventsPerSession: 5 / 3,
+    sources: [
+      {
+        source: 'dsh', calls: 4, totalTokens: 20_000, sessions: 2,
+        earliestEventTs: 1_757_000_000_000, latestEventTs: 1_757_500_000_000,
+        silentForMs: 60_000,
+      },
+      {
+        // ★ 静默档：间隔超过 24 小时 → 状态行与 tag 都要能看见它。
+        source: 'codex', calls: 1, totalTokens: 1_756, sessions: 1,
+        earliestEventTs: 1_756_000_000_000, latestEventTs: 1_756_000_000_000,
+        silentForMs: 3 * 86_400_000,
+      },
+    ],
+    reporters: [
+      {
+        key: 'u-zhang', label: '张三', attributionStatus: 'member', calls: 2,
+        totalTokens: 12_000, groupNames: ['研发'], latestEventTs: 1_757_500_000_000,
+        silentForMs: 60_000,
+      },
+      {
+        key: 'legacy:aHR0cHM', label: '历史人员：李四（待确认）', attributionStatus: 'legacy',
+        calls: 1, totalTokens: 5_000, groupNames: [], latestEventTs: 1_757_400_000_000,
+        silentForMs: 3 * 86_400_000,
+      },
+      {
+        key: 'unknown', label: '未归属', attributionStatus: 'unattributed', calls: 1,
+        totalTokens: 1_756, groupNames: [], latestEventTs: 1_756_000_000_000,
+        silentForMs: 3 * 86_400_000,
+      },
+    ],
   }
+  dashboard.diagnostics = diagnosticsBase
   const dashboardHtml = await render('/src/views/DashboardView.vue')
   for (const label of [
     '计费总量',
@@ -436,10 +497,72 @@ try {
   const unattributedDiagnostics = dashboard.diagnostics
   dashboard.diagnostics = { ...unattributedDiagnostics, unattributedEvents: 0, unattributedRate: 0 }
   const cleanDiagnosticsHtml = await render('/src/views/DiagnosticsView.vue')
-  check('诊断无未归属时状态行恢复常态',
-    cleanDiagnosticsHtml.includes('当前范围内未发现未归属记录') &&
-    cleanDiagnosticsHtml.includes('is-ok') && !cleanDiagnosticsHtml.includes('is-warning'))
+  check('诊断无未归属时状态行不再报未归属',
+    cleanDiagnosticsHtml.includes('存在 1 条未归属记录') === false)
+  // ⚠️ 清掉未归属之后**仍然是警告态**：这份 fixture 里有两个静默来源
+  //   （codex 与一位待确认历史身份都超过 24 小时），状态行必须改说掉线，
+  //   而不是笼统地回到「一切正常」。
+  check('未归属清零后仍按静默来源给出可执行的结论',
+    cleanDiagnosticsHtml.includes('is-warning') &&
+    cleanDiagnosticsHtml.includes('采集来源已超过 24 小时没有新数据'))
+  // ★ 只有未归属与静默都清掉时才是常态绿 —— 这一条钉住「红变绿」的全部条件。
+  dashboard.diagnostics = {
+    ...unattributedDiagnostics,
+    unattributedEvents: 0,
+    unattributedRate: 0,
+    sources: unattributedDiagnostics!.sources.map((row) => ({ ...row, silentForMs: 60_000 })),
+    reporters: unattributedDiagnostics!.reporters.map((row) => ({ ...row, silentForMs: 60_000 })),
+  }
+  const healthyDiagnosticsHtml = await render('/src/views/DiagnosticsView.vue')
+  check('未归属与静默都清零时状态行恢复常态',
+    healthyDiagnosticsHtml.includes('当前范围内未发现未归属记录，采集链路新鲜') &&
+    healthyDiagnosticsHtml.includes('is-ok') && !healthyDiagnosticsHtml.includes('is-warning'))
   dashboard.diagnostics = unattributedDiagnostics
+  // ── v14：来源覆盖与署名覆盖 ──────────────────────────────────────
+  // ⚠️ 分区标题用**分隔符精确匹配**，不能用 `includes('采集来源覆盖')`：
+  //   模板里那段解释性注释本身含有这几个字，而 SSR（开发态）会把注释原样输出。
+  //   子串匹配于是会在「这张表其实没渲染」时依然通过 —— 一条永远绿的断言
+  //   比没有断言更糟。`<h2>…</h2>` 才是标题真正出现时的形态。
+  const hasHeading = (html: string, text: string): boolean =>
+    html.includes(`<h2>${text}</h2>`)
+  // ⚠️ 来源行与署名行的**逐行内容**（哪个来源、哪个人的名字、分组名、
+  //   「不补零」这件事）由 `test/diagnostics-model.test.ts` 断言：
+  //   SSR 下 `el-table` 只输出空 `<tr>`（Element Plus 的表头与单元格由客户端渲染，
+  //   理由与 `rolesModel.ts` 同款），在这里断言行内容会得到一条永远失败的断言。
+  //   这里只钉**表头与文案** —— 它们是真的出现在返回 HTML 里的。
+  for (const label of ['采集来源覆盖', '署名覆盖', '数据时间边界'])
+    check(`诊断含分区 ${label}`, hasHeading(diagnosticsHtml, label))
+  check('来源表说明「不补零」的判据（超过 24 小时无新数据才标静默）',
+    diagnosticsHtml.includes('按上报来源（客户端）折叠') &&
+    diagnosticsHtml.includes('超过 24 小时无新数据会标为静默'))
+  check('署名表说明「待确认历史身份」与截断口径',
+    diagnosticsHtml.includes('按调用条数降序取前 10 名') &&
+    diagnosticsHtml.includes('尚未关联到成员'))
+  // 新增的四张卡片 + 时间节奏：新服务端才出现。
+  // ⚠️ 同样用**标签体**匹配：卡片名也出现在别处（本文件的注释），
+  //   而卡片名本身在正文里是 `<span title="…">名称</span>` 这一个形态。
+  for (const label of ['会话数', '计费总量', '缓存命中率', '每次调用均量', '数据跨度', '平均每会话事件'])
+    check(`诊断含指标 ${label}`, diagnosticsHtml.includes(`>${label}<`))
+  // ⚠️ 平均每次调用的措辞必须守住语义：它是「用量密度」，不是「效率」。
+  //   这句在卡片的 `title` 属性里，只有卡片真的渲染了才会出现。
+  check('每次调用均量说明它不代表效率',
+    diagnosticsHtml.includes('衡量单次调用的用量密度，不代表效率'))
+  // 命中率 0.943 → '94.3%'；口径由服务端算好后透传，页面只格式化。
+  check('诊断直接展示服务端算好的缓存命中率', diagnosticsHtml.includes('94.3%'))
+  // ★ 旧服务端兼容：新字段整个缺席时，那四张卡片必须**消失**而不是显示 0。
+  const { totalTokens: _dropTotal, sessions: _dropSessions, cacheHitRate: _dropHit,
+    avgTokensPerCall: _dropAvg, spanMs: _dropSpan, eventsPerSession: _dropEps,
+    sources: _dropSources, reporters: _dropReporters, ...legacyDiagnostics } =
+    diagnosticsBase as Partial<DiagnosticsResponse> as DiagnosticsResponse
+  dashboard.diagnostics = legacyDiagnostics as DiagnosticsResponse
+  const legacyHtml = await render('/src/views/DiagnosticsView.vue')
+  check('旧服务端（无 v14 字段）时新增卡片与两张表整块消失，不显示 0 冒充',
+    !legacyHtml.includes('每次调用均量') &&
+    !hasHeading(legacyHtml, '采集来源覆盖') && !hasHeading(legacyHtml, '署名覆盖') &&
+    // 老四张卡与时间边界照常在
+    legacyHtml.includes('落库事件数') && legacyHtml.includes('署名键组数') &&
+    legacyHtml.includes('未署名事件') && hasHeading(legacyHtml, '数据时间边界'))
+  dashboard.diagnostics = diagnosticsBase
   const filterHtml = await render('/src/components/FilterBar.vue')
   check(
     '筛选表单使用组件库',
@@ -669,7 +792,9 @@ try {
   check('供应商归一化不混排人员或分组列表', !providersHtml.includes('人员列表') && !providersHtml.includes('分组列表'))
   const projectsHtml = await render('/src/views/ProjectsView.vue')
   check('项目归一化独立展示规则列表、搜索、作用范围与新增入口',
-    ['项目归一化', '规则列表', '搜索目录前缀或项目名', '全部作用范围', '添加规则'].every((label) => projectsHtml.includes(label)))
+    // ⚠️ 占位符按**当前源码**写：这一页的搜索同时匹配仓库名 / 目录前缀与项目名，
+    //   输入框占位语是「搜索仓库名或项目名」。
+    ['项目归一化', '规则列表', '搜索仓库名或项目名', '全部作用范围', '添加规则'].every((label) => projectsHtml.includes(label)))
   // ★ 与供应商那页**刻意不同**的三件事必须写在页面上，否则使用者会照搬供应商那套理解：
   //   ① 匹配的是**目录前缀**、而且按路径分隔符边界（`D:\a\proj` 不吃 `D:\a\proj-other`）；
   //   ② 多条命中时**最长前缀优先**；
@@ -682,19 +807,24 @@ try {
     projectsHtml.includes('区分大小写') && projectsHtml.includes('会被自动去掉'))
   check('项目归一化不混排人员或分组列表', !projectsHtml.includes('人员列表') && !projectsHtml.includes('分组列表'))
   const pricingHtml = await render('/src/views/PricingView.vue')
-  check('模型单价独立展示计价目录、新增入口与种子初始化',
-    ['模型单价', '计价目录', '新增单价', '用内置种子价初始化'].every((label) => pricingHtml.includes(label)))
-  // ★ 这一页最容易误解的三件事必须写在页面上，而不是只写在代码注释里：
+  check('模型单价独立展示计价目录与新增入口',
+    ['模型单价', '计价目录', '新增单价'].every((label) => pricingHtml.includes(label)))
+  // ★ 2026-10 起**不再有任何内置价目表**：这一页不许再出现「用内置种子价初始化」，
+  //   它的旧形态是「一键把一屏没核对过的官方零售价写进库」，那正是被删掉的东西。
+  check('★ 计价页不得再出现「内置种子价」入口',
+    !pricingHtml.includes('内置种子价') && !pricingHtml.includes('种子'))
+  // ★ 这一页最容易误解的四件事必须写在页面上，而不是只写在代码注释里：
   //   ① 粒度是「供应商 → 模型」，同一供应商下不同模型可以各配各的价；
-  //   ② 只存单价、不存金额，所以改价不改写历史用量；
-  //   ③ 未配单价的用量是「未计价」，**不是 0 元**。
+  //   ② 四类 token 各乘各自的价（合成一个价等于让 94% 的缓存读用量算错）；
+  //   ③ 只存单价、不存金额，所以改价不改写历史用量；
+  //   ④ 未配单价的用量是「未计价」，**不是 0 元**。
   check('模型单价写明按「供应商 + 模型」粒度定价',
     pricingHtml.includes('同一供应商下不同模型可以各不相同') &&
     pricingHtml.includes('区间不得重叠'))
   check('模型单价写明「只存单价不存金额」与「未计价不是 0 元」',
     pricingHtml.includes('而历史用量一个字节都不会被动') &&
+    pricingHtml.includes('四类 token 各乘各自的价') &&
     pricingHtml.includes('未计价') &&
-    pricingHtml.includes('缓存读价通常比输入价便宜一个数量级') &&
     pricingHtml.includes('多币种各自累加，绝不换算也绝不相加') &&
     pricingHtml.includes('自建计价永远不会等于财务账单'))
   check('模型单价不混排人员或分组列表', !pricingHtml.includes('人员列表') && !pricingHtml.includes('分组列表'))
@@ -704,10 +834,11 @@ try {
   check('★ v10：模型单价写明「不限供应商的基础价」是兜底价',
     pricingHtml.includes('没有为某个供应商单独配价时') &&
     pricingHtml.includes('不限供应商的基础价') &&
-    pricingHtml.includes('不限供应商的那条是兜底价'))
+    pricingHtml.includes('兜底价'))
   check('★ v10：模型单价写明闲时价是同一行的另一套四个数（不是乘折扣）',
-    pricingHtml.includes('闲时（低谷）价是同一行的另一套四个数') &&
-    pricingHtml.includes('法定节假日表需要逐年补'))
+    pricingHtml.includes('闲时') &&
+    pricingHtml.includes('另一套四个数') &&
+    pricingHtml.includes('高峰 / 闲时'))
   const allHtml =
     loginHtml +
     dashboardHtml +
