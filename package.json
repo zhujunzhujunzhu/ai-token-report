@@ -28,6 +28,7 @@
 
     "verify:npm:cli": "bun run --filter '@ai-token-report/cli' verify:npm",
     "verify:npm:plugin": "bun run --filter 'dsh-plugin-token-report' verify:npm",
+    "verify:market": "bun run packages/dsh-plugin/verify/verify-market-entry.ts",
     "verify:npm": "bun run verify:npm:cli && bun run verify:npm:plugin",
 
     "publish:cli:dry": "bun run scripts/release.ts cli --dry-run",
