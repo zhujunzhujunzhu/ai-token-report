@@ -1274,14 +1274,18 @@ bun run --filter 'dsh-plugin-token-report' build
 
 五层验证脚本，**从内到外逐层接近真实**：
 
+> 下表的断言数是**当前实测值**（会随改动漂移）；权威数字是脚本自己打印的「全部通过：N 项断言」。
+
 | 脚本 | 层次 | 断言数 | 验证什么 |
 |---|---|---|---|
-| `bun test packages/dsh-plugin` | 单元 | 435 | 折叠口径 / 配置优先级 / **面板位置与热切换** / outbox 崩溃不丢 / 热路径只入队 / **就地换连接（runtime）** / **上报实录的字节上限与截断** / **配置与调试路由与页面文案** / **会话日志根的落盘、清空与生效来源** / **界面：格式、取数状态机、挂载点、离屏渲染** |
-| `verify/verify-plugin.ts` | 端到端冒烟 | 70 | **真 HTTP 往返** + 真扫日志 + 崩溃恢复（假 ctx）+ **面板改会话日志根后同一进程就地生效** |
-| `verify/verify-cordis-load.ts` | 真实框架装载 | 10 | 打包产物挂进**真 cordis Context**，含 `inject` 形状 |
-| `verify/verify-resolution.ts` | **宿主语义** | 9 | 用 **Node**（不是 Bun）解析并加载打包产物 |
+| `bun test packages/dsh-plugin` | 单元 | 446 | 折叠口径 / 配置优先级 / **面板位置与热切换** / outbox 崩溃不丢 / 热路径只入队 / **就地换连接（runtime）** / **上报实录的字节上限与截断** / **配置与调试路由与页面文案** / **会话日志根的落盘、清空与生效来源** / **界面：格式、取数状态机、挂载点、离屏渲染** / **捕获侧：宿主事件 → 账本记录、正文不外发、拿不到时间戳整条丢弃** |
+| `verify/verify-plugin.ts` | 端到端冒烟 | 79 | **真 HTTP 往返** + 真扫日志 + 崩溃恢复（假 ctx）+ **面板改会话日志根后同一进程就地生效** + **捕获侧不注册 `sessionTelemetry`**（与官方 OTel 共存的正面证据） |
+| `verify/verify-cordis-load.ts` | 真实框架装载 | 11 | 打包产物挂进**真 cordis Context**：**先让官方后端占住 `sessionTelemetry` 服务名**，断言照样装载、没把它顶掉、真事件总线上的计费事件被捕获并投递、卸载后监听器解除；含 `inject` 形状 |
+| `verify/verify-resolution.ts` | **宿主语义** | 7 | 用 **Node**（不是 Bun）解析并加载打包产物，逐个 peer 断言可解析 |
 | `verify/verify-client-bundle.ts` | **浏览器半产物** | 40 | 真跑 `lib/client.js`：信封形状 / **平台模块纯度** / 双半路由一致（含配置与调试两条新路由） / **会话日志根那一栏真的在产物里** / **三种位置各注册哪些 slot** / slot 注册 |
 | `verify/diagnose-boot.ts` | 排障工具 | — | profile 里哪个包 import 就炸，展开完整 cause 链 |
+| `verify/verify-profile-boot.ts <tgz>` | **发布产物** | — | 从 `bun pm pack` 出来的 tarball 装进临时 profile，**起完整 DSH Web 并打 HTTP**（不是「import 成功就算过」） |
+| `verify/verify-startup.ts` | 真宿主冷启动 | — | 真 `dsh web` + 面板三条查询的绝对条数（已关掉非 DSH 来源，见脚本内注释） |
 
 另有三个辅助脚本：
 
