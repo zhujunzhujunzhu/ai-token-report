@@ -3,7 +3,7 @@
  *
  * ## 🚨 热路径约束（改这个文件前必须理解）
  *
- * `enqueue()` 被 `TokenReportBackend.emit()` **同步**调用，而 `emit()`
+ * `enqueue()` 被 `TokenReportCapture.emit()` **同步**调用，而 `emit()`
  * 又在 `session/event` 的**热路径**上 —— 每一条会话事件都会走到这里。
  * 所以 `enqueue()` 只能做**内存 push**：一旦在里面 `await fetch`，
  * 用户会直接感觉到 agent 卡顿。
@@ -71,11 +71,14 @@ export function emptyReporterStats(): ReporterStats {
 /**
  * 把「读当前统计」包成**既能调用、又能当纯数据读**的对象。
  *
- * 🚨 为什么不是普通方法或 getter：cordis 的 `ctx.get(name)` 返回服务代理，
- *   而 JS 私有字段**穿不过 Proxy** —— 任何 `this.#x` 的取值器经代理都会抛
- *   `TypeError: Cannot access invalid private field`。这里在构造时就把
- *   `read` 捕获进闭包，挂在**自有属性**上，于是
- *   `backend.reporterStats.enqueued` 与 `backend.reporterStats()` 都成立。
+ * 🚨 为什么不是普通方法或 getter：0.8.x 时本插件是 cordis 服务，
+ *   而 `ctx.get(name)` 返回的是**服务代理**，JS 私有字段**穿不过 Proxy** ——
+ *   任何 `this.#x` 的取值器经代理都会抛
+ *   `TypeError: Cannot access invalid private field`。
+ *   0.9.0 起本插件不再是服务，这条约束在构造上已不存在；写法保留，
+ *   是因为「构造时把 `read` 捕获进闭包、挂成自有属性」本来就没有代价，
+ *   而且真有人把它改回服务形态时不会再踩一次。
+ *   于是 `backend.reporterStats.enqueued` 与 `backend.reporterStats()` 都成立。
  *
  * ★ 上报单元可以被**就地替换**（改地址/appKey 后重新启用），
  *   所以这里每次都向 `read()` 要当前值，而不是构造那一刻的快照。
@@ -101,7 +104,7 @@ export function makeReporterStatsView(read: () => ReporterStats | null): (() => 
 /**
  * 计数器本体。
  *
- * ★ 拆成独立对象，是为了让 `TokenReportBackend` 能把**同一份快照**
+ * ★ 拆成独立对象，是为了让 `TokenReportCapture` 能把**同一份快照**
  *   既作为私有状态更新、又作为公开字段暴露 —— 见下面 `Reporter.stats` 的注释。
  */
 class StatsKeeper {
@@ -188,8 +191,8 @@ export class Reporter {
    * 读运行统计的入口 —— **既可直接调用，也可当作纯数据字段读**。
    *
    * 🚨 为什么挂一个带属性的函数而不是普通方法：
-   *   cordis 的 `ctx.get(name)` 返回服务代理，而 JS **私有字段穿不过 Proxy**，
-   *   任何 `this.#xxx` 的方法/取值器经代理调用都会抛
+   *   0.8.x 时本插件是 cordis 服务，`ctx.get(name)` 返回服务代理，而 JS
+   *   **私有字段穿不过 Proxy** —— 任何 `this.#xxx` 的方法/取值器经代理调用都会抛
    *   `TypeError: Cannot access invalid private field`。
    *   这里在构造时就把 `#stats` 捕获进闭包并挂成**自有属性**，
    *   于是 `backend.reporterStats.enqueued` 与 `backend.reporterStats()` 都成立，

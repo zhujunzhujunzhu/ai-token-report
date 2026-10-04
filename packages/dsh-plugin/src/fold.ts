@@ -1,9 +1,9 @@
 /**
- * 折叠：把 DSH 交给 telemetry 后端的一条条原始事件，折叠成**计费记录**。
+ * 折叠：把宿主会话事件流交过来的一条条事件，折叠成**计费记录**。
  *
  * ## 为什么需要这一层
  *
- * `SessionTelemetryCoordinator` 是「一条会话事件 = 一条记录」的**镜像**，
+ * `capture.ts` 是「一条会话事件 = 一条记录」的**镜像**，
  * 它不挑不拣 —— `user/message`、`tool/call`、`step/start` 全都会交过来。
  * 而计费只认一种事件：带 `data.usage` 的 `assistant/message`
  * （provider 真实上报值，见 `dsh-session-log-parsing` skill）。
@@ -26,7 +26,34 @@
  */
 
 import { computeTotal, type TokenUsage } from '@ai-token-report/shared'
-import type { SessionTelemetryRecord } from '@deepseek-ai/dsh-session-telemetry'
+
+/**
+ * 账本记录的**结构形状** —— 只列本模块真正会读的字段。
+ *
+ * ★ 0.9.0 起刻意**不再 import `@deepseek-ai/dsh-session-telemetry` 的类型**：
+ *   本插件不再注册 `sessionTelemetry` 服务。那个服务名一个进程只能注册一次
+ *   （cordis `reflect.provide` 重名直接抛），而官方 `dsh-session-telemetry-otel`
+ *   **永远**占着它 —— 宿主源码原话是 "always registers the `sessionTelemetry`
+ *   service (duplicate load throws)"，连 `mode: DISABLED` 都照样注册。
+ *   于是本插件改为自己订阅宿主会话事件流（见 `capture.ts`）并自行拼出这个形状。
+ *   类型上继续引用那个包，会让「其实已经不依赖它了」这件事在编译期看不出来。
+ *
+ * ⚠️ 保持**具体字段的结构类型**而不是 `unknown`：折叠是本插件唯一会算错数的地方，
+ *   字段名写错时希望编译期就报，而不是等看板上的数字偏低。
+ */
+export interface TelemetryRecord {
+  /** `ledger` = 账本（带 `event.seq`）；`ops` = 运维信号（`agent-error` / `shutdown`），**不参与计费**。 */
+  channel: string
+  /** 事件自己的时间戳（账本记录 = 源事件的 append 时间）。 */
+  time: number
+  severity?: string
+  /** 会话级事实与事件信封；本模块读 `session.id` / `session.cwd` / `event.type` / `event.seq`。 */
+  attributes: Record<string, unknown>
+  /** 源事件的 `data`（未脱敏、未裁剪 —— 只取计费字段是 `foldRecord()` 的责任）。 */
+  body: unknown
+  /** 官方 OTel 后端靠它还原源事件；本插件折叠时用不到，所以是可选的。 */
+  sourceEvent?: unknown
+}
 
 /**
  * 插件的身份参数 —— 折叠时需要它来填 `client` 字段。
@@ -131,7 +158,7 @@ function optNum(v: unknown): number | null {
  * @returns 计费记录；不是计费事件时返回 null。
  */
 export function foldRecord(
-  record: SessionTelemetryRecord,
+  record: TelemetryRecord,
   identity: FoldIdentity,
 ): BillingRecord | null {
   if (record.channel !== 'ledger') return null

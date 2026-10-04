@@ -202,19 +202,25 @@ const manifest = {
   // ⚠️ 一律不写 `dependencies`：`@ai-token-report/*` 已内联，
   //   写进去只会让同事装到指向未发布包的 404。
   peerDependencies: {
-    // DSH 的 session 格式与 telemetry API 必须与宿主同代，**但不必同版本**。
-    // 实测 0.1.7-rc.2 → 0.2.0-rc.2：telemetry 只是**纯增量**（新增可选
-    // `sourceEvent`，`body` 与 coordinator 签名逐字未变），`dsh-session-format*`
-    // 全树 89 个实现文件逐字节相同，`dsh-llm` 的 usage 类型文件也逐字节相同
-    // —— 即落盘日志格式没变，插件读日志的口径不受影响。
+    // DSH 的**会话事件形状**必须与宿主同代，**但不必同版本**。
+    // 实测 0.1.7-rc.2 → 0.2.0-rc.2：`dsh-session-format*` 全树 89 个实现文件
+    // 逐字节相同，`dsh-llm` 的 usage 类型文件也逐字节相同 —— 即落盘日志格式与
+    // `session/event` 的载荷都没变，折叠口径不受影响。
     // 而 0.1.5 那代**不能**放进来：它的 telemetry 会嵌套一套旧 dsh-session，
     // 读取 0.1.7 日志时会把合法的 system-prompt source 误判成缺少 plugin source。
     // 所以下界钉在 0.1.7-rc.2，上界 `<0.3.0-0` 排除下一代的全部预发布
     // （0.3.0-rc.1 之类必须重新验证后再放开）。
+    //
+    // ★ 0.9.0 起**去掉了 `@deepseek-ai/dsh-session-telemetry`**：本插件不再注册
+    //   `sessionTelemetry` 服务（那会与官方 OTel 后端互斥），改为自己订阅宿主
+    //   `session/event` / `session/flush`（见 `src/capture.ts`），因此对那个包
+    //   没有任何依赖 —— 保留这条 peer 会让市场卡片多显示一条并不存在的要求。
+    //   注意 `dsh-session` / `dsh-agent` 仍然**必须留着**：DSH 启动时靠
+    //   `@deepseek-ai/dsh*` 的 peer 决定要不要加载整个 bundle，
+    //   一条都不写等于放弃版本闸门（表现是「新宿主上静默半坏」而不是被跳过）。
     // ⚠️ 这两处（本文件与 packages/dsh-plugin/package.json）必须一致，
     //   由 verify/verify-npm-package.ts 的「发布清单 peer == 源码清单 peer」兜住。
     '@deepseek-ai/cordis': '~4.0.4',
-    '@deepseek-ai/dsh-session-telemetry': '>=0.1.7-rc.2 <0.3.0-0',
     '@deepseek-ai/dsh-agent': '>=0.1.7-rc.2 <0.3.0-0',
     '@deepseek-ai/dsh-session': '>=0.1.7-rc.2 <0.3.0-0',
   },

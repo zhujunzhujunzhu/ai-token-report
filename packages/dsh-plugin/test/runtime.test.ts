@@ -11,11 +11,12 @@
  *   同时往同一个 outbox 写，批次会互相覆盖）；
  * - 未署名 / 停用 → 单元必须停，且诊断仍要能报告 `stopped`。
  *
- * ## 只装一次后端
+ * ## 只装一次捕获
  *
- * `SessionTelemetryCoordinator` 的监听器挂在 fiber 上、**不随服务注销撤销**
- * （见 `runtime.ts` 文件头）。所以后端在这些用例里必须恰好被创建一次 ——
- * 换连接只能换「单元」。
+ * 捕获订阅挂在插件自己的 fiber 上（`ctx.effect` 里注册），每建一个新单元就再挂一套
+ * 会让**每一条会话事件被折叠多次** —— 服务端虽然按 `event_id` 去重（数字不会错），
+ * 宿主却会白烧 CPU，而且这种「重了一份」的症状在页面上完全看不出来。
+ * 所以捕获在这些用例里必须恰好被创建一次 —— 换连接只能换「单元」。
  */
 import { expect, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -24,6 +25,7 @@ import { join } from 'node:path'
 
 import { emptyBackfillStats, type BackfillStats } from '../src/backfill-runner.js'
 import { resolveConfig } from '../src/config.js'
+import type { TelemetryRecord } from '../src/fold.js'
 import { IdentityResolver } from '../src/identity.js'
 import {
   ReportRuntime,
@@ -31,7 +33,6 @@ import {
   type BackendRefs,
   type ReportBackendLike,
 } from '../src/runtime.js'
-import type { SessionTelemetryRecord } from '@deepseek-ai/dsh-session-telemetry'
 
 const HOME = mkdtempSync(join(tmpdir(), 'atr-runtime-'))
 
@@ -46,7 +47,7 @@ function dataDirOf(home: string): string {
 }
 
 /** 一份计费事件（形状与真日志一致，折叠后才会有记录）。 */
-function event(seq: number): SessionTelemetryRecord {
+function event(seq: number): TelemetryRecord {
   return {
     channel: 'ledger',
     time: 1_700_000_000_000 + seq,

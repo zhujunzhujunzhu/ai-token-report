@@ -4,11 +4,12 @@
  * ★ 这里钉死的是**装上去之后会发生什么**：
  *
  * 1. 未署名 / 未配凭证 → **一个字节都不往外发**（合规底线）
- * 2. 三项齐了 → 注册上报后端、工具、服务，且 emit 走的是同一条队列
- * 3. 脱敏规则被挂上 → 事件正文（对话内容、命令输出）不会被带出去
+ * 2. 三项齐了 → 注册上报捕获、工具、服务，且 emit 走的是同一条队列
+ * 3. 正文不外发 → 宿主交过来的事件里带对话内容 / 命令参数时，
+ *    落到请求体里的只有计费字段（走**真实**捕获路径，不是手工调脱敏函数）
  * 4. 凭证不泄漏进日志
  *
- * 用的是假 ctx（不搭 cordis 运行时）—— 我们测的是**装配决策**，
+ * 用的是假 ctx（不搭 cordis 运行时）—— 我们测的是**装配决策**与**捕获路径**，
  * 而不是 cordis 的事件分发（那是 DSH 自己的测试覆盖范围）。
  */
 
@@ -18,12 +19,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { zstdCompressSync } from 'node:zlib'
 
-import type { SessionTelemetryRecord } from '@deepseek-ai/dsh-session-telemetry'
-
 import { apply, describeDisabled, evaluateStatus, TOOL_NAME, type ApplyContext } from '../src/index.js'
 import { resolveConfig } from '../src/config.js'
 import type { EffectiveConfig } from '../src/config.js'
-import type { FoldIdentity } from '../src/fold.js'
+import type { FoldIdentity, TelemetryRecord } from '../src/fold.js'
 import { Reporter } from '../src/reporter.js'
 
 let home: string
@@ -39,17 +38,17 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true })
 })
 
-/** 假 ctx：只实现 apply() 用到的五个能力（不搭 cordis 运行时）。 */
+/** 假 ctx：只实现 apply() 用到的几个能力（不搭 cordis 运行时）。 */
 function fakeCtx(): {
   ctx: ApplyContext
   logs: { level: string; message: string }[]
   provided: Record<string, unknown>
-  listeners: Record<string, ((record: unknown, next: () => unknown) => unknown)[]>
+  listeners: Record<string, ((...args: unknown[]) => unknown)[]>
   effects: number
 } {
   const logs: { level: string; message: string }[] = []
   const provided: Record<string, unknown> = {}
-  const listeners: Record<string, ((record: unknown, next: () => unknown) => unknown)[]> = {}
+  const listeners: Record<string, ((...args: unknown[]) => unknown)[]> = {}
   let effects = 0
 
   const ctx: ApplyContext = {
@@ -58,21 +57,20 @@ function fakeCtx(): {
       warn: (message) => void logs.push({ level: 'warn', message }),
     },
     // ⚠️ 必须**真的执行**回调：cordis 的 `ctx.effect(fn)` 会立即调用 fn 来完成注册，
-//    只在 fn 的返回值上挂 dispose。把这里写成「只计数不执行」，
-//    测出来的就是「脱敏规则没挂上」—— 而生产环境里它是挂上的。
+    //    只在 fn 的返回值上挂 dispose。把这里写成「只计数不执行」，
+    //    测出来的就是「捕获侧没挂上」—— 而生产环境里它是挂上的。
     effect: (callback) => {
       effects += 1
       callback()
     },
-    on: ((event: string, listener: (record: unknown, next: () => unknown) => unknown) => {
+    // 捕获侧订阅的是宿主会话事件流：`session/event` 与 `session/flush`。
+    on: ((event: string, listener: (...args: unknown[]) => unknown) => {
       ;(listeners[event] ??= []).push(listener)
       return () => {}
     }) as ApplyContext['on'],
     reflect: {
       provide: (name, value) => void (provided[name] = value),
     },
-    // coordinator 会扫已在跑的会话；测试里一台都没有
-    sessions: { list: () => [] },
   }
 
   return {
@@ -96,8 +94,8 @@ function signIdentity(): void {
   )
 }
 
-/** 一份计费事件。 */
-function event(seq: number): SessionTelemetryRecord {
+/** 一份计费事件（账本记录形状，与捕获侧拼出来的一致）。 */
+function event(seq: number): TelemetryRecord {
   return {
     channel: 'ledger',
     time: 1_700_000_000_000 + seq,
@@ -121,7 +119,7 @@ function event(seq: number): SessionTelemetryRecord {
  * 拦截出网请求：**绝不真的发请求**。
  *
  * ⚠️ 这里替换的是全局 `fetch`，而不是往 `apply()` 里注入一个假的 ——
- *   因为 `apply()` 走的是真实的 `TokenReportBackend`，那正是我们要测的东西。
+ *   因为 `apply()` 走的是真实的 `TokenReportCapture`，那正是我们要测的东西。
  *   注入工厂会绕开它，测出来的就不是生产路径了。
  */
 function interceptFetch(handler: (url: string, init: RequestInit) => Response | Promise<Response>): {
@@ -216,13 +214,14 @@ describe('★ 未署名 / 未配凭证 = 不上报', () => {
     expect(logs.some((l) => l.message.includes('appKey'))).toBe(true)
   })
 
-  test('★ 未上报时也**不注册**统计工具与服务之外的上报组件（只挂脱敏规则）', () => {
+  test('★ 未上报时**一个捕获监听都不挂**（未填写前不采集）', () => {
     signIdentity()
     const { ctx, listeners } = fakeCtx()
     apply(ctx, { dshHome: home, dataDir }, {})
 
-    // 上报未启用 → 不该有 telemetry 相关的注册动作
-    expect(listeners['session/telemetry']).toBeUndefined()
+    // 未署名 / 未配 appKey → 连宿主会话事件都不订阅，一个字节都不采集
+    expect(listeners['session/event']).toBeUndefined()
+    expect(listeners['session/flush']).toBeUndefined()
   })
 
   test('describeDisabled 对 appKey 缺失给出可执行的下一步', () => {
@@ -244,7 +243,7 @@ describe('★ 未署名 / 未配凭证 = 不上报', () => {
 })
 
 describe('★ 配齐之后：上报 + 工具 + 服务', () => {
-  test('注册上报后端、工具、服务三件，并挂上脱敏规则', () => {
+  test('注册上报捕获、工具、服务三件，并把捕获挂在宿主事件流上', () => {
     signIdentity()
     // ⚠️ 不要解构 `effects` —— getter 在解构那一刻就被求值，
     //    之后 apply() 增加的计数读不到（这行曾经因此误报「没挂脱敏规则」）
@@ -264,9 +263,13 @@ describe('★ 配齐之后：上报 + 工具 + 服务', () => {
     expect(status.serviceRegistered).toBe(true)
     expect(fake.provided['tokenReportTools']).toBeDefined()
     expect(fake.provided['tokenReport']).toBeDefined()
-    // 脱敏规则挂在插件自己的 fiber 上
+    // 捕获订阅挂在插件自己的 fiber 上（`ctx.effect` 里注册，卸载即解除）
     expect(fake.effects).toBeGreaterThan(0)
-    expect(fake.listeners['session-telemetry/record']).toHaveLength(1)
+    expect(fake.listeners['session/event']).toHaveLength(1)
+    expect(fake.listeners['session/flush']).toHaveLength(1)
+    // ★ **不注册任何 cordis 服务名** —— 那正是与官方 OTel 后端互斥的根源
+    //   （`sessionTelemetry` 一个进程只能注册一次，官方后端永远占着它）。
+    expect(fake.provided['sessionTelemetry']).toBeUndefined()
     expect(net.calls).toHaveLength(0)
   })
 
@@ -298,7 +301,7 @@ describe('★ 配齐之后：上报 + 工具 + 服务', () => {
 
     const toolCall = event(1)
     toolCall.attributes['event.type'] = 'tool/call'
-    const ops: SessionTelemetryRecord = {
+    const ops: TelemetryRecord = {
       channel: 'ops',
       time: Date.now(),
       severity: 'info',
@@ -348,65 +351,97 @@ describe('★ 配齐之后：上报 + 工具 + 服务', () => {
   })
 })
 
-describe('★ 脱敏：事件正文不许带出去', () => {
-  test('挂上的规则把 body 裁到只剩计费字段', () => {
+describe('★ 不外发正文：折叠只取计费字段', () => {
+  /** 一条带「正文」的宿主会话事件（形状与 DSH 的 firehose 一致）。 */
+  function hostMessage(data: Record<string, unknown>): {
+    session: { id: string; header: { cwd: string } }
+    event: { type: string; seq: number; time?: number; data: Record<string, unknown> }
+  } {
+    return {
+      session: { id: 's1', header: { cwd: 'D:/Coding/x' } },
+      event: { type: 'assistant/message', seq: 5, time: 1_700_000_000_000, data },
+    }
+  }
+
+  /** 等一次冲刷落到拦截器上（fetch 是异步的，不等就会读到空）。 */
+  const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 50))
+
+  test('带对话内容与推理过程的事件，请求体里只剩计费字段', async () => {
     signIdentity()
     const { ctx, listeners } = fakeCtx()
     const net = interceptFetch(() => okResponse())
-
     apply(ctx, { appKey: 'atr-key', dshHome: home, dataDir, outbox: { dir: join(home, 'outbox') } })
 
-    const listener = listeners['session-telemetry/record']![0]!
-    // 一条**带对话内容与工具参数**的真实形状记录
-    const dirty: SessionTelemetryRecord = {
-      channel: 'ledger',
-      time: Date.now(),
-      severity: 'info',
-      attributes: { 'session.id': 's1', 'event.type': 'assistant/message', 'event.seq': 5 },
-      body: {
-        turn: 1,
-        step: 1,
-        message: {
-          source: { kind: 'model', provider: 'dashscope', model: 'm' },
-          content: [{ type: 'text', text: '这是我的私密提示词与文件内容' }],
-        },
-        usage: { inputTokens: 1, outputTokens: 2, cacheReadTokens: 3 },
-        stream: [{ delta: '私密推理过程' }],
+    // 走**真实**捕获路径：宿主发一条带正文的会话事件（不是手工调某个裁剪函数）
+    const { session, event } = hostMessage({
+      turn: 1,
+      step: 1,
+      message: {
+        source: { kind: 'model', provider: 'dashscope', model: 'm' },
+        content: [{ type: 'text', text: '这是我的私密提示词与文件内容' }],
       },
-    }
+      usage: { inputTokens: 1, outputTokens: 2, cacheReadTokens: 3 },
+      stream: [{ delta: '私密推理过程' }],
+    })
+    listeners['session/event']![0]!(session, event)
+    // 宿主在 turn 结束时会发 `session/flush` —— 用它把这一批推出去
+    listeners['session/flush']![0]!()
+    await settle()
 
-    const cleaned = listener(dirty, () => dirty) as SessionTelemetryRecord
-    const text = JSON.stringify(cleaned.body)
-
-    // 计费字段留着
-    expect(text).toContain('cacheReadTokens')
+    expect(net.calls).toHaveLength(1)
+    const text = JSON.stringify(net.calls[0]!.body)
+    // 计费字段与模型名留着（服务端要靠它们算钱）
+    expect(text).toContain('cache_read_tokens')
     expect(text).toContain('dashscope')
-    // 内容与推理过程必须消失
+    // 正文与推理过程一个字节都不许出现
     expect(text).not.toContain('私密提示词')
     expect(text).not.toContain('私密推理过程')
     expect(text).not.toContain('content')
     expect(text).not.toContain('stream')
   })
 
-  test('工具调用事件里的命令参数同样被剥掉', () => {
+  test('工具调用事件不是计费事件：一条都不入队', async () => {
     signIdentity()
     const { ctx, listeners } = fakeCtx()
     const net = interceptFetch(() => okResponse())
-    apply(ctx, { appKey: 'atr-key', dshHome: home, dataDir, outbox: { dir: join(home, 'outbox') } })
+    const { backend } = apply(ctx, {
+      appKey: 'atr-key', dshHome: home, dataDir, outbox: { dir: join(home, 'outbox') },
+    })
 
-    const listener = listeners['session-telemetry/record']![0]!
-    const toolCall: SessionTelemetryRecord = {
-      channel: 'ledger',
-      time: Date.now(),
-      severity: 'info',
-      attributes: { 'session.id': 's1', 'event.type': 'tool/call', 'event.seq': 6 },
-      body: { turn: 1, step: 2, callId: 'c1', name: 'bash', arguments: '{"command":"cat ~/.ssh/id_rsa"}' },
-    }
+    const { session, event } = hostMessage({
+      turn: 1, step: 2, callId: 'c1', name: 'bash', arguments: '{"command":"cat ~/.ssh/id_rsa"}',
+    })
+    event.type = 'tool/call'
+    listeners['session/event']![0]!(session, event)
+    listeners['session/flush']![0]!()
+    await settle()
 
-    const cleaned = listener(toolCall, () => toolCall) as SessionTelemetryRecord
-    const text = JSON.stringify(cleaned.body)
-    expect(text).not.toContain('id_rsa')
-    expect(text).not.toContain('arguments')
+    // 既不发请求，也不在队列里留任何东西 —— 命令参数连内存都不落
+    expect(net.calls).toHaveLength(0)
+    expect(backend!.reporterStats.enqueued).toBe(0)
+  })
+
+  test('★ 拿不到事件时间的记录整条丢掉（绝不伪造成 1970 或「此刻」）', async () => {
+    signIdentity()
+    const { ctx, listeners } = fakeCtx()
+    const net = interceptFetch(() => okResponse())
+    const { backend } = apply(ctx, {
+      appKey: 'atr-key', dshHome: home, dataDir, outbox: { dir: join(home, 'outbox') },
+    })
+
+    const { session, event } = hostMessage({
+      turn: 1, step: 1, message: { source: { provider: 'p', model: 'm' } }, usage: { inputTokens: 1 },
+    })
+    delete event.time
+    listeners['session/event']![0]!(session, event)
+    listeners['session/flush']![0]!()
+    await settle()
+
+    // 退化成 0 会把记录挪到 1970（时间窗之外，看板上表现为「少了一块」），
+    // Date.now() 则把统计挪到「插件看见它的那一刻」—— 两者都是伪造事实。
+    // 宁可少这一条：磁盘补报线程会按日志里的真实时间把它补上。
+    expect(backend!.reporterStats.enqueued).toBe(0)
+    expect(net.calls).toHaveLength(0)
   })
 })
 

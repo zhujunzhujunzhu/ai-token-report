@@ -66,8 +66,12 @@ try {
   }))
   writeFileSync(join(profile, 'cordis.yml'), '[]\n')
   // JSON 是 YAML 的子集，测试凭证中的特殊字符无需手工拼接转义。
+  //
+  // ★ **刻意不写 `{ id: 'session-telemetry-otel', disabled: true }`**：
+  //   0.9.0 起本插件不再注册 `sessionTelemetry` 服务（改订阅宿主会话事件流，
+  //   见 `src/capture.ts`），所以官方 OTel 后端必须**留在组装里** ——
+  //   这次验收要证明的正是「两者同时工作」：它占着服务名，我们照样上报。
   writeFileSync(join(profile, 'cordis.patch.yml'), JSON.stringify([
-    { id: 'session-telemetry-otel', disabled: true },
     { id: 'token-report', config: {
       appKey: token, endpoint: new URL('/api/v1/token-usage', portalUrl).href,
       batch: { maxRecords: 50, flushIntervalMillis: 250, timeoutMillis: 5000 },
@@ -76,6 +80,19 @@ try {
   ]))
   mkdirSync(join(home, 'token-report'))
   writeFileSync(join(home, 'token-report/identity.json'), JSON.stringify({ name, token, createdAt: Date.now(), updatedAt: Date.now() }), { mode: 0o600 })
+
+  // 起真宿主之前先确认组装结果：**官方 OTel 后端在、本插件也在**。
+  // 少了这一条，下面的「上报成功」既可能是共存、也可能是 OTel 根本没装进来。
+  const dump = Bun.spawnSync([node, dshBin, '--profile', 'headless', '--dump-config'], {
+    cwd: work, env, stdout: 'pipe', stderr: 'pipe',
+  })
+  const dumpText = new TextDecoder().decode(dump.stdout)
+  assert.ok(dumpText.includes('session-telemetry-otel'), '官方 OTel 后端必须留在组装里（本验收证明的是共存）')
+  assert.ok(dumpText.includes('token-report'), '本插件必须在组装里')
+  assert.ok(
+    !/id:\s*session-telemetry-otel[\s\S]{0,160}?disabled:\s*true/.test(dumpText),
+    '官方 OTel 后端不许被禁用 —— 那会把「共存」验成「互斥」',
+  )
 
   console.log(`真实 DSH 验收目录：${home}`)
   child = Bun.spawn([node, dshBin, '--profile', 'headless', 'Reply exactly OK. Do not call tools, read files, run commands, or perform any other work.'], {

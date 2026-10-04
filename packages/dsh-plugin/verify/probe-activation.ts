@@ -60,7 +60,8 @@ console.log('\n── 场景 1：context 里已提供 sessions 服务 ──')
     root.registry.plugin(spy as never, config as never)
     await new Promise((r) => setTimeout(r, 600))
     console.log(`  apply 是否执行: ${applied ? '✅ 是' : '❌ 否'}`)
-    console.log(`  sessionTelemetry: ${root.get('sessionTelemetry') === undefined ? 'undefined' : '已注册'}`)
+    console.log(`  宿主 sessionTelemetry: ${root.get('sessionTelemetry') === undefined ? 'undefined（本插件不再注册它）' : '已注册（别人占着，两边可以共存）'}`)
+    console.log(`  本插件的 tokenReport: ${root.get('tokenReport') === undefined ? 'undefined' : '已注册'}`)
   } catch (err) {
     console.log(`  ❌ 抛错: ${err instanceof Error ? err.message : String(err)}`)
   }

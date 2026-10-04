@@ -6,31 +6,31 @@
  * 旧实现把上报后端的生命周期钉死在 `apply()` 上：
  *
  * ```
- * apply() → 读配置 + 读身份 → 建 Reporter + 补报线程 → 注册 sessionTelemetry
+ * apply() → 读配置 + 读身份 → 建 Reporter + 补报线程 → 订阅宿主会话事件流
  * ```
  *
  * 于是设置页保存完连接只能提示「请重启 DSH 后启用新的上报连接」——
  * 而用户真正想做的事是「填完就能开始上报」。重启 DSH 意味着丢掉正在跑的会话，
  * 而这一步在旧实现里没有任何技术必要性：变的只是「往哪发、以谁的名义、多久发一次」。
  *
- * ## 结构：后端不变，投递单元可换
+ * ## 结构：捕获不变，投递单元可换
  *
  * ```
- * SessionTelemetryCoordinator（只装配一次，挂在 sessionTelemetry 服务上）
- *        │  emit / flush / shutdown
+ * capture.ts（只装配一次，订阅宿主 session/event）
+ *        │  账本记录
  *        ▼
- * TokenReportBackend（薄适配器，只读自有属性）
+ * TokenReportCapture（薄适配器）
  *        │  转发到下面这组闭包
  *        ▼
  * ReportRuntime  ──►  Unit{ Reporter, Backfill, foldIdentity }   ← 可整体替换
  * ```
  *
- * ★ **后端只装一次**是刻意的：`SessionTelemetryCoordinator` 在构造时会把
- *   `session/created` / `session/event` / `session/disposed` 与 `agent/error`
- *   注册到宿主 fiber 上，而这些注册**不随服务注销而撤销**。
- *   每改一次配置就重建一个后端，等于让每个会话事件被折叠 N 次 ——
+ * ★ **捕获只装一次**是刻意的：订阅挂在插件自己的 fiber 上（`ctx.effect` 里注册），
+ *   每改一次配置就重建一套，等于让每个会话事件被折叠 N 次 ——
  *   服务端虽然按 `event_id` 去重（数字不会错），但宿主会白烧 CPU，
  *   而且这种「重了一倍」的症状在页面上完全看不出来。
+ *   （0.8.x 时这里写的是 `SessionTelemetryCoordinator` 的监听器不随服务注销撤销 ——
+ *   同一条约束，换了个载体。）
  *
  * ★ **单元可换**是因为它只持有「往哪发、以谁的名义、多久发一次」：
  *   这些正是设置页会改的东西。换单元 = 起一个新的 Reporter + 补报线程，
@@ -38,12 +38,12 @@
  *
  * ## 合规底线（不要放宽）
  *
- * `evaluateStatus()` 的判定仍然只在这里：**未署名 / 未配 appKey → 不建后端、
- * 不装 coordinator、一个字节都不采集**。就地启用同样先过这一关。
+ * `evaluateStatus()` 的判定仍然只在这里：**未署名 / 未配 appKey → 不建捕获、
+ * 不订阅宿主事件、一个字节都不采集**。就地启用同样先过这一关。
  */
 
 import { toAssertion, type Identity } from '@ai-token-report/shared'
-import type { SessionTelemetryRecord } from '@deepseek-ai/dsh-session-telemetry'
+import type { TelemetryRecord } from './fold.js'
 
 import {
   claimedUserId,
@@ -159,25 +159,26 @@ export function foldIdentityOf(config: EffectiveConfig, identity: Identity): Fol
 }
 
 /**
- * 后端需要向运行时索要的那几样东西。
+ * 捕获侧需要向运行时索要的那几样东西。
  *
- * 🚨 全部是**闭包**，没有 `this`：后端实例会被 cordis 包成服务代理，
- *   私有字段与 `this` 都可能失效（见 `README.md` §8 与 `verify-cordis-load.ts`）。
+ * 🚨 全部是**闭包**，没有 `this`：这样热路径一定只碰内存，
+ *   也不可能因为实例被谁包一层而失效（0.8.x 时它们还要穿过 cordis 服务代理 ——
+ *   本插件不再是服务之后那条约束没了，但闭包形态继续保留，因为它同样是最省的写法）。
  */
 export interface BackendRefs {
   /** 热路径：折叠 + 入队（当前单元）。 */
-  emit(record: SessionTelemetryRecord): void
+  emit(record: TelemetryRecord): void
   /** turn 结束的冲刷提示。 */
   flush(): void
   /** 插件卸载时排空当前单元。 */
   shutdown(): Promise<void>
-  /** 可经服务代理安全读取的统计入口。 */
+  /** 诊断入口（闭包实现，无 `this` 依赖）。 */
   reporterStats: (() => ReporterStats) & ReporterStats
   /** 历史补报统计（无单元时为零值）。 */
   backfillStats(): BackfillStats
 }
 
-/** 运行时要求后端提供的最小形状。 */
+/** 运行时要求捕获侧提供的最小形状。 */
 export interface ReportBackendLike {
   reporterStats: (() => ReporterStats) & ReporterStats
   backfillStats(): BackfillStats
@@ -200,7 +201,7 @@ export interface ReportRuntimeOptions<B extends ReportBackendLike = ReportBacken
   /** 插件原始配置（未经保存连接覆盖）。 */
   raw: RawConfig
   resolver: IdentityResolver
-  /** 构造上报后端；由 `index.ts` 注入，避免与 cordis 服务定义形成循环依赖。 */
+  /** 构造捕获侧；由 `index.ts` 注入（它要用宿主 ctx 订阅事件，在这里建会形成循环依赖）。 */
   createBackend(refs: BackendRefs): B
   /** 注入用，便于测试。 */
   fetchImpl?: typeof fetch
@@ -289,7 +290,7 @@ export class ReportRuntime<B extends ReportBackendLike = ReportBackendLike> {
     this.#config = initial
     this.#status = { enabled: false, endpoint: initial.endpoint, reason: '尚未启用' }
 
-    // 闭包捕获真实的 this：后端经 cordis 代理调用时也不会碰到私有字段。
+    // 闭包捕获真实的 this：调用方拿到什么都不会碰到私有字段。热路径尤其重要。
     this.#refs = {
       emit: (record) => {
         const unit = this.#unit
@@ -312,7 +313,7 @@ export class ReportRuntime<B extends ReportBackendLike = ReportBackendLike> {
     return this.#config
   }
 
-  /** 后端实例（P1 起由运行时持有，只装一次）。 */
+  /** 捕获侧实例（由运行时持有，只装一次）。 */
   get backend(): B | null {
     return this.#backend
   }
@@ -339,7 +340,7 @@ export class ReportRuntime<B extends ReportBackendLike = ReportBackendLike> {
     return { ...this.#status }
   }
 
-  /** 是否已装配后端（诊断用：说明 coordinator 有没有挂上）。 */
+  /** 是否已装配捕获侧（诊断用：说明宿主事件订阅有没有挂上）。 */
   get attached(): boolean {
     return this.#backend !== null
   }
@@ -347,7 +348,7 @@ export class ReportRuntime<B extends ReportBackendLike = ReportBackendLike> {
   /**
    * 启动时装配。
    *
-   * @returns 后端实例；**不满足上报条件时为 `null`**（那时连 coordinator 都不装）。
+   * @returns 捕获侧实例；**不满足上报条件时为 `null`**（那时连宿主事件都不订阅）。
    */
   start(config: EffectiveConfig, identity: Identity): B | null {
     this.applyState(config, { ready: true, identity, assertion: toAssertion(identity) })
@@ -392,7 +393,7 @@ export class ReportRuntime<B extends ReportBackendLike = ReportBackendLike> {
       return this.status()
     }
 
-    // ★ 后端只装一次：coordinator 的监听器不随服务注销撤销（见文件头）。
+    // ★ 捕获侧只装一次：宿主事件订阅挂在 fiber 上，重复装 = 每条事件折叠两遍（见文件头）。
     if (this.#backend === null) this.#backend = this.#createBackend(this.#refs)
 
     const key = unitKey(config, state.identity)
@@ -458,7 +459,7 @@ export class ReportRuntime<B extends ReportBackendLike = ReportBackendLike> {
   }
 
   /**
-   * 排空并停止（插件卸载 / coordinator 注销时调用）。
+   * 排空并停止（插件卸载时调用）。
    *
    * ⚠️ 与 `applyState` 的停用路径不同：这里**等待**排空，因为进程可能马上退出。
    */
@@ -503,7 +504,8 @@ export class ReportRuntime<B extends ReportBackendLike = ReportBackendLike> {
       onLog: log,
     })
     reporter.start()
-    // ★ coordinator 的 includeHistory 只回放已打开会话；磁盘全部历史由独立线程补齐。
+    // ★ 捕获侧不做回放（0.8.x 的 coordinator 带 includeHistory 只回放已打开会话）；
+    //   磁盘上的全部历史由独立线程补齐，见 capture.ts 的「已知的取舍」。
     backfill.start()
     return {
       key,

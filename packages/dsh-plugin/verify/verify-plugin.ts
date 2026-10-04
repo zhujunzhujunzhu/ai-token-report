@@ -1,5 +1,6 @@
 /**
  * 端到端冒烟：**真实装载**插件，走完整的「会话事件 → 上报 → 服务端收下」链路。
+ * 其中第 2 段直接喂账本记录（验投递与线上字段），第 3 段喂**宿主事件**（验捕获侧）。
  *
  * 这不是单元测试，而是人工验证脚本（`bun run` 执行，不是 `bun test`）：
  *   bun run packages/dsh-plugin/verify/verify-plugin.ts
@@ -30,7 +31,7 @@ import type { IngestPayload } from '@ai-token-report/shared'
 
 import { apply, type ApplyContext } from '../src/index.js'
 import { UI_SETTINGS_PATH, UI_STATS_PATH } from '../src/client/protocol.js'
-import type { SessionTelemetryRecord } from '@deepseek-ai/dsh-session-telemetry'
+import type { TelemetryRecord } from '../src/fold.js'
 
 /**
  * ★ 把**非 DSH 来源**关掉：本脚本断言的是**绝对 token 数**（1,110）。
@@ -83,19 +84,26 @@ function makeHome(signed: boolean): string {
 /**
  * 假 DSH 宿主上下文。
  *
- * 只实现插件真正依赖的五个能力。`effect` **必须真的执行回调** ——
- * cordis 就是这样注册监听的；写成「只计数」会让脱敏规则静默缺失。
+ * 只实现插件真正依赖的几个能力。`effect` **必须真的执行回调** ——
+ * cordis 就是这样注册监听的；写成「只计数」会让捕获侧静默缺失。
+ *
+ * ⚠️ 0.9.0 起捕获侧订阅的是宿主**会话事件流**（`session/event` / `session/flush`），
+ *   不再是 `session-telemetry/record` 瀑布 —— 本插件不再注册 `sessionTelemetry` 服务。
  */
 function makeCtx(): {
   ctx: ApplyContext
   logs: string[]
-  emitEvent: (record: SessionTelemetryRecord) => void
-  runWaterfall: (record: SessionTelemetryRecord) => SessionTelemetryRecord
+  provided: string[]
+  sessionEvents: ((...args: unknown[]) => unknown)[]
+  flushHooks: ((...args: unknown[]) => unknown)[]
+  emitSessionEvent: (payload: { session: unknown; event: unknown }) => void
+  emitFlush: () => void
   collectEffects: () => void
 } {
   const logs: string[] = []
-  const eventListeners: ((...args: unknown[]) => unknown)[] = []
-  const waterfallListeners: ((record: unknown, next: () => unknown) => unknown)[] = []
+  const provided: string[] = []
+  const sessionEvents: ((...args: unknown[]) => unknown)[] = []
+  const flushHooks: ((...args: unknown[]) => unknown)[] = []
   const pendingEffects: (() => (() => void) | void)[] = []
 
   const ctx: ApplyContext = {
@@ -107,32 +115,26 @@ function makeCtx(): {
     // 装配完成后再统一执行，模拟真实的时序。
     effect: (cb) => void pendingEffects.push(cb),
     on: ((event: string, listener: (...args: never[]) => unknown) => {
-      if (event === 'session-telemetry/record') {
-        waterfallListeners.push(listener as unknown as (r: unknown, n: () => unknown) => unknown)
-      } else {
-        eventListeners.push(listener as (...args: unknown[]) => unknown)
-      }
+      if (event === 'session/flush') flushHooks.push(listener as (...args: unknown[]) => unknown)
+      else sessionEvents.push(listener as (...args: unknown[]) => unknown)
       return () => {}
     }) as ApplyContext['on'],
-    reflect: { provide: () => {} },
-    sessions: { list: () => [] },
+    reflect: { provide: (name) => void provided.push(name) },
   }
 
   return {
     ctx,
     logs,
-    emitEvent: (record) => {
-      // coordinator 注册的是 `session/event`，行为是「把事件交给后端」
-      for (const l of eventListeners) void l({}, {})
-      void record
+    provided,
+    sessionEvents,
+    flushHooks,
+    // 宿主发一条会话事件：捕获侧应当就地折叠成账本记录
+    emitSessionEvent: ({ session, event }) => {
+      for (const l of sessionEvents) l(session, event)
     },
-    runWaterfall: (record) => {
-      let current: unknown = record
-      for (const l of waterfallListeners) {
-        const next = (): unknown => current
-        current = l(current, next)
-      }
-      return current as SessionTelemetryRecord
+    // 宿主在 turn 结束时发 `session/flush`：捕获侧应当提示冲刷
+    emitFlush: () => {
+      for (const l of flushHooks) l()
     },
     collectEffects: () => {
       for (const cb of pendingEffects) cb()
@@ -142,7 +144,7 @@ function makeCtx(): {
 }
 
 /** 一条真实的计费事件（字段取自实测样本）。 */
-function usageEvent(seq: number): SessionTelemetryRecord {
+function usageEvent(seq: number): TelemetryRecord {
   return {
     channel: 'ledger',
     time: 1_789_984_019_944 + seq,
@@ -164,6 +166,21 @@ function usageEvent(seq: number): SessionTelemetryRecord {
       usage: { inputTokens: 7772, outputTokens: 186, totalTokens: 8982, cacheReadTokens: 1024 },
       stream: [{ delta: '推理过程也不该被上报' }],
     },
+  }
+}
+
+/**
+ * 同一条计费事件的**宿主事件形状**（`session/event` 的 `(session, event)`）。
+ *
+ * ★ 刻意从 `usageEvent()` 派生，而不是另写一份数字：两条路径（直接喂账本记录 /
+ *   宿主事件流）必须对着**同一份数据**断言，否则「路径 A 对了、路径 B 少一列」
+ *   会因为夹具不同而看不出来。
+ */
+function hostEvent(seq: number, type = 'assistant/message'): { session: unknown; event: unknown } {
+  const record = usageEvent(seq)
+  return {
+    session: { id: record.attributes['session.id'], header: { cwd: record.attributes['session.cwd'] } },
+    event: { type, seq, time: record.time, data: record.body },
   }
 }
 
@@ -237,7 +254,7 @@ console.log('\n── 1. 未署名 = 不采集也不上报 ──')
 }
 
 // ── 2. 已署名 + 配齐：完整链路 ──────────────────────────────────────────────
-console.log('\n── 2. 已署名：会话事件 → 上报 → 服务端收下 ──')
+console.log('\n── 2. 已署名：账本记录 → 上报 → 服务端收下（投递与线上字段） ──')
 {
   const home = makeHome(true)
   const receiver = startReceiver()
@@ -307,28 +324,49 @@ console.log('\n── 2. 已署名：会话事件 → 上报 → 服务端收下
   }
 }
 
-// ── 3. 脱敏瀑布 ─────────────────────────────────────────────────────────────
-console.log('\n── 3. 脱敏：DSH 记录在到达后端前就被裁剪 ──')
+// ── 3. 捕获侧：宿主会话事件流不走服务名 ─────────────────────────────────────
+console.log('\n── 3. 捕获：宿主 session/event → 账本记录，且不注册 sessionTelemetry ──')
 {
   const home = makeHome(true)
+  const receiver = startReceiver()
   try {
     const host = makeCtx()
-    apply(host.ctx, {
+    const { backend } = apply(host.ctx, {
       appKey: 'k',
+      endpoint: receiver.url,
       dshHome: home,
       dataDir: join(home, 'token-report'),
       outbox: { dir: join(home, 'outbox') },
     })
     host.collectEffects()
 
-    const cleaned = host.runWaterfall(usageEvent(9))
-    const text = JSON.stringify(cleaned.body)
+    // ★ 这三条是「与官方 OTel 不再互斥」的全部依据：
+    //   我们不抢那个服务名，改成订阅宿主的会话事件流。
+    check('★ 没有注册 sessionTelemetry 服务（不抢官方 OTel 的名字）', !host.provided.includes('sessionTelemetry'))
+    check('订阅了宿主 session/event', host.sessionEvents.length === 1)
+    check('订阅了宿主 session/flush', host.flushHooks.length === 1)
 
-    check('计费字段保留', text.includes('cacheReadTokens') && text.includes('dashscope'))
-    check('★ 对话内容被剥掉', !text.includes('这段对话内容'))
-    check('★ 推理过程被剥掉', !text.includes('推理过程'))
-    check('★ content / stream 字段整体消失', !text.includes('"content"') && !text.includes('"stream"'))
+    // 喂一条带正文的宿主事件 + 一条工具调用（不计费）
+    host.emitSessionEvent(hostEvent(9))
+    host.emitSessionEvent(hostEvent(10, 'tool/call'))
+    check('只有计费事件入队：enqueued = 1', backend!.reporterStats.enqueued === 1)
+
+    // 宿主 turn 结束 → session/flush → 立即投递（不必等批次周期）
+    host.emitFlush()
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    check('session/flush 触发了真实投递', receiver.received.length === 1)
+
+    const payload = receiver.received[0]
+    const first = payload?.records[0] as unknown as Record<string, unknown>
+    check('捕获路径的 event_id = ${sessionId}:${seq}', first?.['event_id'] === 'session-044004d8:9')
+    check('捕获路径带上 session.cwd', first?.['cwd'] === 'D:\\Coding\\ai-token-report')
+    check('捕获路径四列逐位一致', first?.['input_tokens'] === 7772 && first?.['output_tokens'] === 186
+      && first?.['cache_read_tokens'] === 1024 && first?.['cache_write_tokens'] === 0)
+    check('★ 载荷里没有对话内容', !JSON.stringify(payload).includes('这段对话内容'))
+    check('★ 载荷里没有推理过程', !JSON.stringify(payload).includes('推理过程'))
+    check('★ 载荷里没有 content / stream 字段', !JSON.stringify(payload).includes('"content"') && !JSON.stringify(payload).includes('"stream"'))
   } finally {
+    receiver.stop()
     rmSync(home, { recursive: true, force: true })
   }
 }

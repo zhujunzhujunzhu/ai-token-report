@@ -20,11 +20,10 @@
 dsh plugin --profile web add dsh-plugin-token-report@latest
 ```
 
-1. **禁用官方 OTel 后端** —— 在同一个 profile 的 `cordis.patch.yml` 里合并 `- id: session-telemetry-otel` 与 `disabled: true`（cordis 同时只允许一个 `sessionTelemetry` 后端，不关会启动失败）
-2. **重启** —— `dsh --profile web --no-open`，用终端打印的完整地址打开浏览器
-3. **看用量** —— 选择工作区，输入框上方出现用量条。想汇总到部门看板，点面板右上角齿轮「配置」填服务端地址 + appKey，**保存即生效，不必重启**
+1. **重启** —— `dsh --profile web --no-open`，用终端打印的完整地址打开浏览器
+2. **看用量** —— 选择工作区，输入框上方出现用量条。想汇总到部门看板，点面板右上角齿轮「配置」填服务端地址 + appKey，**保存即生效，不必重启**
 
-第 1 步的完整写法见「安装最新稳定版」；桌面端（DSH Desktop）的安装见「在 DSH Desktop（桌面端）上安装」。
+**不需要改任何 profile 配置**：0.9.0 起本插件不再注册 `sessionTelemetry` 服务（那个名字由官方 OTel 后端占用），改为订阅宿主会话事件流 —— 因此与官方 `session-telemetry-otel` **可以同时开着**，各记各的。桌面端（DSH Desktop）的安装见「在 DSH Desktop（桌面端）上安装」。
 
 ## 环境要求
 
@@ -79,13 +78,11 @@ dsh plugin --profile web add dsh-plugin-token-report@latest
 }
 ```
 
-在该 profile 的 `cordis.patch.yml` 中合并以下条目：
+**不需要额外改 `cordis.patch.yml`**：0.9.0 起本插件不注册 `sessionTelemetry` 服务，所以官方 `session-telemetry-otel` 可以继续开着 —— 它只在你主动提交反馈时上传，本插件只看 token 数值与模型名。
 
-```yaml
-# 同一时间只能有一个 sessionTelemetry 后端。
-- id: session-telemetry-otel
-  disabled: true
-```
+> ⚠️ **0.8.x 及更早**是互斥的：那一版把自己注册成第二个 telemetry 后端（cordis 同名服务只能注册一个），所以必须在同一个 `cordis.patch.yml` 里合并 `- id: session-telemetry-otel` 与 `disabled: true`，否则 DSH 启动会失败并只报一行
+> `service "sessionTelemetry" has been registered at <OpenTelemetrySessionBackend>`。
+> 升级到 0.9.0 之后那一行可以删掉（留着也无害 —— 只是官方后端不再工作）。
 
 随后重启 DSH，用终端打印的完整地址打开浏览器：
 
@@ -156,12 +153,7 @@ node $desktopDsh plugin --profile web add file:D:/path/to/dsh-plugin-token-repor
 
 `add` 会自动在 `profiles/web/package.json` 的 `dsh.profile.bundles` 里登记包名；**不要再手动 `insert`**。
 
-**④ 合并 OTel 禁用**（`profiles/web/cordis.patch.yml`；从 `~/.dsh` 导入过配置的机器通常已经有了）：
-
-```yaml
-- id: session-telemetry-otel
-  disabled: true
-```
+**④ 官方 OTel 不需要再禁用**（0.9.0 起）：本插件不注册 `sessionTelemetry` 服务，两边可以同时开着。0.8.x 才需要在这一步往 `profiles/web/cordis.patch.yml` 里写 `- id: session-telemetry-otel` + `disabled: true`；升级后那两行可以删掉。
 
 **⑤ 核对**（只读，不起服务）：
 
@@ -454,7 +446,7 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 
 | 现象 | 处理 |
 |---|---|
-| `sessionTelemetry` 已注册 | 确认官方 OTel 后端已禁用，且没有重复挂载插件 |
+| 启动报 `service "sessionTelemetry" has been registered at <…>` | 只可能出自 **0.8.x 及更早**的版本（它要独占那个服务名，与官方 OTel 互斥） | 升级到 0.9.0+ 即可共存；暂时不能升级时，在 profile 的 `cordis.patch.yml` 里写 `- id: session-telemetry-otel` + `disabled: true` |
 | 面板不见了，且一条也不上报（启动日志只有 `skipping profile bundle …`） | 宿主版本落在**兼容窗口**之外 —— 见上方「环境要求」。这一行不是报错，是整个 bundle 被跳过了 |
 | 没有用量入口 | 确认安装在 `web` profile、bundle 数组包含发布包名，并已重启；`features.ui` 不能关闭 |
 | 桌面端（DSH Desktop）装不上 / 界面里搜不到 | 桌面端的社区市场只收 awesome-dsh-plugin 精选列表内的来源，本插件不在其中 —— 按上方「在 DSH Desktop（桌面端）上安装」走命令行 |
@@ -480,7 +472,7 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 一直看得见**的用量面板。
 
 ```
-① 实时上报   SessionTelemetryBackend.emit(record)    ← 会话进行中，秒级
+① 实时上报   订阅宿主 session/event → 账本记录 → 入队    ← 会话进行中，秒级
 ② 统计工具   token_usage / token_usage_diagnostics   ← Agent 可调用
 ③ 统计服务   ctx.tokenReport                        ← 其它插件可调用
 ④ 界面面板   输入框上方的用量条 + 标题栏徽章          ← 人直接看
@@ -738,11 +730,13 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 
 - **`appKey`**：管理员发放的上报凭证。没有它插件**不会上报**（这是合规底线）。
 - **`endpoint` 可达**：默认指向本仓部门服务端。
-- `@deepseek-ai/dsh-session-telemetry` `>=0.1.7-rc.2 <0.3.0-0`（与 DSH 宿主同代；已在 `0.1.7-rc.2` 与 `0.2.0-rc.2` 上实测启动）。
+- **宿主会话事件流**：`session/event` / `session/flush` 的形状必须与宿主同代（`@deepseek-ai/dsh-session` `>=0.1.7-rc.2 <0.3.0-0`；已在 `0.1.7-rc.2` 与 `0.2.0-rc.2` 上实测）。
 
-> ⚠️ **与官方 OTel 后端互斥**：同一时刻只能挂载**一个** telemetry 后端
-> （cordis 重复注册同名服务会抛错）。装了本插件就不要同时启用
-> `@deepseek-ai/dsh-session-telemetry-otel`。
+> ★ **与官方 OTel 后端不再互斥**（0.9.0 起）：本插件**不注册** `sessionTelemetry`
+> 服务（cordis 同名服务只能注册一个，而官方 `session-telemetry-otel` 永远占着它 ——
+> 连它的 `mode: DISABLED` 都照样注册），改为自己订阅宿主的会话事件流。
+> 因此两边可以同时开着：官方后端照旧只在你提交反馈时上传，本插件只折叠计费字段。
+> 实测证据与三条宿主源码依据见 `src/capture.ts` 的文件头。
 
 ### 2.2 构建
 
@@ -830,7 +824,11 @@ New-Item -ItemType Junction `
 > 解析范围里找每个插件条目的 `package.json`，读它的 `dsh.client` 声明与
 > `exports["./client"]`。解析不到包 = 宿主半没有、浏览器半也没有。
 
-**④ 🚨 必须关掉官方 OTel telemetry 后端**（与 token-report 互斥）：
+**④ 官方 OTel 后端不需要关**（0.9.0 起）：本插件不注册 `sessionTelemetry` 服务，
+两者可以同时工作。下面这段只在两个场景里还需要：
+
+- 你装的是 **0.8.x 及更早**的版本（那一版要独占那个服务名，与官方后端互斥）；
+- 或者你**明确不想**让官方后端上传反馈（那是另一件事，与本插件无关）。
 
 ```yaml
 # ~/.dsh/profiles/web/cordis.patch.yml
@@ -838,15 +836,16 @@ New-Item -ItemType Junction `
   disabled: true
 ```
 
-不关掉它会直接启动失败：
+0.8.x 不写这两行会直接启动失败：
 
 ```
 service "sessionTelemetry" has been registered at <OpenTelemetrySessionBackend>
 ```
 
-cordis 同一时刻只允许注册**一个** `sessionTelemetry` 服务。
-该后端默认 `mode: FEEDBACK_ONLY`（只在提交反馈时上传到
-`harness-telemetry.deepseeksvc.com`），关掉不影响任何本地功能。
+cordis 同一时刻只允许注册**一个** `sessionTelemetry` 服务 —— 这正是 0.9.0 起
+本插件改走「自己订阅宿主事件流」的原因（`src/capture.ts` 里有完整依据）。
+官方后端默认 `mode: FEEDBACK_ONLY`（只在提交反馈时上传到
+`harness-telemetry.deepseeksvc.com`），不需要时可以按上面的 patch 关掉，与本地功能无关。
 
 ⚠️ 官方明示限制：**新增依赖包需要重启 DSH**（`patchReload: live` 只对 patch 内容生效）。
 升级插件版本同理。
@@ -889,7 +888,7 @@ dsh --profile web --no-open
 ```powershell
 $w = "$env:USERPROFILE\.dsh\profiles\web"
 # ① 从 bundles 与 dependencies 里去掉插件（改 package.json）
-# ② 从 cordis.patch.yml 里删掉 token-report 段，并把 session-telemetry-otel 的 disabled 改回 false
+# ② 从 cordis.patch.yml 里删掉 token-report 段；若你按 0.8.x 的老步骤加过 session-telemetry-otel 的 disabled，可一并删掉（0.9.0 起不需要）
 # ③ 删掉 junction
 Remove-Item "$w\node_modules\@ai-token-report" -Recurse -Force
 # ④ 删掉插件产生的数据（state.json / usage.sqlite 是本地页与 CLI 的，按需保留）
@@ -1120,8 +1119,10 @@ DSH 的 web 服务器**不做任何鉴权**（`dsh-host-webserver` 的文档明�
 > UI 的 30 秒 TTL 缓存也按「库路径 + 数据目录 + 日志根」做了范围指纹，
 > 改完不会继续回旧范围的缓存（那看起来就是「改了没生效」）。
 
-后端（`SessionTelemetryCoordinator` 的监听器）**只装一次**：那些监听器挂在 fiber 上、
-不随服务注销撤销，重复装会让每次会话事件都被折叠两遍。
+捕获侧**只装一次**：订阅挂在插件自己的 fiber 上（`ctx.effect` 里注册），
+每建一个新单元就再挂一套，会让**每一条会话事件被折叠两遍** —— 服务端虽然按
+`event_id` 去重（数字不会错），宿主却会白烧 CPU，而且这种「重了一份」的症状
+在页面上完全看不出来。
 「已采集」计数也是运行时级的（跨单元不归零），所以调试页不会在换连接后突然显示 0。
 
 #### 缓存与轮询
@@ -1250,11 +1251,11 @@ inflight-<ts>-<pid>-<seq>.jsonl   ← 已发出但还没收到响应
 `includeContent` **没有配置项** —— 它在类型与实现上都不存在，
 所以不存在「配置写错就把内容发出去」的可能。代码层面另有两道保险：
 
-1. **`session-telemetry/record` 脱敏瀑布**：DSH 的这条瀑布**默认不带任何规则**
-   （记录会原样带出文件内容与命令输出）。插件自己挂一条**白名单**规则，
-   把 body 裁到只剩 `usage` / `message.source` / `turn` / `step`。
-   用白名单而不是黑名单：DSH 新增字段时，没在白名单里的一律不外发。
-2. **`fold.ts` 只取需要的字段**：折叠后的记录结构里根本没有内容字段。
+1. **`fold.ts` 的白名单**：折叠时逐个字段取值（`usage.*` 五项、`message.source`
+   的 provider/model、`turn` / `step` / `session.cwd`），落盘与外发的记录结构里
+   根本没有内容字段。用白名单而不是黑名单：DSH 新增字段时，没在白名单里的一律不外发。
+   ⚠️ 0.9.0 起**不再**改宿主 `session-telemetry/record` 瀑布来做这件事 ——
+   那条瀑布属于宿主，改它等于修改**官方 OTel 后端**收到的内容。
 
 `sharing = 'full'` 是**部署策略声明**（「本部署全量共享会话遥测」），
 不是投递回执。团队统一安装、员工已知情的前提下才成立 ——
@@ -1313,8 +1314,14 @@ bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败
 任何在方法体里访问 `this.#x` 的公开方法，经代理调用都会抛
 `TypeError: Cannot access invalid private field`。
 
-而 `emit()` 正是被代理调用的 —— coordinator 持有的是代理对象，
+而 0.8.x 的 `emit()` 正是被代理调用的 —— coordinator 持有的是代理对象，
 也就是说**每一次会话事件都会炸**。单测里 `this.emit(...)` 拿到的是真实例，所以全绿。
+
+> ★ **0.9.0 起这条约束在构造上已经消失**：本插件不再注册 `sessionTelemetry`
+> 服务（改订阅宿主会话事件流，见 `src/capture.ts`），因此没有服务代理，
+> 也没有任何「经代理调用」的路径。这段记录保留下来，是因为
+> ①它解释了几处看起来多余的写法（闭包 + 自有属性）；
+> ②谁要把插件改回服务形态，就会立刻重新踩上它。
 
 **② `inject` 写在类上会静默失效。**
 类根本不会被实例化（`apply()` 是被直接调用的），loader 读的是**插件条目对象**的
@@ -1374,7 +1381,8 @@ bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败
 
 | 文件 | 职责 |
 |---|---|
-| `src/index.ts` | 插件入口：`apply()` 装配、`TokenReportBackend`、脱敏规则 |
+| `src/index.ts` | 插件入口：`apply()` 装配、`TokenReportCapture`（薄适配器） |
+| `src/capture.ts` | ★ 捕获侧：订阅宿主 `session/event`，把事件拼成账本记录（不再注册 `sessionTelemetry`） |
 | `src/config.ts` | 全局配置归一化（默认值 / 环境变量 / 校验） |
 | `src/fold.ts` | ★ 原始事件 → 计费记录（纯函数，唯一会算错数的地方） |
 | `src/outbox.ts` | 磁盘 outbox（两态 + 启动重放） |
@@ -1409,7 +1417,7 @@ bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败
 
 | 坑 | 症状 | 规矩 |
 |---|---|---|
-| **cordis 服务代理 vs JS 私有字段** | 每次会话事件都抛 `Cannot access invalid private field`，而单测全绿 | 热路径与诊断入口一律不依赖 `this.#x`；见 §8 开头 |
+| **cordis 服务代理 vs JS 私有字段**（0.8.x 的坑，0.9.0 起已无此路径） | 每次会话事件都抛 `Cannot access invalid private field`，而单测全绿 | 热路径与诊断入口一律不依赖 `this.#x`；见 §8 开头 |
 | **`inject` 写在类上** | 插件能 import、`apply()` 也跑，但依赖注入的等待语义静默失效 | `inject` 必须在 **`default` 导出**上（类根本不会被实例化） |
 | **bundler 提前拉入 `bun:sqlite`** | DSH（Node）加载插件即 `ERR_UNKNOWN_BUILTIN_MODULE` | 动态 import 的说明符要**构建期不可静态分析**（用变量拼） |
 
@@ -1426,7 +1434,7 @@ bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败
 | `cannot resolve profile bundle "dsh-plugin-token-report"`（0.9.0 前会显示 `"@ai-token-report/dsh-plugin"`） | `dsh.profile.bundles` 加了，但 profile 的 `node_modules` 里解析不到 | 见 §2.3 ③，用 junction 或 `file:` 依赖接上 |
 | `profile bundle ... declares no dsh.bundle in its package.json` | 包的 `package.json` 缺 `dsh.bundle.patch` | 加 `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }` |
 | `overlay ... must be a top-level YAML array of loader patch entries` | `cordis.patch.yml` 顶层写成了 `insert:` 映射 | 顶层必须是数组，`- insert:` 是数组元素 |
-| `service "sessionTelemetry" has been registered at <OpenTelemetrySessionBackend>` | 与官方 OTel 后端冲突 | 见 §2.3 ④，disable 掉 OTel |
+| `service "sessionTelemetry" has been registered at <OpenTelemetrySessionBackend>` | 只可能出自 **0.8.x 及更早**（那一版要独占 telemetry 服务名） | 升级到 0.9.0+ 即可与官方 OTel 共存；否则按 §2.3 ④ 关掉官方后端 |
 | `ERR_UNKNOWN_BUILTIN_MODULE: bun:sqlite` | 构建时把 `@ai-token-report/*` external 出去了，或 bundler 把 `bun:sqlite` 提到顶层 | 见 §2.2 的构建命令 |
 | `ERR_UNSUPPORTED_ESM_URL_SCHEME` | `file:` 依赖写成了 Windows 路径 | 用 `file:D:/...` 正斜杠形式 |
 | `skipping profile bundle "dsh-plugin-token-report": … is incompatible with dsh <版本>: peerDependencies {…}` | 插件声明的 `peerDependencies` 与当前 DSH **不同代**。判定由宿主 `dsh-app-boot` 的 `evaluatePluginCompatibility` 做（`semver.satisfies(runtime, range, { includePrerelease: true })`），只检查 `@deepseek-ai/dsh` / `@deepseek-ai/dsh-*` 这些 peer，`@deepseek-ai/cordis` 不参与 | ① **首选**：升级插件到 `>=0.7.0` —— peer 写作 `>=0.1.7-rc.2 <0.3.0-0`，同时接受 `0.1.7-rc.2` 与 `0.2.x`（`0.6.0` 及更早钉的是精确 `0.1.7-rc.2`）；② 若你跑的是 `0.3` 及以后，等插件的下个版本（届时需重新验证宿主 API）；③ 明知风险仍要强跑：按提示 `dsh plugin allow-version dsh-plugin-token-report@<版本> --dsh-version <版本> --accept-risk`。**②③ 都不是「已验证」** —— 插件会被跳过时，DSH 仍能正常启动，只是没有用量面板与上报 |

@@ -10,9 +10,8 @@
 import { describe, expect, test } from 'bun:test'
 
 import { cacheHitRate } from '@ai-token-report/shared'
-import type { SessionTelemetryRecord } from '@deepseek-ai/dsh-session-telemetry'
 
-import { foldRecord, toTokenUsage, toWireRecord, type FoldIdentity } from '../src/fold.js'
+import { foldRecord, toTokenUsage, toWireRecord, type FoldIdentity, type TelemetryRecord } from '../src/fold.js'
 
 const IDENTITY: FoldIdentity = {
   clientName: 'ai-token-report',
@@ -37,7 +36,7 @@ function usageEvent(overrides: {
   time?: number
   turn?: number
   step?: number
-} = {}): SessionTelemetryRecord {
+} = {}): TelemetryRecord {
   const usage =
     overrides.usage === undefined
       ? { inputTokens: 7772, outputTokens: 186, totalTokens: 8982, cacheReadTokens: 1024 }

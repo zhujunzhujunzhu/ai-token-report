@@ -9,7 +9,7 @@
  * ## 三种形态，一份内核
  *
  * ```
- * ① 实时上报   SessionTelemetryBackend.emit(record)   ← 会话进行中，秒级
+ * ① 实时上报   订阅宿主 session/event → 账本记录 → 入队   ← 会话进行中，秒级
  * ② 统计工具   token_usage（Agent 可调用）             ← "我今天用了多少 token"
  * ③ 统计服务   ctx.tokenReport（其它插件可调用）
  * ```
@@ -17,30 +17,32 @@
  * ②③ 与 CLI `ai-token`、本地页面走的是**同一套聚合与同一套口径**，
  * 所以「工具报的数」与「页面上的数」必然一致（`ARCHITECTURE.md` §3）。
  *
- * ## 挂载点：一个 `SessionTelemetryBackend`
- *
- * 复用 DSH 已有的捕获链路，不自建事件监听与 token 计量（见 `docs/插件方案.md` §1）：
+ * ## 挂载点：宿主会话事件流（★ **不占 `sessionTelemetry` 服务**）
  *
  * ```
- * session/event (同步热路径)
- *       ↓
- * SessionTelemetryCoordinator（过滤 + 深拷贝 + 脱敏瀑布）
- *       ↓
- * emit(record)  ← 🚨 必须非阻塞入队（同步调用，不能 await fetch）
+ * session/event（宿主同步热路径）
+ *       ↓  ctx.on(...)                                   ← capture.ts
+ * 账本记录（只搬形状）→ foldRecord() 决定这条算不算计费 → 入队
  *       ↓
  * 内存队列 → 批量 → 磁盘 outbox → HTTP POST → 部门服务端
  * ```
  *
- * ## 四个硬约束（违反即事故）
+ * ★ **刻意不注册 `sessionTelemetry`**：那个服务名一个进程只能注册一次，而官方
+ *   `dsh-session-telemetry-otel` 永远占着它（连它的 `mode: DISABLED` 都照样占名）。
+ *   0.8.x 及更早的实现把自己注册成第二个后端，于是**装了本插件就必须手工停用官方
+ *   OTel** —— 否则部署配置里一带 appKey，DSH 启动即失败，日志只有一行
+ *   `service "sessionTelemetry" has been registered at <…>`。
+ *   现在两边可以同时开着、互不干扰：原因与三条实测证据见 `capture.ts` 的文件头。
+ *
+ * ## 三个硬约束（违反即事故）
  *
  * 1. 🚨 **`emit()` 在热路径同步执行，只能入队**。
  *    任何 `await fetch` 都会拖慢 agent loop —— 用户会直接感觉到卡顿。
- * 2. 🚨 **同一时刻只能挂载一个 telemetry 后端**（cordis 重复注册同名服务会抛错）。
- *    本插件与官方 `dsh-session-telemetry-otel` **互斥**，两者只能装一个。
- * 3. 🚨 **投递是 best-effort**：游标记的是「已交出」不是「已送达」
+ * 2. 🚨 **投递是 best-effort**：游标记的是「已交出」不是「已送达」
  *    → 必须自建磁盘 outbox（`outbox.ts`），否则崩溃会丢数据。
- * 4. 🚨 **`session-telemetry/record` 瀑布默认不脱敏**，记录会原样带出文件内容与命令输出
- *    → 必须自己挂脱敏规则，并保证 `includeContent: false`。
+ * 3. 🚨 **「只取计费字段」是 `foldRecord()` 的责任**：宿主交过来的 `event.data`
+ *    可能带文件内容与命令输出。本插件**不再改写宿主的脱敏瀑布**（改了就等于修改
+ *    官方后端收到的内容），改为在折叠时按**白名单**取值 —— 落盘与外发的只有计费字段。
  *
  * ## 未署名 / 未配凭证 = 不采集也不上报
  *
@@ -49,8 +51,8 @@
  *   宁可数据缺失（看板上能看到缺口），也不要未授权采集。
  */
 
-import type { Context } from '@deepseek-ai/cordis'
-import { SessionTelemetryBackend, SessionTelemetryCoordinator } from '@deepseek-ai/dsh-session-telemetry'
+import { installCapture, type CaptureHost } from './capture.js'
+import type { TelemetryRecord } from './fold.js'
 
 import {
   canReport,
@@ -140,67 +142,49 @@ export function describeDisabled(status: PluginStatus, resolver: IdentityResolve
 }
 
 /**
- * 探针后端的契约形状。
- *
- * ⚠️ 从类上 `Pick` 出来的类型，装进这个文件是为了让测试能传一个假后端，
- *   而**不必** import cordis、更不必起一个真实 Context。
+ * 捕获侧对外的契约形状 —— `ReportRuntime` 与测试都只依赖这三个动作。
  */
-type BackendPort = Pick<SessionTelemetryBackend, 'emit' | 'flush' | 'shutdown'>
+export interface BackendPort {
+  emit(record: TelemetryRecord): void
+  flush(): void
+  shutdown(): Promise<void>
+}
 
 /**
- * 本插件真正依赖的宿主能力。
+ * 本插件真正依赖的宿主能力（捕获用三条 + 装配期日志）。
  *
  * 刻意**收窄**而不是直接写 cordis 的 `Context`：这样「插件依赖了什么」
  * 在类型上一眼可见，而测试也能传一个几行的假 ctx 而不必搭起整个 cordis 运行时。
- * 真实的 cordis Context 结构上满足这个接口。
+ * 真实的 cordis Context 结构上满足这个接口（见 `capture.ts` 的 `CaptureHost`）。
  */
-export interface BackendContext {
-  logger: { info(message: string): void; warn(message: string): void }
-  effect(callback: () => (() => void) | void): void
+export interface BackendContext extends CaptureHost {
   /**
-   * 注册事件监听。
+   * 装配期还要 info 级日志（捕获侧只用得上 warn）。
    *
-   * ⚠️ 参数类型刻意放宽成 `unknown[]`：cordis 的 `ctx.on` 是按事件名做重载的，
-   *   在这里精确还原会引入一整套对 `@deepseek-ai/cordis` 事件表的类型依赖。
-   *   我们只挂 `session-telemetry/record` 一条瀑布，形状在 `installRedaction`
-   *   里就地收窄 —— 收益是插件不必跟着宿主的事件表版本走。
+   * ⚠️ 必须与 `UiHostContext.logger` **逐字同型**，而不是「可赋值即可」：
+   *   `ApplyContext` 同时 extends 这两个接口，TS 要求同名属性在多个基接口里
+   *   **完全一致**；写成交叉类型（`{warn} & {info}`）会让整个接口无法继承
+   *   （TS2320，报错文案只说「不是 identical」，不提是交叉类型惹的）。
    */
-  on(event: string, listener: (...args: never[]) => unknown): () => void
-  /** 会话服务 —— coordinator 会 `ctx.sessions.list()` 扫已在跑的会话。 */
-  sessions: { list(): Iterable<unknown> }
+  logger: { info(message: string): void; warn(message: string): void }
 }
 
 /**
- * 挂上脱敏规则。
+ * 上报捕获侧 —— **薄适配器**。
  *
- * 🚨 这是「`includeContent` 必须为 false」在**代码层面**的保证，
- *   而不是靠配置自觉：DSH 的瀑布默认不带规则，记录会原样带出
- *   文件内容与命令输出。这里用白名单把 body 裁到只剩计费字段。
- */
-function installRedaction(ctx: BackendContext): void {
-  ctx.effect(() => {
-    const dispose = ctx.on('session-telemetry/record', ((record: unknown, next: () => unknown) => {
-      const passed = next()
-      if (passed === null || typeof passed !== 'object') return passed
-      const body = (passed as { body?: unknown }).body
-      if (body === null || typeof body !== 'object') return passed
-      return { ...(passed as object), body: stripToBillingFields(body as Record<string, unknown>) }
-    }) as never)
-    return dispose
-  })
-}
-
-/**
- * 上报后端本体 —— **薄适配器**。
+ * 它只做两件事：把宿主会话事件流接到运行时给的闭包上（`installCapture`），
+ * 以及暴露两个诊断入口。「往哪发、以谁的名义、多久发一次」全都在 `ReportRuntime` 里，
+ * 可以被就地替换（设置页保存后立刻生效，不必重启 DSH）。
  *
- * 它只把 coordinator 的三个回调转发给运行时给的那组闭包，并暴露两个诊断入口。
- * 「往哪发、以谁的名义、多久发一次」全都在 `ReportRuntime` 里，可以被就地替换
- * （设置页保存后立刻生效，不必重启 DSH）。
+ * ★ **它不是 cordis 服务**：不注册 `sessionTelemetry`，所以与官方 OTel 后端并存
+ *   （理由与三条实测证据见 `capture.ts` 的文件头）。0.8.x 及更早的实现继承
+ *   `SessionTelemetryBackend` —— 那既让它与官方后端互斥，又要求它整天提防
+ *   「服务代理穿不过私有字段」那个坑；两条约束随这次改造一起消失。
  *
  * `emit()` 链路上只有一次纯函数折叠 + 一次数组 push —— 这是本类最重要的性质，
  * 任何改动都要重新确认它没有引入 IO。
  */
-export class TokenReportBackend extends SessionTelemetryBackend implements BackendPort {
+export class TokenReportCapture implements BackendPort {
   /**
    * 部署选定的共享模式，**不是**投递回执。
    *
@@ -209,79 +193,48 @@ export class TokenReportBackend extends SessionTelemetryBackend implements Backe
    */
   readonly sharing = 'full' as const
 
-  static inject = ['sessions']
-
   /**
-   * 热路径与诊断入口，挂成**自有属性**而不是私有字段。
+   * 诊断入口（浏览器半的 `GET /api/tokenReport.stats` 与 `token_usage_diagnostics` 都读它）。
    *
-   * 🚨 原因是 cordis 的 `ctx.get('sessionTelemetry')` 返回**服务代理**，
-   *   而 JS 的私有字段（`#x`）穿不过 Proxy —— 任何 `emit()` 方法体里的
-   *   `this.#reporter` 都会抛 `TypeError: Cannot access invalid private field`。
-   *
-   *   这一点在生产里是致命的：coordinator 通过 `this.backend.emit(record)`
-   *   调用后端，而它拿到的正是代理对象 —— 也就是说**每一次会话事件都会炸**。
-   *   实例内部自调用（`this.emit(...)`）拿到的是真实例，所以单测全绿、
-   *   只有真实装载才会暴露。这是 `verify/verify-cordis-load.ts` 存在的全部理由。
+   * ⚠️ 0.8.x 时这里写着另一段话：本类当时是 cordis 服务，`ctx.get('sessionTelemetry')`
+   *   返回**服务代理**，而 JS 私有字段穿不过 Proxy —— 代理上每一次会话事件都会抛
+   *   `Cannot access invalid private field`，且单测全绿、只有真实装载才暴露。
+   *   **那个坑随「不再注册服务」一起消失**；注释留在这里是为了让后来者知道
+   *   「为什么以前必须这么写」，而不是以为这里仍有坑要绕。
    */
   readonly reporterStats: (() => ReporterStats) & ReporterStats
 
-  /** 历史补报独立于实时队列；自有闭包入口可安全经 cordis 代理读取。 */
+  /** 历史补报独立于实时队列（闭包入口，无 `this` 依赖）。 */
   readonly backfillStats: () => BackfillStats
 
   /**
    * 热路径接收器：由运行时给的闭包（折叠 + 入队到**当前**投递单元）。
    *
-   * ★ 闭包实现没有任何 `this` 依赖，因此在代理与原对象上行为完全一致 ——
-   *   并且**顺带保证了热路径不做 IO**（它只碰内存数组）。
+   * ★ 闭包实现没有任何 `this` 依赖 —— 它**顺带保证了热路径不做 IO**
+   *   （闭包体只碰内存数组）。
    */
   readonly sink: BackendRefs
 
   /**
-   * @param ctx - DSH 的插件上下文（cordis Context）。
+   * @param ctx - DSH 的插件上下文（结构上满足 `BackendContext`）。
    * @param refs - 运行时给的闭包组（热路径 + 诊断入口）。
-   *
-   * ⚠️ 类型上刻意收成 `BackendContext` 而不是 cordis 的 `Context`：
-   *   本文件只用到 `logger` / `effect` / `on` / `sessions` 四个能力，
-   *   用宽接口能让 `apply()` 的契约一眼看清「这个插件到底依赖什么」。
-   *   真实的 Context 结构上满足它，所以装配时无需任何断言。
    */
   constructor(ctx: BackendContext, refs: BackendRefs) {
-    super(ctx as Context)
-
     this.sink = refs
     this.reporterStats = refs.reporterStats
     this.backfillStats = refs.backfillStats
-
-    // 装配捕获侧：本后端是热路径的唯一消费者。
-    //
-    // ⚠️ 三个回调都用**闭包**而不是 `this.sink.x` —— 因为 coordinator 拿到的是
-    //   服务代理，走 `this.#x` 会炸（见字段注释）。
-    new SessionTelemetryCoordinator(
-      ctx as Context,
-      {
-        emit: (record) => refs.emit(record),
-        // turn 结束时提示冲刷 —— 长会话的延迟从「一个周期」降到「每轮」
-        flush: () => refs.flush(),
-        shutdown: () => refs.shutdown(),
-      },
-      { capture: 'live', includeHistory: true },
-    )
-
-    // ★ 脱敏兜底：DSH 的 `session-telemetry/record` 瀑布**默认不带任何规则**，
-    //   记录会原样带出文件内容与命令输出。本插件只上报 token 数值与模型名，
-    //   所以即便宿主没装配规则，这里也把话题正文剥掉。
-    //   放在本插件自己的 fiber 上，卸载时自动解除。
-    installRedaction(ctx)
+    // 捕获侧只调 `this.emit` / `this.flush` —— 与测试、诊断走**同一条**路径，
+    // 不给「测试里走捷径、生产里走另一条」留空间。
+    installCapture(ctx, this)
   }
 
   /**
-   * 🚨 同步热路径：只做折叠 + 入队。
+   * 🚨 同步热路径：只做折叠 + 入队（宿主每一条会话事件都会走到这里）。
    *
-   * 这里**不能**访问 `this.#私有字段`（见上方字段注释），
-   * 所以状态与实现都通过自有属性/闭包取。
-   * 实例被 cordis 代理后调用本方法时，`this` 上仍能读到这个自有属性。
+   * 由 `installCapture()` 在宿主 `session/event` 上调用；测试与诊断也用同一个入口，
+   * 所以「单测里绿」与「真实装载里绿」说的是同一件事。
    */
-  emit(record: Parameters<SessionTelemetryBackend['emit']>[0]): void {
+  emit(record: TelemetryRecord): void {
     this.sink.emit(record)
   }
 
@@ -290,60 +243,10 @@ export class TokenReportBackend extends SessionTelemetryBackend implements Backe
     this.sink.flush()
   }
 
-  /** 排空并停止。抛错只会被 coordinator 记一条 warning，不会阻断退出。 */
+  /** 排空并停止（插件卸载时调用；抛错只被捕获侧记一条 warning，不阻断退出）。 */
   async shutdown(): Promise<void> {
     await this.sink.shutdown()
   }
-}
-
-/**
- * 把事件体裁剪到「只含计费字段」。
- *
- * 🚨 保留白名单而不是黑名单：新增事件类型时，凡是没在白名单里的字段
- *   一律不会外发。用黑名单的话，DSH 加一个新字段就可能悄悄带出内容。
- */
-function stripToBillingFields(body: Record<string, unknown>): Record<string, unknown> {
-  const out: Record<string, unknown> = {}
-
-  const usage = body['usage']
-  if (usage !== null && typeof usage === 'object') {
-    const u = usage as Record<string, unknown>
-    const picked: Record<string, unknown> = {}
-    for (const key of [
-      'inputTokens',
-      'outputTokens',
-      'totalTokens',
-      'cacheReadTokens',
-      'cacheWriteTokens',
-      'reasoningTokens',
-    ]) {
-      const v = u[key]
-      if (typeof v === 'number' && Number.isFinite(v)) picked[key] = v
-    }
-    out['usage'] = picked
-  }
-
-  const message = body['message']
-  if (message !== null && typeof message === 'object') {
-    const source = (message as Record<string, unknown>)['source']
-    if (source !== null && typeof source === 'object') {
-      const s = source as Record<string, unknown>
-      out['message'] = {
-        source: {
-          ...(typeof s['kind'] === 'string' ? { kind: s['kind'] } : {}),
-          ...(typeof s['provider'] === 'string' ? { provider: s['provider'] } : {}),
-          ...(typeof s['model'] === 'string' ? { model: s['model'] } : {}),
-        },
-      }
-    }
-  }
-
-  for (const key of ['turn', 'step']) {
-    const v = body[key]
-    if (typeof v === 'number' && Number.isFinite(v)) out[key] = v
-  }
-
-  return out
 }
 
 /** `apply()` 的依赖注入形状 —— 只为让测试能覆盖身份解析结果。 */
@@ -365,7 +268,7 @@ export function apply(
   ctx: ApplyContext,
   rawConfig: RawConfig = {},
   deps: ApplyDeps = {},
-): { status: PluginStatus; backend: TokenReportBackend | null } {
+): { status: PluginStatus; backend: TokenReportCapture | null } {
   const merged = withSavedConnection(rawConfig)
   const config = resolveConfig(merged)
 
@@ -390,7 +293,7 @@ export function apply(
   //
   // ⚠️ 顺序：运行时**先**建，统计上下文跟着它取值 —— 面板里可以把「会话日志根」
   //   改掉，改完必须在同一个进程里立刻按新根取数（见 `buildStatsContext`）。
-  const runtime = new ReportRuntime<TokenReportBackend>(
+  const runtime = new ReportRuntime<TokenReportCapture>(
     {
       logger: {
         info: (message) => ctx.logger.info(message),
@@ -400,7 +303,7 @@ export function apply(
       //   否则保存完再 refresh 会拿着旧快照覆盖新值。
       raw: rawConfig,
       resolver,
-      createBackend: (refs: BackendRefs) => new TokenReportBackend(ctx, refs),
+      createBackend: (refs: BackendRefs) => new TokenReportCapture(ctx, refs),
     },
     config,
   )
@@ -408,7 +311,7 @@ export function apply(
   const statsContext = buildStatsContext(() => runtime.config())
   ctx.effect(() => () => { void closeStatsWorker(statsContext.dbPath) })
 
-  let backend: TokenReportBackend | null = null
+  let backend: TokenReportCapture | null = null
   if (status.reportingEnabled && identityState.ready) {
     backend = runtime.start(config, identityState.identity)
     if (backend !== null && backend.reporterStats.outbox.droppedBatches > 0) {
@@ -566,7 +469,7 @@ export interface ApplyContext extends BackendContext, UiHostContext {
 function registerTools(
   ctx: ApplyContext,
   statsContext: StatsContext,
-  runtime: ReportRuntime<TokenReportBackend>,
+  runtime: ReportRuntime<TokenReportCapture>,
 ): boolean {
   try {
     ctx.reflect.provide('tokenReportTools', {
@@ -648,7 +551,7 @@ async function runTool(statsContext: StatsContext, raw: Record<string, unknown>)
  *   而是**静默地不上报**（凭证过期、地址改了、outbox 满）——
  *   看板上少了几个人的数据，没人会发现。
  */
-function formatReporterDiagnostics(runtime: ReportRuntime<TokenReportBackend>): string {
+function formatReporterDiagnostics(runtime: ReportRuntime<TokenReportCapture>): string {
   const lines: string[] = []
   const n = (v: number): string => v.toLocaleString('en-US')
   // ⚠️ 读**运行时当前**的配置：用户可能刚在设置页换了地址/间隔。
@@ -764,17 +667,23 @@ function registerService(ctx: ApplyContext, config: EffectiveConfig, statsContex
 /**
  * 插件入口对象的依赖声明。
  *
- * 🚨 **必须挂在 `default` 导出上，而不是 `TokenReportBackend` 类上。**
+ * 🚨 **必须挂在 `default` 导出上，而不是 `TokenReportCapture` 类上。**
  *   cordis 读取的是**插件条目对象**的 `inject`，而 DSH 的 loader 加载的是
  *   本模块的 `default` 导出 —— 类根本不会被实例化（`apply()` 是被直接调用的）。
  *
  *   把 `inject` 写在类上会**静默失效**：插件照常被 import，`apply()` 也照常执行，
- *   但所有 `ctx.sessions` / `ctx.logger` 之类的依赖注入都失去了「先等依赖就绪」
- *   的保证。这是真实装载验证抓出来的问题
+ *   但所有 `ctx.logger` 之类的依赖注入都失去了「先等依赖就绪」的保证。
+ *   这是真实装载验证抓出来的问题
  *   （`verify/probe-activation.ts` 会打印 `inject = (无)` 暴露它）。
  *
- * 为什么仍然需要 `sessions`：`SessionTelemetryCoordinator` 在构造函数里会
- * `ctx.sessions.list()` 扫已经在跑的会话。依赖没就绪时那一步会抛错。
+ * 为什么仍然需要 `sessions`：本插件的输入**就是**会话事件流
+ * （`session/event` / `session/flush`，见 `capture.ts`），而发出它们的是会话服务 ——
+ * 声明它 = 让「会话服务就绪之后才开始捕获」成为 loader 的保证，而不是靠运气。
+ *
+ * ⚠️ 0.8.x 时这里的理由是另一件事：当时照抄官方写法，用 `SessionTelemetryCoordinator`
+ *   在构造期 `ctx.sessions.list()` 回放**已经在跑的会话**。那段回放已经去掉
+ *   （历史由磁盘补报线程全量覆盖），所以这条声明现在是**次序保证** ——
+ *   如果哪一天确认连次序都不需要，应当连同这一行一起删，而不是留着当装饰。
  */
 export const inject = ['sessions'] as const
 
@@ -804,7 +713,8 @@ export default {
 export { IdentityResolver, type IdentityState } from './identity.js'
 export type { EffectiveConfig, RawConfig } from './config.js'
 export { resolveConfig, DEFAULT_ENDPOINT, ENV } from './config.js'
-export { foldRecord, toWireRecord, toTokenUsage, type BillingRecord, type FoldIdentity } from './fold.js'
+export { foldRecord, toWireRecord, toTokenUsage, type BillingRecord, type FoldIdentity, type TelemetryRecord } from './fold.js'
+export { installCapture, ledgerRecordOf, type CaptureHost, type HostSession, type HostSessionEvent } from './capture.js'
 export { Outbox, type OutboxStats } from './outbox.js'
 export { Reporter, resolveOutboxDir, type ReporterStats } from './reporter.js'
 export {

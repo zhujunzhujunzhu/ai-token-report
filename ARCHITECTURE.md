@@ -141,7 +141,8 @@ ai-token-report/
 │  │   └─ src/serve-node.ts    #   node:http 适配器（★ 必须动态 import node:http）
 │  │
 │  └─ dsh-plugin/              # ★ ③ DSH 插件（docs/插件方案.md §3）
-│      ├─ src/index.ts         #   SessionTelemetryBackend 实现 + apply() 装配
+│      ├─ src/index.ts         #   apply() 装配 + TokenReportCapture（薄适配器）
+│      ├─ src/capture.ts       #   ★ 订阅宿主 session/event → 账本记录（**不注册 sessionTelemetry**）
 │      ├─ src/reporter.ts      #   非阻塞队列（热路径只能入队！）
 │      ├─ src/outbox.ts        #   磁盘 outbox（崩溃不丢）
 │      ├─ src/identity.ts      #   方案 A 三级回退
@@ -954,16 +955,19 @@ CLI / 插件 ──POST /api/v1/token-usage──► portal.sqlite ──只读�
 > 关键取舍见 §5.2：**鉴权失败必须是非 2xx**、**归属只信服务端**、
 > **上报库绝不自动重建**。
 >
-> **S9 已完成**：`dsh-plugin` 的上报后端已落地 ——
-> `SessionTelemetryBackend` + 内存队列 + 磁盘 outbox（两态 + 启动重放）+ 全局配置
+> **S9 已完成**：`dsh-plugin` 的上报链路已落地 ——
+> 宿主会话事件流捕获 + 内存队列 + 磁盘 outbox（两态 + 启动重放）+ 全局配置
 > （`name` / `appKey` / `endpoint` / batch / outbox / 功能开关），
 > 并额外提供 `token_usage` 工具与 `ctx.tokenReport` 服务。
 > 安装与配置见 `packages/dsh-plugin/README.md`。
 >
-> ⚠️ **与官方 `dsh-session-telemetry-otel` 互斥**：同一时刻只能挂一个 telemetry 后端。
+> ★ **0.9.0 起不再注册 `sessionTelemetry` 服务**（改订阅宿主 `session/event`）：
+> 那个服务名一个进程只能注册一次，而官方 `dsh-session-telemetry-otel` 永远占着它
+> （连它的 `mode: DISABLED` 都照样注册），此前装本插件必须手工停用官方后端，
+> 否则 DSH 启动即失败。理由与三条实测证据见 `packages/dsh-plugin/src/capture.ts` 的文件头。
 > ⚠️ **改插件后必须跑** `bun run packages/dsh-plugin/verify/verify-cordis-load.ts`：
->    cordis 的 `ctx.get()` 返回服务代理，私有字段穿不过 Proxy，
->    单测（拿到真实例）发现不了这类问题。
+>    它拿真 cordis 装载打包产物，并且**先让官方后端占住服务名** ——
+>    「不抢名字」这件事只有这样才测得出来。
 >
 > **S9.5 已完成**：浏览器半（`lib/client.js`）把用量画进 DSH 界面 ——
 > 输入框上方的用量条（`conversation.input.dock`）与会话标题栏的徽章
@@ -1058,10 +1062,12 @@ CLI / 插件 ──POST /api/v1/token-usage──► portal.sqlite ──只读�
 ## 附：关键技术约束速查
 
 - **插件的 `emit()` 在热路径同步执行**，只能入队，任何 `await fetch` 都会拖慢 agent loop
-- **同一时刻只能挂载一个 telemetry 后端**（重复加载抛错）→ 与自带 OTel 后端互斥
+- **同一时刻只能挂载一个 telemetry 后端**（重复加载抛错）→ 插件因此**不注册**它，
+  改为订阅宿主 `session/event`，于是与自带 OTel 后端可以共存（0.9.0 起）
 - **投递是 best-effort**（游标记「已交出」不是「已送达」）→ 插件必须自建磁盘 outbox
-- **`sessionTelemetry/record` 瀑布默认不脱敏** → 必须自己挂脱敏规则，
-  并保证 `includeContent: false`（只采 token 数值与模型名，不采对话内容）
+- **只取计费字段**要在折叠时按白名单取值（`foldRecord()`）—— 插件**不碰**
+  宿主的 `session-telemetry/record` 瀑布（改它等于修改官方后端收到的内容），
+  保证 `includeContent: false`（只采 token 数值与模型名，不采对话内容）
 - 日志为 **zstd 分帧追加**，需按 magic `28 B5 2F FD` 逐帧解压
 - **Node/Bun 原生支持** `zlib.zstdDecompressSync`（已实测可用）
 

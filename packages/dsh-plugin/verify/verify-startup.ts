@@ -38,7 +38,10 @@ try {
     bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'dsh-plugin-token-report'],
   } } }))
   writeFileSync(join(profile, 'cordis.yml'), '[]')
-  writeFileSync(join(profile, 'cordis.patch.yml'), '- id: session-telemetry-otel\n  disabled: true\n- id: token-report\n  config:\n    features: { reporting: false }\n')
+  // ★ 刻意**不再**写 `- id: session-telemetry-otel / disabled: true`：
+  //   0.9.0 起本插件不注册 `sessionTelemetry` 服务（改订阅宿主会话事件流），
+  //   官方 OTel 留在组装里也能启动 —— 这里顺便当一条共存冒烟。
+  writeFileSync(join(profile, 'cordis.patch.yml'), '- id: token-report\n  config:\n    features: { reporting: false }\n')
   const env = cleanChildEnv()
   for (const key of Object.keys(env)) if (key.startsWith('DSH_TOKEN_REPORT_') || key.startsWith('DSH_REPORT_')) delete env[key]
   env.DSH_HOME = home
