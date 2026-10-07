@@ -477,9 +477,17 @@ export class StatsRoute {
     //   键的口径（归一化后的 provider、稳定人员 ID、按项目名合并、按本地时区分桶）
     //   只有 `core/db/portal.ts` 一份实现 —— 让本文件自己去对键，就会多出
     //   第二份「什么算同一组」的判断，而它与分组的判断一定会分叉。
-    const costs = await session.costByGroup(by)
+    //
+    // ★ 两趟聚合**互不依赖**，并发发出去：它们是两次各自独立的全窗口扫描
+    //   （线上实测 30 天窗口 by=user 约 0.3s + 0.6s，全年约 0.5s + 1.9s），
+    //   串行等于把延迟相加，而页面上等的是两者都到。SQLite 后端由
+    //   `SqlitePortalStore` 的 `queued()` 自己串行化，所以那边既不提速也不改语义。
+    const [costs, groupRows] = await Promise.all([
+      session.costByGroup(by),
+      session.groups(by),
+    ])
 
-    const rows = (await session.groups(by)).map((row) => ({
+    const rows = groupRows.map((row) => ({
       key: row.key,
       ...(row.attributionStatus ? {
         label: row.label,
@@ -1056,12 +1064,23 @@ async function buildOverview(
   session: PortalStatsSession,
   window: ParsedWindow,
 ): Promise<OverviewResponse> {
-  const total = await session.totals()
+  // ★ 四条聚合**互不依赖**，必须并发发出去 —— 它们是四次各自独立的全窗口扫描，
+  //   串行等于把延迟相加，而页面上等的是四条都到。线上实测（30 天窗口 /
+  //   27 张表 / 22.5 万事件）：totals 125ms、sessions 105ms、unattributed 1ms、
+  //   costTotals 635ms ⇒ 串行 0.87s、并发取最慢的那条。全年窗口同理（1.9s vs 2.2s）。
+  //   ⚠️ SQLite 后端由 `SqlitePortalStore` 的 `queued()` 自己串行化 ——
+  //     所以这条改动在那边**既不提速也不改语义**（本地页与单测都走那条路）。
+  //   ⚠️ 口径一个字没动：`derive()` / `unattributedRate()` 仍在拿到值之后才算。
+  const [total, cost, sessionCount, unattributed] = await Promise.all([
+    session.totals(),
+    // 没有 `cost:read` 时 `costTotals()` 直接返回 null —— **整个字段不下发**。
+    // 回 0 会让「你没权限」与「这个月没花钱」长得一模一样。
+    session.costTotals(),
+    session.sessions(),
+    session.unattributedCalls(),
+  ])
   // 口径来自 core 的 derive() + shared/metrics.ts，本文件不写公式
   const metrics = derive(total)
-  // 没有 `cost:read` 时 `costTotals()` 直接返回 null —— **整个字段不下发**。
-  // 回 0 会让「你没权限」与「这个月没花钱」长得一模一样。
-  const cost = await session.costTotals()
 
   return {
     range: {
@@ -1075,10 +1094,10 @@ async function buildOverview(
     cacheReadTokens: total.cacheRead,
     cacheWriteTokens: total.cacheWrite,
     calls: total.calls,
-    sessions: await session.sessions(),
+    sessions: sessionCount,
     cacheHitRate: cacheHitRate({ input: total.input, cacheRead: total.cacheRead }),
     avgTokensPerCall: metrics.avgTokensPerCall,
-    unattributedRate: unattributedRate(await session.unattributedCalls(), total.calls),
+    unattributedRate: unattributedRate(unattributed, total.calls),
     ...(cost === null ? {} : { cost }),
   }
 }
@@ -1102,10 +1121,18 @@ async function buildOverview(
  *   而它不会报错，只会让「诊断页说 94% 命中、看板说 88% 命中」长期共存。
  */
 async function buildDiagnostics(session: PortalStatsSession): Promise<DiagnosticsResponse> {
-  const bounds = await session.timeBounds()
-  const total = await session.totals()
-  const unattributed = await session.unattributedCalls()
-  const sessions = await session.sessions()
+  // ★ 这些聚合**互不依赖**，并发发出去（同 `buildOverview`）：诊断页等的是全部到齐，
+  //   串行只是把它们各自的耗时相加。SQLite 后端仍由 `queued()` 串行化，语义不变。
+  const [bounds, total, unattributed, sessions, distinctUsers, lastIngestAt, sources, reporters] = await Promise.all([
+    session.timeBounds(),
+    session.totals(),
+    session.unattributedCalls(),
+    session.sessions(),
+    session.distinctUsers(),
+    session.lastIngestAt(),
+    session.sourceCoverage(),
+    session.reporterCoverage(),
+  ])
   const metrics = deriveMetrics(total, total.calls)
   // ★ 新鲜度以**服务端本次取数时刻**为基准：上报时刻来自服务端，
   //   拿浏览器时钟去减会把一个健康链路显示成「-3 分钟前」（见
@@ -1113,20 +1140,15 @@ async function buildDiagnostics(session: PortalStatsSession): Promise<Diagnostic
   const now = Date.now()
   const silenceOf = (ts: number | null): number | null => (ts === null ? null : Math.max(0, now - ts))
 
-  const [sources, reporters] = await Promise.all([
-    session.sourceCoverage(),
-    session.reporterCoverage(),
-  ])
-
   return {
     totalEvents: total.calls,
     unattributedEvents: unattributed,
     unattributedRate: unattributedRate(unattributed, total.calls),
     identityViolations: 0,
-    distinctUsers: await session.distinctUsers(),
+    distinctUsers,
     earliestTs: bounds.earliest,
     latestTs: bounds.latest,
-    lastIngestAt: await session.lastIngestAt(),
+    lastIngestAt,
 
     totalTokens: total.total,
     sessions,
