@@ -235,18 +235,18 @@ describe('统计状态', () => {
     expect(dashboard.overview?.totalTokens).toBe(101)
   })
   /**
-   * ★ 后台轮询**不重取四个纯目录**，前台路径照旧全取。
+   * ★ 四份纯目录**取一次就够**：后台轮询不取，改筛选 / 切区块 / 翻页也不取，
+   * 只有首次和「刷新数据」按钮（`load(false, true)`）才取。
    *
    * 统计页每 5 秒轮询一次整页（`StatsLayout.vue` 的 `setInterval`），而分组 /
    * 人员名册 / 供应商 / 来源这四份目录**只在管理员改配置时才会变**。线上实测
    * （2026-10-07，2 天 20.7 万请求）：它们合计占 **37%**，每个平均 0.82–0.92 秒，
    * 而且每个请求都要在服务端重跑一遍版本闸门的固定开销 —— 却几乎总是同一份内容。
    *
-   * ⚠️ 前台（首帧 / 手动刷新 / 切区块 / 改筛选 / 翻页）必须照旧全取：
-   *   否则管理员改完分组，使用者在页面上**永远看不到**那个新分组。
    * ⚠️ 跳过 ≠ 清空：已取到的候选项必须原样留着。
+   * ⚠️ 四份**全部成功**才算「取到过」：否则旧后端（404）或一次抖动会让下拉永久空着。
    */
-  test('★ 后台轮询不重取四个纯目录，前台照旧全取', async () => {
+  test('★ 四份纯目录只取一次：后台轮询与改筛选都不重取，「刷新数据」才强制重取', async () => {
     signIn('admin')
     const urls: URL[] = []
     respond((raw) => {
@@ -275,6 +275,11 @@ describe('统计状态', () => {
     expect(catalogs(urls)).toHaveLength(0)
     expect(urls.some((url) => url.pathname.endsWith('overview'))).toBe(true)
     expect(urls.some((url) => url.pathname.endsWith('series'))).toBe(true)
+    urls.length = 0
+    // 改筛选 / 翻页走的是同一个前台 `load()`：目录已经取到过，不重取。
+    await dashboard.applyFilters({ ...dashboard.filters, period: 'today' })
+    await dashboard.setPage(1)
+    expect(catalogs(urls)).toHaveLength(0)
     // 跳过 ≠ 清空：已取到的候选原样留着（名册经 `userOptions` 暴露给页面）。
     expect(dashboard.groupOptions.map((row) => row.group_id)).toEqual(['g-dev'])
     expect(dashboard.userOptions.map((row) => row.key)).toEqual([
@@ -283,8 +288,8 @@ describe('统计状态', () => {
     expect(dashboard.providerOptions).toEqual(['dashscope'])
     expect(dashboard.sourceOptions).toEqual(['dsh'])
     urls.length = 0
-    // 前台刷新（手动「刷新数据」/ 改筛选）仍然补齐目录。
-    await dashboard.load()
+    // 「刷新数据」按钮：显式要求重新拉目录。
+    await dashboard.load(false, true)
     expect(catalogs(urls)).toHaveLength(4)
   })
   test('看板刷新同步更新打开的人员详情并保留服务端数值', async () => {
@@ -358,6 +363,9 @@ describe('统计状态', () => {
     const records = lastOf((u) => u.pathname.endsWith('records'))
     expect(breakdown?.searchParams.has('member_id')).toBe(false)
     // ★ 分组 / 人员 / 供应商 / 来源候选必须始终是完整集合：带上筛选就会让下拉在选中后塌缩成一项。
+    //   ⚠️ 条数从 12 变成 4（2026-10-07）：四份目录只在**首帧**取一次，改筛选 / 翻页
+    //   复用同一份 —— 它们只在管理员改配置时才变，而每次交互重取一遍等于白付
+    //   四倍的服务端闸门（线上实测这四类占全部请求 37%）。
     const candidates = urls.filter(
       (u) =>
         u.pathname.endsWith('/api/v1/stats/groups') ||
@@ -365,7 +373,7 @@ describe('统计状态', () => {
         u.pathname.endsWith('/api/v1/stats/providers') ||
         u.pathname.endsWith('/api/v1/stats/sources'),
     )
-    expect(candidates).toHaveLength(12)
+    expect(candidates).toHaveLength(4)
     expect(candidates.every((u) => u.searchParams.size === 0)).toBe(true)
     expect(records?.searchParams.get('member_id')).toBe(
       '00000000-0000-4000-8000-000000000003',
@@ -602,12 +610,13 @@ describe('统计状态', () => {
       expect(url.searchParams.getAll('provider')).toEqual(['dashscope', 'openai'])
     // 值原样发出（服务端是子串匹配，页面不做任何翻译）
     expect(filtered[0]?.searchParams.get('provider')).toBe('dashscope')
-    // 候选目录仍然只有一条请求，且**不带**供应商筛选（否则下拉会自锁定）
+    // ★ 候选目录**改动筛选时不再重取**（2026-10-07）：它在首帧已经取过一份
+    //   **不带任何筛选**的完整集合，下拉因此不会自锁定 —— 复用它既保持语义，
+    //   又省掉每个请求都要付一遍的服务端闸门。要强制重取只有「刷新数据」按钮。
     const catalogs = urls.filter((url) =>
       url.pathname.endsWith('/api/v1/stats/providers'),
     )
-    expect(catalogs).toHaveLength(1)
-    expect(catalogs[0]?.searchParams.size).toBe(0)
+    expect(catalogs).toHaveLength(0)
     // `openai` 库里没有 → 记成本机自定义项（只影响候选，不写库）
     expect(dashboard.customProviders).toEqual(['openai'])
     expect(dashboard.providerChoices.map((option) => option.value)).toEqual([

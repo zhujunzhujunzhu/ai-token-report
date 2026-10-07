@@ -55,7 +55,7 @@ onUnmounted(() => {
       <el-button
         :icon="Refresh"
         :loading="dashboard.loading"
-        @click="dashboard.load()"
+        @click="dashboard.load(false, true)"
         >刷新数据</el-button
       >
     </div>

@@ -327,6 +327,15 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
   let pending = false
   let detailPending = false
   let dataKey = ''
+  /**
+   * 四份纯目录（分组 / 人册 / 供应商 / 来源）是否**已经取到过**。
+   *
+   * ⚠️ 只有四份**全部成功**才置真：后端还是老版本（404）或某一次失败时保持假，
+   *   下一次前台 `load()` 会重试 —— 否则下拉会永久空着，而页面上看不出原因。
+   * ⚠️ 退出 / 换身份时必须归假（见 `watch(session.generation)`）：新身份的
+   *   数据范围与可见人员都变了，沿用旧目录会拿旧名册去收窄新筛选。
+   */
+  let catalogsLoaded = false
 
   function clearData(): void {
     overview.value = null
@@ -353,7 +362,18 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
         result.status === 503 ? `服务端暂未就绪：${result.error}` : result.error
   }
 
-  async function load(background = false): Promise<void> {
+  /**
+   * `refreshCatalogs`：**显式刷新**（「刷新数据」按钮）才重取四份纯目录。
+   *
+   * ★ 为什么需要这个开关：那四份目录（分组 / 人员名册 / 供应商 / 来源）只在
+   *   管理员改配置时才变，而 `load()` 是**所有**交互的收敛点（切换区块 / 改筛选 /
+   *   翻页都会调它），一次 12 个请求里有 4 个是重复取同一份内容 —— 线上实测这四类
+   *   占全部请求 37%、每个平均 0.82–0.92 秒，且每个都要付一遍服务端闸门。
+   *   现在：**首帧取一次**（或没取到过时重试），之后改筛选 / 切区块直接复用；
+   *   只有点「刷新数据」才强制重取。
+   *   ⚠️ 后台轮询（5 秒定时器 / 回到标签页）永远不取 —— 见下面的 `skipCatalogs`。
+   */
+  async function load(background = false, refreshCatalogs = false): Promise<void> {
     if (!session.signedIn || !section.value) return
     if (
       background &&
@@ -392,20 +412,20 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     // 候选始终不带人员筛选；全员排行可复用同一请求，避免每轮重复聚合。
     const candidates = fetchBreakdown(built.filter, 'user')
     /**
-     * ★ **纯目录只在非后台刷新时取**。
+     * ★ **纯目录只在「没取到过」或「显式刷新」时取**（后台轮询永远不取）。
      *
      * 它们是四个下拉的候选项（分组 / 人员名册 / 供应商 / 来源），只在管理员改配置时
-     * 才会变；而统计页是**每 5 秒**轮询一次整页（`StatsLayout.vue` 的 `setInterval`），
-     * 于是这四个端点被无限重复地取。线上实测（2026-10-07，2 天 20.7 万请求）：
-     * 它们合计 **7.6 万次（37%）**，每个平均 **0.82–0.92 秒**，而且每个请求都要在
-     * 服务端付一遍版本闸门的固定开销（那时 ~175ms/请求）—— 却几乎总是返回同一份内容。
+     * 才会变，而统计页是**每 5 秒**轮询一次整页（`StatsLayout.vue` 的 `setInterval`）、
+     * 每次切换区块 / 改筛选 / 翻页也都会走 `load()`。线上实测（2026-10-07，
+     * 2 天 20.7 万请求）：这四类合计 **7.6 万次（37%）**，每个平均 **0.82–0.92 秒**，
+     * 而且每个请求都要在服务端付一遍版本闸门的固定开销 —— 却几乎总是同一份内容。
      *
-     * ⚠️ 与之相对，`candidates`（`by=user` 用量排行）**不能**跳过后台取数：
+     * ⚠️ 与之相对，`candidates`（`by=user` 用量排行）**不能**跳过：
      *   它同时是「人员排行」的数据源，是**数字**而不是目录。
-     * 非后台路径（首帧 / 手动刷新 / 切区块 / 改筛选 / 翻页）照旧全取，
-     * 所以管理员改完分组，使用者下一次点「刷新数据」或改任何一个筛选就能看到。
+     * ⚠️ 只有四份目录**全部成功**才算「取到过」：否则后端还是老版本（404）时
+     *   就再也不会重试，下拉会永久空着。
      */
-    const skipCatalogs = background
+    const skipCatalogs = !refreshCatalogs && (background || catalogsLoaded)
     // ★ 分组候选同样不能带筛选（含分组筛选本身）：从已筛选结果里取候选，
     //   选中一个分组之后下拉会塌缩成一个选项，使用者再也加不回别的分组。
     const groupCandidates = skipCatalogs ? null : fetchGroupOptions()
@@ -492,6 +512,9 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     if (mo?.ok) memberDirectory.value = mo.data.members ?? []
     if (pv?.ok) providerOptions.value = pv.data.providers ?? []
     if (sv?.ok) sourceOptions.value = sv.data.sources ?? []
+    // ★ 四份都到了才记「取到过」：任何一份失败都保持假，下一次前台 load() 重试
+    //   （旧后端 404、或一次网络抖动，都不该让那个下拉永久空着）。
+    if (gopts?.ok && mo?.ok && pv?.ok && sv?.ok) catalogsLoaded = true
     if (se?.ok) series.value = se.data
     if (rank?.ok) ranking.value = rank.data.rows
     if (groupRank?.ok) groupRanking.value = groupRank.data.rows
@@ -689,6 +712,9 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
       groupOptions.value = []
       providerOptions.value = []
       sourceOptions.value = []
+      // ★ 换身份 / 重新登录后名字与数据范围都变了，目录必须重取一次
+      //   （否则会拿上一身份的名册去收窄这一身份的筛选）。
+      catalogsLoaded = false
       // ⚠️ 自定义供应商**刻意不清**：它是「这台机器上的使用习惯」，
       //   与登录身份 / 数据范围无关（退出登录后重进，候选应该还在）。
       filters.value = initialFilters()
