@@ -93,12 +93,46 @@ describe('上报库请求作用域', () => {
         inside = 1
       })
       expect(inside).toBe(1)
-
       // 复用后总语句数 = 一遍闸门 + 4 条业务查询；对照是 4 遍闸门 + 4 条业务查询。
-      // 这里断言「明显更少」而不是精确数字：闸门条数会随版本演进，
-      // 钉死具体值会让每次升版本都要改这个测试（而它并不测那个）。
-      const saved = outside.n - perGate * 3
-      expect(saved).toBeGreaterThan(0)
+      // ⚠️ 这里**只能**断言作用域外的基线是实打实的 4 遍闸门 —— 「里面省了多少」
+      //   由下一条用例用**连接身份**钉住（计数代理包不到作用域内部开出来的 store，
+      //   这也是本文件第一版写成 `saved > 0` 那种**恒真断言**的原因：
+      //   恒真的断言比没有断言更糟，它会让真正的退化看起来是绿的）。
+      expect(outside.n).toBeGreaterThanOrEqual(perGate * 4)
+    } finally { cleanup(dir) }
+  }, 60_000)
+
+  /**
+   * ★ 「关掉再开」必须是**同一条连接**（= 同一个已过闸门的 store）。
+   *
+   * 🚨 这条用例是 2026-10-07 补的，因为它抓的正是一个**跑了三个月的退化**：
+   *   原实现一见引用计数归零就 `store.close()` 并把 entry 从作用域表里摘掉，
+   *   于是同一请求里「鉴权开一次 → 关 → 业务再开一次」会**重新开库、重新过闸门**。
+   *   线上实测带会话的看板请求 = **55.3 条 SQL/请求**（≈ 4×闸门 + 鉴权 + 业务），
+   *   而未鉴权的 401 只有 11.3 条 —— 差的就是那 3 遍白跑的闸门。
+   *
+   * 判据用**连接级状态**（SQLite 的 `PRAGMA cache_size`）而不是语句计数：
+   *   新连接会回到默认值，同一条连接会保留我们写进去的值。
+   *   ⚠️ 不断言具体毫秒数（那是性能，不是语义）。
+   */
+  test('★ 同一请求里「关掉再开」拿到同一条连接（否则闸门会白跑）', async () => {
+    const { target, dir } = tempTarget()
+    try {
+      await withPortalStoreScope(async () => {
+        const first = await openPortalStore(target)
+        await first.exec('PRAGMA cache_size = 12345')
+        await first.close()
+        const second = await openPortalStore(target)
+        const row = await second.get<{ cache_size: number }>('PRAGMA cache_size')
+        expect(Number(row?.cache_size)).toBe(12345)
+        await second.close()
+      })
+      // ★ 反向：作用域退出后必须**重新开库**（连接级状态回到默认），
+      //   这条同时钉住「作用域不会跨请求复用连接」。
+      const after = await openPortalStore(target)
+      const row = await after.get<{ cache_size: number }>('PRAGMA cache_size')
+      expect(Number(row?.cache_size)).not.toBe(12345)
+      await after.close()
     } finally { cleanup(dir) }
   }, 60_000)
 

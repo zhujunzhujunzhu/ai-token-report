@@ -31,12 +31,20 @@
  * 全都不开作用域 —— 它们一个请求只开一次库，复用对它们没有收益，
  * 却会让「闸门跑了几遍」在测试里变得不可观测。
  *
- * ## 引用计数：最后一个 lease 释放时才真关
+ * ## 连接的生命周期 = **作用域**，不是 lease
  *
- * 每次 `openPortalStore()` 返回的都是一个**独立 lease**，`close()` 只递减计数。
- * 计数归零才真关连接 —— 否则「鉴权先关一次，业务查询后开一次」会把
- * 对方正在用的 store 关掉。作用域退出时兜底关掉所有未释放的 lease
- * （正常路径不该有残留，这条兜底是防泄漏而不是正常流程）。
+ * 每次 `openPortalStore()` 返回一个**独立 lease**，`close()` 只递减引用计数，
+ * **不真关连接** —— 真关只在作用域退出时发生一次。`refs` 仍然有用：它保证
+ * 「作用域退出时还在别人手里」的 store 不会被提前关掉，以及并发开库只开一次。
+ *
+ * 🚨 **这一点是 2026-10-07 修掉的**：原实现一见 `refs` 归零就 `store.close()`
+ *   并把 entry 从作用域表里摘掉，于是「关掉再开」会**重新开库、重新过闸门**。
+ *   而线上一个带会话的看板请求正是**串行**开 4 次库
+ *   （`isRegistered` → `resolveSession` → `authorize` → 统计会话），每处都在
+ *   `finally` 里关掉才轮到下一处 ⇒ 闸门实测跑了 **4 遍**：
+ *   带会话的 `/api/v1/stats/groups` = **55.3 条 SQL/请求**（≈ 4×闸门 + 鉴权 + 业务），
+ *   而未鉴权的 401 只走一次 `isRegistered` = **11.3 条**（1×闸门 + 1）。
+ *   ⇒ 本模块此前**对真实形状完全没生效**（附录 B 的 A/B「零差异」也是这个原因）。
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks'
@@ -85,7 +93,7 @@ function scopeKey(target: PortalTarget): string {
  *   `transaction` / `withConnection` 交出去的是**真实**的子 store，
  *   不套 lease —— 它们由父 store 的队列/连接池管，调用方也不会去 `close()` 它们。
  */
-function lease(entry: ScopeEntry, scope: Map<string, ScopeEntry>): PortalStore {
+function lease(entry: ScopeEntry): PortalStore {
   entry.refs += 1
   const inner = entry.store
   return {
@@ -104,12 +112,21 @@ function lease(entry: ScopeEntry, scope: Map<string, ScopeEntry>): PortalStore {
     withConnection: <T>(fn: (connection: PortalStore) => Promise<T>) => inner.withConnection((connection) => fn(connection)),
     close: async () => {
       entry.refs -= 1
+      // 🚨 **lease 关掉不等于真关连接**：连接的生命周期归**作用域**，不归 lease。
+      //
+      //   为什么必须这样：线上一个带会话的看板请求会**串行**开 4 次库
+      //   （`isRegistered` → `resolveSession` → `authorize` → 统计会话），
+      //   每处都在 `finally` 里 `close()` 完才轮到下一处。原来的实现一见 refs 归零
+      //   就 `store.close()` 并把 entry 从表里摘掉 ⇒ 后一次 open **又开一遍库、又过一遍闸门**。
+      //   实测（2026-10-07，线上 `Questions` 差值 / 10 次请求）：
+      //   带会话的 `groups` = **55.3 条 SQL/请求** ≈ 4×闸门(9) + 鉴权(~18) + 业务(1)，
+      //   而「未鉴权 401」只走一次 `isRegistered` ⇒ **11.3 条**，正好是 1×闸门 + 1。
+      //   ⇒ 这条优化此前**对真实形状完全没生效**（附录 B 的 A/B「零差异」也是这个原因）。
       if (entry.refs > 0 || entry.disposed) return
-      entry.disposed = true
-      // ⚠️ 从作用域表里摘掉：后续再 open 必须重新开库并重新过闸门，
-      //   否则「同一请求里关掉再开」会拿到一个已关闭的 store。
-      if (scope.get(entry.key) === entry) scope.delete(entry.key)
-      await entry.store.close()
+      // 留在作用域表里：同一请求后续再 open 会拿到**同一个**已过闸门的 store。
+      // ⚠️ 这里刻意**不**碰 `scope`，也不关连接 —— 真正的关闭只在作用域退出时发生
+      //   （见 `withPortalStoreScope` 的 `finally`）。`disposed` 仍只表示「真关过一次」，
+      //   所以作用域退出后再来的 `close()` 依旧是空操作（幂等）。
     },
   }
 }
@@ -128,11 +145,13 @@ export async function withPortalStoreScope<T>(fn: () => Promise<T>): Promise<T> 
   try {
     return await storage.run(scope, fn)
   } finally {
-    // 兜底：正常路径下所有 lease 都已在各自的 `finally` 里释放，
-    // 这里捞的是「handler 抛错 / 忘了 close」的残留 —— 宁可关掉，
-    // 也不能让一个连接活过它的作用域（SQLite 会真的关文件句柄）。
+    // ★ **连接的生命周期 = 作用域**：退出时把这一请求开过的库统统关掉。
+    //   lease 的 `close()` 只递减引用计数（它必须在同一个请求里被反复开关，
+    //   见 `lease()` 的注释），真关只在这里发生一次。
+    //   ⚠️ 因此这里**不能**按 `refs > 0` 跳过：handler 忘了 close 的 lease
+    //     同样必须被关掉（SQLite 下那就是一个活过请求的文件句柄）。
     for (const entry of scope.values()) {
-      if (entry.disposed || entry.refs > 0) continue
+      if (entry.disposed) continue
       entry.disposed = true
       await entry.store.close()
     }
@@ -157,7 +176,7 @@ export async function openScopedPortalStore(target: PortalTarget): Promise<Porta
   //   但它的 store 可能还没开出来（`opening` 未 settle）。
   //   少了这个 await，`lease()` 就会包到 `store === undefined` 上 ——
   //   症状是「Promise.all 里两处读，偶发 500」，串行写法永远测不到。
-  if (existing) { await existing.opening; return lease(existing, scope) }
+  if (existing) { await existing.opening; return lease(existing) }
   // 🚨 必须在 `scope.set` **之前**就把 promise 存进去：并发开库
   //   （`Promise.all` 里的两处读）如果各自 `await` 完再 set，
   //   会开两个 store、过两次闸门 —— 正是本模块要消除的那件事。
@@ -180,7 +199,7 @@ export async function openScopedPortalStore(target: PortalTarget): Promise<Porta
       throw error
     })
   scope.set(key, entry)
-  // ⚠️ 这里**必须 `await`**，不能直接 `lease(entry, scope)`：
+  // ⚠️ 这里**必须 `await`**，不能直接 `lease(entry)`：
   //   并发的第二个调用会命中上面 `scope.get(key)` 拿到同一条 entry，
   //   若那时 `entry.store` 还是 `undefined`（`.then` 还没跑），
   //   它的 `all/get/run` 全会炸在「读 undefined 的属性」上 ——
@@ -193,7 +212,7 @@ export async function openScopedPortalStore(target: PortalTarget): Promise<Porta
     await entry.store.close()
     throw new Error('上报库作用域在开库过程中就结束了')
   }
-  return lease(entry, scope)
+  return lease(entry)
 }
 
 /** 真正开库并过闸门。作用域内外共用这一条路径，保证语义完全一致。 */
