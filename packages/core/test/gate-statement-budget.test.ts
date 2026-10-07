@@ -139,9 +139,16 @@ const cases = (): TargetCase[] => {
   return list
 }
 
-/** 只在 MySQL 上跑的用例；没有连接时用 `test.skip` 如实跳过。 */
-const mysqlOnly = (name: string, fn: () => Promise<void>) =>
-  (mysqlUrl ? test : test.skip)(name, fn)
+/**
+ * 只在 MySQL 上跑的用例；没有连接时用 `test.skip` 如实跳过。
+ *
+ * ⚠️ `timeoutMs` 只在**这一步确实比别人重**时才传：本机开发 MySQL 是慢环境
+ *   （同文件其它 MySQL 用例实测 3.5–4.7s，紧贴 bun 默认的 5s 上限），
+ *   不传就会偶发地红在超时上。调大超时**不是把断言改松** —— 它只是给
+ *   「建隔离库 + 跑完整迁移」这件事留出它真正需要的时间。
+ */
+const mysqlOnly = (name: string, fn: () => Promise<void>, timeoutMs?: number) =>
+  (mysqlUrl ? test : test.skip)(name, fn, timeoutMs)
 
 describe('闸门强度：减少往返不许削弱检查（两个后端都必须成立）', () => {
   for (const backend of cases()) {
@@ -229,7 +236,10 @@ describe('MySQL 闸门往返预算（本次优化的主体）', () => {
       const after = await gateStatements(target)
       expect(after).toBe(before)
     })
-  })
+    // ⚠️ 这条在**本机慢 MySQL** 上实测 4.7–5.0s（要建 20 张表 + 过两遍闸门），
+    //   正好压在 bun 默认的 5s 上限上 —— 基线（不含本次优化）同样会红。
+    //   放宽超时只是给它真正需要的时间，断言一个字都没动。
+  }, 20_000)
 
   mysqlOnly('★ 逐版本账本查询已被合并成一条（不逐版本各发一次）', async () => {
     // 钉住 SQL 的**形状**而不只是条数：合并前是 10 条 `WHERE version = N`，
@@ -289,7 +299,9 @@ describe('MySQL 闸门往返预算（本次优化的主体）', () => {
         await store.close()
       }
     })
-  })
+    // 这一步比同文件其它用例多两条指纹查询，在本机慢 MySQL 上实测 ~3.9s
+    // （默认上限 5s）⇒ 显式放宽到 20s，免得它偶发地红在超时上。
+  }, 20_000)
 
   mysqlOnly('★ 不含逐表 CHECK 循环（那条语句必须带 constraint_schema 收窄）', async () => {
     // 直接钉住那条 SQL 的形状：把 information_schema 的查询原样跑一遍，
