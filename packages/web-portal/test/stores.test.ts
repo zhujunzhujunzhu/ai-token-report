@@ -234,6 +234,59 @@ describe('统计状态', () => {
     await initial
     expect(dashboard.overview?.totalTokens).toBe(101)
   })
+  /**
+   * ★ 后台轮询**不重取四个纯目录**，前台路径照旧全取。
+   *
+   * 统计页每 5 秒轮询一次整页（`StatsLayout.vue` 的 `setInterval`），而分组 /
+   * 人员名册 / 供应商 / 来源这四份目录**只在管理员改配置时才会变**。线上实测
+   * （2026-10-07，2 天 20.7 万请求）：它们合计占 **37%**，每个平均 0.82–0.92 秒，
+   * 而且每个请求都要在服务端重跑一遍版本闸门的固定开销 —— 却几乎总是同一份内容。
+   *
+   * ⚠️ 前台（首帧 / 手动刷新 / 切区块 / 改筛选 / 翻页）必须照旧全取：
+   *   否则管理员改完分组，使用者在页面上**永远看不到**那个新分组。
+   * ⚠️ 跳过 ≠ 清空：已取到的候选项必须原样留着。
+   */
+  test('★ 后台轮询不重取四个纯目录，前台照旧全取', async () => {
+    signIn('admin')
+    const urls: URL[] = []
+    respond((raw) => {
+      const url = new URL(raw, 'http://test')
+      urls.push(url)
+      if (url.pathname.endsWith('overview')) return json(overview)
+      if (url.pathname.endsWith('/api/v1/stats/groups'))
+        return json({ groups: [{ group_id: 'g-dev', name: '研发组', status: 'active', member_count: 1 }] })
+      if (url.pathname.endsWith('/api/v1/stats/members'))
+        return json({ members: [{ member_id: '00000000-0000-4000-8000-00000000000a', name: '张三', status: 'active', group_ids: ['g-dev'] }] })
+      if (url.pathname.endsWith('/api/v1/stats/providers')) return json({ providers: ['dashscope'] })
+      if (url.pathname.endsWith('/api/v1/stats/sources')) return json({ sources: ['dsh'] })
+      return json({ rows: [], points: [] })
+    })
+    const catalogs = (list: URL[]): URL[] =>
+      list.filter((url) => /\/(groups|members|providers|sources)$/.test(url.pathname))
+    const dashboard = useDashboardStore()
+    await dashboard.activate('overview')
+    // 前台首帧：四份目录各一次（此时它们还是空的，必须取）
+    expect(catalogs(urls)).toHaveLength(4)
+    expect(dashboard.groupOptions.map((row) => row.group_id)).toEqual(['g-dev'])
+    expect(dashboard.providerOptions).toEqual(['dashscope'])
+    urls.length = 0
+    // 后台轮询：一个目录都不发；数字（overview / series）照旧取。
+    await dashboard.load(true)
+    expect(catalogs(urls)).toHaveLength(0)
+    expect(urls.some((url) => url.pathname.endsWith('overview'))).toBe(true)
+    expect(urls.some((url) => url.pathname.endsWith('series'))).toBe(true)
+    // 跳过 ≠ 清空：已取到的候选原样留着（名册经 `userOptions` 暴露给页面）。
+    expect(dashboard.groupOptions.map((row) => row.group_id)).toEqual(['g-dev'])
+    expect(dashboard.userOptions.map((row) => row.key)).toEqual([
+      '00000000-0000-4000-8000-00000000000a',
+    ])
+    expect(dashboard.providerOptions).toEqual(['dashscope'])
+    expect(dashboard.sourceOptions).toEqual(['dsh'])
+    urls.length = 0
+    // 前台刷新（手动「刷新数据」/ 改筛选）仍然补齐目录。
+    await dashboard.load()
+    expect(catalogs(urls)).toHaveLength(4)
+  })
   test('看板刷新同步更新打开的人员详情并保留服务端数值', async () => {
     signIn()
     let totalTokens = 101

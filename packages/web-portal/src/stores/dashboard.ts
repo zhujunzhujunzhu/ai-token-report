@@ -391,18 +391,33 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     error.value = null
     // 候选始终不带人员筛选；全员排行可复用同一请求，避免每轮重复聚合。
     const candidates = fetchBreakdown(built.filter, 'user')
+    /**
+     * ★ **纯目录只在非后台刷新时取**。
+     *
+     * 它们是四个下拉的候选项（分组 / 人员名册 / 供应商 / 来源），只在管理员改配置时
+     * 才会变；而统计页是**每 5 秒**轮询一次整页（`StatsLayout.vue` 的 `setInterval`），
+     * 于是这四个端点被无限重复地取。线上实测（2026-10-07，2 天 20.7 万请求）：
+     * 它们合计 **7.6 万次（37%）**，每个平均 **0.82–0.92 秒**，而且每个请求都要在
+     * 服务端付一遍版本闸门的固定开销（那时 ~175ms/请求）—— 却几乎总是返回同一份内容。
+     *
+     * ⚠️ 与之相对，`candidates`（`by=user` 用量排行）**不能**跳过后台取数：
+     *   它同时是「人员排行」的数据源，是**数字**而不是目录。
+     * 非后台路径（首帧 / 手动刷新 / 切区块 / 改筛选 / 翻页）照旧全取，
+     * 所以管理员改完分组，使用者下一次点「刷新数据」或改任何一个筛选就能看到。
+     */
+    const skipCatalogs = background
     // ★ 分组候选同样不能带筛选（含分组筛选本身）：从已筛选结果里取候选，
     //   选中一个分组之后下拉会塌缩成一个选项，使用者再也加不回别的分组。
-    const groupCandidates = fetchGroupOptions()
+    const groupCandidates = skipCatalogs ? null : fetchGroupOptions()
     // ★ 人员名册：下拉里「窗口内没有用量的人」唯一的来源，同样不带筛选。
     //   它只喂候选，不参与任何数字；失败也不能拖垮整页（见下面的处理）。
-    const memberCandidates = fetchMemberOptions()
+    const memberCandidates = skipCatalogs ? null : fetchMemberOptions()
     // ★ 供应商目录：同样是**不带任何筛选**的完整集合（否则选中一项后下拉会塌缩）。
     //   它只喂候选，不参与任何数字；失败也不能拖垮整页。
-    const providerCandidates = fetchProviderOptions()
+    const providerCandidates = skipCatalogs ? null : fetchProviderOptions()
     // ★ 来源目录：同样是**不带任何筛选**的完整集合（受控枚举 ∪ 库里出现过的值）。
     //   只喂候选，不参与任何数字；失败也不能拖垮整页。
-    const sourceCandidates = fetchSourceOptions()
+    const sourceCandidates = skipCatalogs ? null : fetchSourceOptions()
     const [ov, opts, gopts, mo, pv, sv, se, rank, groupRank, bd, rec, diag] =
       await Promise.all([
         fetchOverview(filter),
@@ -451,20 +466,21 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     //   那是拿一个下拉的可用性去换所有数字的可读性。回落行为就是以前的样子：
     //   下拉只列用量里出现过的人（`canNarrow` 为假时不做任何收窄）。
     //   ⚠️ 但 401 与数据无关，仍然必须让会话过期 —— 否则页面会一直转圈。
-    if (!mo.ok && mo.status === 401) {
+    //   ★ 后台轮询跳过目录时它们是 `null`：跳过不等于失败，什么都不做才是对的。
+    if (mo && !mo.ok && mo.status === 401) {
       handleFailure(mo)
       return
     }
     // ★ 供应商目录同款：它只是下拉的候选，失败时回落成「使用者自建的 + 现敲现用」，
     //   绝不因为一个下拉把整页数字变成错误提示。
     //   ⚠️ 401 同样必须让会话过期（同 `/api/v1/stats/members`）。
-    if (!pv.ok && pv.status === 401) {
+    if (pv && !pv.ok && pv.status === 401) {
       handleFailure(pv)
       return
     }
     // ★ 来源目录同款：候选失败只影响那个下拉，不影响任何数字。
     //   ⚠️ 401 仍要让会话过期。
-    if (!sv.ok && sv.status === 401) {
+    if (sv && !sv.ok && sv.status === 401) {
       handleFailure(sv)
       return
     }
@@ -472,10 +488,10 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     if (opts.ok) usageUsers.value = opts.data.rows
     // ★ 先分组目录后人员名册：人员选项的展示名要用分组 ID 翻名字，
     //   反过来的话首帧会闪一次「未知分组」。
-    if (gopts.ok) groupOptions.value = gopts.data.groups ?? []
-    if (mo.ok) memberDirectory.value = mo.data.members ?? []
-    if (pv.ok) providerOptions.value = pv.data.providers ?? []
-    if (sv.ok) sourceOptions.value = sv.data.sources ?? []
+    if (gopts?.ok) groupOptions.value = gopts.data.groups ?? []
+    if (mo?.ok) memberDirectory.value = mo.data.members ?? []
+    if (pv?.ok) providerOptions.value = pv.data.providers ?? []
+    if (sv?.ok) sourceOptions.value = sv.data.sources ?? []
     if (se?.ok) series.value = se.data
     if (rank?.ok) ranking.value = rank.data.rows
     if (groupRank?.ok) groupRanking.value = groupRank.data.rows
