@@ -5,3 +5,12 @@
 #   必然失败，且失败信息只有一行 `Expected - 0 / Received + 0`，看不出是行尾。
 docs/database-v4/*.sql text eol=lf
 docs/database-v5/*.sql text eol=lf
+
+# 🚨 **所有 shell 脚本强制 LF**：它们都是按**字节**上传到 Linux 服务器再执行的。
+#   `core.autocrlf=true` 的 Windows 检出会把工作副本变成 CRLF，而后果不是「难看」：
+#   `deploy/atr-server-start.sh` 由部署脚本 `cp -f` 成 pm2 的启动包装，
+#   `bash -n` 照样通过（CR 落在引号里只是普通字符），但 `ATR_RUNTIME_BIN` 会读成
+#   `/usr/local/bin/bun\r` ⇒ `exec` 找不到那个文件 ⇒ 服务起不来（健检失败自动回滚）。
+#   perf 下那几个脚本同款（`ssh-exec.mjs` 也是按字节上传执行）。
+#   `deploy-plan.test.ts` 的「仓库里的启动包装确实是一份能用的包装」就是这条的哨兵。
+*.sh text eol=lf
