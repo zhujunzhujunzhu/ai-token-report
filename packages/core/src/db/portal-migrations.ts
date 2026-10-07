@@ -558,10 +558,29 @@ async function verifyCurrentMysql(store: PortalStore): Promise<void> {
   //   两者取到的是同一份事实（`table_constraints` 与 `check_constraints` 的连接键
   //   就是 `constraint_schema` + `constraint_name`，`table_name` 只是个过滤条件），
   //   差别只在往返次数。线上实测（19→27 张表）：
-  //   逐表 27 次 **446ms**、全库一条 **185ms**，**往返 27→1**。
+  //   逐表 27 次 **446ms**、全库一条 **185ms**，**往返 27→1**（同一条「全库一条」
+  //   在 2026-10-07 复测为 **161ms**，见下面那张表）。
   //   闸门在业务热路径上每个 API 请求都要付一次，这个线性项是每请求固定开销的主因。
+  //
+  // 🚨 **必须是 `STRAIGHT_JOIN`（强制以本库的 `table_constraints` 为驱动表）**。
+  //   写成普通 `JOIN` 时 MySQL 会自己选驱动表，实测它选的是**实例级**的
+  //   `check_constraints` —— 于是每次请求都要把整个实例的 CHECK 视图物化一遍，
+  //   只为挑出本库那 226 行。线上库（27 表 / 226 CHECK）实测同样 226 行的两种写法：
+  //
+  //   | 写法 | 服务端耗时 | 结果集 |
+  //   |---|---|---|
+  //   | `JOIN`（原实现） | **161ms** | 226 行 |
+  //   | `STRAIGHT_JOIN` | **23.8ms** | 226 行，内容逐行等价 |
+  //
+  //   等价性不是推断出来的：两种写法在线上库上按
+  //   `COUNT(*) + SUM(CRC32(table|name|clause|enforced))` 取指纹，两者都是
+  //   `226 / 451807555195`（内连接可交换，`STRAIGHT_JOIN` 只固定连接顺序，
+  //   不改任何一行）。往返条数也没变（仍是一条），所以这次优化不欠新债。
+  //   ⚠️ 顺序反过来写（`check_constraints STRAIGHT_JOIN table_constraints`）等于
+  //     把物化那一步又请回来 —— 改动这一行前先跑
+  //     `packages/core/test/gate-statement-budget.test.ts` 里的形状与等价性用例。
   const checkRows = await store.all<{ table: string; expression: string; enforced: string }>(
-    "SELECT t.table_name AS `table`, c.check_clause AS expression, t.enforced AS enforced FROM information_schema.table_constraints t JOIN information_schema.check_constraints c ON c.constraint_schema=t.constraint_schema AND c.constraint_name=t.constraint_name WHERE t.table_schema=DATABASE() AND t.constraint_type='CHECK' AND c.constraint_schema=DATABASE() ORDER BY t.table_name, t.constraint_name",
+    "SELECT t.table_name AS `table`, c.check_clause AS expression, t.enforced AS enforced FROM information_schema.table_constraints t STRAIGHT_JOIN information_schema.check_constraints c ON c.constraint_schema=t.constraint_schema AND c.constraint_name=t.constraint_name WHERE t.table_schema=DATABASE() AND t.constraint_type='CHECK' AND c.constraint_schema=DATABASE() ORDER BY t.table_name, t.constraint_name",
   )
 
   const groupBy = <Row extends { table: string }>(rows: readonly Row[]): Map<string, Row[]> => {

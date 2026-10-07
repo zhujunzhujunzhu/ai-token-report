@@ -10,6 +10,7 @@
  * |---|---|---|---|
  * | 迁移账本 | 逐版本各查一次（10 次往返） | 一次 `IN` 查（1 次） | 138ms → 16ms |
  * | CHECK 约束 | **每表一次**（27 次往返） | 全库一条 + `constraint_schema` 收窄（1 次） | 446ms → 185ms |
+ * | CHECK 连接顺序 | 普通 `JOIN`（MySQL 自选驱动表 ⇒ 物化实例级 CHECK 视图） | ★ **`STRAIGHT_JOIN`（以本库 `table_constraints` 为驱动表）** | **161ms → 23.8ms**（2026-10-07 线上实测，226 行逐行等价） |
  * | 合计 SELECT | — | — | **13 条 → 5 条** |
  *
  * 这类开销**不会在功能测试里暴露** —— 它只会让接口慢慢变慢，
@@ -244,6 +245,49 @@ describe('MySQL 闸门往返预算（本次优化的主体）', () => {
       // 逐表 CHECK 的指纹：旧实现是一条 `AND t.table_name = ?` / `= '...'`。
       const perTableCheck = sqls.filter((sql) => /check_constraints/.test(sql) && /table_name\s*=/.test(sql))
       expect(perTableCheck.length).toBe(0)
+    })
+  })
+
+  mysqlOnly('★ 🚨 CHECK 查询必须以本库 table_constraints 为驱动表（STRAIGHT_JOIN），且与原 JOIN 逐行等价', async () => {
+    // 2026-10-07 线上实测（27 表 / 226 CHECK，服务端时钟计时）：
+    //   普通 `JOIN` 让 MySQL 自选驱动表 → 它选**实例级**的 `check_constraints`，
+    //   每次请求都物化整个实例的 CHECK 视图，只为挑出本库 226 行 ⇒ **161ms**；
+    //   强制本库 `table_constraints` 作驱动表（`STRAIGHT_JOIN`）⇒ **23.8ms**。
+    //
+    // ⚠️ 这条用例的价值不在「快」而在**钉住连接顺序**：
+    //   把它改回 `JOIN` 之后功能完全正常、行数一模一样、本文件其它用例全绿，
+    //   只是每个 API 请求白付 ~137ms —— 与「v14 索引被删但闸门照样放行」是同一类
+    //   静默退化（`portal-v14.test.ts` 那条用例的注释里也记着同一句话）。
+    //   所以这里既钉 SQL 形状，也在真库上证明两种写法的**结果集逐行等价**
+    //   （内连接可交换，`STRAIGHT_JOIN` 只固定顺序，不改任何一行）。
+    await isolatedMysql(async (target) => {
+      // 裸连接不走闸门、不建表，先过一遍业务入口把库建出来。
+      const opened = await openPortalStore(target)
+      await opened.close()
+      const { sqls } = await gateStatementsWithSql(target)
+      const straight = sqls.find((sql) => /check_constraints/.test(sql))
+      expect(straight).toBeDefined()
+      expect(straight!).toMatch(/\bSTRAIGHT_JOIN\b/i)
+      // 顺序反过来写（`check_constraints STRAIGHT_JOIN table_constraints`）等于把物化请回来。
+      expect(straight!.indexOf('table_constraints')).toBeLessThan(straight!.indexOf('STRAIGHT_JOIN'))
+
+      const store = await openRawPortalStore(target)
+      try {
+        // 内容指纹：行数 + 逐行 CRC32 之和（顺序无关，且能抓住「某一行内容变了」）。
+        const fingerprint = async (sql: string): Promise<string> => {
+          const row = await store.get<{ n: unknown; sig: unknown }>(
+            `SELECT COUNT(*) AS n, SUM(CRC32(CONCAT_WS('|', \`table\`, expression, enforced))) AS sig FROM (${sql}) AS g`,
+          )
+          return `${Number(row?.n ?? 0)}/${String(row?.sig ?? '')}`
+        }
+        const withStraight = await fingerprint(straight!)
+        const withPlain = await fingerprint(straight!.replace(/\bSTRAIGHT_JOIN\b/i, 'JOIN'))
+        expect(withStraight).toBe(withPlain)
+        // 本库应至少有上百条 CHECK（27 张表 / 226 条）：指纹相同但两边都是 0 行就没有意义。
+        expect(Number(withStraight.split('/')[0])).toBeGreaterThan(100)
+      } finally {
+        await store.close()
+      }
     })
   })
 
