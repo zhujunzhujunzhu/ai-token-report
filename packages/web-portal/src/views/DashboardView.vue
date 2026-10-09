@@ -2,8 +2,8 @@
 /**
  * 总览只组织关键指标、趋势、人员排行与分组排行，其余业务有独立路由。
  *
- * ★ 趋势图的三个开关（指标 / 分层维度 / 时间粒度）全部读 store：
- *   总览与分析是同一个问题的两种看法，在一边选了「按用户 + 元」，
+ * ★ 趋势图的几个开关（指标 / 分层维度 / 保留层数 / 时间粒度）全部读 store：
+ *   总览与分析是同一个问题的两种看法，在一边选了「按用户 + 全部 + 元」，
  *   跳到另一边不该被重置。页面只负责渲染，不做任何口径换算。
  */
 import { ElCard, ElRadioButton, ElRadioGroup, ElTag } from 'element-plus'
@@ -16,6 +16,7 @@ import BreakdownTable from '../components/BreakdownTable.vue'
 import TrendChart from '../components/TrendChart.vue'
 import { formatBucket, formatCount } from '../utils/format.js'
 import { COST_LABEL, costText, costTickFormatter } from '../utils/cost.js'
+import { TREND_DEPTH_OPTIONS, type TrendDepth } from '../utils/trendDepth.js'
 import { groupLabelOf } from '../types/portal.js'
 const dashboard = useDashboardStore()
 /**
@@ -65,8 +66,9 @@ const chartMetricLabel = computed(() =>
 /**
  * 图表标题行兼无障碍名。
  *
- * ★ 展开时必须把「前 N 名 + 其余合并」说清楚：少了这句，使用者会以为
+ * ★ 展开时必须把「展开到第几名 + 其余合并」说清楚：少了这句，使用者会以为
  *   图上那几层就是全部，而堆叠柱的总高其实仍然等于总量。
+ * ★ 这句话只在 store 里拼一次（`stackDepthNote`）：总览与分析是同一张图。
  */
 const chartHint = computed(() => {
   const grain = dashboard.granularity === 'hour' ? '按小时统计' : '按天统计'
@@ -76,8 +78,7 @@ const chartHint = computed(() => {
       : grain
   }
   const who = dashboard.stackBy === 'user' ? '按用户展开' : '按模型展开'
-  const merged = dashboard.stackMergedCount
-  return `${grain} · ${who}${merged > 0 ? `（按用量取前 8 名，其余合并）` : ''}`
+  return `${grain} · ${who}${dashboard.stackDepthNote}`
 })
 /** 金额曲线的刻度与悬浮值都显示成货币；其它指标用缺省的「万 / 亿」与千分位。 */
 const chartFormatter = computed(() =>
@@ -89,6 +90,8 @@ const onMetric = (value: string | number | boolean | undefined): void =>
   dashboard.setTrendMetric(value as TrendMetric)
 const onStack = (value: string | number | boolean | undefined): void =>
   void dashboard.setStack(value as TrendStack)
+const onDepth = (value: string | number | boolean | undefined): void =>
+  void dashboard.setTrendDepth(value as TrendDepth)
 </script>
 <template>
   <MetricCardGrid :overview="dashboard.overview" />
@@ -131,6 +134,24 @@ const onStack = (value: string | number | boolean | undefined): void =>
             ><el-radio-button value="none">合计</el-radio-button
             ><el-radio-button value="user">按用户</el-radio-button
             ><el-radio-button value="model">按模型</el-radio-button></el-radio-group
+          >
+          <!--
+            ★ 展开后才有「保留多少层」这个问题：截断发生在**服务端**，
+              前 8 名那趟响应里根本没有第 9 名以后的数据，页面上拆不开
+              「其余 N 人」。所以这个开关切换的是**下一次请求**，选择记在本机。
+            ⚠️ 只在展开时出现：合计模式下服务端连分层都不算。
+          -->
+          <el-radio-group
+            v-if="dashboard.stackBy !== 'none'"
+            :model-value="dashboard.trendDepth"
+            size="small"
+            @update:model-value="onDepth"
+            ><el-radio-button
+              v-for="option in TREND_DEPTH_OPTIONS"
+              :key="option.value"
+              :value="option.value"
+              >{{ option.label }}</el-radio-button
+            ></el-radio-group
           >
           <router-link to="/analysis" class="text-link">查看分析 →</router-link>
         </div></div></template

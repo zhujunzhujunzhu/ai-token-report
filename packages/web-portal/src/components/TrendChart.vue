@@ -111,6 +111,16 @@ const chart = shallowRef<Chart<'bar' | 'line'> | null>(null)
 
 const hasData = computed(() => props.values.length > 0)
 
+/**
+ * 画布高度。
+ *
+ * ★ 图例固定在底部，而它是**按行折行**的：展开成「全部人员」之后十几层图例
+ *   要占掉三四行，固定 260px 会把绘图区挤成一条缝 —— 曲线还在，但看不出高低。
+ *   所以层数多时给一点余量。阈值取 10：默认色板之外（第 9 层起）本来就已经
+ *   进入「需要看图例才分得清」的区间。
+ */
+const plotHeight = computed(() => (props.series.length > 10 ? 340 : 260))
+
 /** 建立或就地更新图表；没有数据时销毁实例（`v-if` 会同时把 canvas 摘掉）。 */
 function draw(): void {
   const el = canvas.value
@@ -175,7 +185,7 @@ onBeforeUnmount(() => {
       <span class="trend__total tabular">合计 {{ total }}</span>
     </div>
 
-    <div v-if="hasData" class="trend__plot">
+    <div v-if="hasData" class="trend__plot" :style="{ height: `${plotHeight}px` }">
       <canvas
         ref="canvas"
         role="img"
@@ -216,6 +226,8 @@ onBeforeUnmount(() => {
 /*
  * Chart.js 在 `maintainAspectRatio: false` 下按**父元素的尺寸**铺满画布，
  * 所以这里必须给出确定的高度：换成 `height: auto` 会得到一张 0 高度的空图。
+ * ⚠️ 这个 260px 是**兜底**：实际高度由 `plotHeight` 以行内样式给出
+ *   （层数多时更高，见那里的注释）；行内样式缺席时仍然画得出来。
  */
 .trend__plot {
   position: relative;

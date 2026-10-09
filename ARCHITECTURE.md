@@ -716,7 +716,7 @@ Content-Type: application/json
 | 接口 | 用途 |
 |---|---|
 | `GET /api/v1/stats/overview?period&from&to&provider&model&user` | 部门总览卡片 |
-| `GET /api/v1/stats/series?bucket=day\|hour[&stack=user\|model]` | 部门趋势。★ 带 `stack` 时多算一趟「每个桶 × 每个分层」的交叉值（含逐层金额），页面据此画**堆叠柱 / 多条折线**；缺 `stack` 字段 = 这次没要过分层（老客户端行为不变） |
+| `GET /api/v1/stats/series?bucket=day\|hour[&stack=user\|model][&stack_top=8\|20\|all]` | 部门趋势。★ 带 `stack` 时多算一趟「每个桶 × 每个分层」的交叉值（含逐层金额），页面据此画**堆叠柱 / 多条折线**；缺 `stack` 字段 = 这次没要过分层（老客户端行为不变）。`stack_top` 只在展开时有用（缺省仍前 8 名 + 「其余 N 个」，`all` = 全部，上限 200） |
 | `GET /api/v1/stats/breakdown?by=user\|group\|model\|provider\|provider-model\|project\|day\|hour` | **★ 人员排行 / 分组排行**（`by=group` 是新增的分组维度） |
 | `GET /api/v1/stats/records?limit&offset` | 明细（分页，最新在前；每行带 `group_ids` 与 `group_name_snapshot`） |
 | `GET /api/v1/stats/groups` | ★ 分组候选项 `{ groups: StatsGroupOption[] }`（`stats:read`；筛选栏与分组排行的选项都取自它） |
@@ -736,12 +736,13 @@ Content-Type: application/json
 | **厂商** | `provider`（**多选**：一值一个同名参数，服务端也接受逗号分隔） | 每个值仍是**子串**匹配（与 CLI 同义）。候选 = `GET /api/v1/stats/providers` **目录 ∪ 使用者在本机浏览器里自建的名字**（`allow-create`）；自建项**不写库** —— 供应商名是用量行上的事实，库里那份可编辑配置是归一化规则（`provider_alias`）。下拉**可搜索**，输入未命中时回车即新建 |
 | **模型** | `model` | **子串**匹配（与 CLI 同义），与人名规则刻意不同 |
 
-**趋势图上的两个开关**（总览与分析共用同一份 store 状态）：
+**趋势图上的三个开关**（总览与分析共用同一份 store 状态）：
 
 | 开关 | 取值 | 传什么 |
 |---|---|---|
 | **指标** | Token 用量 / 调用次数 / 费用（估算） | **不重新取数** —— 三种值本来就在同一份 `series` 载荷里（金额在 `points[].cost`、逐层金额在 `stack.items[].cost`） |
 | **分层维度** | 合计 / 按用户 / 按模型 | `stack=user\|model`；选「合计」时**不传**该参数（载荷里连 `stack` 字段都没有） |
+| **保留层数**（仅展开时出现） | 前 8 名 / 前 20 名 / 全部 | `stack_top=8\|20\|all`；**必须重新取数** —— 截断发生在服务端，前 8 名那趟响应里根本没有第 9 名以后的数据，页面上拆不开「其余」。选择记在**本机** `localStorage`（`utils/trendDepth.ts`），默认「全部」 |
 
 > ★ **柱状图堆叠、折线图不堆叠**：堆叠柱的总高就是趋势总量（各层之和 ≡ 总量，
 > 逐桶逐点成立）；折线堆叠之后只有最上面那条的高度可读，下面几条的值要靠相邻两条
@@ -753,9 +754,15 @@ Content-Type: application/json
 > `PortalStatsSession.stackSeries()` 刻意复制 `memberGroups()` 的键与标签判定 ——
 > 两者分叉的话，图上「张三」那一层与排行里的「张三」不是同一个键，而两边看起来都正常。
 >
-> ★ **超过 8 层时尾部合并成「其余 N 人 / N 个模型」**（`SERIES_STACK_MERGED_KEY`
+> ★ **分层默认只画前 8 层，尾部合并成「其余 N 人 / N 个模型」**（`SERIES_STACK_MERGED_KEY`
 > 这一哨兵键 + `merged: true`）。不是丢弃：合并项让「各层之和 ≡ 总量」在任何层数下
 > 都成立，而几十个人各占一条柱子之后每一层都细到看不见。
+> ★ 但**这个默认值由页面覆盖**：层数是看的人自己的取舍 —— 只想核对「每个人各用了多少」
+> 时，「其余 7 人」恰恰是他唯一看不到的东西。所以页面上有一个「前 8 / 前 20 / 全部」
+> 开关（默认全部），对应 `stack_top`；`all` 在服务端仍有一条 200 层的**载荷护栏**
+> （每一层都要下发 `len(points)` 个数字），被它折掉的层照旧进「其余」并在标题里说明。
+> `mergedCount > 0` 时标题那句说明由 store 的 `stackDepthNote` **只拼一次**
+> （总览与分析是同一张图）。
 >
 > ★ **金额在多币种时逐层整块缺席**（`items[].cost` 不存在），页面据此退回 token 并说明
 > 原因。逐层挑一个币种画出来 = 在堆叠柱上偷偷做一次换算 —— 那是这一期最想避免的误读。

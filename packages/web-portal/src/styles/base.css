@@ -44,7 +44,11 @@
   --c-chart-area-stroke: #3275ed;
   --c-chart-area-fill: #c1d8ff;
   /* 堆叠 / 多序列的配色（按用量降序取用）。相邻两色在明度上刻意拉开，
-     灰度打印时也分得开；canvas 不认 var()，由 trendChartConfig 解析成具体色值。 */
+     灰度打印时也分得开；canvas 不认 var()，由 trendChartConfig 解析成具体色值。
+     ⚠️ 前 8 个是**原有顺序**，一个字节都不要动：色板是按名次取的，
+        往中间插一个颜色会让所有已习惯「蓝色 = 用量最大的那个人」的人重新认一遍。
+        第 9~16 个是为「按用户展开全部」补的：只留 8 色时第 9 个人会与第 1 个人
+        同色，而图例里两行色块一样 —— 那看起来像同一个人出现了两次。 */
   --c-chart-series-1: #3275ed;
   --c-chart-series-2: #21a68e;
   --c-chart-series-3: #9274df;
@@ -53,6 +57,14 @@
   --c-chart-series-6: #dc5961;
   --c-chart-series-7: #5b7ba6;
   --c-chart-series-8: #8cc152;
+  --c-chart-series-9: #d4719f;
+  --c-chart-series-10: #8a6d3b;
+  --c-chart-series-11: #2f9e44;
+  --c-chart-series-12: #e8590c;
+  --c-chart-series-13: #0c8599;
+  --c-chart-series-14: #a61e4d;
+  --c-chart-series-15: #495057;
+  --c-chart-series-16: #b197fc;
 }
 * {
   box-sizing: border-box;

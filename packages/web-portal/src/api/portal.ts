@@ -26,6 +26,7 @@ import type {
   StatsSourcesResponse,
 } from '@ai-token-report/shared'
 
+import type { TrendDepth } from '../utils/trendDepth.js'
 import { request, type ApiResult } from './request.js'
 
 /**
@@ -203,15 +204,24 @@ export function fetchOverview(
  * @param stack 可选的分层维度（`user` / `model`）—— 带上它服务端会多算一趟
  *   「每个桶 × 每个分层」的交叉值（含逐层金额），页面据此画堆叠柱 / 多条折线。
  *   `undefined` = 不展开，载荷里不会有 `stack` 字段（老客户端的行为不变）。
+ * @param stackTop 展开时最多保留多少层（`'8'` / `'20'` / `'all'`，见
+ *   `utils/trendDepth.ts`）。缺省 = 服务端的默认值（前 8 名 + 「其余 N 个」）。
+ *   ⚠️ 只认这三个线上取值：服务端对别的值回 400（不许静默退回默认层数）。
  */
 export function fetchSeries(
   filter: PortalFilter,
   bucket: 'day' | 'hour',
   stack?: 'user' | 'model',
+  stackTop?: TrendDepth,
 ): Promise<ApiResult<SeriesResponse>> {
   const params = new URLSearchParams(toQuery(filter))
   params.set('bucket', bucket)
-  if (stack) params.set('stack', stack)
+  if (stack) {
+    params.set('stack', stack)
+    // ★ `stack_top` 只在展开时有意义：不展开时服务端连分层都不算，
+    //   带上它只会让 URL 里多一个不解释任何东西的参数。
+    if (stackTop) params.set('stack_top', stackTop)
+  }
   return request<SeriesResponse>(`/api/v1/stats/series?${params.toString()}`)
 }
 

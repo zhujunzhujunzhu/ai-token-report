@@ -41,6 +41,11 @@ import {
 } from '../utils/providerCatalog.js'
 import { costSeriesOf } from '../utils/cost.js'
 import { trendSeriesOf } from '../utils/trend.js'
+import {
+  readTrendDepth,
+  writeTrendDepth,
+  type TrendDepth,
+} from '../utils/trendDepth.js'
 import { useSessionStore } from './session.js'
 
 export type StatsSection = 'overview' | 'analysis' | 'records' | 'diagnostics'
@@ -149,6 +154,15 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
    *   使用者在总览选了「按用户」，跳到分析页时不该被重置回合计。
    */
   const stackBy = ref<TrendStack>('none')
+  /**
+   * 趋势图展开时**保留多少层**（前 8 / 前 20 / 全部）。
+   *
+   * ★ 与 `stackBy` 一样放在 store：总览与分析是同一张图的两种看法，
+   *   在总览切到「全部」，跳到分析页不该又被折回前 8 名。
+   * ⚠️ 初值来自**本机记忆**（`utils/trendDepth.ts`），换身份不清空 ——
+   *   它是看图的习惯，与登录身份 / 数据范围无关（与自定义供应商同理）。
+   */
+  const trendDepth = ref<TrendDepth>(readTrendDepth())
   /** 趋势图的指标（token / 元 / 调用次数），同样跨页保留。 */
   const trendMetric = ref<TrendMetric>('totalTokens')
   const overview = ref<OverviewResponse | null>(null)
@@ -261,6 +275,15 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     stackBy.value === 'none' ? undefined : stackBy.value,
   )
   /**
+   * 服务端请求用的 `stack_top`：不展开时**不传**。
+   *
+   * ★ 数值与线上取值逐字对应（`'8'` / `'20'` / `'all'`），页面不做任何翻译：
+   *   中间加一次转换，早晚会出现「选了全部却发了 8」而两边都不报错。
+   */
+  const trendDepthParam = computed<TrendDepth | undefined>(() =>
+    stackBy.value === 'none' ? undefined : trendDepth.value,
+  )
+  /**
    * 趋势点上的金额序列（`utils/cost.ts` 的唯一实现）。
    *
    * ★ `null` = 整段连 `cost` 字段都没有（没有 `cost:read`）：此时页面上
@@ -309,10 +332,30 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
   const stackUnavailable = computed(
     () => stackBy.value !== 'none' && series.value !== null && !series.value.stack,
   )
-  /** 被合并进「其余」的层数；`0` = 没有截断。 */
+  /** 被合并进「其余」的层数；`0` = 没有截断。只喂 `stackDepthNote`（页面不直接读它）。 */
   const stackMergedCount = computed(() =>
     stackBy.value === 'none' ? 0 : (series.value?.stack?.mergedCount ?? 0),
   )
+  /**
+   * 分层被截断时拼在图表标题里的那句说明（没有截断就是空串）。
+   *
+   * ★ 只有一个实现：总览与分析是同一张图，两边各拼一次早晚会出现
+   *   「一边说前 8 名、另一边说全部」。层数取**请求时选的那个**，
+   *   而不是写死 8 —— 使用者选了「全部」却仍被服务端折掉尾巴时（层数超过
+   *   服务端上限、或对面还是旧版本），这句话必须如实说「其余 N 个合并」，
+   *   否则图上那一层就成了没人解释的东西。
+   * ⚠️ 这里不重算任何数值，只描述**服务端已经做过的那次截断**（`mergedCount`）。
+   */
+  const stackDepthNote = computed(() => {
+    if (stackBy.value === 'none') return ''
+    const merged = stackMergedCount.value
+    if (merged <= 0) return ''
+    // 只有「要了全部却还是被折掉」才需要在这里说明 —— 层数超过服务端上限
+    // （`SERIES_STACK_MAX_TOP`）或对面还是旧版本时都会走到这里。
+    if (trendDepth.value === 'all')
+      return `（其余 ${merged} ${stackBy.value === 'user' ? '人' : '个模型'}合并显示）`
+    return `（按用量取前 ${trendDepth.value} 名，其余合并）`
+  })
   const dirty = computed(
     () =>
       !!(
@@ -395,6 +438,9 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
       // ★ 分层维度必须进 key：切换「合计 / 按用户」时合计值往往**一模一样**，
       //   不进 key 就会沿用上一份载荷，于是「点了切换但图和表都没变」。
       stackBy.value,
+      // ★ 层数同理：切到「全部」时**合计值一模一样**，只有分层多寡变了 ——
+      //   不进 key 就会沿用上一份「前 8 名 + 其余」的载荷。
+      trendDepth.value,
       trendMetric.value,
       page.value,
     ])
@@ -448,7 +494,12 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
         providerCandidates,
         sourceCandidates,
         active === 'overview' || active === 'analysis'
-          ? fetchSeries(filter, granularity.value, trendStackParam.value)
+          ? fetchSeries(
+              filter,
+              granularity.value,
+              trendStackParam.value,
+              trendDepthParam.value,
+            )
           : null,
         active === 'overview'
           ? filter.users.length ? fetchBreakdown(filter, 'user') : candidates
@@ -635,6 +686,19 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     await load()
   }
   /**
+   * 切换「保留多少层」（前 8 / 前 20 / 全部）。
+   *
+   * ★ 必须重新取数：截断发生在**服务端**（`stack_top`），前 8 名那趟响应里
+   *   根本没有第 9 名以后的数据 —— 在页面上把「其余」拆开是不可能的。
+   * ⚠️ 选择要写回本机记忆：它是看图的习惯，下次打开还该是它。
+   */
+  async function setTrendDepth(value: TrendDepth): Promise<void> {
+    if (trendDepth.value === value) return
+    trendDepth.value = value
+    writeTrendDepth(value)
+    await load()
+  }
+  /**
    * 切换趋势指标。
    *
    * ★ 不用重新取数：三种指标的值都在同一份 `series` 载荷里
@@ -734,11 +798,12 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     section,
     breakdownBy,
     stackBy,
+    trendDepth,
     trendMetric,
     activeMetric,
     costSeries,
     trendSeries,
-    stackMergedCount,
+    stackDepthNote,
     stackUnavailable,
     overview,
     series,
@@ -770,6 +835,7 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     setPage,
     setBreakdown,
     setStack,
+    setTrendDepth,
     setTrendMetric,
     activate,
     deactivate,

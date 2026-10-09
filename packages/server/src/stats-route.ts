@@ -6,7 +6,7 @@
  * | 路径 | 用途 |
  * |---|---|
  * | `/api/v1/stats/overview` | 部门总览卡片（含**未归属占比**） |
- * | `/api/v1/stats/series?bucket=day\|hour` | 部门趋势 |
+ * | `/api/v1/stats/series?bucket=day\|hour[&stack=user\|model][&stack_top=8\|20\|all]` | 部门趋势 |
  * | `/api/v1/stats/breakdown?by=user\|group\|model\|provider\|project\|…` | ★ **人员排行 / 分组排行** |
  * | `/api/v1/stats/records?limit&offset` | 明细（分页） |
  * | `/api/v1/stats/groups` | ★ **分组候选项**（筛选下拉用） |
@@ -247,14 +247,47 @@ const MAX_RECORDS_LIMIT = 2000
 const DEFAULT_RECORDS_LIMIT = 100
 
 /**
- * 堆叠趋势最多画这么多层，其余的合并成「其余 N 个」。
+ * 堆叠趋势**默认**最多画这么多层，其余的合并成「其余 N 个」。
  *
  * ★ 取舍的理由：几十个人各占一条柱子之后，每一层都细到看不见，
  *   而**合计仍然要等于总量** —— 所以尾部不是被丢掉，而是折进一项
  *   `merged: true` 的「其余」。页面据此说明「其余 12 个」，
  *   使用者既看得清主要的几层，也不会以为少了数据。
+ *
+ * ★ 这只是**默认值**：页面可以带 `stack_top` 覆盖它（见 `#series`）。
+ *   不带参数的请求（老客户端、直接 curl、对账脚本）行为与以前完全一致。
  */
-const SERIES_STACK_TOP = 8
+const SERIES_STACK_DEFAULT_TOP = 8
+
+/**
+ * `stack_top=all`（以及任何更大的层数请求）的**兜底上限**。
+ *
+ * ⚠️ 它不是「默认值的第二份实现」，而是**载荷体积的护栏**：每一层都要下发
+ *   `len(points)` 个数字，几百层 × 上千个桶会变成几十 MB 的 JSON，
+ *   浏览器只会卡死。被这一层折掉的层照旧进「其余 N 个」那一项 ——
+ *   页面上看得见（`mergedCount` 与那句说明），不是静默丢数据。
+ */
+const SERIES_STACK_MAX_TOP = 200
+
+/**
+ * 解析 `stack_top`：缺省 = {@link SERIES_STACK_DEFAULT_TOP}；`all` = 全部
+ * （受 {@link SERIES_STACK_MAX_TOP} 兜底）；正整数原样；其余回 400。
+ *
+ * ⚠️ 刻意**不接受** `0` / 负数 / 小数 / 空串：它们要么让所有层都进「其余」，
+ *   要么让这一趟多算的东西一个都不下发 —— 两种都会在页面上表现成
+ *   「这段时间没数据」，和「真的没数据」长得一模一样。
+ *   这与 `bucket` / `stack` 是同一套规矩：未知取值不许静默退回默认。
+ */
+function parseStackTop(raw: string | null): number | { reason: string } {
+  if (raw === null) return SERIES_STACK_DEFAULT_TOP
+  if (raw === 'all') return SERIES_STACK_MAX_TOP
+  if (!/^[1-9][0-9]*$/.test(raw))
+    return { reason: `stack_top 只支持正整数或 all，收到 "${raw}"` }
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value))
+    return { reason: `stack_top 只支持正整数或 all，收到 "${raw}"` }
+  return Math.min(value, SERIES_STACK_MAX_TOP)
+}
 
 /** 路由处理结果：状态码 + 响应体。`index.ts` 的 `fromRoute()` 直接吃这个形状。 */
 export interface StatsRouteResult {
@@ -420,10 +453,16 @@ export class StatsRoute {
   }
 
   /**
-   * `GET /api/v1/stats/series?bucket=day|hour[&stack=user|model]`
+   * `GET /api/v1/stats/series?bucket=day|hour[&stack=user|model][&stack_top=8|20|all]`
    *
    * `stack` 是可选的：带上它才会多算一趟「每个桶 × 每个分层」的交叉值
-   * （见 `#stack()`）。不带就是原来那条单序列 —— 老客户端一个字节都不用改。
+   * （见 `buildStack()`）。不带就是原来那条单序列 —— 老客户端一个字节都不用改。
+   *
+   * `stack_top` 只在展开时有用：缺省仍是前 8 名 + 「其余 N 个」，`all` 则把
+   * 窗口内出现过的每一层都下发（受 `SERIES_STACK_MAX_TOP` 兜底）。
+   * ★ 页面上的「前 8 / 前 20 / 全部」开关就是这一个参数 ——
+   *   层数是**看的人自己的取舍**：人多时全画出来会糊成一片，而只想核对
+   *   「每个人各用了多少」时，「其余 7 人」恰恰是他唯一看不到的东西。
    */
   async #series(session: PortalStatsSession, params: URLSearchParams): Promise<StatsRouteResult> {
     const raw = params.get('bucket') ?? 'day'
@@ -442,6 +481,10 @@ export class StatsRoute {
     }
     const stackBy: SeriesStackBy | null = rawStack
 
+    const top = parseStackTop(params.get('stack_top'))
+    if (typeof top !== 'number')
+      return { status: 400, body: { ok: false, reason: top.reason } }
+
     const points = (await session.series(bucket, true)).map((p) => ({
       bucket: p.bucket,
       totalTokens: p.counts.total,
@@ -458,7 +501,7 @@ export class StatsRoute {
     const body: SeriesResponse = {
       bucket,
       points,
-      ...(stackBy ? { stack: await buildStack(session, stackBy, bucket, points) } : {}),
+      ...(stackBy ? { stack: await buildStack(session, stackBy, bucket, points, top) } : {}),
     }
     return { status: 200, body }
   }
@@ -940,19 +983,23 @@ export class StatsRoute {
  * 4. ★ **金额只在一个币种时才逐层下发**。多币种时整块 `cost` 缺席 ——
  *    页面上那条「金额绝不跨币种相加」的规则已经会让金额指标不可选，
  *    这里再挑一个币种画出来，等于在堆叠柱上偷偷做一次换算。
+ *
+ * @param top 最多保留多少层（由 `stack_top` 解析而来）。少了的那部分照旧
+ *   折进「其余 N 个」—— `top` 只决定**折在哪里**，不决定「要不要折」。
  */
 async function buildStack(
   session: PortalStatsSession,
   by: SeriesStackBy,
   bucket: Bucket,
   points: SeriesResponse['points'],
+  top: number,
 ): Promise<NonNullable<SeriesResponse['stack']>> {
   const stacks = await session.stackSeries(by, bucket)
   const ranked = [...stacks].sort(
     (a, b) => b.totalTokens - a.totalTokens || a.key.localeCompare(b.key),
   )
-  const kept = ranked.slice(0, SERIES_STACK_TOP)
-  const rest = ranked.slice(SERIES_STACK_TOP)
+  const kept = ranked.slice(0, top)
+  const rest = ranked.slice(top)
 
   const align = (map: Map<string, number>): number[] =>
     points.map((point) => map.get(point.bucket) ?? 0)

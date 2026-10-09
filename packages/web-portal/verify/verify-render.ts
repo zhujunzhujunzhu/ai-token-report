@@ -303,6 +303,49 @@ try {
   // 分层维度开关在分析页同样必须在（折线图的多条线由它决定）
   for (const label of ['合计', '按用户', '按模型'])
     check(`分析页趋势含分层开关：${label}`, analysisHtml.includes(label))
+  /**
+   * ★ 展开之后必须能选「保留多少层」。
+   *
+   * 服务端默认只下发用量前 8 名 + 一项「其余 N 人」，而**「其余」里那几个人
+   * 恰恰是使用者在筛选栏里看得到、却在图上找不到的** —— 少了这个开关，
+   * 页面就无从表达「我要看每一个人」。
+   * ⚠️ 只在展开时出现：合计模式下服务端连分层都不算，它在那个位置不解释任何东西。
+   */
+  dashboard.stackBy = 'user'
+  dashboard.series = {
+    bucket: 'day',
+    points: [],
+    stack: {
+      by: 'user',
+      mergedCount: 2,
+      items: [
+        { key: 'u-zhang', label: '张三', values: [100, 200], calls: [1, 2] },
+        {
+          key: '__other__',
+          label: '其余 2 人',
+          merged: true,
+          values: [0, 0],
+          calls: [0, 0],
+        },
+      ],
+    },
+  }
+  const depthHtml = await render('/src/views/AnalysisView.vue')
+  for (const label of ['前 8 名', '前 20 名', '全部'])
+    check(`分析页展开后含层数开关：${label}`, depthHtml.includes(label))
+  // 本机没记过 → 默认「全部」（SSR 里没有 localStorage）；此时服务端若仍然折掉了
+  // 尾巴（对面是旧版本 / 层数超过上限），标题里那句说明必须如实写出来。
+  check(
+    '分析页：要了「全部」却仍被截断时说明「其余 2 人合并显示」',
+    depthHtml.includes('其余 2 人合并显示'),
+  )
+  dashboard.stackBy = 'none'
+  dashboard.series = { bucket: 'day', points: [] }
+  const collapsedHtml = await render('/src/views/AnalysisView.vue')
+  check(
+    '分析页：合计模式下不出现层数开关（分层都没算，这个开关不解释任何东西）',
+    collapsedHtml.includes('前 20 名') === false,
+  )
   const costPoints = [
     {
       bucket: '2026-09-20',
