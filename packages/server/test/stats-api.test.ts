@@ -1153,6 +1153,61 @@ describe('★ 趋势分层（按用户 / 按模型）', () => {
     expectStackSumsToTotals(body)
   })
 
+  test('★ stack_top=all：10 层全部留下，「其余」一项都不出现', async () => {
+    await report(
+      'tok-zhang',
+      Array.from({ length: 10 }, (_, i) =>
+        rec(`a${i}`, { seq: i + 1, ts: todayAt(10), model: `m${i}`, input_tokens: 1000 - i * 10, output_tokens: 0, cache_read_tokens: 0 }),
+      ),
+    )
+
+    const res = await get('series', { bucket: 'day', period: 'today', stack: 'model', stack_top: 'all' })
+    expect(res.status).toBe(200)
+    const body = res.body as SeriesResponse
+    // ★ 这一条正是使用者要的：**每个人 / 每个模型都在图上**，不是前 8 名 + 一坨「其余」
+    expect(body.stack!.items).toHaveLength(10)
+    expect(body.stack!.mergedCount).toBe(0)
+    expect(body.stack!.items.some((item) => item.merged)).toBe(false)
+    // 顺序仍是窗口总量降序（与人员排行同源），没有「其余」也要保持
+    expect(body.stack!.items.map((item) => item.key)).toEqual(
+      Array.from({ length: 10 }, (_, i) => `m${i}`),
+    )
+    expectStackSumsToTotals(body)
+  })
+
+  test('★ stack_top=3：只有 3 名留下，其余 7 个照旧合并（合计逐桶相等）', async () => {
+    await report(
+      'tok-zhang',
+      Array.from({ length: 10 }, (_, i) =>
+        rec(`b${i}`, { seq: i + 1, ts: todayAt(10), model: `m${i}`, input_tokens: 1000 - i * 10, output_tokens: 0, cache_read_tokens: 0 }),
+      ),
+    )
+
+    const res = await get('series', { bucket: 'day', period: 'today', stack: 'model', stack_top: '3' })
+    const body = res.body as SeriesResponse
+    expect(body.stack!.items).toHaveLength(4)
+    expect(body.stack!.mergedCount).toBe(7)
+    expect(body.stack!.items.at(-1)!.label).toBe('其余 7 个模型')
+    expectStackSumsToTotals(body)
+  })
+
+  test('★ stack_top 非法值回 400，不许静默退回默认层数', async () => {
+    // 静默兜底会让「我要看全部」的页面拿着前 8 名画图，而它只有 mergedCount
+    // 能看出来 —— 提示行里那句「按用量取前 N 名」还会是错的。
+    for (const bad of ['0', '-1', '1.5', 'abc', '', 'all+1', '1e3']) {
+      const res = await get('series', { bucket: 'day', period: 'today', stack: 'model', stack_top: bad })
+      expect([bad, res.status]).toEqual([bad, 400])
+      expect(String((res.body as { reason: string }).reason)).toContain('stack_top')
+    }
+  })
+
+  test('不展开（没带 stack）时 stack_top 不影响响应形状', async () => {
+    await report('tok-zhang', [rec('c1')])
+    const res = await get('series', { bucket: 'day', period: 'today', stack_top: 'all' })
+    expect(res.status).toBe(200)
+    expect('stack' in (res.body as SeriesResponse)).toBe(false)
+  })
+
   test('空窗口返回空分层而不是抛错', async () => {
     const res = await get('series', { bucket: 'day', period: 'today', stack: 'user' })
     expect(res.status).toBe(200)
