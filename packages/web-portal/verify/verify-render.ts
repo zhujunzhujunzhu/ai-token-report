@@ -433,6 +433,47 @@ try {
     cells.get('未缓存输入') === '<td>1,300</td>' &&
     cells.get('输出') === '<td>260</td>' &&
     cells.get('缓存读') === '<td>13,000</td>')
+  // ── 分布表的搜索 + 分页（v12）─────────────────────────────────────────
+  /**
+   * ★ 这一屏的行数随维度走（`厂商 / 模型` 在 90 天窗口下能到几百行），
+   *   所以表头下方有搜索框、右下角有页码条。
+   *
+   * ⚠️ 行内容断言不到（`el-table` 的单元格在 SSR 下不渲染），这里钉的是**工具条**：
+   *   「先匹配后分页」「越界夹回」「装得下一屏时不出现」由
+   *   `test/breakdown-view.test.ts` 的纯逻辑钉住。
+   * ⚠️ 占位语按**整个属性**匹配（`placeholder="搜索维度"`），不拿裸子串：
+   *   SSR 会把模板注释原样输出，而注释里也会出现「搜索」这类字样 ——
+   *   裸子串会在「搜索框其实没渲染」时依然通过。
+   * ⚠️ 条数按导出的常量生成而不是写死 10（同 appKey 那条断言）。
+   */
+  const { BREAKDOWN_PAGE_SIZE } = await server.ssrLoadModule('/src/utils/breakdownView.ts')
+  check('分析页：一屏装得下时不画分布表的搜索框（它在那时解释不了任何事情）',
+    !analysisHtml.includes('placeholder="搜索维度"'))
+  dashboard.breakdown = {
+    by: 'provider-model',
+    rows: Array.from({ length: BREAKDOWN_PAGE_SIZE + 1 }, (_, index) => ({
+      ...modelRow,
+      key: `m-${String(index + 1).padStart(2, '0')}`,
+    })),
+  }
+  const pagedBreakdownHtml = await render('/src/views/AnalysisView.vue')
+  check('★ 分析页：超过一页时分布表出现搜索框、行数与页码条',
+    pagedBreakdownHtml.includes('placeholder="搜索维度"') &&
+    pagedBreakdownHtml.includes(`共 ${BREAKDOWN_PAGE_SIZE + 1} 行`) &&
+    pagedBreakdownHtml.includes('第 1 / 2 页') &&
+    pagedBreakdownHtml.includes(`每页 ${BREAKDOWN_PAGE_SIZE} 行`))
+  // ★ 总览的「分组排行」是同一个组件（分组个数同样会长到几十上百），一起生效。
+  dashboard.groupRanking = Array.from({ length: BREAKDOWN_PAGE_SIZE + 1 }, (_, index) => ({
+    ...modelRow,
+    key: `g-${String(index + 1).padStart(2, '0')}`,
+  }))
+  const pagedGroupHtml = await render('/src/views/DashboardView.vue')
+  check('★ 总览：分组排行同样带搜索框与页码条（同一个组件，不需要调用方各自打开）',
+    pagedGroupHtml.includes('placeholder="搜索分组"') &&
+    pagedGroupHtml.includes('第 1 / 2 页'))
+  // 清回原状：后面还有断言在看同一份 store（尤其是「统计页不出现 ¥」那条）。
+  dashboard.groupRanking = []
+  dashboard.breakdown = { by: 'model', rows: [modelRow] }
   // ── 金额（v7）─────────────────────────────────────────────────────────
   // ★ 三种「没有数」在页面上必须长得不一样，这一组用例逐个钉住：
   //   ① 没有 `cost:read`（字段整个缺席）→ 卡片与列都不出现（由下面的 `allHtml` 断言兜住）；
