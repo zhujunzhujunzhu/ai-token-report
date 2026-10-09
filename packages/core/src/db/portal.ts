@@ -936,6 +936,26 @@ export class PortalStatsSession {
     return [...buckets.entries()].sort(([a], [b]) => a - b).map(([hour, counts]) => ({ hour, counts }))
   }
 
+  /** 概览三项素材来自同一次扫描，也避免上报恰逢三次查询时互相对不上。 */
+  async overviewCounts(): Promise<{ total: TokenCounts; sessions: number; unattributed: number }> {
+    const q = overviewCountsQuery(this.#filter, this.#normalize)
+    const [row] = await this.aggregate<{
+      calls: unknown; input: unknown; output: unknown; cache_read: unknown;
+      cache_write: unknown; reasoning: unknown; sessions: unknown; unattributed: unknown;
+    }>(q)
+    const input = num(row?.input)
+    const output = num(row?.output)
+    const cacheRead = num(row?.cache_read)
+    const cacheWrite = num(row?.cache_write)
+    return {
+      total: {
+        input, output, cacheRead, cacheWrite, reasoning: num(row?.reasoning),
+        total: input + output + cacheRead + cacheWrite, calls: num(row?.calls),
+      },
+      sessions: num(row?.sessions), unattributed: num(row?.unattributed),
+    }
+  }
+
   /** 总计（四项独立 + calls）。派生指标请用 `derive()` / `shared/metrics.ts`。 */
   async totals(): Promise<TokenCounts> {
     const q = totalsQuery(this.#filter, this.#normalize)

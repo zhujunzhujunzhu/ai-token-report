@@ -155,6 +155,24 @@ async function withSession<T>(
 }
 
 describe('上报库查询：总览与筛选', () => {
+  test('概览合并扫描与原三条查询一致：会话去重、空窗、归属和来源筛选', async () => {
+    await seed()
+    for (const filter of [
+      {}, { userIds: ['张三'] }, { userIds: [UNATTRIBUTED_USER] },
+      { identityView: 'member' as const }, { sources: ['codex'] },
+      { providers: ['dash'], models: ['flash'] },
+      { sinceMs: todayAt(9), untilMs: todayAt(9, 30) },
+      { sinceMs: todayAt(7), untilMs: todayAt(8) },
+    ]) {
+      await withSession(async (session) => {
+        expect(await session.overviewCounts()).toEqual({
+          total: await session.totals(), sessions: await session.sessions(),
+          unattributed: await session.unattributedCalls(),
+        })
+      }, filter)
+    }
+  })
+
   test('四项 token 分列求和，sessions 按去重会话数', async () => {
     await seed()
     const totals = await withSession(async (s) => ({

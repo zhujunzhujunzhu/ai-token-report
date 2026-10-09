@@ -1064,21 +1064,15 @@ async function buildOverview(
   session: PortalStatsSession,
   window: ParsedWindow,
 ): Promise<OverviewResponse> {
-  // ★ 四条聚合**互不依赖**，必须并发发出去 —— 它们是四次各自独立的全窗口扫描，
-  //   串行等于把延迟相加，而页面上等的是四条都到。线上实测（30 天窗口 /
-  //   27 张表 / 22.5 万事件）：totals 125ms、sessions 105ms、unattributed 1ms、
-  //   costTotals 635ms ⇒ 串行 0.87s、并发取最慢的那条。全年窗口同理（1.9s vs 2.2s）。
-  //   ⚠️ SQLite 后端由 `SqlitePortalStore` 的 `queued()` 自己串行化 ——
-  //     所以这条改动在那边**既不提速也不改语义**（本地页与单测都走那条路）。
-  //   ⚠️ 口径一个字没动：`derive()` / `unattributedRate()` 仍在拿到值之后才算。
-  const [total, cost, sessionCount, unattributed] = await Promise.all([
-    session.totals(),
+  // ★ 用量、去重会话、未归属计数一次扫描；金额仍按独立价格桶计算。
+  // 两次取数并行，派生指标继续交给 shared，接口字段与筛选口径保持一致。
+  const [counts, cost] = await Promise.all([
+    session.overviewCounts(),
     // 没有 `cost:read` 时 `costTotals()` 直接返回 null —— **整个字段不下发**。
     // 回 0 会让「你没权限」与「这个月没花钱」长得一模一样。
     session.costTotals(),
-    session.sessions(),
-    session.unattributedCalls(),
   ])
+  const { total, sessions: sessionCount, unattributed } = counts
   // 口径来自 core 的 derive() + shared/metrics.ts，本文件不写公式
   const metrics = derive(total)
 

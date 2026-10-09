@@ -532,6 +532,22 @@ export function totalsQuery(filter: QueryFilter = {}, normalize?: ProviderNormal
   }
 }
 
+/** 概览的用量、会话与未归属计数一次取出，避免同一窗口重复扫描三次。 */
+export function overviewCountsQuery(filter: QueryFilter = {}, normalize?: ProviderNormalizer): SqlQuery {
+  const { sql, params } = buildWhere(filter, normalize)
+  const condition = filter.identityView === 'member' ? 'member_id IS NULL AND user_id IS NULL' : 'user_id IS NULL'
+  return {
+    sql: `SELECT COUNT(*) AS calls,
+                 SUM(input_tokens) AS input, SUM(output_tokens) AS output,
+                 SUM(cache_read_tokens) AS cache_read, SUM(cache_write_tokens) AS cache_write,
+                 SUM(reasoning_tokens) AS reasoning,
+                 COUNT(DISTINCT session_id) AS sessions,
+                 COUNT(CASE WHEN ${condition} THEN 1 END) AS unattributed
+          FROM ${EVENT_TABLE}${sql}`,
+    params,
+  }
+}
+
 /** 去重会话数。 */
 export function sessionCountQuery(filter: QueryFilter = {}, normalize?: ProviderNormalizer): SqlQuery {
   const { sql, params } = buildWhere(filter, normalize)
