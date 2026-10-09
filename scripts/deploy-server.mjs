@@ -28,7 +28,7 @@
  */
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { basename, delimiter, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -161,7 +161,7 @@ function which(names) {
 }
 
 /**
- * 从 ~/.ssh/known_hosts 取主机指纹，供 plink/pscp 的 -hostkey 使用。
+ * 从 ~/.ssh/known_hosts 取主机指纹，供 plink 的 -hostkey 使用。
  * ⚠️ 少了它 plink 会停下来问 yes/no；`-batch` 下则直接拒绝连接，表现为「密码对但连不上」。
  *
  * 🚨 指纹形式必须用 **MD5 冒号**（`ab:cd:…`），不能用 `SHA256:…`。
@@ -188,7 +188,7 @@ function knownHostFingerprint(host, sshKeygen) {
 }
 
 /**
- * 传输通道二选一：优先免密 OpenSSH，退到 PuTTY 的 plink/pscp（密码认证）。
+ * 传输通道二选一：优先免密 OpenSSH，退到 PuTTY 的 plink（密码认证、stdin 传输）。
  * ⚠️ OpenSSH 的客户端**不接受命令行密码**，所以密码那条路只能用 PuTTY 工具。
  */
 function resolveTransport(options) {
@@ -198,9 +198,8 @@ function resolveTransport(options) {
     if (probe.status === 0) return { kind: 'openssh', ssh, scp: which(['scp']), hostkey: '' }
   }
   const plink = which(['plink'])
-  const pscp = which(['pscp'])
-  if (!plink || !pscp) {
-    throw new Error('既没有免密 ssh，也没找到 plink/pscp；请配置 SSH 公钥，或安装 PuTTY 工具集')
+  if (!plink) {
+    throw new Error('既没有免密 ssh，也没找到 plink；请配置 SSH 公钥，或安装 PuTTY 工具集')
   }
   if (!options.password) {
     throw new Error('需要密码认证，但 .env 的 password 与 ATR_DEPLOY_PASSWORD 都为空')
@@ -208,24 +207,48 @@ function resolveTransport(options) {
   const sshKeygen = which(['ssh-keygen'])
   const hostkey = options.hostkey || knownHostFingerprint(options.host, sshKeygen)
   if (!hostkey) throw new Error(`无法确定 ${options.host} 的主机指纹；请显式传 --hostkey SHA256:...`)
-  return { kind: 'putty', plink, pscp, hostkey }
+  return { kind: 'putty', plink, hostkey }
 }
 
-/** 统一的远程执行：远程脚本走文件通道（plink -m），避免把引号与 dollar 拼进命令行。 */
+/** PuTTY 只通过临时口令文件认证；脚本与二进制均走 stdin，不塞进 SSH exec 命令。 */
+function withPlinkAuth(transport, options, run) {
+  const directory = mkdtempSync(join(tmpdir(), 'atr-deploy-auth-'))
+  const passwordFile = join(directory, 'password.txt')
+  writeFileSync(passwordFile, options.password, { mode: 0o600 })
+  try {
+    return run(['-ssh', '-batch', '-hostkey', transport.hostkey, '-pwfile', passwordFile, `${options.user}@${options.host}`])
+  } finally { rmSync(directory, { recursive: true, force: true }) }
+}
+
+/** 统一的远程执行：长脚本从 stdin 送入 bash，避免旧 PuTTY 的长 exec 报文断连。 */
 function remoteExec(transport, options, scriptPath) {
   const target = `${options.user}@${options.host}`
   if (transport.kind === 'openssh') return spawnSync(transport.ssh, ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', target, 'bash -s'], { input: readFileSync(scriptPath), encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
-  return spawnSync(transport.plink, ['-ssh', '-batch', '-hostkey', transport.hostkey, '-pw', options.password, '-m', scriptPath, target], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
+  return withPlinkAuth(transport, options, args => spawnSync(transport.plink, [...args, 'bash -s'], { input: readFileSync(scriptPath), encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }))
 }
 
 function remoteUpload(transport, options, files, remoteDirectory) {
   const target = `${options.user}@${options.host}`
-  const args = transport.kind === 'openssh'
-    ? ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', ...files, `${target}:${remoteDirectory}`]
-    : ['-batch', '-hostkey', transport.hostkey, '-pw', options.password, ...files, `${target}:${remoteDirectory}`]
-  const result = spawnSync(transport.kind === 'openssh' ? transport.scp : transport.pscp, args, { encoding: 'utf8' })
-  if (result.status !== 0) throw new Error(`上传失败：${result.stderr || result.stdout}`)
-  return result.stdout
+  if (transport.kind === 'openssh') {
+    const result = spawnSync(transport.scp, ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', ...files, `${target}:${remoteDirectory}`], { encoding: 'utf8' })
+    if (result.status !== 0) throw new Error(`上传失败：${result.stderr || result.stdout}`)
+    return result.stdout
+  }
+  return withPlinkAuth(transport, options, args => {
+    let output = ''
+    for (const file of files) {
+      const destination = remoteDirectory.replace(/\/$/, '') + '/' + basename(file)
+      const quoted = "'" + destination.replaceAll("'", "'\\''") + "'"
+      let result
+      for (let attempt = 0; attempt < 3; attempt++) {
+        result = spawnSync(transport.plink, [...args, `umask 077; cat > ${quoted}`], { input: readFileSync(file), encoding: 'utf8' })
+        if (result.status === 0) break
+      }
+      if (result.status !== 0) throw new Error(`上传失败：${result.stderr || result.stdout}`)
+      output += result.stdout
+    }
+    return output
+  })
 }
 
 function sha256(file) {
@@ -345,7 +368,7 @@ try {
   console.log(`运行时：${runtime.label}（${{ bun: 'Bun 长口令 TLS 修复已确认在产物里', node: '无额外前置要求' }[runtime.name]}）→ ${runtime.bin}`)
 
   // 打包：一次一个 tar，传的与解的就是同一份字节
-  // ★ 文件名自带 stamp：pscp 不能重命名，本地就按远端期望的名字产出，省掉一次远程 mv
+  // 文件名自带 stamp，与远端 staging 名称一致，便于校验与清理。
   //
   // 🚨 **Windows 上必须给 tar 换工作目录 + 相对路径，不能给绝对路径**（2026-10-04 踩到）：
   //   GNU tar 的 `-f` 参数走的是「`host:path` = 从远端主机读文件」的老约定，
@@ -391,10 +414,10 @@ try {
     mode: options.mode, stamp, portalBase: options.portalBase, remoteRoot: options.remoteRoot,
     pm2Name: options.pm2Name, keepOldAssets: options.keepOldAssets,
     runtimeName: runtime.name, runtimeBin: runtime.bin,
-    // ★ 远端路径必须与本地文件名逐字相同：pscp 不能重命名（见上面 tarball 那条注释）
+    // 远端 staging 路径与本次带 stamp 的启动脚本一致。
     startScriptUpload: `/tmp/atr-deploy-${stamp}-start.sh`,
   }))
-  // 只传这两份 tarball + 启动包装：远程脚本走 plink -m / ssh bash -s 的**文件通道**，不需要上传
+  // 只传两份 tarball + 启动包装；远程脚本从 stdin 交给 bash -s，不需要单独上传。
   remoteUpload(transport, options, [serverTarball, portalTarball, startScriptFile], '/tmp/')
   report.steps.push({ label: '上传 staging', code: 0 })
   save()
