@@ -194,6 +194,44 @@ code {
 .el-dialog__header {
   padding-bottom: 25px;
 }
+/*
+ * 弹框里的表单：**说明行**与**校验错误**都必须独占一行。
+ *
+ * `.el-form-item__content` 是 `display:flex; flex-wrap:wrap; align-items:center`
+ * （Element Plus 原文），于是两类元素会跟控件挤在同一行：
+ *
+ * 1. `<p class="muted">` 说明段落 —— 输入框 / 下拉是 100% 宽，它会正常换行；
+ *    但**宽度不满一行**的控件（`el-radio-group`、按钮）后面会直接跟上说明文字，
+ *    读起来像多了一个选项（实测「作用对象」那栏：说明就贴在「模型」右边）；
+ * 2. `.el-form-item__error` 是 `position:absolute; top:100%` —— 它**不占位**，
+ *    校验失败时红字会压到**下一条字段的 label** 上（实测「请填写上报里出现的供应商名」
+ *    与「归一化后的名字」几乎叠在一起，而那栏自己的说明还留在上面）。
+ *
+ * 两条都改成正常流里的整行元素：贴在上一个元素下方，说明行行高收紧到
+ * 「看得出是从属信息、又不至于读不清」。这样「控件 → 说明 → 报错 → 下一条字段」
+ * 的间距才是稳定且互不遮挡的。
+ * ⚠️ 只作用于弹框：看板筛选栏里 `.el-form-item__error` 的绝对定位是**有意的**
+ *   （筛选栏是一行网格，校验失败不该把整条栏顶下去）。
+ */
+.el-dialog .el-form-item__content > p {
+  flex: 0 0 100%;
+  width: 100%;
+  margin: 7px 0 0;
+  font-size: 12px;
+  line-height: 1.65;
+}
+.el-dialog .el-form-item__error {
+  position: static;
+  flex: 0 0 100%;
+  padding-top: 6px;
+  line-height: 1.6;
+}
+/* 分段控件（「作用对象」）与同列的输入框 / 下拉同高：
+   EP 默认上下各 8px 内边距，只有约 29px 高，夹在 36px 的输入框之间矮一截。 */
+.el-dialog .el-radio-button__inner {
+  padding-top: 11px;
+  padding-bottom: 11px;
+}
 .el-message-box {
   --el-messagebox-width: 440px;
   --el-messagebox-border-radius: 12px;

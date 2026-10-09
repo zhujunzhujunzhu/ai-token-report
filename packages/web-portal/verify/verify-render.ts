@@ -781,6 +781,32 @@ try {
   check('人员管理不再承载凭证功能',
     !adminHtml.includes('上报凭证') && !adminHtml.includes('有效凭证') &&
     !adminHtml.includes('签发') && !adminHtml.includes('轮换'))
+  // ★ 「编辑资料」弹框的正文在 SSR 下不渲染（`rendered` 由 mounted 置位），
+  //   所以直接渲染表单本体来钉住「姓名 / 分组 / 角色真的在同一张表单里」。
+  //   ⚠️ 页面壳那几条断言看不出这件事：角色那一栏曾经只存在于角色管理页，
+  //     而两页的页面壳在 SSR 下长得都「正常」。
+  const { default: EditMemberForm } = await server.ssrLoadModule('/src/components/EditMemberForm.vue')
+  const editableMember = {
+    member_id: '00000000-0000-4000-8000-0000000000aa', name: '田文渊', status: 'active',
+    groups: [{ group_id: '00000000-0000-4000-8000-0000000000c1', name: '数字建造中心-开发' }],
+    roles: [{ role_id: '00000000-0000-4000-8000-0000000000b1', code: 'admin', name: '管理员', permissions: [], is_builtin: true, status: 'active', version: 1 }],
+    account: null, active_token_count: 0, version: 5, created_at_ms: 1, updated_at_ms: 1,
+  }
+  const editHtml = await renderToString(createRenderApp({
+    render: () => h(EditMemberForm, {
+      member: editableMember, groups: [], roleOptions: [{ value: '00000000-0000-4000-8000-0000000000b1', label: '管理员' }],
+      canAssignRoles: true, busy: false,
+    }),
+  }))
+  check('编辑资料表单同时给出姓名、分组与角色',
+    editHtml.includes('姓名') && editHtml.includes('aria-label="选择分组"') &&
+    editHtml.includes('aria-label="选择角色"') && editHtml.includes('全量替换'))
+  const lockedEditHtml = await renderToString(createRenderApp({
+    render: () => h(EditMemberForm, { member: editableMember, groups: [], roleOptions: [], canAssignRoles: false, busy: false }),
+  }))
+  // 没有 `roles:assign` 时角色那一栏必须整块消失：让人填完再被 403 更糟。
+  check('没有 roles:assign 时编辑表单不出现角色那一栏',
+    !lockedEditHtml.includes('aria-label="选择角色"') && lockedEditHtml.includes('aria-label="选择分组"'))
   const appKeyHtml = await render('/src/views/AppKeyView.vue')
   check('appKey 管理页只在标题里说明两项固定权限',
     appKeyHtml.includes('appKey 管理') && appKeyHtml.includes('权限固定为') &&

@@ -10,7 +10,7 @@ import { createPinia, disposePinia, setActivePinia, type Pinia } from 'pinia'
 import { useMembersStore } from '../src/stores/members.js'
 import { useSessionStore } from '../src/stores/session.js'
 import { createRole, updateRoleStatus } from '../src/api/admin.js'
-import { assignableRoles, filterRoles, permissionLabel, permissionOptions } from '../src/views/rolesModel.js'
+import { assignableRoles, filterRoles, permissionLabel, permissionOptions, rolePickerOptions } from '../src/views/rolesModel.js'
 import type { PortalRole } from '@ai-token-report/shared'
 
 const originalFetch = globalThis.fetch
@@ -70,6 +70,23 @@ describe('角色页的纯判断', () => {
   })
   test('分配下拉只列启用角色（停用角色选了也一定被服务端拒绝）', () => {
     expect(assignableRoles(roles).map((item) => item.code)).toEqual(['admin', 'member', 'audit-reader'])
+  })
+  /**
+   * ★ 人员「编辑资料」弹框与这里**刻意不同**：那边保存是全量替换，
+   *   把「已停用但仍被这个人持有」的角色从下拉里抹掉，等于保存那一刻静默摘掉它。
+   */
+  test('编辑弹框的角色候选：启用角色 ∪ 当前持有（含已停用，标注出来）', () => {
+    expect(rolePickerOptions(roles, [])).toEqual([
+      { value: roles[0]!.role_id, label: '管理员' },
+      { value: roles[1]!.role_id, label: '成员' },
+      { value: roles[3]!.role_id, label: '审计查阅' },
+    ])
+    // 持有的那个已停用角色必须留在候选里，并写明它为什么保存不上。
+    expect(rolePickerOptions(roles, [roles[2]!.role_id])).toContainEqual({
+      value: roles[2]!.role_id, label: '运营查看者（已停用）',
+    })
+    // 已停用但**没有**被这个人持有：仍然不列（选了必然 400）。
+    expect(rolePickerOptions(roles, [roles[0]!.role_id]).map((option) => option.label)).toEqual(['管理员', '成员', '审计查阅'])
   })
   test('权限标签逐级回退：中文说明 → 服务端描述 → 权限码本身', () => {
     expect(permissionLabel('groups:manage')).toBe('管理分组')

@@ -79,3 +79,30 @@ export function filterRoles(roles: PortalRole[], filter: RoleFilter): PortalRole
 export function assignableRoles(roles: PortalRole[]): PortalRole[] {
   return roles.filter((role) => role.status === 'active')
 }
+
+export interface RolePickerOption {
+  value: string
+  label: string
+}
+
+/**
+ * 人员**编辑资料**弹框里的角色候选项：启用角色 ∪ 这个人当前已持有的角色。
+ *
+ * ★ 它和 `assignableRoles()` 是两种场景，刻意不合并：
+ *   那个用在「分配角色」弹框（从零挑），这里用在「编辑资料」（在现有归属上改）。
+ *   差别在于**已停用但仍被这个人持有**的角色 —— 编辑弹框保存是**全量替换**，
+ *   若把它从下拉里抹掉，保存那一刻它就被静默摘掉了，而页面看起来什么都没发生。
+ *   所以这里列出来并标注「已停用」：使用者能看到它、也能主动移除它。
+ *
+ * ⚠️ 停用角色在服务端仍会被拒（`setRoleRows` 只接受启用角色）——
+ *   标签里的「已停用」就是那句解释，别指望它保存得成功。
+ */
+export function rolePickerOptions(roles: PortalRole[], selectedIds: readonly string[]): RolePickerOption[] {
+  const selected = new Set(selectedIds)
+  return roles
+    .filter((role) => role.status === 'active' || selected.has(role.role_id))
+    .map((role) => ({
+      value: role.role_id,
+      label: role.status === 'active' ? role.name : `${role.name}（已停用）`,
+    }))
+}
