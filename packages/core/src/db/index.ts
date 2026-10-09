@@ -55,3 +55,5 @@ export * from './portal-db.js'
 //   与 `local-rollup.js`（本机库的派生索引）是一对：两者都做「把重复事件压缩」，
 //   但服务的是两个不同的库、两套不同的维度（本机那份按会话/模型，这份按人员/分组归属）。
 export * from './rollup.js'
+
+export * from './cube.js'

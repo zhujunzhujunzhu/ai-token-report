@@ -568,6 +568,34 @@ export function costMicroOf(usage: BillableUsage, price: PriceRates): number {
   )
 }
 
+/** 每类 token 的「除以 1000 后余数 → 事件数」；0 余数省略，不存任何金额。 */
+export type TokenRemainders = readonly (readonly (readonly [number, number])[])[]
+
+/**
+ * 汇总列 + 余数分布精确复原逐事件舍入，单价修改后仍可重新计算。
+ * 整千部分可加，余数部分逐事件用同一个 costMicroForTokens() 取整。
+ */
+export function costMicroOfDistribution(usage: BillableUsage, price: PriceRates, remainders: TokenRemainders): number {
+  const tokens = [usage.input, usage.output, usage.cacheRead, usage.cacheWrite]
+  const rates = [price.inputMicroPerKtok, price.outputMicroPerKtok, price.cacheReadMicroPerKtok, price.cacheWriteMicroPerKtok]
+  if (remainders.length !== 4) throw new Error('计价余数分布必须有四列')
+  let amount = 0
+  for (let i = 0; i < 4; i++) {
+    let restTokens = 0
+    let restAmount = 0
+    for (const [rest, count] of remainders[i]!) {
+      if (!Number.isInteger(rest) || rest < 1 || rest > 999 || !Number.isSafeInteger(count) || count < 1) throw new Error('计价余数分布无效')
+      restTokens += rest * count
+      restAmount += costMicroForTokens(rest, rates[i]!) * count
+    }
+    const wholeTokens = tokens[i]! - restTokens
+    if (!Number.isSafeInteger(wholeTokens) || wholeTokens < 0 || wholeTokens % 1000 !== 0) throw new Error('计价余数与原始 token 和不一致')
+    amount += costMicroForTokens(wholeTokens, rates[i]!) + restAmount
+  }
+  if (!Number.isSafeInteger(amount)) throw new RangeError('逐事件费用聚合超出安全整数范围')
+  return amount
+}
+
 /**
  * 缓存读相对「按未命中输入价计费」省下的微元。
  *
@@ -612,6 +640,8 @@ export interface CostPart {
    * ⚠️ 它与 `price` 是**同一个币种**：时段只换四个数，不换币种。
    */
   rates?: PriceRates | null
+  /** 小时汇总需要精确保留逐事件取整的路径才传入；整体 SQL 价格桶不传。 */
+  remainders?: TokenRemainders
 }
 
 /** 某个币种下的费用小计。 */
@@ -672,7 +702,9 @@ export function summarizeCosts(parts: readonly CostPart[]): CostSummary {
       continue
     }
     const currency = normalizeCurrency(part.price.currency) ?? part.price.currency
-    const amountMicro = costMicroOf(part.usage, part.rates ?? part.price)
+    const amountMicro = part.remainders
+      ? costMicroOfDistribution(part.usage, part.rates ?? part.price, part.remainders)
+      : costMicroOf(part.usage, part.rates ?? part.price)
     const bucket = byCurrency.get(currency)
     if (bucket) {
       bucket.amountMicro += amountMicro

@@ -18,6 +18,7 @@ import {
   cacheSavingMicro,
   costMicroForTokens,
   costMicroOf,
+  costMicroOfDistribution,
   findPriceConflicts,
   findPriceSchedule,
   formatCostMicro,
@@ -41,6 +42,28 @@ import {
 } from '../src/price.js'
 /** 命名空间导入：用来钉「本仓不得再有内置价目表」这条（见文件末尾的 ★ 断言）。 */
 import * as priceModule from '../src/price.js'
+
+test('余数分布逐位保留每事件的微元舍入；整批乘价会得到不同结果', () => {
+  const rates = { inputMicroPerKtok: 7, outputMicroPerKtok: 19, cacheReadMicroPerKtok: 3, cacheWriteMicroPerKtok: 11 }
+  const rows = Array.from({ length: 4000 }, (_, i) => ({ input: i * 37 % 3001, output: i * 17 % 2039, cacheRead: i * 997 % 8101, cacheWrite: i % 89 }))
+  const sums: BillableUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+  const hist = Array.from({ length: 4 }, () => new Map<number, number>())
+  for (const row of rows) (['input', 'output', 'cacheRead', 'cacheWrite'] as const).forEach((key, i) => {
+    sums[key] += row[key]
+    const rest = row[key] % 1000
+    if (rest) hist[i]!.set(rest, (hist[i]!.get(rest) ?? 0) + 1)
+  })
+  const expected = rows.reduce((sum, row) => sum + costMicroOf(row, rates), 0)
+  expect(costMicroOfDistribution(sums, rates, hist.map(column => [...column]))).toBe(expected)
+  expect(costMicroOf(sums, rates)).not.toBe(expected)
+  // 补价以后仍能重算，无需存金额或重建汇总。
+  for (const inputMicroPerKtok of [0, 1, 500, 1001, 33333]) {
+    const price = { ...rates, inputMicroPerKtok }
+    expect(costMicroOfDistribution(sums, price, hist.map(column => [...column])))
+      .toBe(rows.reduce((sum, row) => sum + costMicroOf(row, price), 0))
+  }
+  expect(() => costMicroOfDistribution(sums, rates, [[], [], [], []])).toThrow('余数')
+})
 
 /** 实测样本：dashscope 全量汇总（`docs/口径实测结论.md` §2.2）。 */
 const DASHSCOPE_USAGE: BillableUsage = {

@@ -28,7 +28,7 @@
  */
 
 import { resolvePaths, resolveSourceRoots } from '@ai-token-report/core'
-import { backfillRollups, describePortalTarget, openPortalStore, planBunMysqlAuth, portalDbFileName, resolvePortalTarget, preparePortalDatabase, syncRollups, type PortalTarget } from '@ai-token-report/core/db'
+import { backfillCube, describePortalTarget, openPortalStore, planBunMysqlAuth, portalDbFileName, resolvePortalTarget, preparePortalDatabase, syncCube, type PortalTarget } from '@ai-token-report/core/db'
 import { join } from 'node:path'
 
 import { DatabaseAdminRoute } from './admin-route.js'
@@ -246,6 +246,8 @@ export async function createHandlerFor(options: ServerOptions = {}): Promise<Han
   const identityStore = localOnly ? undefined : new IdentityRepository(target)
   /** 汇总表补齐的定时器（`close()` 里清掉）。 */
   let rollupTimer: ReturnType<typeof setInterval> | undefined
+  let rollupWork: Promise<void> | undefined
+  const rollupStop = new AbortController()
   if (identityStore) {
     await preparePortalDatabase(target)
     await identityStore.initialize({
@@ -254,56 +256,34 @@ export async function createHandlerFor(options: ServerOptions = {}): Promise<Han
       adminUsername: options.adminUsername ?? process.env.ATR_ADMIN_USERNAME,
       adminPassword: options.adminPassword ?? process.env.ATR_ADMIN_PASSWORD,
     })
-    /**
-     * ★ 汇总表（v8）的补齐：**尽力而为，绝不阻塞启动、绝不因此启动失败**。
-     *
-     * 它是性能设施而不是正确性依赖 —— 空着 / 落后 / 时区不匹配时，
-     * 查询层会退原始表并给出正确数字（只是慢）。
-     *
-     * ## 🚨 第一次补齐必须是**后台**的（不能 await）
-     *
-     * 实测（1M 行 / 2GB pool）：首次全量重建的一批要 **19.5 秒**，
-     * 之后每批 10~12 秒、共 5 批才追平（≈64 秒）。若在这里 `await`，
-     * **服务端要 20 秒后才开始监听端口** —— 部署脚本的健检、PM2 的就绪探针
-     * 与浏览器首屏都会撞 ECONNRESET / 超时。
-     * 而这段时间里按原始表出数是**完全正确**的（只是慢），没有任何理由让用户等。
-     *
-     * ⚠️ 单次同步有行数上界（`maxRows` = 20 万），所以「积压很多」时分多批推进。
-     *   启动那次用 `backfillRollups()` **一次追平**（1M 行实测 5 批 / ~64 秒，跑在后台）；
-     *   定时器那次只推一批 —— 否则新库要等 5 分钟一轮、约 25 分钟才追平。
-     */
+    // v15 首次回填在后台进行；查询会在同一快照补上尚未汇总的小时。
+    // 失效标记与上报同事务写入，不再靠接收水位或全表 COUNT 判断新鲜度。
     let syncing = false
     /**
      * @param catchUp `true` = 反复推批直到没有新数据（启动那次用）。
      */
     const syncOnce = async (label: string, catchUp = false, forceRebuild = false): Promise<void> => {
-      // 单飞：首次补齐与定时器可能叠加触发，而 upsert 是**加法**语义，
-      // 两批并发跑同一段会让计数翻倍。
-      if (syncing) return
+      // 单飞避免定时器叠加回填；关闭时在批次之间停止。
+      if (syncing || rollupStop.signal.aborted) return
       syncing = true
       try {
         const store = await openPortalStore(target)
         try {
-          if (catchUp) {
-            const result = await backfillRollups(store, { forceRebuild })
-            console.log(`[rollup] ${label}：${result.rounds} 批，日格 ${result.dayCells} / 小时格 ${result.hourCells} / 时段格 ${result.hodCells}${result.caughtUp ? '（已追平）' : '；⚠️ 达到轮数上界仍未追平，余下交给定时补齐'}`)
-          } else {
-            const result = await syncRollups(store, { forceRebuild })
-            if (result.mode !== 'skipped') {
-              console.log(`[rollup] ${label}：${result.mode}，日格 ${result.dayCells} / 小时格 ${result.hourCells} / 时段格 ${result.hodCells}${result.unattributedWindow > 0 ? `；⚠️ ${result.unattributedWindow} 条历史行没有接收时刻，永远进不了汇总（查询层会为它们退原始表）` : ''}`)
-            }
-          }
+          const result = catchUp
+            ? await backfillCube(store, { forceRebuild, signal: rollupStop.signal })
+            : await syncCube(store, { forceRebuild })
+          if ('caughtUp' in result || result.hours > 0) console.log(`[cube] ${label}：${result.hours} 小时 / ${result.cells} 格`)
         } finally { await store.close() }
       } catch (error) {
         // 汇总表不可用（表缺失 / 权限不足 / 连接问题）不该影响服务可用性。
-        console.warn(`[rollup] ${label}失败（看板将退原始表）：${error instanceof Error ? error.message : String(error)}`)
+        console.warn(`[cube] ${label}失败（失效小时将补读原始表）：${error instanceof Error ? error.message : String(error)}`)
       } finally { syncing = false }
     }
     // ⚠️ **刻意不 await**：见上面的 🚨。
-    void syncOnce('启动补齐', true)
-    const intervalMs = options.rollupSyncMs ?? 5 * 60_000
+    rollupWork = syncOnce('启动补齐', true)
+    const intervalMs = options.rollupSyncMs ?? 30_000
     if (intervalMs > 0) {
-      rollupTimer = setInterval(() => { void syncOnce('定时补齐') }, intervalMs)
+      rollupTimer = setInterval(() => { if (!syncing) rollupWork = syncOnce('定时补齐') }, intervalMs)
       rollupTimer.unref?.()
     }
   }

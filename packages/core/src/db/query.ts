@@ -50,6 +50,7 @@ import {
   scheduleHolidayDayIndices,
   UNATTRIBUTED_USER,
   type BillableUsage,
+  type ModelPrice,
   type PriceSlot,
 } from '@ai-token-report/shared'
 
@@ -631,6 +632,9 @@ export function groupsQuery(
  */
 export const PRICE_TABLE = 'model_price'
 
+/** 查询使用与计价相同的价表快照，避免连接时恰逢管理员换价而跨错边界。 */
+export interface CostQueryPrice extends ModelPrice { priceId: string }
+
 /**
  * 金额取数的原始行。
  *
@@ -735,10 +739,10 @@ function slotExpressionSql(dialect: PortalDialect, scheduleExpr: string, tsExpr:
  * 这与 `shared/price.ts` 的 `resolvePrice()`（先专属、后基础）逐位一致，
  * 连「库里同时存在两行」这种直接改库的情况也一致。
  *
- * ⚠️ 三条已知代价（都刻意接受）：
- *   - 这是**区间连接**，代价约 O(事件数 × 单价行数 × 2)。单价只有几十行，
- *     所以实际影响很小；真要优化需要给 `usage_event(provider, model)` 加索引，
- *     那是一次 schema 变更（加索引 = 改受控 DDL = 改校验和），不在这一期做。
+ * ★ 调用方传入价表快照时，先按原值、换价区间与实际时段汇总四列，再区间连接。
+ *   线上 40 万事件逐事件连接实测约 6 秒；预聚合使连接次数随桶数走，约 3 秒。
+ *   快照同时用于 SQL 连接与 JS 计价，查询中途修改价表不会跨错换价边界。
+ * ⚠️ 两条保留的约束：
  *   - 区间**重叠**时一条事件会命中两行、被算两次。写入路径由
  *     `findPriceConflicts()` 回 409 挡住重叠，所以只可能来自直接改库；
  *     这条风险记在 `docs/费用统计方案.md`。
@@ -756,6 +760,7 @@ function costQueryFor(
   dimParams: Record<string, string | number>,
   dialect: PortalDialect,
   withTarget = false,
+  prices?: readonly CostQueryPrice[],
 ): SqlQuery {
   const { sql, params: whereParams } = buildWhere(filter, normalize)
   const targetCols = withTarget ? 'provider, model, ' : ''
@@ -767,31 +772,86 @@ function costQueryFor(
   const priceId = 'COALESCE(mp_e.price_id, mp_b.price_id)'
   const currency = 'COALESCE(mp_e.currency, mp_b.currency)'
   const schedule = 'COALESCE(mp_e.offpeak_schedule, mp_b.offpeak_schedule)'
-  const slot = slotExpressionSql(dialect, schedule, ts)
+  const withSlots = prices === undefined || prices.some((price) => price.offpeakSchedule)
+  const slot = withSlots ? slotExpressionSql(dialect, schedule, ts) : '0'
+  // ★ 先按原值、换价边界与时段折叠事件，再连接几十行价表。
+  // 每个桶内所有时刻命中同一套价格；MIN(ts) 仅用于连接，不改变金额口径。
+  // 时段按每份实际使用的 schedule 分桶，专属价覆盖基础价时多拆桶也会在外层合回。
+  const preParams: Record<string, string | number> = {}
+  let source: string = EVENT_TABLE
+  let outerSelect = select
+  let outerWhere = sql
+  if (prices !== undefined) {
+    const boundaries = [...new Set(prices.flatMap((price) => [
+      price.effectiveFromMs,
+      ...(price.effectiveToMs === null ? [] : [price.effectiveToMs + 1]),
+    ]))].sort((a, b) => a - b)
+    const epoch = boundaries.length === 0 ? '0' : `CASE ${boundaries.map((at, i) => {
+      const key = `$cost_epoch_${i}`
+      preParams[key] = at
+      return `WHEN ts < ${key} THEN ${i}`
+    }).join(' ')} ELSE ${boundaries.length} END`
+    const slots = PRICE_SCHEDULES.flatMap((schedule, i) => {
+      const models = [...new Set(prices.filter((p) => p.offpeakSchedule === schedule.id).map((p) => p.model))]
+      if (models.length === 0) return []
+      const keys = models.map((model, j) => {
+        const key = `$cost_slot_${i}_${j}`
+        preParams[key] = model
+        return key
+      })
+      return [`CASE WHEN model IN (${keys.join(', ')}) THEN ${slotExpressionSql(dialect, `'${schedule.id}'`, 'ts')} ELSE 0 END AS cost_slot_${i}`]
+    })
+    // schedule 下标不一定连续，分组键跟随 SELECT 里的别名。
+    const slotGroups = slots.map((value) => /AS (cost_slot_\d+)$/.exec(value)![1]!)
+    source = `(SELECT ${select}provider, model, MIN(ts) AS ts,
+                     ${epoch} AS cost_epoch, ${slots.length ? slots.join(', ') + ',' : ''}
+                     SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,
+                     SUM(cache_read_tokens) AS cache_read_tokens, SUM(cache_write_tokens) AS cache_write_tokens
+              FROM ${EVENT_TABLE}${sql}
+              GROUP BY ${group}provider, model, cost_epoch${slotGroups.length ? ', ' + slotGroups.join(', ') : ''}) AS ${EVENT_TABLE}`
+    outerSelect = dimExpr === null ? '' : 'grp_key, '
+    outerWhere = ''
+  }
+  const priceSource = prices === undefined ? priceSourceSql() : prices.length === 0
+    ? `SELECT NULL AS price_id, NULL AS mp_provider, NULL AS mp_model, NULL AS currency,
+              NULL AS effective_from_ms, NULL AS effective_to_ms, NULL AS offpeak_schedule WHERE 1 = 0`
+    : prices.map((price, i) => {
+        const fields = {
+          price_id: price.priceId, mp_provider: price.provider, mp_model: price.model,
+          currency: price.currency, effective_from_ms: price.effectiveFromMs,
+          effective_to_ms: price.effectiveToMs, offpeak_schedule: price.offpeakSchedule ?? null,
+        }
+        return 'SELECT ' + Object.entries(fields).map(([name, value]) => {
+          if (value === null) return `NULL AS ${name}`
+          const key = `$cost_price_${i}_${name}`
+          preParams[key] = value
+          return `${key} AS ${name}`
+        }).join(', ')
+      }).join(' UNION ALL ')
   const range = (alias: string): string =>
     `${ts} >= ${alias}.effective_from_ms
                  AND (${alias}.effective_to_ms IS NULL OR ${ts} <= ${alias}.effective_to_ms)`
   return {
-    sql: `SELECT ${select}${targetCols}${priceId} AS price_id,
+    sql: `SELECT ${outerSelect}${targetCols}${priceId} AS price_id,
                  ${currency} AS currency,
                  ${slot} AS price_slot,
                  SUM(input_tokens)       AS input,
                  SUM(output_tokens)      AS output,
                  SUM(cache_read_tokens)  AS cache_read,
                  SUM(cache_write_tokens) AS cache_write
-          FROM ${EVENT_TABLE}
-          LEFT JOIN (${priceSourceSql()}) mp_e
+          FROM ${source}
+          LEFT JOIN (${priceSource}) mp_e
                  ON mp_e.mp_provider = ${EVENT_TABLE}.provider
                 AND mp_e.mp_model = ${EVENT_TABLE}.model
                 AND ${range('mp_e')}
-          LEFT JOIN (${priceSourceSql()}) mp_b
+          LEFT JOIN (${priceSource}) mp_b
                  ON mp_b.mp_provider = '${ANY_PROVIDER}'
                 AND mp_b.mp_model = ${EVENT_TABLE}.model
                 AND mp_e.price_id IS NULL
-                AND ${range('mp_b')}${sql}
-          GROUP BY ${group}${targetGroup}${priceId}, ${currency}, ${slot}`,
+                AND ${range('mp_b')}${outerWhere}
+          GROUP BY ${group}${targetGroup}${priceId}, ${currency}${withSlots ? ', ' + slot : ''}`,
     // ⚠️ 与 `groupsQuery` 同样的合并理由：`dimExpr` 内联了归一化映射的绑定值。
-    params: { ...dimParams, ...whereParams },
+    params: { ...dimParams, ...whereParams, ...preParams },
   }
 }
 
@@ -805,11 +865,12 @@ export function costByDimensionQuery(
   filter: QueryFilter = {},
   dialect: PortalDialect = SQLITE_DIALECT,
   normalize?: ProviderNormalizer,
+  prices?: readonly CostQueryPrice[],
 ): SqlQuery | null {
   const dimParams: Record<string, string | number> = {}
   const dimExpr = dimensionExpression(dim, dialect, normalize, dimParams)
   if (!dimExpr) return null
-  return costQueryFor(dimExpr, filter, normalize, dimParams, dialect)
+  return costQueryFor(dimExpr, filter, normalize, dimParams, dialect, false, prices)
 }
 
 /**
@@ -828,8 +889,9 @@ export function costTotalsQuery(
   filter: QueryFilter = {},
   normalize?: ProviderNormalizer,
   dialect: PortalDialect = SQLITE_DIALECT,
+  prices?: readonly CostQueryPrice[],
 ): SqlQuery {
-  return costQueryFor(null, filter, normalize, {}, dialect, true)
+  return costQueryFor(null, filter, normalize, {}, dialect, true, prices)
 }
 
 /** `project` 维度的金额：先按 `cwd` 取，再在 JS 侧按项目名合并（同分组路径）。 */
@@ -837,8 +899,9 @@ export function costByCwdQuery(
   filter: QueryFilter = {},
   normalize?: ProviderNormalizer,
   dialect: PortalDialect = SQLITE_DIALECT,
+  prices?: readonly CostQueryPrice[],
 ): SqlQuery {
-  return costQueryFor('cwd', filter, normalize, {}, dialect)
+  return costQueryFor('cwd', filter, normalize, {}, dialect, false, prices)
 }
 
 /** 金额取数行 → 内核形状（`SUM` 的字符串归一化只此一处，理由同 `mapGroupRows`）。 */
@@ -1004,6 +1067,9 @@ export function timeBucketRowsQuery(
  *   这一支只取原始行、不做任何 SUM，但列类型仍然按同一约定声明。
  */
 export interface StackRow {
+  calls?: unknown
+  event_hi?: unknown
+  remainders?: unknown
   ts: unknown
   /** `model` 维度的分组键。`user` 维度没有这一列。 */
   stack_key?: unknown
@@ -1331,6 +1397,9 @@ export function queryGroups(
  * ⚠️ 数值字段是 `unknown`：SQLite 驱动给数字，MySQL 驱动给字符串（`SUM()`）。
  */
 export interface TimeBucketRow {
+  calls?: unknown
+  event_hi?: unknown
+  remainders?: unknown
   ts: unknown
   session_id?: unknown
   input_tokens: unknown
@@ -1376,13 +1445,14 @@ export function groupRowsFromTime(
     row.counts.cacheRead += toNumber(r.cache_read_tokens)
     row.counts.cacheWrite += toNumber(r.cache_write_tokens)
     row.counts.reasoning += toNumber(r.reasoning_tokens)
-    row.counts.calls += 1
+    row.counts.calls += r.calls === undefined ? 1 : toNumber(r.calls)
     row.counts.total =
       row.counts.input + row.counts.output + row.counts.cacheRead + row.counts.cacheWrite
     // ts=0 视为「无时间」，不参与边界计算 —— 与 aggregate() 的语义一致
     if (ts > 0) {
       if (row.firstTime === 0 || ts < row.firstTime) row.firstTime = ts
-      if (ts > row.lastTime) row.lastTime = ts
+      const hi = r.event_hi === undefined ? ts : toNumber(r.event_hi)
+      if (hi > row.lastTime) row.lastTime = hi
     }
     sessionSets.get(key)!.add(String(r.session_id ?? ''))
   }
@@ -1578,7 +1648,7 @@ export function seriesFromRows(
     counts.cacheRead += toNumber(r.cache_read_tokens)
     counts.cacheWrite += toNumber(r.cache_write_tokens)
     counts.reasoning += toNumber(r.reasoning_tokens)
-    counts.calls += 1
+    counts.calls += r.calls === undefined ? 1 : toNumber(r.calls)
     counts.total = counts.input + counts.output + counts.cacheRead + counts.cacheWrite
   }
 

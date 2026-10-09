@@ -47,11 +47,47 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { costMicroOf } from '@ai-token-report/shared'
+import { costMicroOf, modelPriceFromWire } from '@ai-token-report/shared'
 
 import { insertAttributedRecords, openPortalStore, type IngestRecord } from '../src/db/index.js'
 import { openPortalStats, type PortalStatsSession } from '../src/db/portal.js'
 import type { QueryFilter } from '../src/db/query.js'
+import { costTotalsQuery, costByDimensionQuery, costByCwdQuery, mapCostRows, type RawCostRow } from '../src/db/query.js'
+
+test('预聚合与原逐事件连接逐列一致：换价边界、未计价、四列与所有 SQL 维度', async () => {
+  await seed()
+  const store = await openPortalStore({ sqlitePath: dbPath })
+  try {
+    const prices = PRICES.map((p) => ({ priceId: p.id, ...modelPriceFromWire({
+      provider: p.provider, model: p.model, currency: p.currency,
+      input_micro_per_ktok: p.input, output_micro_per_ktok: p.output,
+      cache_read_micro_per_ktok: p.cacheRead, cache_write_micro_per_ktok: p.cacheWrite,
+      effective_from_ms: p.from, effective_to_ms: p.to,
+    }) }))
+    // 精确边界前、边界上、边界后都必须各自落在正确价格桶。
+    await insertAttributedRecords(store, [-1, 0, 1].map((offset, i) => event(`edge-${i}`, {
+      seq: 10 + i, ts: NOON + offset, model: 'model-shift',
+      input_tokens: 1, output_tokens: 2, cache_read_tokens: 3, cache_write_tokens: 4,
+    })), { userId: '张三', userName: '张三', groupName: '研发一部' })
+    const pairs = [
+      [costTotalsQuery(), costTotalsQuery({}, undefined, undefined, prices)],
+      [costByCwdQuery(), costByCwdQuery({}, undefined, undefined, prices)],
+      ...(['user', 'provider', 'model', 'provider-model', 'source', 'session'] as const)
+        .map((dim) => [costByDimensionQuery(dim)!, costByDimensionQuery(dim, {}, undefined, undefined, prices)!]),
+    ]
+    const ordered = (rows: RawCostRow[]) => mapCostRows(rows).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
+    for (const [oldQuery, nextQuery] of pairs) {
+      expect(ordered(await store.all<RawCostRow>(nextQuery!.sql, nextQuery!.params)))
+        .toEqual(ordered(await store.all<RawCostRow>(oldQuery!.sql, oldQuery!.params)))
+    }
+    const snapshot = costTotalsQuery({}, undefined, undefined, prices)
+    const before = ordered(await store.all<RawCostRow>(snapshot.sql, snapshot.params))
+    await store.run('DELETE FROM model_price')
+    expect(ordered(await store.all<RawCostRow>(snapshot.sql, snapshot.params))).toEqual(before)
+    const empty = costTotalsQuery({}, undefined, undefined, [])
+    expect(mapCostRows(await store.all<RawCostRow>(empty.sql, empty.params)).every((r) => r.priceId === null)).toBe(true)
+  } finally { await store.close() }
+})
 
 let home: string
 let dbPath: string

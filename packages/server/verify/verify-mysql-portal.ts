@@ -42,6 +42,7 @@ import { join } from 'node:path'
 
 import {
   closeAllMysqlBackends,
+  backfillCube,
   openPortalStore,
   type PortalStore,
 } from '@ai-token-report/core/db'
@@ -432,6 +433,11 @@ try {
   check('usage_event 带 user_id / user_name / group_name 三列', ['user_id', 'user_name', 'group_name'].every((c) => colNames.includes(c)), JSON.stringify(colNames))
 
   // ── 5. 逐位对照看板接口 ──────────────────────────────────────────────────
+  // v15 也必须在真 HTTP 上走已回填快路径，不能只比较两个原始表兜底。
+  for (const target of [{ sqlitePath: sqliteDbPath }, { sqlitePath: mysqlSideDbPath, mysqlUrl: MYSQL_URL }]) {
+    const store = await openPortalStore(target)
+    try { await backfillCube(store) } finally { await store.close() }
+  }
   console.log('\n【5】★ 看板接口逐位对照（这是防方言/驱动漂移的核心断言）')
 
   const overviewLite = await stats(sqlite, 'overview', { period: 'today' })

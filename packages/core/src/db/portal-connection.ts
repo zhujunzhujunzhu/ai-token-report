@@ -88,7 +88,12 @@ export class SqlitePortalStore implements PortalStore {
     return this.perform(() => this.db.query<Row>(sql).get(params as never) ?? null)
   }
   run(sql: string, params?: Record<string, unknown> | unknown[]): Promise<{ changes: number }> {
-    return this.perform(() => ({ changes: Number(this.db.query(sql).run(params as never).changes) }))
+    return this.perform(() => {
+      this.db.query(sql).run(params as never)
+      // Bun 的 run().changes 会包含触发器写入；上报确认需要的只是事实 INSERT 的行数。
+      // SQLite changes() 排除触发器副作用，与 Node 驱动和 MySQL affectedRows 的语义一致。
+      return { changes: Number(this.db.query<{ n: number }>('SELECT changes() AS n').get()?.n ?? 0) }
+    })
   }
   exec(sql: string): Promise<void> { return this.perform(() => this.db.exec(sql)) }
   withConnection<T>(fn: (connection: PortalStore) => Promise<T>): Promise<T> {

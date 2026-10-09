@@ -23,8 +23,9 @@ import { existsSync, readFileSync, mkdirSync, statSync, writeFileSync } from 'no
 import { dirname, resolve } from 'node:path'
 import type { Database } from './driver.js'
 import { describePortalTarget, openRawPortalStore, type PortalStore, type PortalTarget } from './portal-connection.js'
-import { PORTAL_SCHEMA_VERSION, PORTAL_SQLITE_INGEST_SQL, PORTAL_MYSQL_INGEST_SQL, portalSchemaChecksum, portalSchemaChecksumV6, portalSchemaChecksumV7, portalSchemaChecksumV8, portalSchemaChecksumV9, portalSchemaChecksumV10, portalSchemaChecksumV11, portalSchemaChecksumV12, portalSchemaChecksumV13, portalSchemaStatements, portalV6Statements, portalV6TableStatement, portalV7Statements, portalV7TableStatement, portalV8Statements, portalV8TableStatement, PORTAL_V8_TABLES, PORTAL_SOURCE_COLUMN, portalV9AddColumnStatement, portalV10AddColumnStatements, PORTAL_OFFPEAK_SCHEDULE_COLUMN, portalV11Statements, portalV11TableStatement, portalV13Statements, portalSourceIndex, PORTAL_SOURCE_INDEX, PORTAL_SOURCE_INDEX_COLUMNS, PROJECT_ALIAS_TABLE, portalV12AddColumnStatement, portalV12ReplaceProviderAliasIndex, portalProviderAliasTemporaryIndex, portalProviderAliasUniqueIndex, PORTAL_MODEL_COLUMN, PORTAL_PROVIDER_ALIAS_TEMP_INDEX, PORTAL_PROVIDER_ALIAS_UNIQUE_COLUMNS, PORTAL_PROVIDER_ALIAS_UNIQUE_INDEX } from './portal-schema-v5.js'
+import { PORTAL_SCHEMA_VERSION, PORTAL_SQLITE_INGEST_SQL, PORTAL_MYSQL_INGEST_SQL, portalSchemaChecksum, portalSchemaChecksumV6, portalSchemaChecksumV7, portalSchemaChecksumV8, portalSchemaChecksumV9, portalSchemaChecksumV10, portalSchemaChecksumV11, portalSchemaChecksumV12, portalSchemaChecksumV13, portalSchemaChecksumV14, portalSchemaStatements, portalV6Statements, portalV6TableStatement, portalV7Statements, portalV7TableStatement, portalV8Statements, portalV8TableStatement, PORTAL_V8_TABLES, PORTAL_SOURCE_COLUMN, portalV9AddColumnStatement, portalV10AddColumnStatements, PORTAL_OFFPEAK_SCHEDULE_COLUMN, portalV11Statements, portalV11TableStatement, portalV13Statements, portalSourceIndex, PORTAL_SOURCE_INDEX, PORTAL_SOURCE_INDEX_COLUMNS, PROJECT_ALIAS_TABLE, portalV12AddColumnStatement, portalV12ReplaceProviderAliasIndex, portalProviderAliasTemporaryIndex, portalProviderAliasUniqueIndex, PORTAL_MODEL_COLUMN, PORTAL_PROVIDER_ALIAS_TEMP_INDEX, PORTAL_PROVIDER_ALIAS_UNIQUE_COLUMNS, PORTAL_PROVIDER_ALIAS_UNIQUE_INDEX } from './portal-schema-v5.js'
 import { PORTAL_SQLITE_V4_INGEST_SQL, PORTAL_MYSQL_V4_INGEST_SQL, portalSchemaChecksumV4, portalSchemaStatementsV4 } from './portal-schema-v4.js'
+import { portalV15TableStatements, portalV15TriggerStatements, CUBE_TRIGGER_NAMES, CUBE_HOUR_INDEX, cubeHourIndexSql, cubeHourSql } from './portal-schema-v15.js'
 import { checkExpressions, sameChecks, normalizeTrigger } from './portal-catalog.js'
 
 /**
@@ -109,6 +110,7 @@ const V12_VERSION = 12
  *   （服务端拒绝启动），而 v14 只是一个索引。
  */
 const V13_VERSION = 13
+const V14_VERSION = 14
 /**
  * ★ 闸门需要逐个判定的**全部**账本版本（v4 基线 + v5~v13 过渡 + v14 当前）。
  *
@@ -117,7 +119,7 @@ const V13_VERSION = 13
  *   —— 服务端拒绝启动，而错误文案说的是「状态 unsupported」，不说是谁漏了。
  *   与其靠人记得改这里，不如让测试对着版本号范围断言（见 `portal-v14.test.ts`）。
  */
-const LEDGER_VERSIONS: readonly number[] = [BASELINE_VERSION, V5_VERSION, V6_VERSION, V7_VERSION, V8_VERSION, V9_VERSION, V10_VERSION, V11_VERSION, V12_VERSION, V13_VERSION, PORTAL_SCHEMA_VERSION]
+const LEDGER_VERSIONS: readonly number[] = [BASELINE_VERSION, V5_VERSION, V6_VERSION, V7_VERSION, V8_VERSION, V9_VERSION, V10_VERSION, V11_VERSION, V12_VERSION, V13_VERSION, V14_VERSION, PORTAL_SCHEMA_VERSION]
 type SchemaVersion = 4 | 5
 
 export interface PortalInspection {
@@ -232,6 +234,7 @@ async function readPortalState(store: PortalStore): Promise<Omit<PortalInspectio
   const v11Row = rowOf(V11_VERSION)
   const v12Row = rowOf(V12_VERSION)
   const v13Row = rowOf(V13_VERSION)
+  const v14Row = rowOf(V14_VERSION)
   let status: PortalInspection['status'] = 'unsupported'
   if (tables.length === 0 && version === 0) status = 'empty'
   else if (version === 0 && tables.length === 1 && tables[0] === 'portal_schema_migrations' && !current && !baseline) status = 'incomplete'
@@ -289,8 +292,9 @@ async function readPortalState(store: PortalStore): Promise<Omit<PortalInspectio
   //     所以这一条**看起来**与上面那条同形，但它们判的是**不同的版本号**，
   //     少一条就会让 v13 库（线上库升级后的形态）变成 unsupported。
   else if (version === V13_VERSION && v13Row?.status === 'completed' && v13Row.checksum === portalSchemaChecksumV13(store.kind) && !current) status = 'legacy'
+  else if (version === V14_VERSION && v14Row?.status === 'completed' && v14Row.checksum === portalSchemaChecksumV14(store.kind) && !current) status = 'legacy'
   // v5/v6/v7/v8/v9/v10/v11/v12 账本存在但 checksum 不符（程序换了 SQL 或库被改过）会落到 'unsupported'，绝不冒充 current。
-  return { kind: store.kind, label: store.label, version, status, tables, migration: current ?? v13Row ?? v12Row ?? v11Row ?? v10Row ?? v9Row ?? v8Row ?? v7Row ?? v6Row ?? v5Row ?? baseline }
+  return { kind: store.kind, label: store.label, version, status, tables, migration: current ?? v14Row ?? v13Row ?? v12Row ?? v11Row ?? v10Row ?? v9Row ?? v8Row ?? v7Row ?? v6Row ?? v5Row ?? baseline }
 }
 async function inspectStore(store: PortalStore): Promise<PortalInspection> {
   const state = await readPortalState(store)
@@ -474,6 +478,8 @@ async function verifyCurrent(store: PortalStore, checkHistory = true): Promise<v
   //   实测 19 张表从 116 条降到 5 条，闸门从 55~85ms 降到 3~8ms。
   if (store.kind === 'mysql') {
     await verifyCurrentMysql(store)
+    await verifyCubeTriggers(store)
+    await ensureCubeHourIndex(store, false)
     if (checkHistory) await verifyHistoricalReferences(store)
     return
   }
@@ -489,6 +495,8 @@ async function verifyCurrent(store: PortalStore, checkHistory = true): Promise<v
   if (!tables.includes('ingest_run')) throw gate('缺少 ingest_run 诊断表。')
   await requireEventPrimaryKey(store,true)
   await verifySqliteUsageConstraints(store, false)
+  await verifyCubeTriggers(store)
+  await ensureCubeHourIndex(store, false)
   // 每条业务连接已启用外键，新增写入由数据库逐行拒绝无效引用。
   // 全历史检查留在启动和显式迁移；每次鉴权都扫一次会让上报随历史积累退化。
   if (checkHistory) await verifyHistoricalReferences(store)
@@ -742,6 +750,13 @@ export function ensurePortalSqliteReady(db: Database): void {
     const table = /^CREATE TABLE (\w+)/.exec(sql)?.[1]
     if (table && !tables.includes(table)) throw gate(`v${PORTAL_SCHEMA_VERSION} 缺少表 ${table}。`)
   }
+  for (const sql of portalV15TriggerStatements('sqlite')) {
+    const name = /^CREATE TRIGGER (\w+)/.exec(sql)![1]!
+    const row = db.query<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=$name").get({ $name: name })
+    if (!row || normalizeTrigger(row.sql) !== normalizeTrigger(sql)) throw gate(`汇总失效触发器 ${name} 缺失或定义不一致。`)
+  }
+  const hourIndex = db.query<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type='index' AND name=$name").get({ $name: CUBE_HOUR_INDEX })
+  if (!hourIndex || normalizeTrigger(hourIndex.sql) !== normalizeTrigger(cubeHourIndexSql('sqlite'))) throw gate(`索引 ${CUBE_HOUR_INDEX} 缺失或定义不一致。`)
 }
 
 /** 迁移锁必须跨 MySQL 隐式提交的 DDL 保持在同一条连接。 */
@@ -795,15 +810,28 @@ export async function preparePortalDatabase(target: PortalTarget, options: Porta
  *   在另一半迁移里必然失败，而报错文案只会说「原始事件不一致」——
  *   看起来像数据被改了，实际是校验自己写错了列名。
  */
-async function historyFingerprint(store: PortalStore, snapshot: 'dept' | 'group_name'): Promise<{ hash: string; count: number }> {
+export async function historyFingerprint(store: PortalStore, snapshot: 'dept' | 'group_name'): Promise<{ hash: string; count: number }> {
   const columns = snapshot === 'dept' ? legacyColumns : V5_FACT_COLUMNS
   const hash = createHash('sha256')
+  // 当前 MySQL 主键为二进制排序；去掉 BINARY 包裹才能利用主键。
+  // PAD SPACE 排序忽略尾部空格，含这类旧键时仍保留原来的逐字节顺序。
+  let order = 'event_id COLLATE BINARY'
+  if (store.kind === 'mysql') {
+    const column = await store.get<{ collation: string }>("SELECT collation_name AS collation FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='usage_event' AND column_name='event_id'")
+    const binary = column?.collation?.endsWith('_bin') ?? false
+    const padded = binary && await store.get("SELECT event_id FROM usage_event WHERE LENGTH(event_id)<>LENGTH(RTRIM(event_id)) LIMIT 1")
+    order = binary && !padded ? 'event_id' : 'BINARY event_id'
+  }
   let count = 0
+  let cursor: string | undefined
+  // 旧库非二进制排序或带尾部空格时，保留旧算法，避免更改已存检查点的顺序。
+  const seek = store.kind === 'sqlite' || order === 'event_id'
   for (;;) {
-    const rows = await store.all<Record<string, unknown>>(`SELECT ${columns.join(',')} FROM usage_event ORDER BY ${store.kind === 'mysql' ? 'BINARY event_id' : 'event_id COLLATE BINARY'} LIMIT 1000 OFFSET ${count}`)
+    const rows = await store.all<Record<string, unknown>>(`SELECT ${columns.join(',')} FROM usage_event${!seek || cursor === undefined ? '' : ` WHERE ${order} > $cursor`} ORDER BY ${order} LIMIT 1000${seek ? '' : ` OFFSET ${count}`}`, !seek || cursor === undefined ? {} : { $cursor: cursor })
     for (const row of rows) hash.update(JSON.stringify(columns.map(name => typeof row[name] === 'bigint' ? String(row[name]) : row[name])) + '\n')
     count += rows.length
     if (rows.length < 1000) return { hash: hash.digest('hex'), count }
+    cursor = String(rows[rows.length - 1]!.event_id)
   }
 }
 async function preflight(store: PortalStore): Promise<void> {
@@ -1102,6 +1130,7 @@ async function upgradeV4ToV5(store: PortalStore, target: PortalTarget, options: 
     //   它还必须在 v5 的事实表重建之前：`provider_alias` 引用 `members`，
     //   重建 `members` 时这张表必须已经存在（理由见下面 v6 的注释）。
     await upgradeV11ToV12(store)
+    await upgradeCubeTables(store)
     // 🚨 **v6 的追加必须早于 v5 的表重建**：`provider_alias.member_id` 有外键
     //   指向 `members`，而 SQLite 在重建 `members`（RENAME → 新建 → 拷贝 → 删旧）
     //   的过程中会重新解析全部引用它的表 —— 那一刻 `provider_alias` 还不存在时，
@@ -1150,6 +1179,7 @@ async function upgradeV4ToV5(store: PortalStore, target: PortalTarget, options: 
     // ★ v14：**建索引**（`usage_event(source)`），它不改任何数据 ——
     //   所以放在事件指纹终检之前是安全的（指纹必然不变，那一步只是照例跑一遍）。
     await upgradeV13ToV14(store)
+    await installCubeTriggers(store)
     const final = await historyFingerprint(store, 'group_name')
     if (checkpoint.historyHash && (final.hash !== checkpoint.historyHash || final.count !== checkpoint.historyCount)) {
       throw gate('迁移前后原始事件不一致，拒绝标记完成。')
@@ -1854,6 +1884,7 @@ async function ensureControlledIndexes(store: PortalStore, statements: string[])
 }
 
 async function ensureIndex(store: PortalStore, sql: string, createMissing = true): Promise<void> {
+  if (sql === cubeHourIndexSql(store.kind)) return ensureCubeHourIndex(store, createMissing)
   const match = /^CREATE (?:UNIQUE )?INDEX (\w+) ON (\w+) \(([^)]+)\)/.exec(sql)
   if (!match) throw new Error('不支持的受控索引定义')
   const [, name, table, columns] = match
@@ -1865,6 +1896,23 @@ async function ensureIndex(store: PortalStore, sql: string, createMissing = true
     await store.exec(sql)
   }
   else if (existing.map(row => row.name).join(',') !== columns!.replace(/\s/g,'')) throw gate(`索引 ${name} 目录定义不匹配。`)
+}
+
+/** 表达式索引的列名是 NULL，必须核对表达式，而非把它当成普通列索引。 */
+async function ensureCubeHourIndex(store: PortalStore, createMissing: boolean): Promise<void> {
+  if (store.kind === 'sqlite') {
+    const row = await store.get<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type='index' AND name=$name", { $name: CUBE_HOUR_INDEX })
+    if (row && normalizeTrigger(row.sql) === normalizeTrigger(cubeHourIndexSql('sqlite'))) return
+    if (row) throw gate(`索引 ${CUBE_HOUR_INDEX} 目录定义不匹配。`)
+  } else {
+    const rows = await store.all<{ expression: string | null; name: string | null; non_unique: number; sub_part: number | null; visible: string; index_type: string }>(
+      'SELECT expression AS expression,column_name AS name,non_unique AS non_unique,sub_part AS sub_part,is_visible AS visible,index_type AS index_type FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name=\'usage_event\' AND index_name=$name ORDER BY seq_in_index', { $name: CUBE_HOUR_INDEX })
+    const normalize = (value: string) => value.replace(/[\s`()]/g, '').toLowerCase()
+    if (rows.length === 1 && rows[0]!.name === null && Number(rows[0]!.non_unique) === 1 && rows[0]!.sub_part === null && rows[0]!.visible === 'YES' && rows[0]!.index_type === 'BTREE' && normalize(rows[0]!.expression ?? '') === normalize(cubeHourSql('mysql', 'ts'))) return
+    if (rows.length) throw gate(`索引 ${CUBE_HOUR_INDEX} 目录定义不匹配。`)
+  }
+  if (!createMissing) throw gate(`索引 ${CUBE_HOUR_INDEX} 缺失，拒绝自愈。`)
+  await store.exec(cubeHourIndexSql(store.kind))
 }
 async function addLegacyColumns(store: PortalStore, verifyOnly = false): Promise<void> {
   const ddl = tableStatement(store.kind, 'usage_event', BASELINE_VERSION)
@@ -1896,5 +1944,47 @@ async function addLegacyColumns(store: PortalStore, verifyOnly = false): Promise
       if (expression && !constraints.some(row => row.name === `ck_usage_v4_${name}`)) await store.exec(`ALTER TABLE usage_event ADD CONSTRAINT ck_usage_v4_${name} CHECK (${expression})`)
     }
     await verifyMysqlConstraints(store,'usage_event',ddl)
+  }
+}
+
+/** v15 只追加派生表；必须先于 v5 的索引补齐，触发器则在事实表重建后安装。 */
+async function upgradeCubeTables(store: PortalStore): Promise<void> {
+  const statements = portalV15TableStatements(store.kind)
+  const existing = await tablesOf(store)
+  for (const sql of statements) {
+    const table = /^CREATE TABLE (\w+)/.exec(sql)?.[1]
+    if (table && !existing.includes(table)) await store.exec(sql)
+  }
+  await ensureControlledIndexes(store, statements)
+  for (const sql of statements) {
+    const table = /^CREATE TABLE (\w+)/.exec(sql)?.[1]
+    if (table) await verifyTable(store, table, sql)
+  }
+}
+async function installCubeTriggers(store: PortalStore): Promise<void> {
+  const rows = store.kind === 'mysql'
+    ? await store.all<{ name: string }>('SELECT trigger_name AS name FROM information_schema.triggers WHERE trigger_schema=DATABASE()')
+    : await store.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type='trigger'")
+  const names = new Set(rows.map(row => row.name))
+  for (const sql of portalV15TriggerStatements(store.kind)) {
+    const name = /^CREATE TRIGGER (\w+)/.exec(sql)![1]!
+    if (!names.has(name)) await store.exec(sql)
+  }
+  await verifyCubeTriggers(store)
+}
+async function verifyCubeTriggers(store: PortalStore): Promise<void> {
+  const rows = store.kind === 'mysql'
+    ? await store.all<{ name: string; body: string; event: string; timing: string; table_name: string }>(
+        "SELECT trigger_name AS name, action_statement AS body, event_manipulation AS event, action_timing AS timing, event_object_table AS table_name FROM information_schema.triggers WHERE trigger_schema=DATABASE() AND trigger_name IN ('usage_cube_insert','usage_cube_update','usage_cube_delete')")
+    : await store.all<{ name: string; body: string }>("SELECT name, sql AS body FROM sqlite_master WHERE type='trigger' AND name IN ('usage_cube_insert','usage_cube_update','usage_cube_delete')")
+  for (const [i, sql] of portalV15TriggerStatements(store.kind).entries()) {
+    const row = rows.find(row => row.name === CUBE_TRIGGER_NAMES[i])
+    const expected = store.kind === 'mysql' ? sql.slice(sql.indexOf('BEGIN')) : sql
+    const actual = row?.body ?? ''
+    if (!row || normalizeTrigger(actual) !== normalizeTrigger(expected)) throw gate(`汇总失效触发器 ${CUBE_TRIGGER_NAMES[i]} 缺失或定义不一致。`)
+    if (store.kind === 'mysql') {
+      const value = row as { event?: string; timing?: string; table_name?: string }
+      if (value.event !== ['INSERT', 'UPDATE', 'DELETE'][i] || value.timing !== 'AFTER' || value.table_name !== 'usage_event') throw gate('汇总失效触发器挂载位置不一致。')
+    }
   }
 }

@@ -50,6 +50,9 @@
 
 import type { PortalBackendKind, PortalDialect, PortalStore, PortalTarget } from './portal-db.js'
 import { openPortalStore, portalDialect } from './portal-db.js'
+import { aggregateFlight, readAggregate } from './aggregate-flight.js'
+import { cubeAvailable, cubeQuery, cubeRemainders } from './cube.js'
+import type { SqlQuery } from './query.js'
 
 import type { TokenCounts } from '../types.js'
 import { renderSeriesGaps, type SeriesPointCounts } from './stats.js'
@@ -78,6 +81,7 @@ import {
   toNumber,
   toNumberOrNull,
   totalsQuery,
+  overviewCountsQuery,
   unattributedCallsQuery,
   type ProjectGroupRow,
   type ProjectSessionPair,
@@ -85,6 +89,7 @@ import {
   type QueryFilter,
   type QueryGroupRow,
   type RawCostRow,
+  type CostQueryPrice,
   type RawGroupRow,
   type StackRow,
   type TimeBucketRow,
@@ -107,6 +112,7 @@ import {
   UNATTRIBUTED_USER,
   type BillableUsage,
   type CostPart,
+  type TokenRemainders,
   type CostSummary,
   type ModelPrice,
   type PriceSlot,
@@ -165,7 +171,7 @@ export type { CostTotals, CostTotalsWithTargets } from './cost.js'
 
 /** 单价目录一次读入后的两份索引。 */
 interface PriceIndex {
-  list: readonly ModelPrice[]
+  list: readonly CostQueryPrice[]
   byId: Map<string, ModelPrice>
 }
 
@@ -183,10 +189,11 @@ function eventCostPart(
   model: string,
   atMs: number,
   usage: BillableUsage,
+  remainders?: TokenRemainders,
 ): CostPart {
   const price = resolvePrice(prices, provider, model, atMs)
   if (price === null) return { usage, price: null }
-  return { usage, price, rates: priceRatesAt(price, atMs) }
+  return { usage, price, rates: priceRatesAt(price, atMs), ...(remainders ? { remainders } : {}) }
 }
 
 /** 单价表的取数行（snake_case 只活在这一层）。 */
@@ -398,7 +405,10 @@ export class PortalStatsSession {
   /** 打开时刻，供页面显示「数据多新」。 */
   readonly openedAt: number
 
+  #cubeState: Promise<boolean> | undefined
+  readonly #disableCube: boolean
   readonly #store: PortalStore
+  readonly #target: PortalTarget
   /** ★ 与 `store.kind` 绑定的方言：`provider-model` 的拼接表达式靠它。 */
   readonly #dialect: PortalDialect
   readonly #filter: QueryFilter
@@ -449,8 +459,11 @@ export class PortalStatsSession {
      */
     projectAliases?: ProjectAliasMap
     withCost?: boolean
+    /** 验证 / 基准使用同一事实快照直接对照原始查询。 */
+    disableCube?: boolean
   }) {
     this.#store = init.store
+    this.#target = init.target
     this.#dialect = portalDialect(init.store.kind)
     this.label = init.store.label
     this.dbPath = init.target.sqlitePath
@@ -470,6 +483,55 @@ export class PortalStatsSession {
       : undefined
     this.openedAt = Date.now()
     this.#withCost = init.withCost === true
+    this.#disableCube = init.disableCube === true
+  }
+
+  private cubeReady(): Promise<boolean> {
+    return this.#cubeState ??= this.#disableCube ? Promise.resolve(false) : cubeAvailable(this.#store)
+  }
+
+  #priceTask: Promise<PriceIndex> | undefined
+
+  private async sourceQuery(q: SqlQuery, filter = this.#filter): Promise<SqlQuery> {
+    // 明细、接收新鲜度不能从压缩后的行还原。
+    if (!/FROM usage_event\b/.test(q.sql) || /\bevent_id\b|MAX\(received_at_ms\)/.test(q.sql) || !await this.cubeReady()) return q
+    const rows = /^SELECT ts,/.test(q.sql)
+    const prices = this.#withCost && (rows || /\bprice_id\b/.test(q.sql)) ? (await this.prices()).list : []
+    return cubeQuery(q, this.kind, filter, prices, { rows, withRemainders: this.#withCost })
+  }
+
+  private async readRows<T>(sql: string, params?: SqlQuery['params'], filter = this.#filter): Promise<T[]> {
+    const q = await this.sourceQuery({ sql, params: params ?? {} }, filter)
+    type WeightedRow = T & { copies?: unknown; remainders?: unknown }
+    const fetched = q.sql.startsWith('WITH cube_meta') && /^SELECT ts,/.test(sql)
+      ? await readAggregate<WeightedRow>(this.#target, this.#store, q)
+      : await this.#store.all<WeightedRow>(q.sql, q.params)
+    // 合并飞行中的查询会共享结果，权重展开必须写入自己的行副本。
+    const rows = fetched.map(row => row.copies === undefined ? row : { ...row })
+    for (const row of rows) {
+      if (row.copies === undefined) continue
+      const copies = num(row.copies)
+      const values = row as Record<string, unknown>
+      if (copies > 1 && this.#withCost) {
+        const histogram = cubeRemainders(row.remainders) ?? ['input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens'].map(name => {
+          const rest = num(values[name]) % 1000
+          return rest ? [[rest, 1] as const] : []
+        })
+        row.remainders = JSON.stringify(histogram.map(column => column.map(([rest, count]) => [rest, count * copies])))
+      }
+      for (const name of ['calls', 'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens', 'reasoning_tokens']) {
+        if (values[name] !== undefined) values[name] = num(values[name]) * copies
+      }
+    }
+    return rows
+  }
+
+  private async readRow<T>(sql: string, params?: SqlQuery['params']): Promise<T | undefined> {
+    return (await this.readRows<T>(sql, params))[0]
+  }
+
+  private async aggregate<T>(query: SqlQuery): Promise<T[]> {
+    return readAggregate<T>(this.#target, this.#store, await this.sourceQuery(query))
   }
 
   // -------------------------------------------------------------------------
@@ -489,9 +551,14 @@ export class PortalStatsSession {
    *   把「读价失败」降级成「未计价」会让整个看板的金额静默变成 0，
    *   那正是这一期最想避免的误读。
    */
-  private async prices(): Promise<PriceIndex> {
+  private prices(): Promise<PriceIndex> {
+    // 同一请求内并发的查询共享同一份价表，不让中途改价产生两套边界。
+    return this.#priceTask ??= this.loadPrices()
+  }
+
+  private async loadPrices(): Promise<PriceIndex> {
     if (this.#prices === null) {
-      const rows = await this.#store.all<PortalPriceSqlRow>(
+      const rows = await this.readRows<PortalPriceSqlRow>(
         `SELECT price_id, provider, model, currency,
                 input_micro_per_ktok, output_micro_per_ktok,
                 cache_read_micro_per_ktok, cache_write_micro_per_ktok,
@@ -505,7 +572,7 @@ export class PortalStatsSession {
       //   「四个闲时价缺一个怎么处理」「effective_to_ms 的 NULL 怎么处理」在这里
       //   再写一遍，就等于把「什么时候算不分时段」变成两处判断 —— 分叉不会报错，
       //   只会让某段时间的金额按错的档算。
-      const list: ModelPrice[] = rows.map((row) => modelPriceFromWire({
+      const list: CostQueryPrice[] = rows.map((row) => ({ priceId: String(row.price_id), ...modelPriceFromWire({
         provider: String(row.provider ?? ''),
         model: String(row.model ?? ''),
         currency: String(row.currency ?? ''),
@@ -522,7 +589,7 @@ export class PortalStatsSession {
           : String(row.offpeak_schedule),
         effective_from_ms: num(row.effective_from_ms),
         effective_to_ms: toNumberOrNull(row.effective_to_ms),
-      }))
+      }) }))
       const byId = new Map<string, ModelPrice>()
       rows.forEach((row, index) => byId.set(String(row.price_id), list[index]!))
       this.#prices = { list, byId }
@@ -551,9 +618,9 @@ export class PortalStatsSession {
    */
   async costTotals(): Promise<CostTotalsWithTargets | null> {
     if (!this.#withCost) return null
-    const { byId } = await this.prices()
-    const q = costTotalsQuery(this.#filter, this.#normalize, this.#dialect)
-    const rows = mapCostRows(await this.#store.all<RawCostRow>(q.sql, q.params))
+    const { list, byId } = await this.prices()
+    const q = costTotalsQuery(this.#filter, this.#normalize, this.#dialect, list)
+    const rows = mapCostRows(await this.aggregate<RawCostRow>(q))
     const targets = new Set<string>()
     for (const row of rows) {
       // 未计价的行才进清单；`price_id` 非空说明这条用量已经有价了。
@@ -616,18 +683,18 @@ export class PortalStatsSession {
       //   不能拿分桶后的总量去乘一个价：一个桶里可能横跨一次换价，
       //   也可能横跨高峰与闲时（同一行价的两套数）。
       const q = timeBucketRowsQuery(this.#filter, false, this.#normalize, true)
-      const rows = await this.#store.all<TimeBucketRow & { provider?: unknown; model?: unknown }>(q.sql, q.params)
+      const rows = await this.readRows<TimeBucketRow & { provider?: unknown; model?: unknown }>(q.sql, q.params)
       for (const row of rows) {
         const ts = num(row.ts)
         PortalStatsSession.push(
           parts,
           dim === 'day' ? toDayKey(ts) : toHourKey(ts),
-          eventCostPart(list, String(row.provider ?? ''), String(row.model ?? ''), ts, this.usageOf(row)),
+          eventCostPart(list, String(row.provider ?? ''), String(row.model ?? ''), ts, this.usageOf(row), cubeRemainders(row.remainders)),
         )
       }
     } else if (dim === 'project') {
-      const q = costByCwdQuery(this.#filter, this.#normalize, this.#dialect)
-      for (const row of mapCostRows(await this.#store.all<RawCostRow>(q.sql, q.params))) {
+      const q = costByCwdQuery(this.#filter, this.#normalize, this.#dialect, list)
+      for (const row of mapCostRows(await this.aggregate<RawCostRow>(q))) {
         PortalStatsSession.push(
           parts,
           // 🚨 必须与 `groups('project')` 用**同一个**解析器：一条路径按归一化名、
@@ -638,9 +705,9 @@ export class PortalStatsSession {
         )
       }
     } else {
-      const q = costByDimensionQuery(dim, this.#filter, this.#dialect, this.#normalize)
+      const q = costByDimensionQuery(dim, this.#filter, this.#dialect, this.#normalize, list)
       if (!q) return result
-      for (const row of mapCostRows(await this.#store.all<RawCostRow>(q.sql, q.params))) {
+      for (const row of mapCostRows(await this.aggregate<RawCostRow>(q))) {
         PortalStatsSession.push(parts, row.key ?? '', this.partOf(row.priceId, row.slot, row.usage, byId))
       }
     }
@@ -691,6 +758,7 @@ export class PortalStatsSession {
    *   汇总表是性能设施，不是正确性依赖，绝不让它把看板打成 5xx。
    */
   async #rollupUsable(): Promise<boolean> {
+    if (await this.cubeReady()) return false
     if (this.#rollupState !== undefined) return this.#rollupState
     this.#rollupState = false
     // 🚨 **按来源筛选/分组时必须退原始表**：`usage_rollup_*` 的键是
@@ -705,10 +773,10 @@ export class PortalStatsSession {
     if ((this.#filter.sources?.length ?? 0) > 0) return this.#rollupState
     try {
       const { sql, params } = buildWhere(this.#filter, undefined)
-      const source = await this.#store.get<{ c: unknown }>(
+      const source = await this.readRow<{ c: unknown }>(
         `SELECT COUNT(*) AS c FROM ${EVENT_TABLE}${sql}`, params,
       )
-      const rolled = await this.#store.get<{ c: unknown }>(
+      const rolled = await this.readRow<{ c: unknown }>(
         `SELECT SUM(calls) AS c FROM usage_rollup_day${sql}`, params,
       )
       this.#rollupState = num(source?.c) > 0 && num(rolled?.c) === num(source?.c)
@@ -734,7 +802,7 @@ export class PortalStatsSession {
     if (!isTimeWindowOnly(this.#filter)) return null
     const table = granularity === 'day' ? 'usage_rollup_day' : 'usage_rollup_hour'
     const { sql, params } = buildWhere(this.#filter, undefined)
-    const rows = await this.#store.all<{
+    const rows = await this.readRows<{
       day_key: unknown; hour_of_day?: unknown
       input_tokens: unknown; output_tokens: unknown; cache_read_tokens: unknown; cache_write_tokens: unknown
       reasoning_tokens: unknown; calls: unknown
@@ -827,7 +895,7 @@ export class PortalStatsSession {
         try {
           const { sql } = buildWhere(this.#filter, undefined)
           if (!sql) {
-            const rows = await this.#store.all<{ hour_of_day: unknown; day_kind: unknown; calls: unknown; input_tokens: unknown; output_tokens: unknown; cache_read_tokens: unknown; cache_write_tokens: unknown; reasoning_tokens: unknown }>(
+            const rows = await this.readRows<{ hour_of_day: unknown; day_kind: unknown; calls: unknown; input_tokens: unknown; output_tokens: unknown; cache_read_tokens: unknown; cache_write_tokens: unknown; reasoning_tokens: unknown }>(
               'SELECT hour_of_day, day_kind, calls, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens FROM usage_rollup_hod',
             )
             const folded = foldRows(rows)
@@ -837,7 +905,7 @@ export class PortalStatsSession {
         // ② 保留窗口内的小时表（带日期）
         try {
           const { sql, params } = buildWhere(this.#filter, undefined)
-          const rows = await this.#store.all<{ hour_of_day: unknown; calls: unknown; input_tokens: unknown; output_tokens: unknown; cache_read_tokens: unknown; cache_write_tokens: unknown; reasoning_tokens: unknown }>(
+          const rows = await this.readRows<{ hour_of_day: unknown; calls: unknown; input_tokens: unknown; output_tokens: unknown; cache_read_tokens: unknown; cache_write_tokens: unknown; reasoning_tokens: unknown }>(
             `SELECT hour_of_day, calls, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens FROM usage_rollup_hour${sql}`,
             params,
           )
@@ -847,8 +915,9 @@ export class PortalStatsSession {
       }
     }
     // ③ 原始表：永远正确的兜底。分桶在 JS 侧做（`toHourOfDay`），不用 SQL 的 HOUR()。
-    const q = timeBucketRowsQuery({ ...this.#filter, sinceMs: undefined, untilMs: undefined })
-    const rows = await this.#store.all<TimeBucketRow>(q.sql, q.params)
+    const filter = { ...this.#filter, sinceMs: undefined, untilMs: undefined }
+    const q = timeBucketRowsQuery(filter)
+    const rows = await this.readRows<TimeBucketRow>(q.sql, q.params, filter)
     const buckets = new Map<number, TokenCounts>()
     for (const row of rows) {
       const ts = num(row.ts)
@@ -861,7 +930,7 @@ export class PortalStatsSession {
       counts.cacheRead += num(row.cache_read_tokens)
       counts.cacheWrite += num(row.cache_write_tokens)
       counts.reasoning += num(row.reasoning_tokens)
-      counts.calls += 1
+      counts.calls += row.calls === undefined ? 1 : num(row.calls)
       counts.total = counts.input + counts.output + counts.cacheRead + counts.cacheWrite
     }
     return [...buckets.entries()].sort(([a], [b]) => a - b).map(([hour, counts]) => ({ hour, counts }))
@@ -870,7 +939,7 @@ export class PortalStatsSession {
   /** 总计（四项独立 + calls）。派生指标请用 `derive()` / `shared/metrics.ts`。 */
   async totals(): Promise<TokenCounts> {
     const q = totalsQuery(this.#filter, this.#normalize)
-    const row = await this.#store.get<{
+    const row = await this.readRow<{
       calls: unknown
       input: unknown
       output: unknown
@@ -912,14 +981,14 @@ export class PortalStatsSession {
   /** 涉及的会话数（按筛选去重）。 */
   async sessions(): Promise<number> {
     const q = sessionCountQuery(this.#filter, this.#normalize)
-    const row = await this.#store.get<{ c: unknown }>(q.sql, q.params)
+    const row = await this.readRow<{ c: unknown }>(q.sql, q.params)
     return num(row?.c)
   }
 
   /** 未归属的调用条数（`user_id IS NULL`）。 */
   async unattributedCalls(): Promise<number> {
     const q = unattributedCallsQuery(this.#filter, this.#normalize)
-    const row = await this.#store.get<{ c: unknown }>(q.sql, q.params)
+    const row = await this.readRow<{ c: unknown }>(q.sql, q.params)
     return num(row?.c)
   }
 
@@ -927,27 +996,27 @@ export class PortalStatsSession {
   async distinctUsers(): Promise<number> {
     if (this.#filter.identityView === 'member') {
       const { sql, params } = buildWhere(this.#filter, this.#normalize)
-      const row = await this.#store.get<{ c: unknown }>(`SELECT COUNT(*) AS c FROM (
+      const row = await this.readRow<{ c: unknown }>(`SELECT COUNT(*) AS c FROM (
         SELECT member_id, CASE WHEN member_id IS NULL THEN user_id ELSE NULL END AS legacy_id
         FROM ${EVENT_TABLE}${sql}${sql ? ' AND' : ' WHERE'} (member_id IS NOT NULL OR user_id IS NOT NULL)
         GROUP BY member_id, legacy_id) AS identities`, params)
       return num(row?.c)
     }
     const q = distinctUsersQuery(this.#filter, this.#normalize)
-    const row = await this.#store.get<{ c: unknown }>(q.sql, q.params)
+    const row = await this.readRow<{ c: unknown }>(q.sql, q.params)
     return num(row?.c)
   }
 
   /** 数据的时间边界。NULL 必须保持 null（见 `numOrNull`）。 */
   async timeBounds(): Promise<{ earliest: number | null; latest: number | null }> {    const q = timeBoundsQuery(this.#filter, this.#normalize)
-    const row = await this.#store.get<{ lo: unknown; hi: unknown }>(q.sql, q.params)
+    const row = await this.readRow<{ lo: unknown; hi: unknown }>(q.sql, q.params)
     return { earliest: numOrNull(row?.lo), latest: numOrNull(row?.hi) }
   }
 
   /** 最近一次成功落库的时刻。 */
   async lastIngestAt(): Promise<number | null> {
     const q = ingestMomentQuery()
-    const row = await this.#store.get<{ last_ingest_ms: unknown }>(q.sql, q.params)
+    const row = await this.readRow<{ last_ingest_ms: unknown }>(q.sql, q.params)
     return numOrNull(row?.last_ingest_ms)
   }
 
@@ -964,7 +1033,7 @@ export class PortalStatsSession {
    */
   async sourceCoverage(): Promise<PortalSourceCoverageRow[]> {
     const { sql, params } = buildWhere(this.#filter, this.#normalize)
-    const rows = await this.#store.all<{
+    const rows = await this.readRows<{
       source: string | null
       input: unknown
       output: unknown
@@ -1023,7 +1092,7 @@ export class PortalStatsSession {
     if (this.#filter.identityView !== 'member') {
       // 旧视图下只有 `user_id` 一列，键与展示名都退化成它本身。
       const { sql, params } = buildWhere(this.#filter, this.#normalize)
-      const rows = await this.#store.all<{
+      const rows = await this.readRows<{
         user_id: string | null
         user_name: string | null
         calls: unknown
@@ -1063,7 +1132,7 @@ export class PortalStatsSession {
     }
 
     const { sql, params } = buildWhere(this.#filter, this.#normalize)
-    const rows = await this.#store.all<{
+    const rows = await this.readRows<{
       member_id: string | null
       legacy_id: string | null
       snapshot_name: string | null
@@ -1136,7 +1205,7 @@ export class PortalStatsSession {
     if (dim === 'group') return this.groupGroups()
     const q = groupsQuery(dim, this.#filter, this.#dialect, this.#normalize)
     if (q) {
-      const rows = await this.#store.all<RawGroupRow>(q.sql, q.params)
+      const rows = await this.aggregate<RawGroupRow>(q)
       return sortGroupRows(mapGroupRows(rows), dim)
     }
 
@@ -1144,8 +1213,8 @@ export class PortalStatsSession {
     if (dim === 'project') {
       const groups = projectGroupsQuery(this.#filter)
       const pairs = projectSessionsQuery(this.#filter)
-      const rows = await this.#store.all<ProjectGroupRow>(groups.sql, groups.params)
-      const sessionPairs = await this.#store.all<ProjectSessionPair>(pairs.sql, pairs.params)
+      const rows = await this.readRows<ProjectGroupRow>(groups.sql, groups.params)
+      const sessionPairs = await this.readRows<ProjectSessionPair>(pairs.sql, pairs.params)
       // ★ 项目归一化（v11）就在这里生效：先按 cwd 聚合、再按项目名合并的
       //   两段都走 `#projectOf`，所以「同一项目名下的多个 cwd」会正确合并，
       //   而 sessions 去重也按**合并后的项目名**做（见 groupRowsFromProject 的注释）。
@@ -1155,7 +1224,7 @@ export class PortalStatsSession {
     // day / hour：时间键必须在 JS 侧算（见 `dimensionExpression` 的注释）
     if (dim === 'day' || dim === 'hour') {
       const rowsQuery = timeBucketRowsQuery(this.#filter, true, this.#normalize)
-      const rows = await this.#store.all<TimeBucketRow>(rowsQuery.sql, rowsQuery.params)
+      const rows = await this.readRows<TimeBucketRow>(rowsQuery.sql, rowsQuery.params)
       return groupRowsFromTime(rows, dim)
     }
 
@@ -1178,7 +1247,7 @@ export class PortalStatsSession {
       const chunk = unique.slice(start, start + 200)
       const params: Record<string, string> = {}
       chunk.forEach((id, i) => { params[`$m${i}`] = id })
-      const rows = await this.#store.all<{ member_id: string; group_id: string; name: string }>(
+      const rows = await this.readRows<{ member_id: string; group_id: string; name: string }>(
         `SELECT a.member_id AS member_id, g.group_id AS group_id, g.name AS name
          FROM member_group_assignments a JOIN member_groups g ON g.group_id = a.group_id
          WHERE a.member_id IN (${chunk.map((_, i) => `$m${i}`).join(',')})
@@ -1195,17 +1264,17 @@ export class PortalStatsSession {
   /** 按固定人员 ID 聚合；未确认历史的 key 与当前人员、真正未归属互不混淆。 */
   private async memberGroups(): Promise<QueryGroupRow[]> {
     const { sql, params } = buildWhere(this.#filter, this.#normalize)
-    const rows = await this.#store.all<RawGroupRow & {
+    const rows = await this.aggregate<RawGroupRow & {
       member_id: string | null; legacy_id: string | null; snapshot_name: string | null
       display_name: string | null
-    }>(`SELECT g.*, m.display_name FROM (
+    } >({ sql: `SELECT g.*, m.display_name FROM (
       SELECT member_id, CASE WHEN member_id IS NULL THEN user_id ELSE NULL END AS legacy_id,
         MIN(user_name) AS snapshot_name, SUM(input_tokens) AS input, SUM(output_tokens) AS output,
         SUM(cache_read_tokens) AS cache_read, SUM(cache_write_tokens) AS cache_write,
         SUM(reasoning_tokens) AS reasoning, COUNT(*) AS calls, MIN(ts) AS lo, MAX(ts) AS hi,
         COUNT(DISTINCT session_id) AS sessions
       FROM ${EVENT_TABLE}${sql} GROUP BY member_id, legacy_id
-      ) AS g LEFT JOIN members m ON m.member_id = g.member_id`, params)
+      ) AS g LEFT JOIN members m ON m.member_id = g.member_id`, params })
     const groups = await this.groupsOf(rows.map((row) => row.member_id))
     return sortGroupRows(rows.map((row) => {
       const attributionStatus = row.member_id ? 'member' : row.legacy_id !== null ? 'legacy' : 'unattributed'
@@ -1230,8 +1299,8 @@ export class PortalStatsSession {
    */
   private async groupGroups(): Promise<QueryGroupRow[]> {
     const { sql, params } = buildWhere(this.#filter, this.#normalize)
-    const rows = await this.#store.all<RawGroupRow & { grp_name: string }>(
-      `SELECT g.group_id AS grp_key, g.name AS grp_name,
+    const rows = await this.aggregate<RawGroupRow & { grp_name: string } >({
+      sql: `SELECT g.group_id AS grp_key, g.name AS grp_name,
               SUM(x.input_tokens) AS input, SUM(x.output_tokens) AS output,
               SUM(x.cache_read_tokens) AS cache_read, SUM(x.cache_write_tokens) AS cache_write,
               SUM(x.reasoning_tokens) AS reasoning, COUNT(*) AS calls,
@@ -1241,7 +1310,7 @@ export class PortalStatsSession {
              FROM ${EVENT_TABLE}${sql}) AS x
        JOIN member_group_assignments a ON a.member_id = x.member_id
        JOIN member_groups g ON g.group_id = a.group_id
-       GROUP BY g.group_id, g.name`, params)
+       GROUP BY g.group_id, g.name`, params })
     return sortGroupRows(rows.map((row) => ({ ...mapGroupRows([row])[0]!, label: row.grp_name })), 'group')
   }
 
@@ -1249,7 +1318,7 @@ export class PortalStatsSession {
   async assertLegacyIdentityView(): Promise<void> {
     if (this.#filter.identityView === 'member') return
     const { sql, params } = buildWhere(this.#filter, this.#normalize)
-    const pairs = await this.#store.all<{ member_id: string | null; user_id: string | null }>(
+    const pairs = await this.readRows<{ member_id: string | null; user_id: string | null }>(
       `SELECT DISTINCT member_id, user_id FROM ${EVENT_TABLE}${sql}`, params,
     )
     const byLegacy = new Map<string, Set<string>>(), byMember = new Map<string, Set<string>>()
@@ -1293,7 +1362,15 @@ export class PortalStatsSession {
     //   每条事件当时的价**算，而价是按 (provider, model) 定的。
     //   拿「这个点一共多少 token」× 某个价 = 用一个平均单价算账，那是错的。
     const q = timeBucketRowsQuery(this.#filter, false, this.#normalize, this.#withCost)
-    const rows = await this.#store.all<TimeBucketRow & { provider?: unknown; model?: unknown }>(q.sql, q.params)
+    const source = await this.sourceQuery(q)
+    const prices = this.#withCost ? (await this.prices()).list : null
+    return aggregateFlight(this.#target, this.kind,
+      ['series', source.sql, Object.entries(source.params).sort(([a], [b]) => a.localeCompare(b)), granularity, fillGaps, prices],
+      () => this.computeSeries(q, granularity, fillGaps))
+  }
+
+  private async computeSeries(q: SqlQuery, granularity: 'day' | 'hour', fillGaps: boolean): Promise<PortalSeriesPoint[]> {
+    const rows = await this.readRows<TimeBucketRow & { provider?: unknown; model?: unknown }>(q.sql, q.params)
     const points = seriesFromRows(rows, granularity)
     const filled = fillGaps ? renderSeriesGaps(points, granularity) : points
     if (!this.#withCost) return filled
@@ -1305,7 +1382,7 @@ export class PortalStatsSession {
       PortalStatsSession.push(
         parts,
         granularity === 'day' ? toDayKey(ts) : toHourKey(ts),
-        eventCostPart(list, String(row.provider ?? ''), String(row.model ?? ''), ts, this.usageOf(row)),
+        eventCostPart(list, String(row.provider ?? ''), String(row.model ?? ''), ts, this.usageOf(row), cubeRemainders(row.remainders)),
       )
     }
     // 补零出来的点没有用量 —— 给一份全 0 的金额（币种列表为空），
@@ -1343,7 +1420,7 @@ export class PortalStatsSession {
     granularity: 'day' | 'hour',
   ): Promise<PortalStackSeries[]> {
     const q = stackRowsQuery(dim, this.#filter, this.#normalize, this.#withCost)
-    const rows = await this.#store.all<StackRow>(q.sql, q.params)
+    const rows = await this.readRows<StackRow>(q.sql, q.params)
     /**
      * 只有 `user` 维度才有归属可言。
      *
@@ -1397,16 +1474,16 @@ export class PortalStatsSession {
       const usage = this.usageOf(row)
       const tokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite
       entry.totalTokens += tokens
-      entry.calls += 1
+      entry.calls += row.calls === undefined ? 1 : num(row.calls)
       entry.tokensByBucket.set(bucket, (entry.tokensByBucket.get(bucket) ?? 0) + tokens)
-      entry.callsByBucket.set(bucket, (entry.callsByBucket.get(bucket) ?? 0) + 1)
+      entry.callsByBucket.set(bucket, (entry.callsByBucket.get(bucket) ?? 0) + (row.calls === undefined ? 1 : num(row.calls)))
       if (this.#withCost) {
         PortalStatsSession.push(
           entry.costParts,
           bucket,
           // ★ 逐条按**它自己的时刻**取价：一个桶里可能横跨一次换价，
           //   也可能横跨高峰与闲时（同一行价的两套数）。
-          eventCostPart(priceList, String(row.provider ?? ''), String(row.model ?? ''), ts, usage),
+          eventCostPart(priceList, String(row.provider ?? ''), String(row.model ?? ''), ts, usage, cubeRemainders(row.remainders)),
         )
       }
     }
@@ -1486,7 +1563,7 @@ export class PortalStatsSession {
       const chunk = unique.slice(start, start + 200)
       const params: Record<string, string> = {}
       chunk.forEach((id, i) => { params[`$n${i}`] = id })
-      const rows = await this.#store.all<{ member_id: string; display_name: string }>(
+      const rows = await this.readRows<{ member_id: string; display_name: string }>(
         `SELECT member_id, display_name FROM members
          WHERE member_id IN (${chunk.map((_, i) => `$n${i}`).join(',')})`, params)
       for (const row of rows) map.set(String(row.member_id), String(row.display_name))
@@ -1501,7 +1578,7 @@ export class PortalStatsSession {
     // ⚠️ 这条 SQL 刻意留在本文件：它带 `user_id`（**上报库专有**的列，
     //   本地库那三列恒为 NULL），因此不与本地路径共用。
     //   但参数仍是 `$named`，MySQL 侧由 `toPositional()` 翻成 `?`。
-    const totalRow = await this.#store.get<{ c: unknown }>(
+    const totalRow = await this.readRow<{ c: unknown }>(
       `SELECT COUNT(*) AS c FROM ${EVENT_TABLE}${sql}`,
       params,
     )
@@ -1509,7 +1586,7 @@ export class PortalStatsSession {
     // ★ provider 的归一化表达式来自 `query.ts` 的 `recordProjection()`
     //   （与分组维度同一份实现），这里只负责把两份参数合起来。
     const projection = recordProjection(this.#normalize)
-    const rows = await this.#store.all<PortalRecordSqlRow>(
+    const rows = await this.readRows<PortalRecordSqlRow>(
       // ⚠️ ORDER BY 用 (ts, seq) 而不是 ts：同一毫秒内的多条记录需要有
       //   稳定的次序，否则翻页时会出现「第 2 页重复了第 1 页的最后一行」。
       `SELECT event_id, session_id, seq, ts, user_id, member_id, user_name, group_name, model, cwd, source,

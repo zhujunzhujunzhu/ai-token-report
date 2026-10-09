@@ -37,6 +37,7 @@ import { insertAttributedRecords, insertAttributedRecordsInTransaction, type Ing
 import { PORTAL_MYSQL_V4_SQL, PORTAL_SQLITE_V4_SQL, PORTAL_MYSQL_V4_INGEST_SQL, PORTAL_SQLITE_V4_INGEST_SQL, portalSchemaChecksumV4, portalSchemaStatementsV4 } from '../src/db/portal-schema-v4.js'
 import { PORTAL_MYSQL_V5_SQL, PORTAL_SQLITE_V5_SQL, PORTAL_SCHEMA_VERSION, PORTAL_SOURCE_COLUMN, portalSchemaChecksumV6, portalSchemaStatements } from '../src/db/portal-schema-v5.js'
 import { closeAllMysqlBackends, openMysqlBackend } from '../src/db/mysql.js'
+import { CUBE_TRIGGER_NAMES } from '../src/db/portal-schema-v15.js'
 import { canonicalCheck } from '../src/db/portal-catalog.js'
 import { ensurePortalReady } from '../src/db/portal-migrations.js'
 
@@ -236,7 +237,7 @@ test('v5 运行时 SQL 与设计契约逐字一致，v4 基线仍逐字冻结', 
   expect(PORTAL_SQLITE_V4_SQL).toBe(readFileSync(join(repoRoot, 'docs/database-v4/schema.sqlite.sql'), 'utf8'))
   expect(PORTAL_MYSQL_V4_SQL).toBe(readFileSync(join(repoRoot, 'docs/database-v4/schema.mysql.sql'), 'utf8'))
 })
-test('SQLite 新库 v11、FULL、26 表及旧诊断表', async () => {
+test('SQLite 新库当前版本、FULL、受控表及旧诊断表', async () => {
   const t = target()
   const info = await preparePortalDatabase(t)
   expect(info.status).toBe('current')
@@ -244,7 +245,7 @@ test('SQLite 新库 v11、FULL、26 表及旧诊断表', async () => {
   // ★ v11 = v10 的 25 张表 + `project_alias`（v9 / v10 都只改既有表，不建表）。
   //   ⚠️ 这个数字是**结构**断言，加表时必须跟着改；它不是版本号，
   //   所以不适用「断言一律对着 PORTAL_SCHEMA_VERSION」那条规矩。
-  expect(info.tables.length).toBe(26)
+  expect(info.tables.length).toBe(portalSchemaStatements('sqlite').filter(sql => sql.startsWith('CREATE TABLE ')).length + 1)
   expect(info.tables).toContain('member_groups')
   expect(info.tables).toContain('member_group_assignments')
   expect(info.tables).toContain('provider_alias')
@@ -506,7 +507,7 @@ test('SQLite v4→v5 清空全部补偿触发器，事实表由真实复合外�
   const after = await openRawPortalStore(t)
   // v5 的事实表带真正的复合外键，触发器全部清掉 —— 残留的补偿触发器会与真实外键重复判定，
   // 而且它们引用的可能是「旧表名/旧列名」，留着只会让下一次重建更难。
-  expect(await after.all("SELECT name FROM sqlite_master WHERE type='trigger'")).toEqual([])
+  expect((await after.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type='trigger'")).map(row => row.name).sort()).toEqual([...CUBE_TRIGGER_NAMES].sort())
   await after.close()
 }, 20_000)
 test('SQLite v3→v5 一次迁移：两份备份、token 四列逐位保留、迁移后无触发器', async () => {
@@ -525,7 +526,7 @@ test('SQLite v3→v5 一次迁移：两份备份、token 四列逐位保留、�
     // 历史事件逐位保留：迁移是「加列 + 换快照列名」，绝不重建事件值。
     expect(await raw.get<Record<string, unknown>>('SELECT user_id,user_name,group_name,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,member_id,received_at_ms FROM usage_event')).toEqual({ user_id: '原姓名', user_name: '原姓名', group_name: '原部门', input_tokens: 11, output_tokens: 22, cache_read_tokens: 33, cache_write_tokens: 44, member_id: null, received_at_ms: null })
     // v3→v4 的补偿触发器在 v5 阶段必须被清空（理由见上一条用例）。
-    expect(await raw.all("SELECT name FROM sqlite_master WHERE type='trigger'")).toEqual([])
+    expect((await raw.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type='trigger'")).map(row => row.name).sort()).toEqual([...CUBE_TRIGGER_NAMES].sort())
     // 账本三行：v4 基线、v5 终态、v6 终态各自 completed。
     // ★ v5 那一行是**本次迁移补写的**：这台机器上可能还有旧版本进程，
     //   它认的「当前版本」是 5（见 upgradeV4ToV5 里的注释）。

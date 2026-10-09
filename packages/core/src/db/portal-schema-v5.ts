@@ -13,15 +13,19 @@
  * | v9 | 结构追加步骤 | `usage_event` 加一列 `source`（这条用量是哪个客户端写的） |
  * | v10 | 结构追加步骤 | `model_price` 加五列：闲时（低谷）时段表 + 四类闲时单价 |
  * | v11 | 结构追加步骤 | 追加 `project_alias` 表与权限码 `projects:*`（项目归一化） |
- * | v12 | ★ **当前终态** | `provider_alias` 加一列 `model`，唯一索引换成 `(member_id, provider, model)`（模型归一化） |
+ * | v12 | 结构追加步骤 | `provider_alias` 加一列 `model`，唯一索引换成 `(member_id, provider, model)`（模型归一化） |
+ * | v13 | 权限追加步骤 | 内置 member 角色增加 `cost:read`，无 DDL |
+ * | v14 | 结构追加步骤 | `usage_event.source` 单列索引 |
+ * | v15 | ★ **当前终态** | 全窗口精确汇总表、事务内脏小时标记及事实表尾部索引 |
  *
  * ⚠️ **本文件的 SQL 常量代表 v7 终态**（v5 的 `usage_event` 那一列除外，见下），
  *   v5 / v6 / v7 的结构变化都是它的一部分：
- *   `PORTAL_SCHEMA_VERSION = 12` + 末尾的 {@link PORTAL_SQLITE_V6_ADDITIONS}
+ *   `PORTAL_SCHEMA_VERSION = 15` + 末尾的 {@link PORTAL_SQLITE_V6_ADDITIONS}
  *   + {@link PORTAL_SQLITE_V7_ADDITIONS} + `portal-schema-v8.ts` 的三张汇总表
  *   + `portal-schema-v9.ts` 的 `source` 列 + `portal-schema-v10.ts` 的闲时五列
  *   + `portal-schema-v11.ts` 的 `project_alias` + `portal-schema-v12.ts` 的
- *   `provider_alias.model`（含唯一索引替换）
+ *   `provider_alias.model`（含唯一索引替换）+ v13 权限行 + v14 来源索引
+ *   + `portal-schema-v15.ts` 的汇总表、脏小时触发器及尾部索引
  *   （追加 `provider_alias`、`model_price`、`usage_rollup_*`、`usage_event.source`、
  *   `model_price.offpeak_*`、`project_alias`、`provider_alias.model` 与权限行）
  *   共同构成受控定义。
@@ -85,6 +89,7 @@ import {
 } from './portal-schema-v12.js'
 import { portalV13Statements } from './portal-schema-v13.js'
 import { portalV14ChecksumInput, portalV14Statements } from './portal-schema-v14.js'
+import { portalV15ChecksumInput, portalV15Statements } from './portal-schema-v15.js'
 
 // 交付面：调用方（迁移器 / 汇总构建 / 测试）一律从本模块取，
 // 不必知道 v8 / v9 / v10 的实现住在独立文件里 —— 与 v6 / v7 的导出方式保持一致。
@@ -147,7 +152,7 @@ export {
  *   **没有任何 DDL**，所以 v13 那一版的 {@link portalSchemaChecksum} 算式不变；
  *   理由与放开的口径写在 `portal-schema-v13.ts` 的文件头。
  */
-export const PORTAL_SCHEMA_VERSION = 14
+export const PORTAL_SCHEMA_VERSION = 15
 export const PORTAL_SQLITE_V5_SQL = `-- 数据库 v5：分组（多对多）+ 权限码 groups:*。
 -- 不执行 ALTER/DROP，不修改本地 usage.sqlite 的 schema v3。
 -- 部署前必须另行实现带备份、版本闸门与恢复点的生产迁移。
@@ -1053,7 +1058,7 @@ export function portalSchemaStatements(kind: PortalBackendKind): string[] {
   const statements = base.map(statement => statement.startsWith('CREATE TABLE usage_event (')
     ? portalV9UsageEventStatement(kind, statement)
     : statement)
-  const all = [...statements, ...portalV6Statements(kind), ...portalV7Statements(kind), ...portalV8Statements(kind), ...portalV11Statements(kind), ...portalV13Statements(), ...portalV14Statements()]
+  const all = [...statements, ...portalV6Statements(kind), ...portalV7Statements(kind), ...portalV8Statements(kind), ...portalV11Statements(kind), ...portalV13Statements(), ...portalV14Statements(), ...portalV15Statements(kind)]
   // ★ v10：`model_price` 多五列闲时价。⚠️ 它**必须在合并之后**再拼：
   //   这张表来自 v7 的追加常量（那段文本已冻结、一个字都不许改），
   //   在 `base` 上找 `CREATE TABLE model_price (` 是找不到的 —— 找不到就不会拼，
@@ -1094,6 +1099,14 @@ export function portalSchemaStatements(kind: PortalBackendKind): string[] {
  *   **服务端拒绝启动**，而 v14 只是一个索引。
  */
 export function portalSchemaChecksum(kind: PortalBackendKind): string {
+  const source = kind === 'mysql' ? PORTAL_MYSQL_V5_SQL : PORTAL_SQLITE_V5_SQL
+  const additions = kind === 'mysql'
+    ? `${PORTAL_MYSQL_V6_ADDITIONS}\n${PORTAL_MYSQL_V7_ADDITIONS}\n${PORTAL_MYSQL_V8_ADDITIONS}\n${portalV9ChecksumInput(kind)}\n${portalV10ChecksumInput(kind)}\n${portalV11ChecksumInput(kind)}\n${portalV12ChecksumInput(kind)}\n${portalV14ChecksumInput(kind)}\n${portalV15ChecksumInput(kind)}`
+    : `${PORTAL_SQLITE_V6_ADDITIONS}\n${PORTAL_SQLITE_V7_ADDITIONS}\n${PORTAL_SQLITE_V8_ADDITIONS}\n${portalV9ChecksumInput(kind)}\n${portalV10ChecksumInput(kind)}\n${portalV11ChecksumInput(kind)}\n${portalV12ChecksumInput(kind)}\n${portalV14ChecksumInput(kind)}\n${portalV15ChecksumInput(kind)}`
+  return createHash('sha256').update(`${source}\n${additions}`).digest('hex')
+}
+/** 已发布的 v14 文本摘要冻结，保证线上 v14 能显式迁到 v15。 */
+export function portalSchemaChecksumV14(kind: PortalBackendKind): string {
   const source = kind === 'mysql' ? PORTAL_MYSQL_V5_SQL : PORTAL_SQLITE_V5_SQL
   const additions = kind === 'mysql'
     ? `${PORTAL_MYSQL_V6_ADDITIONS}\n${PORTAL_MYSQL_V7_ADDITIONS}\n${PORTAL_MYSQL_V8_ADDITIONS}\n${portalV9ChecksumInput(kind)}\n${portalV10ChecksumInput(kind)}\n${portalV11ChecksumInput(kind)}\n${portalV12ChecksumInput(kind)}\n${portalV14ChecksumInput(kind)}`
