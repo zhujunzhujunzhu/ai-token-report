@@ -36,7 +36,12 @@ import {
   Warning,
 } from '@element-plus/icons-vue'
 import type { DiagnosticsResponse } from '@ai-token-report/shared'
-import { formatCompact, formatFullDateTime, formatTimeGap } from '../utils/format.js'
+import {
+  formatCompact,
+  formatCount,
+  formatFullDateTime,
+  formatTimeGap,
+} from '../utils/format.js'
 // ⚠️ 判断一律走 `diagnosticsModel.ts`：那里是纯函数，能被 `bun test` 直接钉住。
 //   在本组件里重写一遍静默阈值或卡片集合，等于多出一份「24 小时」的定义 ——
 //   两份一旦漂移，页面上就会出现「状态行说没掉线、表格里那一行标着静默」。
