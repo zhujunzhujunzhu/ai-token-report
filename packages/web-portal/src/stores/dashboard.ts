@@ -475,8 +475,6 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     pending = true
     if (!background) loading.value = true
     error.value = null
-    // 候选始终不带人员筛选；全员排行可复用同一请求，避免每轮重复聚合。
-    const candidates = fetchBreakdown(built.filter, 'user')
     /**
      * ★ **纯目录只在「没取到过」或「显式刷新」时取**（后台轮询永远不取）。
      *
@@ -486,8 +484,7 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
      * 2 天 20.7 万请求）：这四类合计 **7.6 万次（37%）**，每个平均 **0.82–0.92 秒**，
      * 而且每个请求都要在服务端付一遍版本闸门的固定开销 —— 却几乎总是同一份内容。
      *
-     * ⚠️ 与之相对，`candidates`（`by=user` 用量排行）**不能**跳过：
-     *   它同时是「人员排行」的数据源，是**数字**而不是目录。
+     * 人员排行仍按当前筛选刷新；名册可用时不再为了候选单独聚合全年用量。
      * ⚠️ 只有四份目录**全部成功**才算「取到过」：否则后端还是老版本（404）时
      *   就再也不会重试，下拉会永久空着。
      */
@@ -504,6 +501,20 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     // ★ 来源目录：同样是**不带任何筛选**的完整集合（受控枚举 ∪ 库里出现过的值）。
     //   只喂候选，不参与任何数字；失败也不能拖垮整页。
     const sourceCandidates = skipCatalogs ? null : fetchSourceOptions()
+    // ★ 只有页面实际展示全员排行时才取这份数字；其它页面优先使用名册。
+    // 已取得的历史归属候选保留，名册失败或旧部署返回空名册时才回落聚合。
+    const needsAllUsers = !filter.users.length &&
+      (active === 'overview' || (active === 'analysis' && breakdownBy.value === 'user'))
+    const candidates = needsAllUsers
+      ? fetchBreakdown(built.filter, 'user')
+      : (async () => {
+          const directory = memberCandidates ? await memberCandidates : null
+          if (directory && !directory.ok && directory.status === 401) return null
+          const available = directory?.ok
+            ? directory.data.members.length > 0
+            : memberDirectory.value.length > 0
+          return available ? null : fetchBreakdown(built.filter, 'user')
+        })()
     const [ov, opts, gopts, mo, pv, sv, se, rank, groupRank, bd, rec, diag] =
       await Promise.all([
         fetchOverview(filter),

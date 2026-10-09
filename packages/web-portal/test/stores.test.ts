@@ -156,6 +156,34 @@ describe('登录状态', () => {
 })
 
 describe('统计状态', () => {
+  test('名册可用时筛人总览只取一份人员金额排行，明细页不为候选聚合', async () => {
+    signIn('admin')
+    const urls: URL[] = []
+    respond((raw) => {
+      const url = new URL(raw, 'http://test')
+      urls.push(url)
+      if (url.pathname.endsWith('/members')) return json({ members: [
+        { member_id: 'selected', name: '张三', status: 'active', group_ids: [] },
+        { member_id: 'other', name: '李四', status: 'active', group_ids: [] },
+      ] })
+      if (url.pathname.endsWith('/overview')) return json(overview)
+      return json({ rows: [{ key: 'selected' }], points: [], groups: [], providers: [], sources: [], total: 0 })
+    })
+    const dashboard = useDashboardStore()
+    dashboard.filters.users = ['selected']
+    await dashboard.activate('overview')
+    const userQueries = () => urls.filter((u) => u.pathname.endsWith('/breakdown') && u.searchParams.get('by') === 'user')
+    expect(userQueries()).toHaveLength(1)
+    expect(userQueries()[0]!.searchParams.get('member_id')).toBe('selected')
+    expect(dashboard.userOptions.map((row) => row.key)).toEqual(['selected', 'other'])
+    urls.length = 0
+    await dashboard.load(true)
+    expect(urls).toHaveLength(4)
+    expect(userQueries()).toHaveLength(1)
+    urls.length = 0
+    await dashboard.activate('records')
+    expect(urls.map((u) => u.pathname.split('/').at(-1)).sort()).toEqual(['overview', 'records'])
+  })
   test('未登录时不查询统计接口', async () => {
     let calls = 0
     respond(() => {
