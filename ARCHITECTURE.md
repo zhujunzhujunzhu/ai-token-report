@@ -721,7 +721,7 @@ Content-Type: application/json
 | `GET /api/v1/stats/records?limit&offset` | 明细（分页，最新在前；每行带 `group_ids` 与 `group_name_snapshot`） |
 | `GET /api/v1/stats/groups` | ★ 分组候选项 `{ groups: StatsGroupOption[] }`（`stats:read`；筛选栏与分组排行的选项都取自它） |
 | `GET /api/v1/stats/members` | ★ 人员候选项 `{ members: StatsMemberOption[] }`（`stats:read`；名册 + 每人**当前**分组 ID，筛选栏的人员下拉取自它） |
-| `GET /api/v1/stats/providers` | ★ 供应商候选项 `{ providers: string[] }`（`stats:read`；库里出现过的名字，**已按查看者的归一化规则映射成展示名**，去重升序。刻意**不带时间窗与筛选**，也不含任何用量数字 —— 它是一份目录，因此不跟数据范围收窄） |
+| `GET /api/v1/stats/providers` | ★ 供应商候选项 `{ providers: string[]; aliases?: string[] }`（`stats:read`）。`providers` = 库里出现过的名字，**已按查看者的归一化规则映射成展示名**；`aliases` = **归一化规则里配的名字**（配置面，**可能还没有任何用量** —— 只从用量取候选时那个名字不会出现在下拉里）。两份都去重升序。刻意**不带时间窗与筛选**，也不含任何用量数字 —— 它是一份目录，因此不跟数据范围收窄 |
 | `GET /api/v1/stats/projects` | ★ **项目目录候选项** `{ projects: string[] }`（v11，`stats:read`）。回的是**原始 `cwd`**（项目归一化配置页要配的就是「哪个目录算哪个项目」，给它归一化后的名字等于让它无据可配），去重升序、**不含任何用量数字**、**不带时间窗**（候选必须是完整集合）。🚨 与供应商候选的关键差别：它**跟着数据范围收窄** —— `cwd` 会带出使用者路径（`C:\Users\alice\…`），一份全量路径清单等于给「非管理员只看本人」开一个侧门。⚠️ 实现上是**开裸连接跑一条 `distinctCwdsQuery()`**（同 `/stats/providers`），**不走 `openPortalStats()`** —— 那条路会撞上 `assertLegacyIdentityView()` 的 409，而那一关是给「按人排行」用的 |
 | `GET /api/v1/stats/diagnostics` | 覆盖率 / 未归属 / 数据边界 / 最近落库 |
 
@@ -733,7 +733,7 @@ Content-Type: application/json
 | **自定义区间** | `from` / `to`（epoch 毫秒） | 那本来就是使用者选定的两个绝对时刻，不是口径；结束时刻按「含该分钟」处理 |
 | **人员** | `member_id` / `legacy_user` / `unattributed`（**多选**） | 归属筛选是**精确匹配**；候选来自 `GET /api/v1/stats/members` **名册 ∪ 用量派生键**（未署名 / 待确认历史） |
 | **分组** | `group_id`（**逗号分隔多选**，精确匹配） | 候选项来自 `GET /api/v1/stats/groups`，**不是** `/api/v1/admin/groups` |
-| **厂商** | `provider`（**多选**：一值一个同名参数，服务端也接受逗号分隔） | 每个值仍是**子串**匹配（与 CLI 同义）。候选 = `GET /api/v1/stats/providers` **目录 ∪ 使用者在本机浏览器里自建的名字**（`allow-create`）；自建项**不写库** —— 供应商名是用量行上的事实，库里那份可编辑配置是归一化规则（`provider_alias`）。下拉**可搜索**，输入未命中时回车即新建 |
+| **厂商** | `provider`（**多选**：一值一个同名参数，服务端也接受逗号分隔） | 每个值仍是**子串**匹配（与 CLI 同义）。候选三档 = `GET /api/v1/stats/providers` 的 **`providers`（数据里出现过的，已归一化）∪ `aliases`（归一化规则里配的名字，可能还没有用量）∪ 使用者在本机浏览器里自建的名字**（`allow-create`）；自建项**不写库** —— 供应商名是用量行上的事实，库里那份可编辑配置是归一化规则（`provider_alias`）。合并规则只在 `providerFilterOptions()` 一处（同名以数据 > 规则 > 自建为准）。下拉**可搜索**，输入未命中时回车即新建 |
 | **模型** | `model` | **子串**匹配（与 CLI 同义），与人名规则刻意不同 |
 
 **趋势图上的三个开关**（总览与分析共用同一份 store 状态）：
@@ -794,16 +794,21 @@ Content-Type: application/json
 > 只有「未署名 / 待确认历史」这两类归属状态目录里表达不出来，仍由用量行补上。
 
 > ★ 厂商下拉的候选同样**不带任何筛选参数**（`GET /api/v1/stats/providers` 本身不收），
-> 否则选中一个供应商之后下拉会塌缩成一项。目录给的是**归一化后**的展示名 ——
+> 否则选中一个供应商之后下拉会塌缩成一项。响应里有**两份**候选：
+> `providers` 给的是**归一化后**的展示名（数据里出现过的原值经映射）——
 > 与筛选匹配用的是同一份映射（`loadProviderAliases` 按**查看者**解析），
-> 所以「页面上看到什么名字就能筛什么名字」。
+> 所以「页面上看到什么名字就能筛什么名字」；`aliases` 给的是**归一化规则里配的名字**
+> （`provider_alias`）—— 只从用量取候选时，一条规则配好了、对应原值却还没有用量时，
+> 那个规范化名字在下拉里**根本不会出现**，而它正是使用者在 `/providers` 页配出来、
+> 想在看板上筛的那个名字（选中它可能是如实的 0 行，与来源候选里「本机还没跑过
+> Codex」同一件事 —— 所以它在下拉里**单独成组**，把这句写在组标题上）。
 > ⚠️ 使用者还能在框里**手输一个新名字**（`allow-create`）：它只被记进
 > **本机浏览器**（`web-portal/src/utils/providerCatalog.ts` 的 `atr.portal.customProviders.v1`），
 > **绝不写库** —— 供应商名是用量行上的事实，往库里插一个没有用量、没有价格的
 > 「供应商」只会得到一个永远查不出数据的幽灵选项，而且没有地方能删掉它。
 > 库里那份可编辑配置是归一化规则（`provider_alias`），那是管理面的事。
 > 合并规则只有一处：`web-portal/src/types/portal.ts` 的 `providerFilterOptions()`
-> （同名以目录为准）。
+> （**同名以靠前一档为准：数据 > 规则 > 自建**；`aliases` 缺字段 = 老服务端，按空数组处理）。
 
 **分组维度是「展开」语义，不是重复计数**：人员与分组是多对多（§4.5.9），
 所以 `by=group` 与 `group_id` 筛选都把一条事件计入它的人员所属的**每个**分组 ——

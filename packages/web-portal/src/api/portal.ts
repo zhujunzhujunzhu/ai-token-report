@@ -145,8 +145,11 @@ export function fetchMemberOptions(): Promise<ApiResult<StatsMembersResponse>> {
  *
  * ★ 同样走**看板接口**（`stats:read`）而不是供应商归一化的管理接口
  *   `/api/v1/admin/provider-aliases`（那是 `providers:read`）：筛选栏只需要
- *   知道「库里出现过哪些供应商名」，能看数据的人不一定能读那份配置。
+ *   知道「有哪些供应商名可以筛」，能看数据的人不一定能读那份配置。
  * ★ 名字已经是**归一化后**的展示名 —— 它就是筛选可以用的名字（同一份映射）。
+ * ★ 响应里有**两份**候选：`providers`（数据里出现过的）与 `aliases`
+ *   （归一化规则里配的名字，**可能还没有用量**）。两份都进下拉，合并与去重
+ *   只在 `types/portal.ts` 的 `providerFilterOptions()` 一处做。
  * ⚠️ 与分组 / 人员候选同理，**不带任何筛选参数**：候选必须始终是完整集合，
  *   否则选中一个供应商之后下拉会塌缩成一项（自锁定）。
  */

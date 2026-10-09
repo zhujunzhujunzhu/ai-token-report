@@ -546,6 +546,13 @@ export interface StatsMembersResponse {
  *   `bailian-tpp`，筛 `bailian-tpp` 就必须把 `dashscope` 那些原值一起筛出来。
  *   回原始名会造出「按页面上看到的名字筛，一行都筛不出来」这种查不出原因的坑。
  *
+ * ★ 候选**不止来自用量**：还有 {@link StatsProvidersResponse.aliases}
+ *   —— 归一化规则里配的**归一化名**。只从 `usage_event.provider` 取候选时，
+ *   一条规则配好了、对应原值却还没有用量（或原值只在别的库里出现过）时，
+ *   那个规范化名字**根本不会出现在下拉里**，而它恰恰是看板上要用的那个名字。
+ *   两份候选**各自如实给出**，同名怎么取舍由页面的 `providerFilterOptions()`
+ *   一处决定（数据派生的优先）—— 服务端不替展示层去重。
+ *
  * ⚠️ 只回名字，**不含任何用量数字**（没有条数、没有 token），因此它是一份
  *   **目录**：与分组 / 人员候选一样**不跟着数据范围收窄**（`applyDataScope()`
  *   只管用量查询）。
@@ -553,6 +560,20 @@ export interface StatsMembersResponse {
 export interface StatsProvidersResponse {
   /** 去重、升序的展示名（多条规则指向同一个名字时只出现一次）。 */
   providers: string[]
+  /**
+   * 归一化规则（`provider_alias`，**按查看者**解析、只看启用中的行）里配的
+   * 归一化名，去重、升序。
+   *
+   * ★ 与 `providers` 的差别是**来源**而不是形状：`providers` 是
+   *   「数据里出现过的原值经映射后的名字」，这里是「配置里定义的名字」。
+   *   所以后者**可能没有任何用量指向它**（选中它会如实得到 0 行 ——
+   *   与来源候选里「本机还没跑过 Codex」是同一件事），也可能与 `providers`
+   *   里的某一项**同名**（规则目标恰好等于某个原值 / 展示名）。
+   *
+   * ⚠️ 缺字段 = **老服务端**（那时只有数据派生的候选）：页面按
+   *   「没有规则候选」处理，绝不能因此把下拉打成空的。
+   */
+  aliases?: string[]
 }
 
 /**

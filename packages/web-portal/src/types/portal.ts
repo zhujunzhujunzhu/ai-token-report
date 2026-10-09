@@ -178,21 +178,38 @@ export interface ProviderFilterOption {
   value: string
   label: string
   /**
-   * `true` = 使用者手动创建的（`allow-create`），只存在本机浏览器里。
+   * 这一项**从哪来**：`data` = 数据里出现过的（经归一化映射后的展示名）、
+   * `alias` = 归一化规则里配的名字、`custom` = 使用者手动创建的。
    *
-   * ⚠️ 它与「库里有这个供应商」是两件事：自定义项**不写库**，也**不保证有用量**。
-   *   它的用途只有一个：把名字记下来，下次不用再手输。
+   * ★ 三档的顺序就是**优先级**（见 {@link providerFilterOptions}）：同名的
+   *   以靠前的为准。页面按它分组渲染 —— 使用者必须能看出「这一项为什么在这里」：
+   *   `alias` 那一档**可能一条用量都还没有**（选中会如实得到 0 行）。
    */
-  custom: boolean
+  source: ProviderOptionSource
 }
 
 /**
- * 供应商下拉的候选集合：**库里的目录 ∪ 使用者自建的**。
+ * 供应商候选的来源，也是**同名时的优先级**（靠前者胜出）：
  *
- * ★ 目录（`GET /api/v1/stats/providers`）给的是**归一化后**的展示名，与筛选的
- *   匹配口径同一份 —— 页面不在这里做任何名字变换。
- * ★ 自建项排在目录之后，并在 `custom` 上标出来：同名的以目录为准
- *   （库里真的有这个名字，它就不是「自定义」）。
+ * | 取值 | 含义 | 可能没有用量吗 |
+ * |---|---|---|
+ * | `data` | `usage_event.provider` 里出现过的原值（映射后的展示名） | 不会 |
+ * | `alias` | 归一化规则（`provider_alias`）里配的归一化名 | **可能**（规则配好了、原值还没上报） |
+ * | `custom` | 使用者手输、只记在本机浏览器里的名字 | **可能** |
+ */
+export type ProviderOptionSource = 'data' | 'alias' | 'custom'
+
+/**
+ * 供应商下拉的候选集合：**库里的目录 ∪ 归一化规则里的名字 ∪ 使用者自建的**。
+ *
+ * ★ 目录（`GET /api/v1/stats/providers` 的 `providers`）给的是**归一化后**的
+ *   展示名，与筛选的匹配口径同一份 —— 页面不在这里做任何名字变换。
+ * ★ 归一化名（同一条响应的 `aliases`）来自**规则配置**，不是用量：
+ *   只从数据取候选时，一条规则配好了、对应原值却还没有用量时，那个名字
+ *   **根本不会出现在下拉里**，而它正是看板上要用的那个名字。
+ *   ⚠️ 老服务端没有这个字段（`undefined`）—— 调用方按空数组传进来即可。
+ * ★ 自建项排最后：同名以靠前的为准（数据里真的有这个名字，它就不是「配置的」；
+ *   规则里真的有，它就不是「自定义的」）。
  *
  * ⚠️ 服务端对每个值仍是**子串**匹配，所以「输入一半的名字」也能筛 ——
  *   这是既有语义（CLI `--provider` 同款），不是这里引入的。下拉的可搜索
@@ -200,33 +217,41 @@ export interface ProviderFilterOption {
  */
 export function providerFilterOptions(
   catalog: readonly string[],
+  aliases: readonly string[],
   custom: readonly string[],
 ): ProviderFilterOption[] {
   const options: ProviderFilterOption[] = []
   const seen = new Set<string>()
-  for (const name of catalog) {
-    const value = name.trim()
-    if (!value || seen.has(value)) continue
-    seen.add(value)
-    options.push({ value, label: value, custom: false })
+  /**
+   * 按**优先级从高到低**逐档铺，同名只留最先出现的那一档。
+   *
+   * ★ 去重必须在**同一个** `seen` 上做：三个档各自去重的话，
+   *   「规则名与数据里的展示名同名」会变成下拉里两个一模一样的选项，
+   *   而发出去的筛选值逐字相同 —— 使用者只会以为自己看花了眼。
+   */
+  const push = (names: readonly string[], source: ProviderOptionSource): void => {
+    for (const name of names) {
+      const value = name.trim()
+      if (!value || seen.has(value)) continue
+      seen.add(value)
+      options.push({ value, label: value, source })
+    }
   }
-  for (const name of custom) {
-    const value = name.trim()
-    // ★ 与目录重名的不再列为自定义：那会让人以为有两个不同的选项，
-    //   而筛选发出去的是同一个字符串。
-    if (!value || seen.has(value)) continue
-    seen.add(value)
-    options.push({ value, label: value, custom: true })
-  }
+  push(catalog, 'data')
+  push(aliases, 'alias')
+  push(custom, 'custom')
   return options
 }
 
 /**
- * 从当前选择里挑出**刚刚手输出来的**名字（去掉目录里已有的与已经记过的）。
+ * 从当前选择里挑出**刚刚手输出来的**名字（去掉三档候选里已有的与已经记过的）。
  *
- * ★ 判据是「既不在目录、也不在已有自定义里」：下拉里能选到的值都来自这两处，
- *   所以剩下的只可能是使用者刚敲进去并回车的那一个 —— 把它记下来，
+ * ★ 判据是「既不在数据目录、也不在归一化名、也不在已有自定义里」：下拉里能选到的
+ *   值都来自这三处，所以剩下的只可能是使用者刚敲进去并回车的那一个 —— 把它记下来，
  *   下次打开下拉就能直接选，而不用再输一遍。
+ *   ⚠️ 漏掉 `aliases` 那一档的后果是：使用者选了一个规则里配好的名字，
+ *   它会被当成「自建」再记一遍（下拉里仍只出现一次，但本机记忆里多了一条
+ *   永远用不上的名字，而「清除自定义」也清不掉那个来源）。
  * ⚠️ 副产物是「输入一半的子串」也会被记下来（服务端本来就是子串匹配）。
  *   这是刻意的：那是使用者自己建的一个筛选项，页面没有资格替他判断它「不完整」。
  *   不想要了用「清除自定义」——页面必须给出这个出口。
@@ -234,9 +259,12 @@ export function providerFilterOptions(
 export function newCustomProviders(
   selected: readonly string[],
   catalog: readonly string[],
+  aliases: readonly string[],
   custom: readonly string[],
 ): string[] {
-  const known = new Set<string>([...catalog, ...custom].map((name) => name.trim()))
+  const known = new Set<string>(
+    [...catalog, ...aliases, ...custom].map((name) => name.trim()),
+  )
   const added: string[] = []
   for (const name of selected) {
     const value = name.trim()

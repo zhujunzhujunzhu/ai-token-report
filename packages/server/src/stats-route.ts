@@ -11,7 +11,7 @@
  * | `/api/v1/stats/records?limit&offset` | 明细（分页） |
  * | `/api/v1/stats/groups` | ★ **分组候选项**（筛选下拉用） |
  * | `/api/v1/stats/members` | ★ **人员候选项**（筛选下拉用；带当前分组 ID） |
- * | `/api/v1/stats/providers` | ★ **供应商候选项**（筛选下拉用；已归一化的展示名） |
+ * | `/api/v1/stats/providers` | ★ **供应商候选项**（筛选下拉用；数据派生的展示名 ∪ 归一化规则里的名字） |
  * | `/api/v1/stats/diagnostics` | 覆盖率 / 未归属 / 数据边界 |
  *
  * 响应结构全部来自 `shared/src/protocol.ts`，前端与之共用 —— 字段对不上时
@@ -806,6 +806,15 @@ export class StatsRoute {
    * ⚠️ 刻意**不带时间窗、不带任何筛选**：候选必须始终是完整集合，
    *   否则「上个月用过的供应商」会从下拉里消失 —— 那看起来像数据丢了，
    *   而不像「这段时间没人用」。
+   *
+   * ★ 候选有**两个来源**（缺一个都是「下拉里没有那个名字」）：
+   *   1. `usage_event.provider` 里出现过的原值（经上面的映射后的展示名）；
+   *   2. 归一化规则里配的**归一化名**（`aliases`）—— 只从用量取候选时，
+   *      一条规则配好了、对应原值却还没有用量时，那个规范化名字**根本不会出现**，
+   *      而它正是使用者在 `/providers` 页配出来、想在看板上筛的那个名字。
+   *      代价是它可能筛出 0 行，那是**如实的答案**（与来源候选里
+   *      「本机还没跑过 Codex」同一件事），不是「数据丢了」。
+   *
    * ⚠️ 只回名字、不回任何用量数字，所以**不按数据范围收窄**（同分组 / 人员候选）。
    *   供应商名不属于任何一个人，`usage_event.provider` 上也没有人。
    *
@@ -835,7 +844,23 @@ export class StatsRoute {
         if (!raw) continue
         names.add(aliases.providers.get(raw) ?? raw)
       }
-      const body: StatsProvidersResponse = { providers: [...names].sort() }
+      // ★ 归一化规则里配的**归一化名**（配置面，与用量无关）：一条规则配好了、
+      //   对应原值却还没有用量时，那个名字在上面的循环里**根本不会出现** ——
+      //   而它正是看板上要用的那个名字（使用者在 `/providers` 页配的就是它）。
+      //   ⚠️ 只读**启用中**的规则：`loadProviderAliases()` 已经按 `enabled = 1`
+      //   过滤，停用一条规则 = 该名字不再参与归一化，也就不是候选了。
+      //   ⚠️ 刻意不与 `providers` 去重：两份候选是**两个事实**
+      //   （数据里出现过的 / 配置里定义的），同名怎么取舍由页面的
+      //   `providerFilterOptions()` 一处决定（数据派生的优先）。
+      const aliasNames = new Set<string>()
+      for (const target of aliases.providers.values()) {
+        const value = String(target ?? '')
+        if (value) aliasNames.add(value)
+      }
+      const body: StatsProvidersResponse = {
+        providers: [...names].sort(),
+        aliases: [...aliasNames].sort(),
+      }
       return { status: 200, body }
     } catch (err) {
       if (this.#identityStore) return { status: 503, body: { ok: false, reason: '统计数据库暂时不可用，请稍后重试' } }

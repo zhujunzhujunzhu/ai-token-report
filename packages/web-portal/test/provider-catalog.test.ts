@@ -1,13 +1,17 @@
 /**
- * 供应商候选（库里的目录 ∪ 使用者自建的）与本机记忆。
+ * 供应商候选（数据里的 ∪ 归一化规则里的 ∪ 使用者自建的）与本机记忆。
  *
  * ## 这些断言在守什么
  *
- * 1. ★ 候选的**合并规则只有一处**（`providerFilterOptions`）：同名以目录为准，
- *    目录顺序原样保留 —— 页面不自己拼，否则「同名算哪一类」会有两份答案。
- * 2. ★ 手输的名字会被记下来（`newCustomProviders`），而**判据必须与下拉一致**：
- *    下拉里能选到的都来自目录或已有自定义，剩下的才可能是刚敲进去的。
- * 3. 🚨 记在本机（`localStorage`）而**不写库**：存储不可用 / 内容损坏时当成
+ * 1. ★ 候选的**合并规则只有一处**（`providerFilterOptions`）：同名以靠前的
+ *    一档为准（数据 > 规则 > 自建），各档顺序原样保留 —— 页面不自己拼，
+ *    否则「同名算哪一类」会有两份答案。
+ * 2. ★ 归一化规则里配的名字**必须进候选**（`alias` 那一档）：只在
+ *    `usage_event.provider` 里找候选时，一条规则配好了、原值还没上报时，
+ *    那个规范化名字在下拉里根本不存在 —— 而它正是看板上要筛的名字。
+ * 3. ★ 手输的名字会被记下来（`newCustomProviders`），而**判据必须与下拉一致**：
+ *    下拉里能选到的都来自三档候选或已有自定义，剩下的才可能是刚敲进去的。
+ * 4. 🚨 记在本机（`localStorage`）而**不写库**：存储不可用 / 内容损坏时当成
  *    「还没记过」，绝不让一个筛选下拉的记忆把整页打成白屏。
  */
 import { beforeEach, describe, expect, test } from 'bun:test'
@@ -54,53 +58,85 @@ beforeEach(() => {
   storageHost.localStorage = fakeStorage()
 })
 
-describe('供应商候选 = 目录 ∪ 自建', () => {
-  test('目录在前、自建在后，并标出哪一项是自己建的', () => {
+describe('供应商候选 = 数据里的 ∪ 归一化规则里的 ∪ 自建的', () => {
+  test('三档依次排列，并标出每一项从哪来', () => {
     const options = providerFilterOptions(
       ['dashscope', 'bailian-tpp'],
+      ['未来网关'],
       ['my-gateway'],
     )
     expect(options).toEqual([
-      { value: 'dashscope', label: 'dashscope', custom: false },
-      { value: 'bailian-tpp', label: 'bailian-tpp', custom: false },
-      { value: 'my-gateway', label: 'my-gateway', custom: true },
+      { value: 'dashscope', label: 'dashscope', source: 'data' },
+      { value: 'bailian-tpp', label: 'bailian-tpp', source: 'data' },
+      { value: '未来网关', label: '未来网关', source: 'alias' },
+      { value: 'my-gateway', label: 'my-gateway', source: 'custom' },
     ])
   })
 
-  test('★ 同名以目录为准（库里真的有这个名字，它就不是「自定义」）', () => {
-    const options = providerFilterOptions(['dashscope'], ['dashscope', 'other'])
-    expect(options.map((option) => [option.value, option.custom])).toEqual([
-      ['dashscope', false],
-      ['other', true],
+  test('★ 同名以靠前的一档为准（数据 > 规则 > 自建）', () => {
+    // 三档里都有 `dashscope`，后两档都有「未来网关」：每一档只在该名字
+    // **还没出现过**时才贡献一项 —— 否则下拉里会出现两个逐字相同的选项，
+    // 而发出去的筛选值一模一样（使用者只会以为自己看花了眼）。
+    const options = providerFilterOptions(
+      ['dashscope'],
+      ['dashscope', '未来网关'],
+      ['dashscope', '未来网关', 'other'],
+    )
+    expect(options.map((option) => [option.value, option.source])).toEqual([
+      ['dashscope', 'data'],
+      ['未来网关', 'alias'],
+      ['other', 'custom'],
     ])
   })
 
   test('空串与首尾空格被清掉，重复只留一项', () => {
-    expect(providerFilterOptions([' dashscope ', '', 'dashscope'], ['  ', 'x'])).toEqual([
-      { value: 'dashscope', label: 'dashscope', custom: false },
-      { value: 'x', label: 'x', custom: true },
+    expect(
+      providerFilterOptions(
+        [' dashscope ', '', 'dashscope'],
+        [' 未来网关 ', '未来网关'],
+        ['  ', 'x'],
+      ),
+    ).toEqual([
+      { value: 'dashscope', label: 'dashscope', source: 'data' },
+      { value: '未来网关', label: '未来网关', source: 'alias' },
+      { value: 'x', label: 'x', source: 'custom' },
+    ])
+  })
+
+  test('★ 老服务端没有规则候选（`aliases` 缺席）时退化成本次改动之前的行为', () => {
+    // 调用方把缺字段折成空数组（见 store 的 `pv.data.aliases ?? []`）。
+    expect(providerFilterOptions(['dashscope'], [], ['my-gateway'])).toEqual([
+      { value: 'dashscope', label: 'dashscope', source: 'data' },
+      { value: 'my-gateway', label: 'my-gateway', source: 'custom' },
     ])
   })
 })
 
 describe('手输的名字怎么算「新的」', () => {
-  test('目录里已有的、已经记过的不再重记', () => {
+  test('三档候选里已有的、已经记过的不再重记', () => {
     expect(
       newCustomProviders(
-        ['dashscope', 'my-gateway', 'my-gateway'],
+        ['dashscope', '未来网关', 'my-gateway', 'my-gateway'],
         ['dashscope'],
+        ['未来网关'],
         [],
       ),
     ).toEqual(['my-gateway'])
-    expect(newCustomProviders(['my-gateway'], ['dashscope'], ['my-gateway'])).toEqual([])
+    expect(
+      newCustomProviders(['my-gateway'], ['dashscope'], ['未来网关'], ['my-gateway']),
+    ).toEqual([])
+  })
+
+  test('★ 归一化规则里配的名字不算「刚敲进去的」（否则本机记忆里多一条幽灵项）', () => {
+    expect(newCustomProviders(['未来网关'], [], ['未来网关'], [])).toEqual([])
   })
 
   test('★ 输入一半的子串也照记（服务端本来就是子串匹配，页面不替使用者判断）', () => {
-    expect(newCustomProviders(['dash'], ['dashscope'], [])).toEqual(['dash'])
+    expect(newCustomProviders(['dash'], ['dashscope'], [], [])).toEqual(['dash'])
   })
 
   test('空白值不进候选', () => {
-    expect(newCustomProviders(['  ', ''], [], [])).toEqual([])
+    expect(newCustomProviders(['  ', ''], [], [], [])).toEqual([])
   })
 })
 

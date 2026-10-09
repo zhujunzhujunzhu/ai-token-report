@@ -9,8 +9,9 @@
  *   少一个筛不了的控件，也**不说**自己在数据范围上受限（见模板里的说明）。
  *
  * ★ 厂商是**多选 + 可搜索 + 可新建**：候选来自看板接口
- *   `/api/v1/stats/providers`（库里出现过的名字，已归一化），使用者还能在框里
- *   手输一个库里没有的名字并回车（`allow-create`）——那个名字只记在**本机浏览器**
+ *   `/api/v1/stats/providers` 的**两份**（`providers` = 库里出现过的名字，已归一化；
+ *   `aliases` = 归一化规则里配的名字，可能还没有用量），使用者还能在框里
+ *   手输一个两份里都没有的名字并回车（`allow-create`）——那个名字只记在**本机浏览器**
  *   里（`utils/providerCatalog.ts`），绝不写库。服务端对每个值仍是子串匹配，
  *   与 CLI 的 `--provider` 同义。
  */
@@ -182,8 +183,14 @@ onUnmounted(() => clearTimeout(selectTimer))
       <!--
         厂商：多选（OR）+ 可搜索 + 可新建。
 
-        ★ 候选 = 库里出现过的名字（`GET /api/v1/stats/providers`，已归一化）
-          ∪ 使用者自己建的（只存在本机浏览器里，不写库）。
+        ★ 候选有**三档来源**（`GET /api/v1/stats/providers` 两份 + 本机自建）：
+          1. 数据里出现过的名字（`providers`，已归一化）；
+          2. 归一化规则里配的名字（`aliases`，来自 `/providers` 页那份配置）——
+             ⚠️ 它**可能一条用量都还没有**（规则配好了、原值还没上报），
+             所以必须与第 1 档**分开成组**：混在一起会让人以为那是一个查得出
+             数据的供应商，而选中它是 0 行。分开之后那句「可能还没有用量」
+             就在组标题上，一眼能看懂。
+          3. 使用者自己建的（只存在本机浏览器里，不写库）。
         ★ `allow-create` + `default-first-option` 让「库里还没有的名字」也能筛：
           输入后回车即成为一枚标签 —— 这正是原来的自由输入能力，只是现在
           它会留在下拉里、下次直接可选。
@@ -207,18 +214,26 @@ onUnmounted(() => clearTimeout(selectTimer))
           data-testid="provider-filter"
           @change="applySelectsSoon"
           ><el-option-group
-            v-if="dashboard.providerChoices.some((option) => !option.custom)"
+            v-if="dashboard.providerChoices.some((option) => option.source === 'data')"
             label="数据中出现过的供应商"
             ><el-option
-              v-for="option in dashboard.providerChoices.filter((item) => !item.custom)"
+              v-for="option in dashboard.providerChoices.filter((item) => item.source === 'data')"
               :key="option.value"
               :value="option.value"
               :label="option.label" /></el-option-group
           ><el-option-group
-            v-if="dashboard.providerChoices.some((option) => option.custom)"
+            v-if="dashboard.providerChoices.some((option) => option.source === 'alias')"
+            label="归一化规则里的名字（可能还没有用量）"
+            ><el-option
+              v-for="option in dashboard.providerChoices.filter((item) => item.source === 'alias')"
+              :key="option.value"
+              :value="option.value"
+              :label="option.label" /></el-option-group
+          ><el-option-group
+            v-if="dashboard.providerChoices.some((option) => option.source === 'custom')"
             label="自定义（只保存在本机浏览器）"
             ><el-option
-              v-for="option in dashboard.providerChoices.filter((item) => item.custom)"
+              v-for="option in dashboard.providerChoices.filter((item) => item.source === 'custom')"
               :key="option.value"
               :value="option.value"
               :label="option.label" /></el-option-group

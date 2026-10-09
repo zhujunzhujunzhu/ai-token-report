@@ -664,13 +664,17 @@ try {
    * ⚠️ 判据里**不能**出现候选项文本（`dashscope` 之类）：Element Plus 的下拉
    *   内容是 `<teleport>` 出去的，SSR 产物里只有一个空的 teleport ——
    *   拿选项文本当判据会得到一条永远失败（或永远通过）的断言。
-   *   「候选 = 库里的目录 ∪ 使用者自建的」由 `test/stores.test.ts` 的
+   *   「候选 = 数据里的 ∪ 归一化规则里的 ∪ 使用者自建的」由
+   *   `test/provider-catalog.test.ts` 与 `test/stores.test.ts` 的
    *   `providerChoices` 断言钉住（那里是纯数据，不经过 teleport）。
    *
    * 所以这里验的是**控件形状**与**说清自定义项存在哪里**：
    * 一个带 `role="combobox"` 的筛选控件（`el-select` 才有）+ 可新建的占位提示。
+   * ★ 三档候选都塞进去再渲染一次：三组 `el-option-group` 的分支都要真的走过
+   *   （只塞数据派生的那一档时，「归一化规则」与「自定义」两个分支从未被执行过）。
    */
   dashboard.providerOptions = ['dashscope', 'bailian-tpp']
+  dashboard.providerAliasOptions = ['未来网关']
   dashboard.customProviders = ['my-gateway']
   const providerHtml = await render('/src/components/FilterBar.vue')
   check(
@@ -684,8 +688,21 @@ try {
     '★ 自定义项说明它存在本机并提供清除入口',
     providerHtml.includes('不写入数据库') && providerHtml.includes('清除'),
   )
+  // ⚠️ 三档都进过模板之后，候选必须仍是「数据 > 规则 > 自建」的合并结果
+  //   （页面只渲染 `providerChoices`，它自己不做任何拼接）。
+  check(
+    '★ 三档候选合并后每项都带来源（数据 / 归一化规则 / 自定义）',
+    JSON.stringify(dashboard.providerChoices.map((option) => [option.value, option.source])) ===
+      JSON.stringify([
+        ['dashscope', 'data'],
+        ['bailian-tpp', 'data'],
+        ['未来网关', 'alias'],
+        ['my-gateway', 'custom'],
+      ]),
+  )
   // 清回原状：下面的断言看的仍是同一份 store。
   dashboard.providerOptions = []
+  dashboard.providerAliasOptions = []
   dashboard.customProviders = []
   dashboard.filters = { ...dashboard.filters, period: 'custom' }
   const customHtml = await render('/src/components/FilterBar.vue')

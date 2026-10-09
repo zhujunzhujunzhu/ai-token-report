@@ -985,7 +985,11 @@ describe('人员候选目录（GET /api/v1/stats/members）', () => {
  *    时候，上个月用过的供应商会从下拉里消失 —— 那看起来像数据丢了。
  * 2. ★ 名字是**归一化后的展示名**，与查询期的筛选口径是**同一份映射**：
  *    页面按它筛必须筛得出来（否则使用者会以为筛选坏了）。
- * 3. 只回名字，**不含任何用量数字**，因此不跟着数据范围收窄（同分组 / 人员候选）。
+ * 3. ★ 候选有**两个来源**：用量里出现过的（`providers`）与**归一化规则里配的**
+ *    （`aliases`）。后者可能一条用量都没有（规则配好了、原值还没上报）——
+ *    只从用量取候选时，那个规范化名字**根本不会出现在下拉里**，而它正是
+ *    使用者在 `/providers` 页配出来、想在看板上筛的那个名字。
+ * 4. 只回名字，**不含任何用量数字**，因此不跟着数据范围收窄（同分组 / 人员候选）。
  */
 describe('供应商候选目录（GET /api/v1/stats/providers）', () => {
   test('★ 列出库里出现过的供应商（去重、升序），且不受时间窗影响', async () => {
@@ -1002,8 +1006,11 @@ describe('供应商候选目录（GET /api/v1/stats/providers）', () => {
       'historic-gw',
       'openai',
     ])
-    // ★ 只回名字：整份响应体就这一个字段（没有条数、没有 token）
-    expect(Object.keys(res.body as object)).toEqual(['providers'])
+    // ★ 一条规则都没配时 `aliases` 是**空数组**（不是缺字段）：两个来源
+    //   各自如实给出，页面据此决定要不要画第二组。
+    expect((res.body as StatsProvidersResponse).aliases).toEqual([])
+    // ★ 只回名字：整份响应体就这两个字段（没有条数、没有 token）
+    expect(Object.keys(res.body as object)).toEqual(['providers', 'aliases'])
   })
 
   test('★ 名字按归一化后的展示名给（与筛选用的是同一份映射）', async () => {
@@ -1034,6 +1041,10 @@ describe('供应商候选目录（GET /api/v1/stats/providers）', () => {
     const res = await route.handle('providers', new URLSearchParams(), 'Bearer tok-admin')
     expect(res.status).toBe(200)
     expect((res.body as StatsProvidersResponse).providers).toEqual(['bailian-tpp'])
+    // ★ 规则里配的名字也照给（哪怕它同时已经是数据派生的那一项）：
+    //   服务端给的是**两个事实**，同名怎么取舍只在页面的
+    //   `providerFilterOptions()` 一处决定（数据派生的优先）。
+    expect((res.body as StatsProvidersResponse).aliases).toEqual(['bailian-tpp'])
     // ★ 按页面上看到的名字筛，两条都筛得到（候选与筛选共用同一份口径）
     const filtered = await route.handle(
       'overview',
@@ -1041,6 +1052,41 @@ describe('供应商候选目录（GET /api/v1/stats/providers）', () => {
       'Bearer tok-admin',
     )
     expect((filtered.body as Record<string, number>)['calls']).toBe(2)
+  })
+
+  test('★ 规则里配的名字也进候选 —— 哪怕它一条用量都还没有', async () => {
+    // 只有 `openai` 有用量；规则把 `future-gw`（**没有任何用量**）折成「未来网关」。
+    // 这是「候选不能只从用量取」最典型的一刻：那个规范化名字在数据里
+    // 根本不存在，只从 `usage_event.provider` 取候选的下拉里永远看不到它。
+    await report('tok-zhang', [rec('fu1', { provider: 'openai', model: 'gpt-4o' })])
+    const repository = new IdentityRepository({ sqlitePath: dbPath })
+    await repository.initialize({
+      adminToken: 'tok-admin',
+      adminName: '管理员',
+      adminUsername: 'admin',
+      adminPassword: 'test-password-2026',
+    })
+    const admin = (await repository.resolveBearer('tok-admin'))!
+    await repository.setProviderAlias(admin, {
+      scope: 'global',
+      provider: 'future-gw',
+      alias: '未来网关',
+    })
+    const route = new StatsRoute({ identityStore: repository, dbPath })
+    const res = await route.handle('providers', new URLSearchParams(), 'Bearer tok-admin')
+    expect(res.status).toBe(200)
+    // 数据派生的一档里**没有**它（原值根本没上报过）
+    expect((res.body as StatsProvidersResponse).providers).toEqual(['openai'])
+    // 配置派生的一档里有 —— 这就是本次改动要补上的那一个名字
+    expect((res.body as StatsProvidersResponse).aliases).toEqual(['未来网关'])
+    // ★ 拿它筛是 0 行：**如实的答案**（与来源候选里「本机还没跑过 Codex」
+    //   同一件事），不是「数据丢了」。页面靠分组标题把这件事说清楚。
+    const filtered = await route.handle(
+      'overview',
+      new URLSearchParams({ period: 'today', provider: '未来网关' }),
+      'Bearer tok-admin',
+    )
+    expect((filtered.body as Record<string, number>)['calls']).toBe(0)
   })
 
   test('缺 Authorization → 401（与其它看板接口同一道门）', async () => {
@@ -1051,6 +1097,7 @@ describe('供应商候选目录（GET /api/v1/stats/providers）', () => {
     const res = await get('providers')
     expect(res.status).toBe(200)
     expect((res.body as StatsProvidersResponse).providers).toEqual([])
+    expect((res.body as StatsProvidersResponse).aliases).toEqual([])
   })
 })
 

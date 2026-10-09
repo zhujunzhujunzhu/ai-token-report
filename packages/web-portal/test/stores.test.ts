@@ -257,7 +257,7 @@ describe('统计状态', () => {
         return json({ groups: [{ group_id: 'g-dev', name: '研发组', status: 'active', member_count: 1 }] })
       if (url.pathname.endsWith('/api/v1/stats/members'))
         return json({ members: [{ member_id: '00000000-0000-4000-8000-00000000000a', name: '张三', status: 'active', group_ids: ['g-dev'] }] })
-      if (url.pathname.endsWith('/api/v1/stats/providers')) return json({ providers: ['dashscope'] })
+      if (url.pathname.endsWith('/api/v1/stats/providers')) return json({ providers: ['dashscope'], aliases: ['未来网关'] })
       if (url.pathname.endsWith('/api/v1/stats/sources')) return json({ sources: ['dsh'] })
       return json({ rows: [], points: [] })
     })
@@ -286,6 +286,9 @@ describe('统计状态', () => {
       '00000000-0000-4000-8000-00000000000a',
     ])
     expect(dashboard.providerOptions).toEqual(['dashscope'])
+    // ★ 归一化规则里的名字与数据派生的候选**同一条响应**带回（都是目录，
+    //   同样只取一次），到这里也必须原样留着。
+    expect(dashboard.providerAliasOptions).toEqual(['未来网关'])
     expect(dashboard.sourceOptions).toEqual(['dsh'])
     urls.length = 0
     // 「刷新数据」按钮：显式要求重新拉目录。
@@ -652,8 +655,8 @@ describe('统计状态', () => {
     // 目录里有的不重复记；只有手输的那个进自定义列表
     expect(dashboard.customProviders).toEqual(['my-gateway'])
     expect(dashboard.providerChoices).toEqual([
-      { value: 'dashscope', label: 'dashscope', custom: false },
-      { value: 'my-gateway', label: 'my-gateway', custom: true },
+      { value: 'dashscope', label: 'dashscope', source: 'data' },
+      { value: 'my-gateway', label: 'my-gateway', source: 'custom' },
     ])
     // 🚨 记忆不落库：整轮一个写请求都没有
     expect(calls.every((call) => call.startsWith('GET '))).toBe(true)
@@ -663,6 +666,43 @@ describe('统计状态', () => {
     expect(dashboard.filters.providers).toEqual(['dashscope', 'my-gateway'])
     expect(dashboard.providerChoices.map((option) => option.value)).toEqual([
       'dashscope',
+    ])
+  })
+
+  /**
+   * ★ 归一化规则里配的名字**也进候选**（`aliases`），哪怕数据里一条都没有。
+   *
+   * 只从 `usage_event.provider` 取候选时，一条规则配好了、对应原值还没上报时，
+   * 那个规范化名字在下拉里**根本不存在** —— 而它正是使用者在 `/providers` 页
+   * 配出来、想在看板上筛的那个名字。它可能与数据派生的那一档同名（那时以
+   * 数据派生为准，只出现一次），也可能完全没有用量（选中即如实的 0 行）。
+   */
+  test('★ 归一化规则里的名字进候选并单独一组；选中它不算「手输」', async () => {
+    signIn('admin')
+    respond((raw) => {
+      const url = new URL(raw, 'http://test')
+      if (url.pathname.endsWith('/api/v1/stats/providers'))
+        return json({ providers: ['dashscope', 'bailian-tpp'], aliases: ['bailian-tpp', '未来网关'] })
+      if (url.pathname.endsWith('overview')) return json(overview)
+      return json({ rows: [], points: [], members: [], groups: [] })
+    })
+    const dashboard = useDashboardStore()
+    await dashboard.activate('overview')
+    expect(dashboard.providerAliasOptions).toEqual(['bailian-tpp', '未来网关'])
+    // `bailian-tpp` 在三档里出现两次（数据 + 规则）：只留数据派生那一项。
+    expect(dashboard.providerChoices).toEqual([
+      { value: 'dashscope', label: 'dashscope', source: 'data' },
+      { value: 'bailian-tpp', label: 'bailian-tpp', source: 'data' },
+      { value: '未来网关', label: '未来网关', source: 'alias' },
+    ])
+    // ★ 选中一个**规则里配好的**名字不该被记成「手输」（否则本机记忆里
+    //   会多出一条永远用不上的自定义项，而「清除自定义」也清不掉它）。
+    await dashboard.applyFilters({ ...dashboard.filters, providers: ['未来网关'] })
+    expect(dashboard.customProviders).toEqual([])
+    expect(dashboard.providerChoices.map((option) => option.value)).toEqual([
+      'dashscope',
+      'bailian-tpp',
+      '未来网关',
     ])
   })
 

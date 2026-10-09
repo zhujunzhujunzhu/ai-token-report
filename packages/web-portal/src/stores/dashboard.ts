@@ -211,6 +211,21 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
    */
   const providerOptions = ref<string[]>([])
   /**
+   * 归一化规则里配的**归一化名**（同一条响应的 `aliases`，`stats:read`）。
+   *
+   * ★ 与 `providerOptions` 的差别是**来源**而不是形状：那一份来自用量
+   *   （数据里出现过的原值经映射后的展示名），这一份来自**配置**
+   *   （`provider_alias`，按查看者解析）。只从用量取候选时，一条规则配好了、
+   *   对应原值却还没有用量时，那个规范化名字**根本不会出现在下拉里** ——
+   *   而它正是使用者在 `/providers` 页配出来、想在看板上筛的那个名字。
+   * ⚠️ 它**可能没有任何用量指向**（选中即 0 行 —— 那是如实的答案，与来源候选里
+   *   「本机还没跑过 Codex」同一件事），所以下拉里必须单独成组、不能与数据
+   *   派生的那一档混在一起。
+   * ⚠️ **老服务端没有这个字段**（`undefined`）：按空数组处理，退化成本次改动
+   *   之前的行为，绝不因为它缺席把下拉打成空的。
+   */
+  const providerAliasOptions = ref<string[]>([])
+  /**
    * 来源目录（`GET /api/v1/stats/sources`，`stats:read`）。
    *
    * ★ 它带回「本进程注册的全部来源 ∪ 库里出现过的值」：所以本机还没跑过
@@ -228,13 +243,18 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
    */
   const customProviders = ref<string[]>(readCustomProviders())
   /**
-   * 供应商下拉的候选 = 库里的目录 ∪ 使用者自建的（唯一实现见 `providerFilterOptions`）。
+   * 供应商下拉的候选 = 数据里的目录 ∪ 归一化规则里的名字 ∪ 使用者自建的
+   * （唯一实现见 `providerFilterOptions`）。
    *
-   * ⚠️ 页面只负责渲染这一份：自己在模板里拼接会把「同名以目录为准」
+   * ⚠️ 页面只负责渲染这一份：自己在模板里拼接会把「同名以靠前的为准」
    *   这条规则复制到第二个地方。
    */
   const providerChoices = computed<ProviderFilterOption[]>(() =>
-    providerFilterOptions(providerOptions.value, customProviders.value),
+    providerFilterOptions(
+      providerOptions.value,
+      providerAliasOptions.value,
+      customProviders.value,
+    ),
   )
   /**
    * 人员下拉的选项 = 名册 ∪ 用量派生键，再按所选分组收窄。
@@ -556,12 +576,17 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
       return
     }
     if (ov.ok) overview.value = ov.data
-    if (opts.ok) usageUsers.value = opts.data.rows
+    if (opts?.ok) usageUsers.value = opts.data.rows
     // ★ 先分组目录后人员名册：人员选项的展示名要用分组 ID 翻名字，
     //   反过来的话首帧会闪一次「未知分组」。
     if (gopts?.ok) groupOptions.value = gopts.data.groups ?? []
     if (mo?.ok) memberDirectory.value = mo.data.members ?? []
-    if (pv?.ok) providerOptions.value = pv.data.providers ?? []
+    if (pv?.ok) {
+      providerOptions.value = pv.data.providers ?? []
+      // ★ 归一化规则里的名字：缺字段 = **老服务端**（那时只有数据派生的候选），
+      //   按空数组处理 —— 退化成本次改动之前的行为，而不是让下拉空掉。
+      providerAliasOptions.value = pv.data.aliases ?? []
+    }
     if (sv?.ok) sourceOptions.value = sv.data.sources ?? []
     // ★ 四份都到了才记「取到过」：任何一份失败都保持假，下一次前台 load() 重试
     //   （旧后端 404、或一次网络抖动，都不该让那个下拉永久空着）。
@@ -626,6 +651,7 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     const added = newCustomProviders(
       selected,
       providerOptions.value,
+      providerAliasOptions.value,
       customProviders.value,
     )
     if (added.length === 0) return
@@ -775,12 +801,15 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
       memberDirectory.value = []
       groupOptions.value = []
       providerOptions.value = []
+      providerAliasOptions.value = []
       sourceOptions.value = []
       // ★ 换身份 / 重新登录后名字与数据范围都变了，目录必须重取一次
       //   （否则会拿上一身份的名册去收窄这一身份的筛选）。
       catalogsLoaded = false
       // ⚠️ 自定义供应商**刻意不清**：它是「这台机器上的使用习惯」，
       //   与登录身份 / 数据范围无关（退出登录后重进，候选应该还在）。
+      // ⚠️ 趋势图的层数（`trendDepth`）同理**刻意不清**：它是看图的习惯，
+      //   不是任何人的数据；退出登录后重进还该是「全部」。
       filters.value = initialFilters()
       page.value = 1
       breakdownBy.value = 'provider-model'
@@ -812,6 +841,7 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     userOptions,
     groupOptions,
     providerOptions,
+    providerAliasOptions,
     providerChoices,
     sourceOptions,
     customProviders,

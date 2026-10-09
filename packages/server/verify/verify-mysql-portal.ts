@@ -480,14 +480,24 @@ try {
   // ★ 供应商候选目录（`/api/v1/stats/providers`）：这句 SQL 只有两个后端都写对
   //   才成立（`DISTINCT` + `ORDER BY` 一个列），而它**只在活体 MySQL 上才算证据**。
   //   候选名字逐个对得上，才说明「页面上能选到的供应商」在两种部署下一致。
-  const providersLite = (await stats(sqlite, 'providers'))['providers'] as string[]
-  const providersMy = (await stats(mysql, 'providers'))['providers'] as string[]
-  same('providers 逐位一致（供应商候选目录）', providersLite, providersMy)
+  //   ★ 整份响应体逐位比对（`providers` + `aliases`）：后者是**归一化规则里配的
+  //   名字**，同样走那条裸连接读 `provider_alias`，两个后端必须给出同一份。
+  const providersLite = await stats(sqlite, 'providers')
+  const providersMy = await stats(mysql, 'providers')
+  same('providers 逐位一致（供应商候选目录，含归一化规则里的名字）', providersLite, providersMy)
+  const providersMyNames = providersMy['providers'] as string[]
   check(
     'providers 非空且已排序去重（不是「两边都空」）',
-    providersMy.length > 0 &&
-      JSON.stringify(providersMy) === JSON.stringify([...new Set(providersMy)].sort()),
-    JSON.stringify(providersMy),
+    providersMyNames.length > 0 &&
+      JSON.stringify(providersMyNames) === JSON.stringify([...new Set(providersMyNames)].sort()),
+    JSON.stringify(providersMyNames),
+  )
+  check(
+    '★ aliases 是排序去重的名字数组（本夹具没配规则 ⇒ 两边都是空数组）',
+    Array.isArray(providersMy['aliases']) &&
+      JSON.stringify(providersMy['aliases']) ===
+        JSON.stringify([...new Set(providersMy['aliases'] as string[])].sort()),
+    JSON.stringify(providersMy['aliases']),
   )
 
   // ★ 人员候选目录（`/api/v1/stats/members`）**不能逐位比对**：两侧的
