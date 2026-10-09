@@ -67,6 +67,7 @@ import type { IdentityRoute } from './identity-route.js'
 import type { IngestRoute } from './ingest-route.js'
 import type { LocalStatsRouter } from './local-api.js'
 import type { StatsRoute } from './stats-route.js'
+import type { AssistantRoute } from './assistant-route.js'
 import { verifyDatabaseToken, verifyToken } from './verify-route.js'
 
 /** 服务端版本（`/api/health` 会回报它，便于确认线上到底是哪一版）。 */
@@ -84,6 +85,7 @@ export interface AppDeps {
   ingestRoute: IngestRoute
   ingestQueue?: IngestQueue
   statsRoute: StatsRoute
+  assistantRoute?: AssistantRoute
   adminRoute?: AdminRoute
   /** 本地直查路由。`enableLocalApi` 为 false 时是 null。 */
   localStats: LocalStatsRouter | null
@@ -210,8 +212,8 @@ export function createApp(deps: AppDeps): Hono {
   // Cookie 写操作要求同源与自定义头；Bearer 客户端保留原有 HTTP 契约。
   app.use('/api/v1/*', async (c, next) => {
     const path = new URL(c.req.url).pathname
-    if (path.startsWith('/api/v1/auth/') || path.startsWith('/api/v1/admin/')) c.header('Cache-Control', 'no-store')
-    if (c.req.method === 'POST' && (path.startsWith('/api/v1/auth/') || (path.startsWith('/api/v1/admin/') && !authOf(c) && getCookie(c, sessionCookie)))) {
+    if (path.startsWith('/api/v1/auth/') || path.startsWith('/api/v1/admin/') || path.startsWith('/api/v1/assistant/')) c.header('Cache-Control', 'no-store')
+    if ((c.req.method === 'POST' || c.req.method === 'DELETE') && (path.startsWith('/api/v1/auth/') || ((path.startsWith('/api/v1/admin/') || path.startsWith('/api/v1/assistant/')) && !authOf(c) && getCookie(c, sessionCookie)))) {
       const origin = c.req.header('origin')
       if (c.req.header('x-portal-request') !== '1' || (origin && origin !== (publicOrigin ?? new URL(c.req.url).origin)) || c.req.header('sec-fetch-site') === 'cross-site') {
         return fail('请从本站页面提交操作', 403)
@@ -326,6 +328,19 @@ export function createApp(deps: AppDeps): Hono {
     c.header('Cache-Control', 'no-store')
     return respond(await deps.statsRoute.handle(sub, url.searchParams, await portalAuthorization(c)))
   })
+
+  if (deps.assistantRoute) {
+    const dispatch = async (c: Context, action: string) => {
+      const parsed = c.req.method === 'POST' ? await readJsonBodyStrict(c) : { value: undefined }
+      if ('error' in parsed) return fail(parsed.error, 400)
+      return deps.assistantRoute!.handle(c.req.method, action, await portalAuthorization(c), parsed.value, c.req.raw.signal)
+    }
+    app.get('/api/v1/assistant/status', c => dispatch(c, 'status'))
+    app.get('/api/v1/assistant/sessions', c => dispatch(c, 'sessions'))
+    app.get('/api/v1/assistant/sessions/:id', c => dispatch(c, `sessions/${c.req.param('id')}`))
+    app.delete('/api/v1/assistant/sessions/:id', c => dispatch(c, `sessions/${c.req.param('id')}`))
+    app.post('/api/v1/assistant/chat', c => dispatch(c, 'chat'))
+  }
 
   // ── 人员管理与 token 发放（web-portal 的管理页）──────────────
   // ★ 唯一会写凭证文件的通路。鉴权失败回 401 / 403 / 503 三者之一，

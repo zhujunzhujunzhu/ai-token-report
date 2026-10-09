@@ -39,6 +39,7 @@ import {
   SwitchButton,
 } from '@element-plus/icons-vue'
 import { useSessionStore } from '../stores/session.js'
+import GlobalAssistant from '../components/GlobalAssistant.vue'
 const session = useSessionStore()
 const route = useRoute()
 const router = useRouter()
@@ -198,5 +199,6 @@ async function signOut(): Promise<void> {
         AI Token <span>·</span> 让每一次 AI 使用清晰可见
       </footer>
     </div>
+    <GlobalAssistant />
   </div>
 </template>

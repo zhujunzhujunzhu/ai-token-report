@@ -39,6 +39,7 @@ import { cp, mkdir, readdir, rm, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { dshBundlePlugin } from '../../server/scripts/dsh-bundle.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const pkgRoot = resolve(here, '..') // packages/cli
@@ -81,12 +82,12 @@ await mkdir(distDir, { recursive: true })
 
 // ── 2. 打包成单文件 ──────────────────────────────────────────────────────
 // `--target=node` 让产物同时能跑在 Node 与 Bun 上（Bun 是 Node 的超集）。
-const build = Bun.spawnSync(
-  [process.execPath, 'build', entry, '--target=node', `--outfile=${join(distDir, 'cli.js')}`],
-  { stdout: 'pipe', stderr: 'pipe' },
-)
-if (build.exitCode !== 0) {
-  fail(`打包失败：\n${new TextDecoder().decode(build.stderr)}`)
+const build = await Bun.build({
+  entrypoints: [entry], target: 'node', format: 'esm', outdir: distDir, naming: 'cli.js',
+  plugins: [dshBundlePlugin],
+})
+if (!build.success) {
+  fail(`打包失败：\n${build.logs.join('\n')}`)
 }
 
 const cliPath = join(distDir, 'cli.js')

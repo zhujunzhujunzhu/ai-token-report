@@ -28,7 +28,7 @@ export type ApiResult<T> =
  * ⚠️ 只在此处拼接：各 api 模块继续写 `/api/v1/...` 的**根相对路径**，
  *    这样调用方不必知道自己被部署在哪个子路径下。
  */
-function withBase(path: string): string {
+export function withBase(path: string): string {
   const base = import.meta.env.BASE_URL || '/'
   if (base === '/') return path
   // base 以 `/` 结尾、path 以 `/` 开头，去掉一个斜杠避免出现 `//`

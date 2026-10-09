@@ -11,3 +11,4 @@ export * from './protocol.js'
 export * from './portal-identity.js'
 // 服务端根地址的归一化（插件面板 / 本地页配置 / CLI 部署参数共用一份实现）
 export * from './portal-url.js'
+export * from './assistant.js'
