@@ -40,6 +40,7 @@
 
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
 
 /** 一个已启动的 HTTP 服务（两个运行时的公共形状）。 */
 export interface ServeHandle {
@@ -172,9 +173,13 @@ async function handleNodeRequest(
       else headers.set(key, value)
     }
 
+    const disconnect = new AbortController()
+    req.once('aborted', () => disconnect.abort())
+    res.once('close', () => { if (!res.writableEnded) disconnect.abort() })
     const init: RequestInit & { duplex?: 'half' } = {
       method,
       headers,
+      signal: disconnect.signal,
     }
     if (hasBody) {
       // 默认策略按块计数，会把 Node 的字节水位误当成块数；零预读避免排队请求积攒正文。
@@ -194,6 +199,15 @@ async function handleNodeRequest(
     const cookies = response.headers.getSetCookie()
     if (cookies.length) outHeaders['set-cookie'] = cookies
 
+    // ★ SSE 不能先 arrayBuffer：浏览器需要实时事件，断开时也要取消 DSH 对话。
+    if (response.headers.get('content-type')?.startsWith('text/event-stream') && response.body) {
+      finishUnreadBody(outHeaders)
+      res.writeHead(response.status, outHeaders)
+      res.flushHeaders()
+      await pipeline(Readable.fromWeb(response.body as import('node:stream/web').ReadableStream<Uint8Array>), res)
+      return
+    }
+
     // 两个运行时的 Response 都支持 arrayBuffer()，用它统一取值，
     // 避免依赖 Node 特有的 Readable.fromWeb 桥接。
     const body = Buffer.from(await response.arrayBuffer())
@@ -201,6 +215,7 @@ async function handleNodeRequest(
     res.writeHead(response.status, outHeaders)
     res.end(body)
   } catch (err) {
+    if (res.destroyed) return
     // 兜底：任何未捕获异常都返回 JSON 而不是让连接挂断 ——
     // 与 `index.ts` 处理器内的兜底保持同一策略，前端才能拿到结构化错误。
     if (!res.headersSent) {

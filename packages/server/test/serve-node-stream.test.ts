@@ -32,6 +32,7 @@ function deferred() {
   return { promise, resolve }
 }
 const held = deferred(), release = deferred()
+const sseAborted = deferred()
 let bufferedBytes = 0, limitedCalls = 0
 const originalEmit = IncomingMessage.prototype.emit
 IncomingMessage.prototype.emit = function(event, ...args) {
@@ -48,6 +49,12 @@ app.post('/api/v1/token-usage', async c => {
 const server = await serveWithNodeHttp({ host: '127.0.0.1', port: 0, idleTimeoutSeconds: 10,
   handler: async req => {
     const path = new URL(req.url).pathname
+    if (path === '/sse') return new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: first\\n\\n'))
+        req.signal.addEventListener('abort', () => { sseAborted.resolve() }, { once: true })
+      },
+    }), { headers: { 'content-type': 'text/event-stream' } })
     if (path === '/limited' || path === '/api/v1/token-usage') return app.fetch(req)
     if (path === '/busy') return Response.json({ ok: false, reason: '队列已满' }, { status: 503 })
     if (path === '/held') { held.resolve(); await release.promise; return new Response('busy', { status: 503 }) }
@@ -79,6 +86,12 @@ function send(path, { method = 'POST', headers = {}, chunks = [], end = true } =
   })
 }
 try {
+  const sse = await fetch('http://127.0.0.1:' + server.port + '/sse', { signal: AbortSignal.timeout(3000) })
+  const reader = sse.body.getReader()
+  assert.equal(new TextDecoder().decode((await reader.read()).value), 'data: first\\n\\n')
+  await reader.cancel()
+  await Promise.race([sseAborted.promise, delay(1000).then(() => { throw new Error('SSE 断开未取消服务端请求') })])
+  checks.push('SSE 首帧无需等流结束，断开会取消服务端请求')
   const normal = await send('/echo?ok=1', { headers: { cookie: 'portal=fixture', 'x-marker': 'value' }, chunks: ['{"a":', '1}'] })
   assert.equal(normal.status, 200)
   const parsed = JSON.parse(normal.body)
@@ -158,6 +171,7 @@ try {
     })
     if (child.status !== 0) throw new Error(child.error?.message ?? child.stdout + child.stderr)
     expect(JSON.parse(child.stdout)).toEqual([
+      'SSE 首帧无需等流结束，断开会取消服务端请求',
       '正常分块正文、请求头、URL 与独立 Cookie',
       'GET 与 HEAD 不构造正文',
       '空 POST 可正常结束',
