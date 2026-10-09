@@ -6,8 +6,9 @@ import { useRoute } from 'vue-router'
 import { Refresh, Clock } from '@element-plus/icons-vue'
 import FilterBar from '../components/FilterBar.vue'
 import UserDetailPanel from '../components/UserDetailPanel.vue'
-import { useDashboardStore, type StatsSection } from '../stores/dashboard.js'
+import { buildFilter, useDashboardStore, type StatsSection } from '../stores/dashboard.js'
 import { formatFullDateTime } from '../utils/format.js'
+import { refreshIntervalMs, refreshIntervalLabel } from '../utils/refresh.js'
 const dashboard = useDashboardStore()
 const route = useRoute()
 // 页面副标题只在真正需要补充说明时给（`section` 未登记即不渲染）：
@@ -21,8 +22,12 @@ const description = computed(
   () => descriptions[String(route.meta.section)] ?? '',
 )
 let timer: ReturnType<typeof setInterval> | undefined
+const refreshInterval = computed(() =>
+  refreshIntervalMs(dashboard.filters.period, buildFilter(dashboard.filters).span),
+)
 function refreshWhenVisible(): void {
-  if (!document.hidden) void dashboard.load(true)
+  if (!document.hidden && (!dashboard.fetchedAt || Date.now() - dashboard.fetchedAt >= refreshInterval.value))
+    void dashboard.load(true)
 }
 watch(
   () => route.meta.section,
@@ -32,10 +37,11 @@ watch(
   { immediate: true },
 )
 onMounted(() => {
-  timer = setInterval(() => {
-    void dashboard.load(true)
-  }, 5_000)
-  // 隐藏时 Store 会跳过轮询；返回页面后立即补一次，不必等下一个周期。
+  watch(refreshInterval, (interval) => {
+    clearInterval(timer)
+    timer = setInterval(() => { void dashboard.load(true) }, interval)
+  }, { immediate: true })
+  // 隐藏时跳过轮询；返回时只补过期数据，避免频繁切标签触发全年扫描。
   document.addEventListener('visibilitychange', refreshWhenVisible)
 })
 onUnmounted(() => {
@@ -66,7 +72,7 @@ onUnmounted(() => {
         ><el-icon><Clock /></el-icon
         >{{
           dashboard.fetchedAt
-            ? `更新于 ${formatFullDateTime(dashboard.fetchedAt)} · 每 5 秒自动刷新`
+            ? `更新于 ${formatFullDateTime(dashboard.fetchedAt)} · ${refreshIntervalLabel(refreshInterval)}`
             : '等待获取数据'
         }}</span
       >
