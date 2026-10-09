@@ -813,6 +813,35 @@ try {
   //   它同时也是使用者唯一能在点按钮之前看到的口径说明。
   check('页面壳写明删除只对从未上报过的凭证开放',
     appKeyHtml.includes('误发且从未上报过的可以删除'))
+  /**
+   * ★ 分页：`appKeyHtml` 是**空列表**渲染的那一屏，所以它不该出现分页条
+   *   （「第 1 / 1 页」加两个点不动的箭头只是噪音）。第二屏塞进比一页多一行的
+   *   夹具，断言页脚真的画出来了、且写明页码与页长。
+   *
+   * ⚠️ 条数按**导出的常量**生成而不是写死 10：页长是这一页的策略，
+   *   写死会让「把每页改成 20」变成一条假失败，而不是一次真实的口径变更。
+   * ⚠️ 行本身断言不到：`el-table` 的单元格在 SSR 下不渲染（见下面角色页那段），
+   *   所以「第一屏只画 10 行」由 `test/pagination.test.ts` 的纯逻辑钉住。
+   */
+  const { APP_KEY_PAGE_SIZE } = await server.ssrLoadModule('/src/utils/pagination.ts')
+  check('★ 只有一页时不画分页条', !appKeyHtml.includes('每页'))
+  members.appKeys = Array.from({ length: APP_KEY_PAGE_SIZE + 1 }, (_, index) => ({
+    token: {
+      token_id: `00000000-0000-4000-8000-0000000001${String(index).padStart(2, '0')}`,
+      member_id: '00000000-0000-4000-8000-0000000000c1',
+      token_prefix: `p${index}`, label: '上报 appKey', scopes: [], status: 'active' as const,
+      version: 1, created_at_ms: 1, expires_at_ms: null, revoked_at_ms: null,
+    },
+    member: { member_id: '00000000-0000-4000-8000-0000000000c1', name: `成员${index}`, status: 'active' as const, groups: [] },
+  }))
+  const pagedHtml = await render('/src/views/AppKeyView.vue')
+  check('★ 超过一页时页脚写明页码与页长',
+    pagedHtml.includes('第 1 / 2 页') && pagedHtml.includes(`每页 ${APP_KEY_PAGE_SIZE} 把`))
+  // ★ 分页不参与筛选：搜索框仍然是对**全部**凭证生效的那一个。
+  check('分页不改变筛选口径（搜索框仍在，且计数是命中总数）',
+    pagedHtml.includes('aria-label="搜索 appKey"') &&
+    pagedHtml.includes(`共 ${APP_KEY_PAGE_SIZE + 1} 把`))
+  members.appKeys = []
   // ★ 完整明文不落在页面上：连「拿到过明文」这一次也不进 DOM。
   const demoSecret = 'atr-' + 'demo'.repeat(12)
   members.issuedSecret = demoSecret

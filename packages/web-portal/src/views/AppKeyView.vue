@@ -47,10 +47,21 @@
  *   回 409 并在原因里直说「请改用吊销」，页面把那条原因**原样**呈现出来。
  * ⚠️ 按钮不做「先禁用」的猜测：appKey 列表里没有「这把 key 用过没有」这个事实，
  *   猜错不是「按钮能点却必然失败」，就是更糟的「明明能删却点不动」。
+ *
+ * ## 分页：列表一次取全，在页面上切片
+ *
+ * 凭证条数随人数增长（几十到几百把），一屏放不下。`GET /api/v1/admin/appkeys`
+ * 一次返回全部、也没有 `total`，所以这一页在客户端分页（切片与页码的唯一实现
+ * 在 `utils/pagination.ts`）—— 与调用明细的服务端分页刻意不同，理由见那个文件头。
+ *
+ * ⚠️ 搜索框与状态筛选筛的是**全部**凭证，不是当前页：分页只决定「这一屏画哪几把」，
+ *   不参与任何筛选判断（否则搜索会变成「只搜当前页」，而它看起来完全正常）。
+ * ⚠️ 页码是**临时视图状态**：改搜索 / 改状态筛选都回到第 1 页，条数变少（删除最后
+ *   一页的行）时夹回有效范围 —— 否则会停在越界页码上，看见一张空表。
  */
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { Refresh, Search, Ticket } from '@element-plus/icons-vue'
-import { ElAlert, ElButton, ElCard, ElDatePicker, ElDialog, ElInput, ElMessage, ElMessageBox, ElOption, ElSelect, ElSkeleton, ElTable, ElTableColumn, ElTag } from 'element-plus'
+import { ElAlert, ElButton, ElCard, ElDatePicker, ElDialog, ElInput, ElMessage, ElMessageBox, ElOption, ElPagination, ElSelect, ElSkeleton, ElTable, ElTableColumn, ElTag } from 'element-plus'
 import type { PortalAppKeyEntry, PortalMember, PortalReportToken } from '@ai-token-report/shared'
 import AppKeyDelivery from '../components/AppKeyDelivery.vue'
 import IssueAppKeyForm from '../components/IssueAppKeyForm.vue'
@@ -58,6 +69,7 @@ import { useSessionStore } from '../stores/session.js'
 import { useMembersStore } from '../stores/members.js'
 import * as api from '../api/admin.js'
 import { expiryOf, type ExpiryMode } from '../utils/expiry.js'
+import { APP_KEY_PAGE_SIZE, paginate } from '../utils/pagination.js'
 import { formatFullDateTime } from '../utils/format.js'
 import { tokenHint } from '../utils/credential.js'
 import { groupLabel, memberLabel } from '../utils/memberLabel.js'
@@ -71,6 +83,8 @@ interface DeliveryTarget {
 
 const session = useSessionStore(), admin = useMembersStore()
 const search = ref(''), status = ref('')
+/** 当前页码（1 起）。★ 只是视图状态，不进任何请求 —— 筛选与它无关。 */
+const page = ref(1)
 /** 发放弹框是否打开（表单状态跟着弹框一起销毁重建）。 */
 const issueOpen = ref(false)
 /** 明文属于谁（姓名 + 分组）。★ 必须在请求**之前**定下来：明文随响应一起到。 */
@@ -118,12 +132,50 @@ const rowKey = (entry: PortalAppKeyEntry): string => entry.token.token_id
  * 在这里收窄一次。行的真实形状由 `GET /api/v1/admin/appkeys` 决定。
  */
 const rowEntry = (row: unknown): PortalAppKeyEntry => row as PortalAppKeyEntry
-const appKeys = computed(() => admin.appKeys.filter((entry) => {
+/**
+ * 搜索 + 状态筛选命中的**全部**凭证（分页前）。
+ *
+ * ★ 筛选永远在整份列表上做：分页只决定「这一屏画哪几把」。把筛选放在当前页里
+ *   （`paginate` 之后再 filter）会让搜索框静默变成「只搜当前页」——
+ *   表现是「明明有这把 key，却搜不到」，而页面上没有任何迹象。
+ */
+const matched = computed(() => admin.appKeys.filter((entry) => {
   const keyword = search.value.trim().toLowerCase()
-  const matched = !keyword || [entry.member.name, groupLabel(entry.member.groups), entry.token.label, entry.token.token_prefix, entry.member.member_id]
+  const ok = !keyword || [entry.member.name, groupLabel(entry.member.groups), entry.token.label, entry.token.token_prefix, entry.member.member_id]
     .join(' ').toLowerCase().includes(keyword)
-  return matched && (!status.value || keyState(entry.token) === status.value)
+  return ok && (!status.value || keyState(entry.token) === status.value)
 }))
+/**
+ * 当前页的行与页码（切片 + 越界修正的唯一实现在 `utils/pagination.ts`）。
+ *
+ * ⚠️ 模板里画的行与页码必须**同出这一份**：表里用 `paged.rows`、分页条用
+ *   `paged.page`，一旦一处读原始 `page.value`，删掉最后一页最后一行之后就会出现
+ *   「高亮在第 2 页、表里却是第 1 页的行」。
+ */
+const paged = computed(() => paginate(matched.value, page.value, APP_KEY_PAGE_SIZE))
+/** 只有一页时不画分页条：一条「第 1 / 1 页」加两个点不动的箭头纯属噪音。 */
+const showPager = computed(() => paged.value.pageCount > 1)
+/**
+ * 换了一批行（改搜索 / 改状态筛选）就回到第 1 页。
+ *
+ * ⚠️ 不复用上一次的页码：停在「第 3 页」上看一个只有 2 行的筛选结果，
+ *   使用者会以为筛选没生效，而实际上他只是被留在了越界的那一页上。
+ */
+watch([search, status], () => { page.value = 1 })
+/**
+ * 命中条数变少（删除一把凭证、筛选变化）时把页码夹回有效范围。
+ *
+ * ★ `paginate` 内部也会夹，这里回写原始状态是为了**让状态与画面一致**：
+ *   否则清掉筛选之后，页码会突然跳回上一次那个早已越界的值。
+ */
+watch(() => matched.value.length, () => { page.value = paged.value.page })
+/**
+ * 分页条翻页。
+ *
+ * ⚠️ 这里不做范围判断：页面上传给分页条的是 `paged.page`（已经是有效页码），
+ *   而任何越界值都会在下一次 `paginate` 里被夹回来 —— 再写一遍判断就是第二个实现。
+ */
+function setPage(value: number): void { page.value = value }
 /**
  * 「档位 + 自定义时刻」→ 请求里的 `expires_at_ms` 在 `utils/expiry.ts`：
  * 发放弹框与下面的「设置有效期」问的是同一个问题，换算与校验只留一处。
@@ -246,10 +298,10 @@ onUnmounted(() => { admin.clear() })
         <el-select v-model="status" clearable placeholder="全部状态" aria-label="筛选凭证状态">
           <el-option value="active" label="有效" /><el-option value="revoked" label="已吊销" /><el-option value="expired" label="已到期" />
         </el-select>
-        <span class="muted">共 {{ appKeys.length }} 把</span>
+        <span class="muted">共 {{ matched.length }} 把</span>
       </div>
       <el-skeleton v-if="admin.appKeysLoading && !admin.appKeys.length" :rows="5" animated />
-      <el-table v-else :data="appKeys" :row-key="rowKey" empty-text="还没有发放过 appKey">
+      <el-table v-else :data="paged.rows" :row-key="rowKey" empty-text="还没有发放过 appKey">
         <el-table-column label="发给谁" min-width="170"><template #default="{ row }">
           <div class="member-name"><strong>{{ row.member.name }}</strong><el-tag v-if="row.member.status !== 'active'" type="warning" size="small">已停用</el-tag></div>
           <small class="muted">{{ groupLabel(row.member.groups) || '未分组' }}</small>
@@ -270,6 +322,20 @@ onUnmounted(() => { admin.clear() })
           <el-button link type="danger" :disabled="!!admin.busyId" @click="remove(rowEntry(row))">删除</el-button>
         </div></template></el-table-column>
       </el-table>
+      <!-- ★ 只有一页时不画分页条：一条「第 1 / 1 页」加两个点不动的箭头只是噪音，
+            而它占的位置正是最下面那行凭证。分页条与表里的行同出 `paged`（见 script）。 -->
+      <div v-if="showPager" class="table-footer">
+        <span>第 {{ paged.page }} / {{ paged.pageCount }} 页 · 每页 {{ APP_KEY_PAGE_SIZE }} 把</span>
+        <el-pagination
+          :current-page="paged.page"
+          :page-size="APP_KEY_PAGE_SIZE"
+          :total="matched.length"
+          :disabled="admin.appKeysLoading || !!admin.busyId"
+          background
+          layout="prev, pager, next"
+          @current-change="setPage"
+        />
+      </div>
     </el-card>
     <!-- ★ 发放弹框：`destroy-on-close` 让「选的人 / 有效期」不跨次残留 ——
          否则上一次给张三选的 90 天会静静等着下一次打开，看起来像默认值。 -->
