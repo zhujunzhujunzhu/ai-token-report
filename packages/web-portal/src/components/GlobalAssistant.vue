@@ -1,9 +1,9 @@
 <script setup lang="ts">
 /** 公共布局中的浮动助手；页面跳转和收起窗口都不会销毁正在运行的对话。 */
-import { defineAsyncComponent, ref, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
+import { computed, defineAsyncComponent, ref, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { useSessionStore } from '../stores/session.js'
 import { assistantStatus } from '../api/assistant.js'
-import { Minus } from '@element-plus/icons-vue'
+import { Minus, FullScreen, CopyDocument } from '@element-plus/icons-vue'
 import AssistantSymbol from './AssistantSymbol.vue'
 const AssistantView = defineAsyncComponent(() => import('../views/AssistantView.vue'))
 const session = useSessionStore()
@@ -11,12 +11,113 @@ const enabled = ref(false), expanded = ref(false), mounted = ref(false)
 const sidebarOpen = ref(false)
 const left = ref(0), top = ref(0)
 const panel = ref<HTMLElement>()
+const maximized = ref(false)
+const viewport = ref({ width: typeof window === 'undefined' ? 1280 : window.innerWidth, height: typeof window === 'undefined' ? 900 : window.innerHeight })
+const customSize = ref<{ width: number; height: number }>()
+const orbPositionKey = 'ai-token-report.assistant-orb-position'
+const orbPosition = ref<{ left: number; top: number }>()
+const orbDragging = ref(false)
+const orbSize = computed(() => viewport.value.width <= 600 ? 54 : 60)
+const orbStyle = computed(() => orbPosition.value ? { left: `${orbPosition.value.left}px`, top: `${orbPosition.value.top}px`, right: 'auto', bottom: 'auto' } : undefined)
+let orbDrag: { pointer: number; x: number; y: number; left: number; top: number; moved: boolean } | undefined
+let suppressOrbClick = false
+let restoredPosition = { left: 0, top: 0 }
+const size = computed(() => {
+  const maxWidth = Math.max(0, viewport.value.width - 24)
+  const maxHeight = Math.max(0, viewport.value.height - 104)
+  return {
+    width: Math.min(maxWidth, maximized.value ? maxWidth : customSize.value?.width ?? (sidebarOpen.value && viewport.value.width > 700 ? 720 : 480)),
+    height: Math.min(maxHeight, maximized.value ? maxHeight : customSize.value?.height ?? 680),
+  }
+})
 let drag: { pointer: number; x: number; y: number; left: number; top: number } | undefined
+let resizing: { pointer: number; x: number; y: number; width: number; height: number } | undefined
 function clamp() {
-  if (!panel.value) return
-  left.value = Math.max(8, Math.min(left.value, window.innerWidth - panel.value.offsetWidth - 8))
+  left.value = Math.max(8, Math.min(left.value, viewport.value.width - size.value.width - 8))
   // ★ 给悬浮入口留出底部空间，缩小视口后不能压住发送按钮。
-  top.value = Math.max(8, Math.min(top.value, window.innerHeight - panel.value.offsetHeight - 92))
+  top.value = Math.max(8, Math.min(top.value, viewport.value.height - size.value.height - 92))
+}
+function clampOrb(position: { left: number; top: number }) {
+  orbPosition.value = {
+    left: Math.max(8, Math.min(position.left, viewport.value.width - orbSize.value - 8)),
+    top: Math.max(8, Math.min(position.top, viewport.value.height - orbSize.value - 8)),
+  }
+}
+function saveOrbPosition() {
+  try { window.localStorage.setItem(orbPositionKey, JSON.stringify(orbPosition.value)) }
+  catch { /* 浏览器禁用存储时，仍允许本次页面内移动入口。 */ }
+}
+function startOrbDrag(event: PointerEvent) {
+  if (event.button !== 0 || !event.isPrimary || orbDrag) return
+  suppressOrbClick = false
+  const target = event.currentTarget as HTMLElement
+  const rect = target.getBoundingClientRect()
+  orbDrag = { pointer: event.pointerId, x: event.clientX, y: event.clientY, left: rect.left, top: rect.top, moved: false }
+  target.setPointerCapture(event.pointerId)
+}
+function moveOrbDrag(event: PointerEvent) {
+  if (!orbDrag || event.pointerId !== orbDrag.pointer) return
+  const dx = event.clientX - orbDrag.x, dy = event.clientY - orbDrag.y
+  // ★ 容忍点击时的轻微手抖；拖动后浏览器仍会派发 click，必须单独拦住。
+  if (!orbDrag.moved && Math.hypot(dx, dy) < 5) return
+  orbDrag.moved = true
+  suppressOrbClick = true
+  orbDragging.value = true
+  clampOrb({ left: orbDrag.left + dx, top: orbDrag.top + dy })
+}
+function endOrbDrag(event: PointerEvent) {
+  if (!orbDrag || event.pointerId !== orbDrag.pointer) return
+  if (orbDrag.moved) saveOrbPosition()
+  orbDrag = undefined
+  orbDragging.value = false
+}
+function clickOrb(event: MouseEvent) {
+  if (suppressOrbClick && event.detail !== 0) { suppressOrbClick = false; event.preventDefault(); return }
+  suppressOrbClick = false
+  toggle()
+}
+function moveOrbWithKeyboard(event: KeyboardEvent) {
+  const changes: Record<string, [number, number]> = { ArrowLeft: [-20, 0], ArrowRight: [20, 0], ArrowUp: [0, -20], ArrowDown: [0, 20] }
+  const change = changes[event.key]
+  if (!change) return
+  event.preventDefault()
+  const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
+  clampOrb({ left: rect.left + change[0], top: rect.top + change[1] })
+  saveOrbPosition()
+}
+function fitViewport() {
+  viewport.value = { width: window.innerWidth, height: window.innerHeight }
+  clamp()
+  if (orbPosition.value) clampOrb(orbPosition.value)
+}
+function toggleMaximize() {
+  if (maximized.value) { maximized.value = false; left.value = restoredPosition.left; top.value = restoredPosition.top }
+  else { restoredPosition = { left: left.value, top: top.value }; maximized.value = true; left.value = 12; top.value = 12 }
+  clamp()
+}
+function resizeBy(width: number, height: number) {
+  customSize.value = {
+    width: Math.min(Math.max(360, width), Math.max(0, viewport.value.width - 24)),
+    height: Math.min(Math.max(420, height), Math.max(0, viewport.value.height - 104)),
+  }
+  clamp()
+}
+function startResize(event: PointerEvent) {
+  if (event.button !== 0 || maximized.value) return
+  resizing = { pointer: event.pointerId, x: event.clientX, y: event.clientY, ...size.value }
+  ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
+}
+function moveResize(event: PointerEvent) {
+  if (!resizing || event.pointerId !== resizing.pointer) return
+  resizeBy(resizing.width + event.clientX - resizing.x, resizing.height + event.clientY - resizing.y)
+}
+function endResize() { resizing = undefined }
+function resizeWithKeyboard(event: KeyboardEvent) {
+  const changes: Record<string, [number, number]> = { ArrowLeft: [-40, 0], ArrowRight: [40, 0], ArrowUp: [0, -40], ArrowDown: [0, 40] }
+  const change = changes[event.key]
+  if (!change) return
+  event.preventDefault()
+  resizeBy(size.value.width + change[0], size.value.height + change[1])
 }
 function toggle() {
   if (!mounted.value) { left.value = Math.max(12, window.innerWidth - 504); top.value = Math.max(12, window.innerHeight - 772) }
@@ -25,7 +126,7 @@ function toggle() {
   if (expanded.value) void nextTick(clamp)
 }
 function startDrag(event: PointerEvent) {
-  if (event.button !== 0 || (event.target as HTMLElement).closest('button')) return
+  if (event.button !== 0 || maximized.value || (event.target as HTMLElement).closest('button')) return
   drag = { pointer: event.pointerId, x: event.clientX, y: event.clientY, left: left.value, top: top.value }
   ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
 }
@@ -39,32 +140,42 @@ function endDrag() { drag = undefined }
 async function setSidebar(open: boolean) {
   const previousWidth = panel.value?.offsetWidth ?? 0
   sidebarOpen.value = open
+  if (customSize.value && !maximized.value && viewport.value.width > 700) resizeBy(customSize.value.width + (open ? 240 : -240), customSize.value.height)
   await nextTick()
   if (panel.value && previousWidth) left.value += previousWidth - panel.value.offsetWidth
   clamp()
 }
 watch(() => session.generation, async () => {
   const generation = session.generation
-  enabled.value = false; expanded.value = false; mounted.value = false; sidebarOpen.value = false
+  // 捕获元素因身份切换被移除时，丢失捕获事件可能不会回到按钮。
+  orbDrag = undefined; orbDragging.value = false; suppressOrbClick = false
+  enabled.value = false; expanded.value = false; mounted.value = false; sidebarOpen.value = false; maximized.value = false; customSize.value = undefined
   if (!session.can('stats:read')) return
   const result = await assistantStatus()
   if (generation === session.generation) enabled.value = result.ok && result.data.enabled
 }, { immediate: true })
-onMounted(() => window.addEventListener('resize', clamp))
-onBeforeUnmount(() => window.removeEventListener('resize', clamp))
+onMounted(() => {
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(orbPositionKey) ?? 'null')
+    if (Number.isFinite(saved?.left) && Number.isFinite(saved?.top)) clampOrb(saved)
+  } catch { /* 损坏或不可读的位置记录不影响默认入口。 */ }
+  window.addEventListener('resize', fitViewport)
+})
+onBeforeUnmount(() => window.removeEventListener('resize', fitViewport))
 </script>
 
 <template>
   <template v-if="enabled">
-    <button class="assistant-orb" :class="{ expanded }" :aria-expanded="expanded" aria-controls="global-assistant" :aria-label="expanded ? '收起 AI 助手' : '打开 AI 助手'" @click="toggle">
-      <AssistantSymbol /><span class="assistant-orb-label">AI</span><span class="assistant-orb-tip">{{ expanded ? '收起助手' : 'AI 助手' }}</span>
+    <button class="assistant-orb" :class="{ expanded, dragging: orbDragging }" :style="orbStyle" :aria-expanded="expanded" aria-controls="global-assistant" :aria-label="expanded ? '收起 AI 助手' : '打开 AI 助手'" title="拖动移动，点击开关助手；也可用方向键移动" @pointerdown="startOrbDrag" @pointermove="moveOrbDrag" @pointerup="endOrbDrag" @pointercancel="endOrbDrag" @lostpointercapture="endOrbDrag" @keydown="moveOrbWithKeyboard" @click="clickOrb">
+      <AssistantSymbol /><span class="assistant-orb-label">AI</span><span class="assistant-orb-tip" :class="{ 'tip-right': orbPosition && orbPosition.left < viewport.width / 2 }">{{ expanded ? '收起助手' : 'AI 助手' }}</span>
     </button>
-    <section v-if="mounted" v-show="expanded" id="global-assistant" ref="panel" class="assistant-floating" :class="{ 'with-sidebar': sidebarOpen }" :style="{ left: `${left}px`, top: `${top}px` }" role="region" aria-label="AI 助手浮动窗口">
+    <section v-if="mounted" v-show="expanded" id="global-assistant" ref="panel" class="assistant-floating" :class="{ maximized }" :style="{ left: `${left}px`, top: `${top}px`, width: `${size.width}px`, height: `${size.height}px` }" role="region" aria-label="AI 助手浮动窗口">
       <header class="assistant-floating-header" @pointerdown="startDrag" @pointermove="moveDrag" @pointerup="endDrag" @pointercancel="endDrag">
         <div class="assistant-brand"><span class="assistant-brand-icon"><AssistantSymbol /></span><div><strong>AI 助手<span class="assistant-brand-badge">用量分析</span></strong><small>随时提问，也可以继续操作页面</small></div></div>
-        <div class="assistant-window-controls"><span class="assistant-drag-handle" aria-hidden="true" title="拖动标题栏移动"><i /><i /><i /><i /><i /><i /></span><button aria-label="收起助手窗口" title="收起助手" @click="expanded = false"><Minus /></button></div>
+        <div class="assistant-window-controls"><span class="assistant-drag-handle" aria-hidden="true" title="拖动标题栏移动"><i /><i /><i /><i /><i /><i /></span><button :aria-label="maximized ? '还原助手窗口' : '放大助手窗口'" :title="maximized ? '还原窗口' : '放大窗口'" :aria-pressed="maximized" @click="toggleMaximize"><CopyDocument v-if="maximized" /><FullScreen v-else /></button><button aria-label="收起助手窗口" title="收起助手" @click="expanded = false"><Minus /></button></div>
       </header>
-      <div class="assistant-floating-body"><AssistantView :key="session.generation" floating @sessions-toggle="setSidebar" /></div>
+      <div class="assistant-floating-body"><AssistantView :key="session.generation" floating @sessions-toggle="setSidebar" @form-opened="expanded = false" /></div>
+      <button v-if="!maximized" class="assistant-resize-handle" aria-label="调整助手窗口大小" title="拖动调整大小，或用方向键调整" @pointerdown.prevent="startResize" @pointermove="moveResize" @pointerup="endResize" @pointercancel="endResize" @lostpointercapture="endResize" @keydown="resizeWithKeyboard"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 13 13 5M10 13l3-3" /></svg></button>
     </section>
   </template>
 </template>
@@ -76,22 +187,28 @@ onBeforeUnmount(() => window.removeEventListener('resize', clamp))
   border: 1px solid #ffffff80; border-radius: 50%; color: #fff;
   background: radial-gradient(circle at 30% 15%, #8fb9ff 0, #4b86f5 35%, #3466db 80%);
   box-shadow: 0 0 0 5px #ffffffb3, 0 9px 26px #3275ed40, inset 0 1px 2px #ffffff66;
-  z-index: 1500; cursor: pointer; transition: transform .2s, box-shadow .2s;
+  z-index: 1500; cursor: grab; touch-action: none; user-select: none; transition: box-shadow .2s;
 }
 .assistant-orb > svg { width: 27px; height: 27px; }
 .assistant-orb-label { font-size: 9px; font-weight: 750; letter-spacing: 1.5px; line-height: 1; }
-.assistant-orb:hover { transform: translateY(-3px); box-shadow: 0 0 0 7px #edf3ffa6, 0 12px 30px #3275ed50; }
+.assistant-orb:hover { box-shadow: 0 0 0 7px #edf3ffa6, 0 12px 30px #3275ed50; }
+.assistant-orb.dragging { cursor: grabbing; }
 .assistant-orb.expanded { background: linear-gradient(145deg, #4b86f5, #3264d6); }
 .assistant-orb:focus-visible { outline: 3px solid #93b7f7; outline-offset: 7px; }
 .assistant-orb-tip { position: absolute; right: 76px; padding: 7px 12px; border-radius: 9px; color: #53637a; background: #fff; box-shadow: 0 4px 20px #24334b14; font-size: 12px; white-space: nowrap; opacity: 0; pointer-events: none; transform: translateX(5px); transition: opacity .2s, transform .2s; }
+.assistant-orb-tip.tip-right { right: auto; left: 76px; }
 .assistant-orb:hover .assistant-orb-tip, .assistant-orb:focus-visible .assistant-orb-tip { opacity: 1; transform: translateX(0); }
 .assistant-floating {
-  position: fixed; width: min(480px, calc(100vw - 24px)); height: min(680px, calc(100dvh - 104px));
+  position: fixed;
   display: flex; flex-direction: column; z-index: 1499; border: 1px solid #e2e9f4; border-radius: 22px;
   background: #fbfcff; box-shadow: 0 24px 70px #24334b24, 0 4px 16px #24334b0a; overflow: hidden;
 }
 .assistant-floating-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 19px 20px; background: linear-gradient(110deg, #edf3ff, #fff 75%); border-bottom: 1px solid #e8eef7; cursor: move; touch-action: none; user-select: none; flex-shrink: 0; }
-.assistant-floating.with-sidebar { width: min(720px, calc(100vw - 24px)); }
+.assistant-floating.maximized .assistant-floating-header { cursor: default; }
+.assistant-resize-handle { position: absolute; right: 0; bottom: 0; width: 24px; height: 24px; display: grid; place-items: center; border: 0; background: transparent; color: #91a6c5; cursor: nwse-resize; touch-action: none; }
+.assistant-resize-handle svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.5; }
+.assistant-resize-handle:hover { color: #3275ed; }
+.assistant-resize-handle:focus-visible { outline: 2px solid #93b7f7; outline-offset: -3px; border-radius: 5px; }
 .assistant-brand { display: flex; gap: 12px; align-items: center; min-width: 0; }
 .assistant-brand-icon { display: grid; place-items: center; width: 42px; height: 42px; flex-shrink: 0; border-radius: 14px; color: #3275ed; background: #fff; border: 1px solid #dce8fc; box-shadow: 0 3px 8px #3275ed0a; }
 .assistant-brand-icon svg { width: 26px; height: 26px; }
@@ -104,7 +221,7 @@ onBeforeUnmount(() => window.removeEventListener('resize', clamp))
 .assistant-window-controls button { display: grid; place-items: center; width: 30px; height: 30px; border: 0; background: transparent; border-radius: 9px; cursor: pointer; color: #7c8aa0; transition: background .15s; }
 .assistant-window-controls button svg { width: 18px; height: 18px; }
 .assistant-window-controls button:hover { background: #eaf0fa; color: #3275ed; }
-.assistant-floating-body { padding: 0 20px 14px; flex: 1; min-height: 0; overflow: hidden; }
+.assistant-floating-body { padding: 0 20px 14px; flex: 1; min-height: 0; overflow: hidden; container-type: inline-size; }
 @media (max-width: 600px) {
   .assistant-orb { right: 18px; bottom: 18px; width: 54px; height: 54px; }
   .assistant-floating { border-radius: 18px; }
@@ -115,6 +232,5 @@ onBeforeUnmount(() => window.removeEventListener('resize', clamp))
   .assistant-window-controls { gap: 3px; }
   .assistant-drag-handle { display: none; }
 }
-@media (max-width: 700px) { .assistant-floating.with-sidebar { width: min(480px, calc(100vw - 24px)); } }
 @media (prefers-reduced-motion: reduce) { .assistant-orb, .assistant-orb-tip { transition: none; } }
 </style>
