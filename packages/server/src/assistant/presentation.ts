@@ -33,7 +33,7 @@ function tableOf(rows: Row[], leading: Column[], sourceOf: (row: Row) => Record<
   if (rows.some(row => costOf(row.cost) !== null)) columns.push({ key: 'cost', label: '费用（估算）' })
   return {
     columns,
-    rows: rows.slice(0, 100).map(row => ({
+    rows: rows.slice(0, 400).map(row => ({
       ...sourceOf(row),
       ...Object.fromEntries(metrics.map(column => [column.key, cell(row[column.source])])),
       ...(columns.some(column => column.key === 'cost') ? { cost: costOf(row.cost) } : {}),
@@ -41,15 +41,9 @@ function tableOf(rows: Row[], leading: Column[], sourceOf: (row: Row) => Record<
     total_rows: rows.length,
   }
 }
-function chartOf(rows: Row[], labels: string[], kind: 'line' | 'bar'): AssistantResult['chart'] {
-  const displayed = rows.slice(0, 100)
-  const series = metricColumns.filter(column => ['total_tokens', 'calls', 'cache_read_tokens'].includes(column.key) && displayed.every(row => numeric(row[column.source])))
-    .map(column => ({ key: column.key, label: column.label, values: displayed.map(row => row[column.source] as number) }))
-  return displayed.length && series.length ? { kind, labels: labels.slice(0, 100), series } : undefined
-}
 export function presentAssistantResult(endpoint: string, query: string, value: unknown): AssistantResult {
   const body = object(value), params = new URLSearchParams(query)
-  const periods: Record<string, string> = { today: '今天', yesterday: '昨天', last7d: '最近 7 天', last30d: '最近 30 天', month: '本月' }
+  const periods: Record<string, string> = { today: '今天', yesterday: '昨天', week: '本周', lastweek: '上周', last7d: '最近 7 天', last30d: '最近 30 天', last90d: '最近 90 天', month: '本月', lastmonth: '上月', year: '今年' }
   const from = Number(params.get('from')), to = Number(params.get('to'))
   const range = params.has('from') && params.has('to') ? `${new Date(from).toLocaleDateString('zh-CN')} — ${new Date(to).toLocaleDateString('zh-CN')}` : periods[params.get('period') ?? ''] ?? '当前查询范围'
   const result: AssistantResult = { result_id: randomUUID(), tool: `stats_${endpoint}`, query, captured_at_ms: Date.now(), title: titles[endpoint] ?? '查询结果', description: range }
@@ -69,12 +63,10 @@ export function presentAssistantResult(endpoint: string, query: string, value: u
   } else if (endpoint === 'series') {
     const points = Array.isArray(body.points) ? body.points.map(object) : []
     result.table = tableOf(points, [{ key: 'bucket', label: '时间' }], row => ({ bucket: cell(row.bucket) }))
-    result.chart = chartOf(points, points.map(row => text(row.bucket) ?? '—'), 'line')
   } else if (endpoint === 'breakdown') {
     const dimensions: Record<string, string> = { model: '模型', provider: '厂商', source: '来源', user: '成员', group: '分组', project: '项目', day: '日期' }
     result.title = `${dimensions[text(body.by) ?? ''] ?? '维度'}用量分布`
     result.table = tableOf(rows, [{ key: 'dimension', label: dimensions[text(body.by) ?? ''] ?? '维度' }], row => ({ dimension: text(row.label) ?? text(row.key) }))
-    result.chart = chartOf(rows, rows.map(row => text(row.label) ?? text(row.key) ?? '—'), 'bar')
     if (body.by === 'group') result.note = '成员可属于多个分组，各分组用量之和可能大于部门总量。'
   } else if (endpoint === 'records') {
     result.table = tableOf(rows, [{ key: 'time', label: '时间', format: 'datetime' }, { key: 'model', label: '模型' }, { key: 'provider', label: '厂商' }, { key: 'source', label: '来源' }], row => ({ time: cell(row.ts), model: cell(row.model), provider: cell(row.provider), source: cell(row.source) }))
@@ -85,7 +77,6 @@ export function presentAssistantResult(endpoint: string, query: string, value: u
     result.cards = fields.filter(field => numeric(body[field.key])).map(field => ({ label: field.label, value: count(body[field.key] as number) }))
     const sources = Array.isArray(body.sources) ? body.sources.map(object) : []
     result.table = tableOf(sources, [{ key: 'source', label: '来源' }, { key: 'latest_event', label: '最近用量时间', format: 'datetime' }, { key: 'silent_for_ms', label: '距最近用量（毫秒）', format: 'number' }], row => ({ source: cell(row.source), latest_event: cell(row.latestEventTs), silent_for_ms: cell(row.silentForMs) }))
-    result.chart = chartOf(sources, sources.map(row => text(row.source) ?? '—'), 'bar')
     result.note = '仅展示本次查询范围内已入库的来源；最近用量时间不等于最近上报时间。未上报人员需要结合人员名册核对。'
   } else if (endpoint === 'providers') {
     const providers = Array.isArray(body.providers) ? body.providers : []
