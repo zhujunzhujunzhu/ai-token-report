@@ -25,8 +25,9 @@ const temporaryRoot = resolve(process.cwd(), '.tmp'), reportDirectory = resolve(
 mkdirSync(temporaryRoot, { recursive: true })
 const root = mkdtempSync(join(temporaryRoot, 'ai-manage-')), dbPath = join(root, 'portal.sqlite'), token = randomBytes(32).toString('hex')
 const checks: Array<{ id: string; status: 'passed' | 'failed'; duration_ms: number }> = []
+const diagnostics: Array<{ turn: number; tools: Array<{ name: string; state?: string; status: number }>; has_error: boolean }> = []
 let server: Awaited<ReturnType<typeof createServer>> | undefined
-let sessionId: string | undefined, turns = 0, passed = false, phase = 'setup', started = Date.now()
+let sessionId: string | undefined, turns = 0, passed = false, phase = 'setup', started = Date.now(), failureReason = ''
 async function check(id: string, work: () => Promise<void>) {
   phase = id; started = Date.now()
   await work()
@@ -60,6 +61,7 @@ try {
     const response = await request('POST', '/api/v1/assistant/chat', { prompt, ...(!fresh && sessionId ? { session_id: sessionId } : {}), page: '/providers' })
     assert.equal(response.status, 200)
     const events = (await response.text()).split('\n').filter(line => line.startsWith('data: ')).map(line => JSON.parse(line.slice(6)) as AssistantEvent)
+    diagnostics.push({ turn: turns, tools: events.filter(event => event.type === 'tool').map(event => ({ name: event.tool, state: event.state, status: event.status })), has_error: events.some(event => event.type === 'error') })
     assert(events.some(event => event.type === 'done') && !events.some(event => event.type === 'error'), '自然语言轮次没有正常完成')
     assert(!events.some(event => event.type === 'tool' && event.state === 'failed'), '自然语言轮次有失败工具')
     const session = events.find(event => event.type === 'session')
@@ -106,14 +108,16 @@ try {
   })
   passed = true
   console.log('ASSISTANT_MANAGEMENT_LIVE_OK: 真实模型五轮管理工具验收全部通过。')
-} catch {
+} catch (error) {
+  // 自有断言只涉及合成字段、工具名及HTTP状态；SDK异常仍不输出。
+  if (error instanceof assert.AssertionError) failureReason = String(error.message).slice(0, 300)
   checks.push({ id: phase, status: 'failed', duration_ms: Date.now() - started })
   console.error('ASSISTANT_MANAGEMENT_LIVE_FAILED: ' + phase + '；未输出凭证或模型回答。')
   process.exitCode = 1
 } finally {
   await server?.stop()
   await mkdir(reportDirectory, { recursive: true })
-  await writeFile(join(reportDirectory, 'report.json'), JSON.stringify({ ok: passed, turns, checks }, null, 2) + '\n')
+  await writeFile(join(reportDirectory, 'report.json'), JSON.stringify({ ok: passed, turns, checks, diagnostics, ...(failureReason ? { failure_reason: failureReason } : {}) }, null, 2) + '\n')
   const destination = resolve(root)
   if (!destination.startsWith(temporaryRoot + sep) || !destination.slice(temporaryRoot.length + 1).startsWith('ai-manage-')) throw new Error('清理目录超出隔离验收边界')
   await rm(destination, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 })
