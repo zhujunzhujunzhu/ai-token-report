@@ -23,13 +23,14 @@ const props = defineProps<{
   roleOptions: RolePickerOption[]
   canAssignRoles: boolean
   busy: boolean
+  initialValues?: { name?: string; group_ids?: string[] }
 }>()
 const emit = defineEmits<{ save: [draft: MemberEditDraft]; cancel: [] }>()
 // 打开时把「当前归属」抄进草稿：这里给的就是全量替换后的集合，取消即不提交，
 // 所以不存在「只发变化量」这种需要服务端求差的语义。
 const draft = reactive({
-  name: props.member.name,
-  group_ids: props.member.groups.map((group) => group.group_id),
+  name: props.initialValues?.name ?? props.member.name,
+  group_ids: props.initialValues?.group_ids ? [...props.initialValues.group_ids] : props.member.groups.map((group) => group.group_id),
   role_ids: props.member.roles.map((role) => role.role_id),
 })
 /**

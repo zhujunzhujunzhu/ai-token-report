@@ -15,7 +15,7 @@ export function groupLabel(groups: PortalMemberGroupRef[]): string {
 }
 
 /** 「姓名（分组）」；未分组时只留姓名。 */
-export function memberLabel(member: PortalMember): string {
+export function memberLabel(member: Pick<PortalMember, 'name' | 'groups'>): string {
   const groups = groupLabel(member.groups)
   return member.name + (groups ? `（${groups}）` : '')
 }
