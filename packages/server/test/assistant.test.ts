@@ -1,6 +1,7 @@
 /** 助手隔离与 DSH 实际装载验证；模型服务只用回环夹具，不消耗线上额度。 */
 import { afterAll, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -12,6 +13,7 @@ import { AssistantStore } from '../src/assistant/store.js'
 import type { AssistantEngine } from '../src/assistant/runtime.js'
 import { queryAssistantStats, projectToolResult } from '../src/assistant/tools.js'
 import { StatsRoute } from '../src/stats-route.js'
+import { AssistantDatasets } from '../src/assistant/datasets.js'
 
 const root = mkdtempSync(join(tmpdir(), 'atr-assistant-'))
 const dbPath = join(root, 'portal.sqlite')
@@ -31,14 +33,16 @@ const engine: AssistantEngine = { async run(input) {
     await released
   }
   input.signal.throwIfAborted()
-  await queryAssistantStats(stats, input.principal, 'overview', 'period=last7d', input.emit)
+  const datasets = new AssistantDatasets()
+  const query = await queryAssistantStats(stats, input.principal, 'overview', 'period=last7d', input.emit, datasets) as { dataset_id: string }
+  input.emit({ type: 'result', result: datasets.render('table', { dataset_id: query.dataset_id }, input.principal) })
   input.emit({ type: 'text', text: '隔离后的回答' })
 } }
 const bundle = await createHandlerFor({ dshHome: root, dataDir: root, dbPath, assistantEngine: engine, requestLog: false })
 afterAll(async () => {
   await bundle.close()
   if (!resolve(root).startsWith(join(resolve(tmpdir()), 'atr-assistant-'))) throw new Error('临时目录超出测试边界')
-  rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 })
+  await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 })
 })
 function call(method: string, path: string, token?: string, body?: unknown) {
   return bundle.handler(new Request(`http://localhost/api/v1/assistant/${path}`, {
@@ -58,6 +62,15 @@ test('登录才可访问助手，拒绝客户端指定身份和目录', async ()
   expect((await call('POST', 'chat', 'assistant-admin', { prompt: '你好', session_id: '../escape' })).status).toBe(400)
   expect((await call('POST', 'chat', 'assistant-admin', { prompt: '' })).status).toBe(400)
   expect((await call('GET', 'status', 'assistant-admin')).status).toBe(200)
+  expect((await call('GET', 'status', 'assistant-admin').then(r => r.json())).retention_days).toBeNull()
+})
+
+test('即时引导通过正式 HTTP 路由鉴权、校验请求并限制方法', async () => {
+  expect((await call('POST', 'steer', undefined, { prompt: '继续' })).status).toBe(401)
+  expect((await call('POST', 'steer', 'assistant-admin', { prompt: '继续', member_id: '别人' })).status).toBe(400)
+  const wrongMethod = await call('GET', 'steer', 'assistant-admin')
+  expect(wrongMethod.status).toBe(405)
+  expect(wrongMethod.headers.get('Allow')).toBe('POST')
 })
 test('同一成员重启后续聊；不同用户及管理员也不能读取或删除他人的空间', async () => {
   const a = await conversationId(await call('POST', 'chat', 'assistant-admin', { prompt: '首问' }))
@@ -79,15 +92,29 @@ test('同一成员重启后续聊；不同用户及管理员也不能读取或�
   expect((await call('DELETE', `sessions/${a}`, 'assistant-admin')).status).toBe(200)
   expect((await call('GET', `sessions/${a}`, 'assistant-admin')).status).toBe(404)
 })
-test('并发续聊和运行中删除被拒绝，取消流释放用户锁', async () => {
+test('同会话并发续聊和运行中删除被拒绝，取消流释放会话锁', async () => {
   waiting = true
   const started = new Promise<void>(done => { entered = done })
   const response = await call('POST', 'chat', 'assistant-admin', { prompt: '等待取消' })
   await started
-  expect((await call('POST', 'chat', 'assistant-admin', { prompt: '并发' })).status).toBe(409)
   const reader = response.body!.getReader()
-  const first = await reader.read()
-  const id = JSON.parse(new TextDecoder().decode(first.value).split('\n')[0]!.slice(6)).session.session_id
+  // ★ 慢磁盘可能让心跳早于 session；HTTP 块也不保证与 SSE 帧边界重合。
+  const decoder = new TextDecoder()
+  let buffer = '', id: string | undefined
+  while (!id) {
+    const chunk = await reader.read()
+    if (chunk.done) throw new Error('未收到 session 事件')
+    buffer += decoder.decode(chunk.value, { stream: true })
+    let boundary: number
+    while ((boundary = buffer.indexOf('\n\n')) >= 0) {
+      const frame = buffer.slice(0, boundary); buffer = buffer.slice(boundary + 2)
+      const data = frame.split('\n').find(line => line.startsWith('data: '))
+      if (!data) continue
+      const event = JSON.parse(data.slice(6))
+      if (event.type === 'session') id = event.session.session_id
+    }
+  }
+  expect((await call('POST', 'chat', 'assistant-admin', { prompt: '并发', session_id: id })).status).toBe(409)
   expect((await call('DELETE', `sessions/${id}`, 'assistant-admin')).status).toBe(409)
   await reader.cancel()
   release?.()
@@ -140,7 +167,26 @@ test('工具沿用真实数据范围：伪造人员筛选仍只能读自己，�
   // ★ 传入快照不能跳过数据库裁决；现有身份重新授权后仍认当前权限。
   expect((await queryAssistantStats(stats, denied, 'overview', '', () => {})) as any).toBeDefined()
 })
-test('过期清理覆盖不再登录的用户，同时移除 DSH 记录；活跃用户受锁保护', async () => {
+test('默认永久保存：多年未更新的对话经清理、列表和重建存储后仍可读取，仅手动删除移除', async () => {
+  const directory = join(root, 'permanent')
+  const store = new AssistantStore(directory)
+  const old = await store.create(admin.memberId)
+  old.session.updated_at_ms = Date.now() - 10 * 365 * 86_400_000
+  old.messages = [{ role: 'user', text: '长期保存的提问' }, { role: 'assistant', text: '长期保存的回答' }]
+  await store.save(admin.memberId, old)
+  const path = store.sessionPath(admin.memberId, old.session.session_id)
+  mkdirSync(join(path, 'dsh'))
+  writeFileSync(join(path, 'dsh', 'log'), '对话正文')
+  await store.prune(new Set())
+  expect((await store.list(admin.memberId)).map(s => s.session_id)).toEqual([old.session.session_id])
+  const restored = new AssistantStore(directory)
+  expect((await restored.get(admin.memberId, old.session.session_id)).messages).toEqual(old.messages)
+  expect(existsSync(join(path, 'dsh', 'log'))).toBe(true)
+  await restored.delete(admin.memberId, old.session.session_id)
+  expect(existsSync(path)).toBe(false)
+})
+
+test('显式有限保留期：过期清理覆盖不再登录的用户，同时移除 DSH 记录；活跃用户受锁保护', async () => {
   const store = new AssistantStore(join(root, 'retention'), 1)
   const expired = await store.create(admin.memberId)
   expired.session.updated_at_ms = Date.now() - 2 * 86_400_000
@@ -162,9 +208,10 @@ test('真实 DSH agent 在 Bun 与 Node 中均能调用工具并持久化续聊'
   if (!built.success) throw new Error(built.logs.join('\n'))
   const node = resolveNodeBin()
   expect(node).not.toBeNull()
-  for (const [binary, script] of [[process.execPath, entry], [node!, join(root, 'runtime-node', 'verify-assistant-runtime.mjs')]]) {
-    const child = spawnSync(binary!, [script!], { env: cleanChildEnv(), encoding: 'utf8', windowsHide: true, timeout: 15_000 })
+  for (const [binary, script] of [[process.execPath, entry], [node!, join(root, 'runtime-node', 'verify-assistant-runtime.mjs')]]) for (const protocol of ['deepseek-messages', 'openai-completions', 'openai-responses', 'live-http']) {
+    const args = protocol === 'live-http' ? ['openai-completions', '--live-http'] : [protocol]
+    const child = spawnSync(binary!, [script!, ...args], { env: cleanChildEnv(), encoding: 'utf8', windowsHide: true, timeout: 60_000 })
     if (child.status !== 0) throw new Error(child.error?.message ?? child.stdout + child.stderr)
-    expect(child.stdout).toContain('DSH_RUNTIME_OK')
+    expect(child.stdout).toContain(protocol === 'live-http' ? 'LOOPBACK_TEST_OK' : 'DSH_RUNTIME_OK')
   }
-}, 35_000)
+}, 240_000)

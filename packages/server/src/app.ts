@@ -165,7 +165,12 @@ export function createApp(deps: AppDeps): Hono {
   //    线上实测一次请求要开 2~4 次库，每次都重跑一遍 schema 闸门
   //    （见 `docs/性能探索-线上-2026-10-04.md`）。
   //    ⚠️ 它不是 TTL 缓存：作用域就是一个请求，改结构后下一个请求立刻拒绝。
-  app.use('*', async (_c, next) => await withPortalStoreScope(next))
+  app.use('*', async (c, next) => {
+    // ★ SSE 返回 Response 后 agent 仍在运行，不能继承已经结束的请求数据库作用域。
+    // 工具查询各自开关连接，避免后续异步调用把连接留在无人清理的作用域表里。
+    if (c.req.method === 'POST' && c.req.path === '/api/v1/assistant/chat') return await next()
+    return await withPortalStoreScope(next)
+  })
   // 1) request-id 最先：后面所有日志与错误都带上它
   app.use('*', requestId())
   // 2) 访问日志必须包住 405 中间件：它在返回时把 404 改成 405，
@@ -331,15 +336,24 @@ export function createApp(deps: AppDeps): Hono {
 
   if (deps.assistantRoute) {
     const dispatch = async (c: Context, action: string) => {
-      const parsed = c.req.method === 'POST' ? await readJsonBodyStrict(c) : { value: undefined }
+      // ★ 附件先经过全局字节上限，解析与存储在助手完成身份校验后执行。
+      const multipart = action === 'chat' && c.req.header('content-type')?.split(';')[0]?.trim().toLowerCase() === 'multipart/form-data'
+      const parsed = multipart ? { value: c.req.raw } : c.req.method === 'POST' ? await readJsonBodyStrict(c) : { value: undefined }
       if ('error' in parsed) return fail(parsed.error, 400)
-      return deps.assistantRoute!.handle(c.req.method, action, await portalAuthorization(c), parsed.value, c.req.raw.signal)
+      return deps.assistantRoute!.handle(c.req.method, action, await portalAuthorization(c), parsed.value, c.req.raw.signal, new URL(c.req.url).searchParams)
     }
     app.get('/api/v1/assistant/status', c => dispatch(c, 'status'))
     app.get('/api/v1/assistant/sessions', c => dispatch(c, 'sessions'))
     app.get('/api/v1/assistant/sessions/:id', c => dispatch(c, `sessions/${c.req.param('id')}`))
+    app.get('/api/v1/assistant/sessions/:id/attachments/:attachmentId/download', c => dispatch(c, `sessions/${c.req.param('id')}/attachments/${c.req.param('attachmentId')}/download`))
     app.delete('/api/v1/assistant/sessions/:id', c => dispatch(c, `sessions/${c.req.param('id')}`))
     app.post('/api/v1/assistant/chat', c => dispatch(c, 'chat'))
+    app.post('/api/v1/assistant/steer', c => dispatch(c, 'steer'))
+    app.post('/api/v1/assistant/actions/:id/confirm', c => dispatch(c, 'actions/' + c.req.param('id') + '/confirm'))
+    app.get('/api/v1/assistant/artifacts/:id/download', c => dispatch(c, 'artifacts/' + c.req.param('id') + '/download'))
+    app.post('/api/v1/assistant/artifacts/:id/share', c => dispatch(c, 'artifacts/' + c.req.param('id') + '/share'))
+    app.post('/api/v1/assistant/artifacts/:id/revoke', c => dispatch(c, 'artifacts/' + c.req.param('id') + '/revoke'))
+    app.get('/api/v1/assistant/shared/:token', c => dispatch(c, 'shared/' + c.req.param('token')))
   }
 
   // ── 人员管理与 token 发放（web-portal 的管理页）──────────────

@@ -44,6 +44,9 @@ import { StatsRoute } from './stats-route.js'
 import { AssistantRoute } from './assistant-route.js'
 import { AssistantStore } from './assistant/store.js'
 import { DshAssistantEngine, type AssistantEngine } from './assistant/runtime.js'
+import { assistantConfigFromEnv, type DshAssistantConfig } from './assistant/config.js'
+import { AssistantArtifacts } from './assistant/artifacts.js'
+import { AssistantActions } from './assistant/actions.js'
 
 export { DEFAULT_PORT, IDLE_TIMEOUT_SECONDS } from './runtime/listen.js'
 export { SERVER_VERSION } from './app.js'
@@ -69,7 +72,7 @@ export function portalTargetLabelFor(target: PortalTarget, bunRuntime: boolean):
 
 export interface ServerOptions {
   /** 可信部署配置；模型凭证由 DSH 的 DEEPSEEK_API_KEY 环境引用解析。 */
-  assistant?: { model: string; baseUrl?: string; retentionDays?: number }
+  assistant?: DshAssistantConfig & { retentionDays?: number | null }
   /** 嵌入宿主可提供同契约的 DSH 驱动，HTTP 请求无法设置。 */
   assistantEngine?: AssistantEngine
   /** 有界上报队列；生产默认 64 个请求（含执行中）、等待最多 5 秒。 */
@@ -318,15 +321,19 @@ export async function createHandlerFor(options: ServerOptions = {}): Promise<Han
   // ★ 与上报路由**必须拿到同一个目标**：一个写 MySQL、另一个读 SQLite 会让
   //   「上报成功但看板永远是 0」—— 这类分叉不会报错，只会让人以为没人用。
   const statsRoute = new StatsRoute({ identityStore, credentials, dbPath, ...mysqlOption })
-  const assistantConfig = options.assistant ?? (process.env.ATR_ASSISTANT_ENABLED === '1'
-    ? { model: process.env.ATR_ASSISTANT_MODEL ?? 'deepseek-v4-flash', baseUrl: process.env.ATR_ASSISTANT_BASE_URL }
-    : undefined)
+  const databaseAdminRoute = identityStore ? new DatabaseAdminRoute(identityStore) : undefined
+  const assistantStore = new AssistantStore(join(paths.dataDir, 'assistant'), options.assistant?.retentionDays ?? null)
+  const assistantServices = {
+    // ★ 列表必须和匿名访问一样复验数据库中的主人权限，不能把窄 scope 的凭证当作主人全量权限。
+    artifacts: new AssistantArtifacts(assistantStore.root, options.portalOrigin ?? process.env.ATR_PORTAL_ORIGIN, Date.now, identityStore ? memberId => identityStore.memberAccess(memberId) : undefined),
+    ...(databaseAdminRoute ? { actions: new AssistantActions(databaseAdminRoute, assistantStore) } : {}),
+  }
+  const assistantConfig = options.assistant ?? assistantConfigFromEnv()
   const assistantRoute = identityStore ? new AssistantRoute(identityStore,
-    new AssistantStore(join(paths.dataDir, 'assistant'), options.assistant?.retentionDays ?? 30),
-    options.assistantEngine ?? (assistantConfig ? new DshAssistantEngine(statsRoute, assistantConfig) : undefined)) : undefined
+    assistantStore,
+    options.assistantEngine ?? (assistantConfig ? new DshAssistantEngine(statsRoute, assistantConfig, assistantServices) : undefined), assistantServices) : undefined
 
   // 人员管理与上报共用同一个身份仓储和数据库事务边界。
-  const databaseAdminRoute = identityStore ? new DatabaseAdminRoute(identityStore) : undefined
 
   // 本地直查：只有启用 `/api/local/*` 时才构造，避免部门服务端
   // 白白持有一条指向本机日志/本地库的通路。
