@@ -68,6 +68,7 @@ const model = createModelServer(async (req, res) => {
 const step = (message: string) => console.log('CAPABILITY_STEP_OK: ' + message)
 const headers = (secret = token) => ({ Authorization: 'Bearer ' + secret, 'Content-Type': 'application/json' })
 const sharedToken = (url: string) => url.slice(url.lastIndexOf('/') + 1)
+const completedToolStatuses = (events: AssistantEvent[], name: string) => events.flatMap(event => event.type === 'tool' && event.tool === name && event.state === 'completed' ? [event.status] : [])
 function toolResponses(from: number, name: string): Array<Record<string, unknown>> {
   const previous = new Set(capturedModelRequests[from]?.messages?.filter(message => message.role === 'tool').map(message => message.tool_call_id))
   const collected = new Map<string, Record<string, unknown>>()
@@ -250,11 +251,16 @@ try {
     assert.equal(response.status, 200)
     return (await response.json() as { aliases: ProviderAlias[] }).aliases
   }
-  const sqlProvider = (id: string) => identity.read(tx => tx.get<{ provider: string; model: string | null; alias: string }>('SELECT provider, model, alias FROM provider_alias WHERE alias_id = $id', { $id: id }))
+  const sqlProvider = async (id: string) => {
+    const row = await identity.read(tx => tx.get<{ provider: string; model: string | null; alias: string }>('SELECT provider, model, alias FROM provider_alias WHERE alias_id = $id', { $id: id }))
+    // ★ Node SQLite 行对象无原型；跨运行时只对账列值，保留各字段原始类型。
+    return row ? { ...row } : null
+  }
   const mappings = [{ provider: 'dashscope', alias: '数字集团阿里云' }, { provider: 'deepseek-official', alias: 'DeepSeek' }]
   const originalPromptFrom = capturedModelRequests.length
   const directSaved = await chat('是的直接帮我新建两条', mappings.map(values => ({ name: 'portal_manage_save', args: { resource: 'provider-aliases', operation: 'create', values: { scope: 'global', ...values, enabled: true } } })))
   assert(!directSaved.some(event => event.type === 'action' || event.type === 'open_form'), '直接保存误生成确认卡或填写弹框')
+  assert.deepEqual(completedToolStatuses(directSaved, 'portal_manage_save'), [200, 200], '已真实落库的保存完成状态不是 200')
   assert(capturedModelRequests.slice(originalPromptFrom).every(modelRequest => modelRequest.tools?.some(tool => tool.function?.name === 'portal_manage_save')), '原话未挂载直接保存工具')
   assert.deepEqual(toolResponses(originalPromptFrom, 'portal_manage_save').map(result => [result.ok, result.executed]), [[true, true], [true, true]], '直接保存真实结果未明确告知模型已经执行')
   for (const mapping of mappings) {
@@ -288,6 +294,7 @@ try {
     const formEvents = await chat('帮我打开供应商规则新建弹框，预填原供应商，让我填写后保存', [{ name: 'portal_open_form', args: { resource: 'provider-aliases', operation: 'create', values: { scope: 'global', provider: formProvider } } }], token, null)
     const formEvent = formEvents.find(event => event.type === 'open_form')
     assert(formEvent?.type === 'open_form', '打开表单工具没有真实 SSE 表单事件')
+    assert.deepEqual(completedToolStatuses(formEvents, 'portal_open_form'), [202], '仅请求填写弹框却报告为已落库状态')
     const form: AssistantForm = formEvent.form
     assert.equal(form.resource, 'provider-aliases'); assert.equal(form.operation, 'create'); assert.equal(form.path, '/providers')
     assert.match(form.request_id, /^[0-9a-f-]{36}$/); assert.equal(form.target_id, undefined)
@@ -303,13 +310,18 @@ try {
     assert.deepEqual(await sqlProvider(formRow.alias_id), { provider: formProvider, model: null, alias: '用户填写后保存' }, '页面保存后的 SQL 与表单不符')
 
     phase = '编辑弹框精确目标与实际值'
+    const updateFrom = capturedModelRequests.length
     const updateEvents = await chat('帮我打开刚才规则的编辑弹框，预填新的统一名称，让我填写后保存', [{ name: 'portal_manage_query', args: { resource: 'provider-aliases', search: formProvider } }, { name: 'portal_open_form', args: { resource: 'provider-aliases', operation: 'update', target_id: formRow.alias_id, values: { alias: '编辑弹框的预填名称' } } }])
     const updateEvent = updateEvents.find(event => event.type === 'open_form')
     assert(updateEvent?.type === 'open_form', '编辑表单没有真实 SSE 表单事件')
     assert.equal(updateEvent.form.target_id, formRow.alias_id, '编辑弹框目标 ID 不精确')
-    assert.deepEqual(updateEvent.form.values, { scope: 'global', provider: formProvider, model: null, alias: '编辑弹框的预填名称' }, '编辑弹框未合并目标真实值与指定预填值')
+    assert.deepEqual(updateEvent.form.values, { alias: '编辑弹框的预填名称' }, '编辑弹框预填混入了用户未指定的旧快照字段')
+    assert.deepEqual(toolResponses(updateFrom, 'portal_open_form')[0]?.current_values, { scope: 'global', provider: formProvider, model: null, alias: '编辑弹框的预填名称' }, '模型没有收到精确目标的真实值与指定预填值')
+    assert.deepEqual(completedToolStatuses(updateEvents, 'portal_open_form'), [202], '编辑弹框尚未保存却报告为已落库状态')
     assert.equal((await sqlProvider(formRow.alias_id))?.alias, '用户填写后保存', '打开编辑弹框已经修改了数据库')
-    assert.equal((await request('POST', '/api/v1/admin/provider-aliases', { ...updateEvent.form.values, alias: '用户编辑后保存', enabled: formRow.enabled })).status, 200, '编辑弹框的页面保存失败')
+    const latestFormRow = (await providerAliases()).find(row => row.alias_id === updateEvent.form.target_id)
+    assert(latestFormRow, '页面打开编辑弹框时精确目标已不存在')
+    assert.equal((await request('POST', '/api/v1/admin/provider-aliases', { scope: latestFormRow.scope, provider: latestFormRow.provider, model: latestFormRow.model, ...updateEvent.form.values, alias: '用户编辑后保存', enabled: latestFormRow.enabled })).status, 200, '编辑弹框的页面保存失败')
     assert.equal((await sqlProvider(formRow.alias_id))?.alias, '用户编辑后保存', '编辑弹框保存没有真实入库')
 
     phase = '普通成员填写表单权限拒绝'
@@ -325,6 +337,7 @@ try {
     const events = await chat('删除刚才新建的项目规则，请准备待用户确认的删除卡片。', [{ name: 'portal_manage_mutate', args: { resource: 'project-aliases', operation: 'delete', target_id: created.alias_id } }])
     const action = events.find(event => event.type === 'action')
     assert(action?.type === 'action' && action.action.status === 'pending', '删除未生成待确认卡片')
+    assert.deepEqual(completedToolStatuses(events, 'portal_manage_mutate'), [202], '待确认删除却报告为已落库状态')
     assert((await aliases()).some(row => row.alias_id === created.alias_id), '用户确认前规则已被删除')
     return action.action
   }
