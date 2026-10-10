@@ -64,6 +64,7 @@ import {
 import type { CredentialStore } from './credentials.js'
 import { authorize, authorizeDatabase, databaseFailure, type Authentication } from './http/auth.js'
 import type { IdentityRepository } from './identity/index.js'
+import type { IdentityMutationPrecondition } from './identity/repository.js'
 import type { MemberAdmin, MemberResult } from './member-admin.js'
 import { VIEWER_AUTH_MESSAGES } from './verify-route.js'
 
@@ -219,7 +220,16 @@ function badRequest(reason: string): AdminRouteResult {
 export class DatabaseAdminRoute {
   constructor(private readonly repository: IdentityRepository) {}
 
-  async handle(method: string, path: string, authentication: Authentication, body: unknown, params: URLSearchParams): Promise<AdminRouteResult> {
+  /** 助手先校验写权限再出确认卡；仍重新读取数据库，不能采信会话开始时的权限。 */
+  authorizeAssistantMutation(actor: import('./identity/types.js').Principal, resource: string) {
+    const permissions: Record<string, string> = { members: 'members:manage', groups: 'groups:manage', 'provider-aliases': 'providers:manage', 'project-aliases': 'projects:manage', pricing: 'pricing:manage' }
+    const permission = permissions[resource]
+    if (!permission) throw new Error('不支持助手管理资源')
+    return this.repository.authorize(actor, permission)
+  }
+
+  async handle(method: string, path: string, authentication: Authentication, body: unknown, params: URLSearchParams, condition?: IdentityMutationPrecondition): Promise<AdminRouteResult> {
+    if (condition) return this.repository.withMutationPrecondition(condition, () => this.handle(method, path, authentication, body, params))
     const key = `${method} ${path}`
     const permissions: Record<string, string> = {
       'GET members': 'members:read', 'POST members': 'members:manage',

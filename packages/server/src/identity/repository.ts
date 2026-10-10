@@ -1,5 +1,6 @@
 /** 人员 / 分组身份的数据库真值；与用量写入共用连接、锁顺序和提交边界。 */
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { openPortalStore, PORTAL_SCHEMA_VERSION, aliasNameError, providerNameError, modelNameError, ANY_PROVIDER, projectAliasNameError, projectPrefixError, normalizeProjectPrefix, type PortalProviderAlias, type PortalProjectAlias, type PortalStore, type PortalTarget } from '@ai-token-report/core/db'
 import { hashPassword, normalizeUsername, passwordError, usernameError } from '../auth/password.js'
 import type { CredentialInput } from '../credentials.js'
@@ -12,6 +13,20 @@ export const digest = (value: string): string => createHash('sha256').update(val
 export const randomSecret = (): string => randomBytes(32).toString('base64url')
 export interface BootstrapOptions { adminToken?: string; adminName?: string; adminUsername?: string; adminPassword?: string }
 export type LegacyCredentialInput = CredentialInput & { loginEnabled?: boolean }
+
+/** 助手内部的条件写入；HTTP 请求体不能设置它，旧管理接口仍沿用原契约。 */
+export interface IdentityMutationPrecondition {
+  resource: 'members' | 'groups' | 'provider-aliases' | 'project-aliases' | 'pricing'
+  targetId?: string
+  snapshotHash?: string
+  absentKey?: MutationInput
+}
+/** 对象键顺序不属于业务内容；数组保持原顺序，防止确认摘要与实际目标分叉。 */
+export function identitySnapshotHash(value: unknown): string {
+  const canonical = (item: unknown): unknown => Array.isArray(item) ? item.map(canonical)
+    : item && typeof item === 'object' ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, child]) => [key, canonical(child)])) : item
+  return digest(JSON.stringify(canonical(value)))
+}
 
 /**
  * 把一个生效区间说成人话。
@@ -35,6 +50,7 @@ const describePriceTarget = (price: ModelPrice): string =>
   `${isAnyProvider(price.provider) ? '不限供应商' : price.provider} / ${price.model}`
 
 export class IdentityRepository {
+  private readonly mutationPrecondition = new AsyncLocalStorage<IdentityMutationPrecondition>()
   readonly now: () => number
   private readonly afterPasswordHash?: () => Promise<void>
   constructor(readonly target: PortalTarget, options: { now?: () => number; afterPasswordHash?: () => Promise<void> } = {}) {
@@ -65,6 +81,35 @@ export class IdentityRepository {
     })
   }
 
+  /** 条件只沿当前异步调用传播，并发管理请求不会误用另一个确认动作的目标。 */
+  withMutationPrecondition<T>(condition: IdentityMutationPrecondition, work: () => Promise<T>): Promise<T> {
+    return this.mutationPrecondition.run(condition, work)
+  }
+  private async checkMutationPrecondition(tx: PortalStore): Promise<void> {
+    const condition = this.mutationPrecondition.getStore()
+    if (!condition) return
+    const { resource, targetId, snapshotHash, absentKey } = condition
+    if (targetId && snapshotHash) {
+      const value = resource === 'members' ? await this.member(tx, targetId)
+        : resource === 'groups' ? await this.group(tx, targetId)
+        : resource === 'provider-aliases' ? await this.providerAliasById(tx, targetId)
+        : resource === 'project-aliases' ? await this.projectAliasById(tx, targetId)
+        : await this.modelPriceById(tx, targetId)
+      if (identitySnapshotHash(value) !== snapshotHash) throw new IdentityError(409, '对象已发生变化，请重新生成操作并核对', 'assistant_target_changed')
+      return
+    }
+    if (absentKey) {
+      const memberId = absentKey.scope === 'member' ? idField(absentKey, 'member_id') : null
+      const existing = resource === 'provider-aliases'
+        ? await this.findProviderAlias(tx, memberId, textField(absentKey, 'provider'), nullableTextField(absentKey, 'model'))
+        : resource === 'project-aliases' ? await this.findProjectAlias(tx, memberId, normalizeProjectPrefix(textField(absentKey, 'prefix')))
+        : resource === 'pricing' ? await tx.get<Row>('SELECT price_id FROM model_price WHERE provider = $provider AND model = $model AND effective_from_ms = $from', { $provider: absentKey.provider, $model: absentKey.model, $from: absentKey.effective_from_ms }) : null
+      if (existing) throw new IdentityError(409, '同一目标的配置已存在，请先查询再编辑', 'assistant_target_exists')
+      return
+    }
+    throw new IdentityError(400, '操作前置条件无效')
+  }
+
   async isRegistered(): Promise<boolean> {
     return this.read(async (tx) => (await tx.get<Row>('SELECT initialized_at_ms FROM portal_identity_state WHERE singleton_key = 1'))?.initialized_at_ms != null)
   }
@@ -88,6 +133,15 @@ export class IdentityRepository {
       if (!fresh) throw new IdentityError(401, '登录或凭证已失效，请重新认证')
       requirePermission(fresh, permission)
       return fresh
+    })
+  }
+  /** 公开分享只读复核归属人与权限；不携带认证凭据，因此不能用于任何管理写入。 */
+  async memberAccess(memberId: string): Promise<Omit<Principal, 'auth'> | null> {
+    return this.read(async (tx) => {
+      const principal = await this.principal(tx, memberId, { kind: 'session', sessionId: '', accountId: '' })
+      if (!principal) return null
+      const { auth: _auth, ...access } = principal
+      return access
     })
   }
   async verifyIdentity(secret: string) {
@@ -329,6 +383,8 @@ export class IdentityRepository {
   }
   private async mutate<T>(actor: Principal, permission: string, action: string, targetType: string, targetId: string | null, fn: (tx: PortalStore, fresh: Principal) => Promise<T>): Promise<T> {
     return this.withWrite(actor, permission, async (tx, fresh) => {
+      // ★ 复核在同一身份写事务与单例锁内；先 GET 再 DELETE 会留下并发改目标的窗口。
+      await this.checkMutationPrecondition(tx)
       const result = await fn(tx, fresh)
       await this.ensureRecovery(tx)
       await this.audit(tx, fresh, action, targetType, targetId, {})
