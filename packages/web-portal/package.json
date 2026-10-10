@@ -16,6 +16,7 @@
     "@ai-token-report/shared": "workspace:*",
     "@element-plus/icons-vue": "2.3.2",
     "chart.js": "4",
+    "echarts": "6.1.0",
     "element-plus": "2.14.6",
     "markdown-it": "15.0.2",
     "pinia": "4.0.3",
