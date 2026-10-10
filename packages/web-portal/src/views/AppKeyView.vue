@@ -60,6 +60,7 @@
  *   一页的行）时夹回有效范围 —— 否则会停在越界页码上，看见一张空表。
  */
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { useAssistantPageSearch } from '../utils/assistantPageSearch.js'
 import { Refresh, Search, Ticket } from '@element-plus/icons-vue'
 import { ElAlert, ElButton, ElCard, ElDatePicker, ElDialog, ElInput, ElMessage, ElMessageBox, ElOption, ElPagination, ElSelect, ElSkeleton, ElTable, ElTableColumn, ElTag } from 'element-plus'
 import type { PortalAppKeyEntry, PortalMember, PortalReportToken } from '@ai-token-report/shared'
@@ -82,7 +83,7 @@ interface DeliveryTarget {
 }
 
 const session = useSessionStore(), admin = useMembersStore()
-const search = ref(''), status = ref('')
+const search = useAssistantPageSearch(() => { void refresh() }, () => admin.loading || admin.appKeysLoading), status = ref('')
 /** 当前页码（1 起）。★ 只是视图状态，不进任何请求 —— 筛选与它无关。 */
 const page = ref(1)
 /** 发放弹框是否打开（表单状态跟着弹框一起销毁重建）。 */

@@ -7,6 +7,8 @@
  *   既不改写任何人的现有归属，也不改写历史用量（用量按事件归属展开统计）。
  */
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { useAssistantPageSearch } from '../utils/assistantPageSearch.js'
+import { useAssistantForm, assistantFormEntry } from '../utils/assistantForms.js'
 import { Plus, Refresh, Search } from '@element-plus/icons-vue'
 import {
   ElAlert, ElButton, ElCard, ElDialog, ElForm, ElFormItem, ElInput,
@@ -20,7 +22,7 @@ import * as api from '../api/admin.js'
 import { formatFullDateTime } from '../utils/format.js'
 
 const admin = useMembersStore(), session = useSessionStore()
-const search = ref(''), status = ref('')
+const search = useAssistantPageSearch(() => { void admin.load('groups') }, () => admin.loading), status = ref('')
 const showForm = ref(false)
 const selected = ref<PortalGroup | null>(null)
 const form = ref<FormInstance>()
@@ -76,6 +78,11 @@ async function changeStatus(group: PortalGroup): Promise<void> {
     }), group.group_id)) ElMessage.success(enabling ? '分组已启用' : '分组已停用')
   } catch { /* 用户取消。 */ }
 }
+useAssistantForm('groups', {
+  canOpen: () => session.can('groups:manage'), isLoading: () => admin.loading, isBusy: () => !!admin.busyId,
+  isOpen: () => showForm.value, error: () => admin.error,
+  open: request => { open(assistantFormEntry(request, admin.groups, row => row.group_id)); if (typeof request.values.name === 'string') draft.name = request.values.name },
+})
 onMounted(() => { void admin.load('groups') })
 onUnmounted(() => { admin.clear() })
 </script>

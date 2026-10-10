@@ -5,6 +5,7 @@ import { useSessionStore } from '../src/stores/session.js'
 import { buildFilter, useDashboardStore } from '../src/stores/dashboard.js'
 import { useMembersStore } from '../src/stores/members.js'
 import { periodReadyForQuery } from '../src/types/portal.js'
+import { assistantDashboardFilters } from '../src/utils/assistantNavigation.js'
 import { createGroup, issueMember, updateMember, updateRoles } from '../src/api/admin.js'
 
 const originalFetch = globalThis.fetch
@@ -468,6 +469,39 @@ describe('统计状态', () => {
     expect(dashboard.filters.users).toEqual([inGroup])
     // 展示名用分组 ID 翻名字（服务端只回 ID），与排行里的拼法一致。
     expect(dashboard.userOptions[0]?.label).toBe('张三 · 研发组 · 00000000')
+  })
+
+  test('助手显式人员与分组冲突时保持条件和毫秒窗口，仍遵循本人范围', async () => {
+    signIn('admin')
+    const memberId = '00000000-0000-4000-8000-00000000000b'
+    const groupId = '00000000-0000-4000-8000-00000000000c'
+    const urls: URL[] = []
+    respond((raw) => {
+      const url = new URL(raw, 'http://test')
+      urls.push(url)
+      if (url.pathname.endsWith('overview')) return json({ ...overview, totalTokens: url.searchParams.has('member_id') ? 0 : 101 })
+      if (url.pathname.endsWith('/api/v1/stats/members')) return json({ members: [
+        { member_id: memberId, name: '组外人员', status: 'active', group_ids: ['other-group'] },
+      ] })
+      return json({ rows: [], points: [], groups: [] })
+    })
+    const dashboard = useDashboardStore()
+    await dashboard.activate('overview')
+    urls.length = 0
+    const filters = assistantDashboardFilters({ member_id: memberId, group_id: groupId, from: '1790800000123', to: '1790800000456' })!
+    await dashboard.activate('records', filters)
+    expect(dashboard.filters.users).toEqual([memberId])
+    expect(dashboard.overview?.totalTokens).toBe(0)
+    const request = urls.find(url => url.pathname.endsWith('overview'))!
+    expect(request.searchParams.getAll('member_id')).toEqual([memberId])
+    expect(request.searchParams.getAll('group_id')).toEqual([groupId])
+    expect(request.searchParams.get('from')).toBe('1790800000123')
+    expect(request.searchParams.get('to')).toBe('1790800000456')
+    signIn()
+    urls.length = 0
+    await dashboard.activate('records', filters)
+    expect(dashboard.filters.users).toEqual([])
+    expect(urls.every(url => !url.searchParams.has('member_id'))).toBe(true)
   })
 
   /**

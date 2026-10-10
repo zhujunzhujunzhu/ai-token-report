@@ -14,6 +14,7 @@
  *   硬编码一份会漏掉数据库里真实存在的权限，而页面看起来「权限就这些」。
  */
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { useAssistantPageSearch } from '../utils/assistantPageSearch.js'
 import { Plus, Refresh, Search } from '@element-plus/icons-vue'
 import {
   ElAlert, ElButton, ElCard, ElCheckbox, ElCheckboxGroup, ElDialog, ElForm, ElFormItem,
@@ -27,7 +28,7 @@ import { assignableRoles, filterRoles, permissionLabel, permissionOptions } from
 import * as api from '../api/admin.js'
 
 const admin = useMembersStore(), session = useSessionStore()
-const search = ref(''), status = ref('')
+const search = useAssistantPageSearch(() => { void admin.load('roles') }, () => admin.loading), status = ref('')
 const showRoleForm = ref(false), showAssign = ref(false)
 const editing = ref<PortalRole | null>(null)
 const form = ref<FormInstance>()

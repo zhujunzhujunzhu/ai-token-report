@@ -49,6 +49,8 @@
  *    手动切回的「全部币种」反复改掉。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
+import { useAssistantPageSearch } from '../utils/assistantPageSearch.js'
+import { useAssistantForm, assistantFormEntry, assistantPricingPrefill, assistantPriceTime, assertAssistantFormIdentity } from '../utils/assistantForms.js'
 import { Delete, Edit, Plus, Refresh, Search } from '@element-plus/icons-vue'
 import {
   ElAlert, ElButton, ElCard, ElDatePicker, ElDialog, ElEmpty, ElForm, ElFormItem, ElInput,
@@ -61,7 +63,7 @@ import * as api from '../api/admin.js'
 import { useSessionStore } from '../stores/session.js'
 import { formatFullDateTime } from '../utils/format.js'
 import {
-  BASE_PROVIDER_LABEL, DEFAULT_CURRENCY, PRICE_STATUS_TEXT, defaultCurrencyForFilter, defaultCurrencyForNewPrice,
+  DEFAULT_CURRENCY, PRICE_STATUS_TEXT, defaultCurrencyForFilter, defaultCurrencyForNewPrice,
   groupPricesByProvider, hasOffpeak, microToRateText, offpeakRatesOf, priceSpanText, priceStatusOf, providerLabel,
   rateTextToMicro, scheduleHint, scheduleLabel,
 } from '../utils/unitPrice.js'
@@ -71,7 +73,7 @@ const prices = ref<PortalModelPrice[]>([])
 const loading = ref(false)
 const busy = ref(false)
 const error = ref<string | null>(null)
-const search = ref('')
+const search = useAssistantPageSearch(() => { void load() }, () => loading.value)
 /**
  * 币种筛选：**默认 CNY**（见 `utils/unitPrice.ts` 的 `DEFAULT_CURRENCY`）。
  *
@@ -84,6 +86,7 @@ let currencyFilterInitialized = false
 const onlyEffective = ref(false)
 const showForm = ref(false)
 const selected = ref<PortalModelPrice | null>(null)
+const exactFormRange = ref<{ from?: number; to?: number | null }>({})
 const form = ref<FormInstance>()
 /** 「当前生效」的判定基准在**加载时**取一次：渲染过程中反复读 `Date.now()` 会让同一屏里两行用不同的基准。 */
 const nowMs = ref(Date.now())
@@ -149,8 +152,8 @@ async function load(): Promise<void> {
   // 基准取一次，并对齐「这次读取」的时刻（见 `nowMs` 的注释）。
   nowMs.value = Date.now()
   const result = await api.fetchModelPrices()
-  if (result.status === 401) { session.expire('登录已失效，请重新登录'); loading.value = false; return }
-  if (!result.ok) error.value = result.reason ?? '单价加载失败'
+  if (!result.ok && result.status === 401) { session.expire('登录已失效，请重新登录'); loading.value = false; return }
+  if (!result.ok) error.value = result.error
   else {
     prices.value = result.data.prices
     // 默认币种只套一次（见 `currencyFilterInitialized` 的注释），且只在**真取到数**之后。
@@ -165,6 +168,7 @@ async function load(): Promise<void> {
 
 function openForm(row: PortalModelPrice | null = null): void {
   selected.value = row
+  exactFormRange.value = row ? { from: row.effective_from_ms, to: row.effective_to_ms } : {}
   draft.basePrice = row?.provider === ANY_PROVIDER
   draft.provider = row?.provider ?? ''
   draft.model = row?.model ?? ''
@@ -291,8 +295,10 @@ async function save(): Promise<void> {
     offpeakSchedule: offpeak.schedule,
   })
   if (offpeakReason) { error.value = offpeakReason; return }
-  const from = draft.from ? new Date(draft.from).getTime() : 0
-  const to = draft.to ? new Date(draft.to).getTime() : null
+  // 日期控件只显示到分钟；未手动改时间时保留真实业务键的毫秒，避免编辑变成另一条区间。
+  const original = exactFormRange.value
+  const from = assistantPriceTime(draft.from, original.from, original.from !== undefined && original.from > 0 ? localInput(original.from) : '', 0)!
+  const to = assistantPriceTime(draft.to, original.to, original.to !== null && original.to !== undefined ? localInput(original.to) : '', null)
   if (!Number.isSafeInteger(from) || from < 0) { error.value = '生效起点无效'; return }
   if (to !== null && (!Number.isSafeInteger(to) || to < 0)) { error.value = '生效终点无效'; return }
   if (to !== null && to < from) { error.value = '生效终点不能早于生效起点'; return }
@@ -312,10 +318,10 @@ async function save(): Promise<void> {
     note: draft.note.trim() || null,
   })
   busy.value = false
-  if (result.status === 401) { session.expire('登录已失效，请重新登录'); return }
+  if (!result.ok && result.status === 401) { session.expire('登录已失效，请重新登录'); return }
   // 🚨 409（区间重叠）**原样呈现服务端那句话**：它点出了撞上的是哪一条区间，
   //   而「保存失败」四个字会让使用者以为是网络问题，反复重试同一件不可能成功的事。
-  if (!result.ok) { error.value = result.reason ?? '保存失败'; return }
+  if (!result.ok) { error.value = result.error; return }
   showForm.value = false
   ElMessage.success('单价已保存，费用按事件发生时刻选用对应区间的价')
   await load()
@@ -334,12 +340,24 @@ async function remove(row: PortalModelPrice): Promise<void> {
   busy.value = true
   const result = await api.deleteModelPrice({ price_id: row.price_id })
   busy.value = false
-  if (result.status === 401) { session.expire('登录已失效，请重新登录'); return }
-  if (!result.ok) { ElMessage.error(result.reason ?? '删除失败'); return }
+  if (!result.ok && result.status === 401) { session.expire('登录已失效，请重新登录'); return }
+  if (!result.ok) { ElMessage.error(result.error); return }
   ElMessage.success('单价已删除')
   await load()
 }
 
+useAssistantForm('pricing', {
+  canOpen: () => canManage.value, isLoading: () => loading.value, isBusy: () => busy.value,
+  isOpen: () => showForm.value, error: () => error.value,
+  open: request => {
+    const entry = assistantFormEntry(request, prices.value, row => row.price_id)
+    assertAssistantFormIdentity(request.values, entry, ['provider', 'model', 'currency', 'effective_from_ms'])
+    openForm(entry)
+    Object.assign(draft, assistantPricingPrefill(request.values, localInput))
+    if (typeof request.values.effective_from_ms === 'number') exactFormRange.value.from = request.values.effective_from_ms
+    if (request.values.effective_to_ms === null || typeof request.values.effective_to_ms === 'number') exactFormRange.value.to = request.values.effective_to_ms
+  },
+})
 onMounted(() => { void load() })
 </script>
 
@@ -421,12 +439,12 @@ onMounted(() => { void load() })
                 <template v-if="hasOffpeak(rowPrice(row))">
                   <div class="muted">{{ scheduleLabel(rowPrice(row).offpeak_schedule) }}</div>
                   <div>
-                    输入 {{ formatUnitPriceMicro(rowPrice(row).offpeak_input_micro_per_ktok, row.currency) }} ·
-                    输出 {{ formatUnitPriceMicro(rowPrice(row).offpeak_output_micro_per_ktok, row.currency) }}
+                    输入 {{ formatUnitPriceMicro(offpeakRatesOf(rowPrice(row))!.input, row.currency) }} ·
+                    输出 {{ formatUnitPriceMicro(offpeakRatesOf(rowPrice(row))!.output, row.currency) }}
                   </div>
                   <div class="muted">
-                    缓存读 {{ formatUnitPriceMicro(rowPrice(row).offpeak_cache_read_micro_per_ktok, row.currency) }} ·
-                    缓存写 {{ formatUnitPriceMicro(rowPrice(row).offpeak_cache_write_micro_per_ktok, row.currency) }}
+                    缓存读 {{ formatUnitPriceMicro(offpeakRatesOf(rowPrice(row))!.cacheRead, row.currency) }} ·
+                    缓存写 {{ formatUnitPriceMicro(offpeakRatesOf(rowPrice(row))!.cacheWrite, row.currency) }}
                   </div>
                 </template>
                 <span v-else class="muted">不分时段（全天一个价）</span>

@@ -90,6 +90,8 @@ export interface DashboardFilters {
   groups: string[]
   customFrom: string
   customTo: string
+  /** 助手的绝对窗口绑定输入值；手工改日期后自动恢复整分钟结束边界。 */
+  exactRange?: { from: number; to: number; fromInput: string; toInput: string }
 }
 export interface UserDetail {
   userId: string
@@ -127,6 +129,8 @@ export function buildFilter(input: DashboardFilters): {
     groups: [...new Set(input.groups)],
   }
   if (input.period === CUSTOM_PERIOD) {
+    if (input.exactRange && input.customFrom === input.exactRange.fromInput && input.customTo === input.exactRange.toInput)
+      return { filter: { ...filter, from: input.exactRange.from, to: input.exactRange.to }, error: null, span: input.exactRange.to - input.exactRange.from }
     const from = input.customFrom ? new Date(input.customFrom).getTime() : NaN
     const to = input.customTo ? new Date(input.customTo).getTime() : NaN
     if (!Number.isFinite(from) || !Number.isFinite(to))
@@ -616,7 +620,7 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
     if (detail.value) await openUser(detail.value.userId, true)
   }
 
-  async function applyFilters(next: DashboardFilters): Promise<boolean> {
+  async function applyFilters(next: DashboardFilters, preserveRequestedUsers = false): Promise<boolean> {
     const built = buildFilter(next)
     rangeError.value = built.error
     if (built.error) return false
@@ -637,7 +641,7 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
           //   ⚠️ 只在名册可用时收窄。名册取不到（旧服务端 / 请求失败）时我们
           //   并不知道谁属于哪个分组，此时按原样保留 —— 不能凭一份空名册
           //   删掉使用者的选择。
-          memberDirectory.value.length > 0
+          !preserveRequestedUsers && memberDirectory.value.length > 0
           ? pruneUsers(next.users, groups)
           : [...next.users],
     }
@@ -745,9 +749,11 @@ export const useDashboardStore = defineStore('portal-dashboard', () => {
   function setTrendMetric(value: TrendMetric): void {
     trendMetric.value = value
   }
-  async function activate(value: StatsSection): Promise<void> {
+  async function activate(value: StatsSection, next?: DashboardFilters): Promise<void> {
     section.value = value
-    await load()
+    // 助手带来的显式人员/分组是查询条件；冲突交给服务端，不能删掉人员扩大范围。
+    if (next) await applyFilters(next, true)
+    else await load()
   }
   function deactivate(): void {
     section.value = null

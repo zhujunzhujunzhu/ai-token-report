@@ -31,6 +31,8 @@
  *   要写清楚是谁 —— 同一个库，两个人看到的分布可以不同。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
+import { useAssistantPageSearch } from '../utils/assistantPageSearch.js'
+import { useAssistantForm, assistantFormEntry, assertAssistantFormIdentity } from '../utils/assistantForms.js'
 import { Delete, Plus, Refresh, Search } from '@element-plus/icons-vue'
 import {
   ElAlert, ElButton, ElCard, ElDialog, ElForm, ElFormItem, ElInput,
@@ -50,7 +52,7 @@ const people = ref<PortalMember[]>([])
 const loading = ref(false)
 const busy = ref(false)
 const error = ref<string | null>(null)
-const search = ref('')
+const search = useAssistantPageSearch(() => { void load() }, () => loading.value)
 const scopeFilter = ref('')
 /** 按「作用对象」筛：供应商规则与模型规则混在一张表里，一类可能只有两三条。 */
 const targetFilter = ref('')
@@ -113,8 +115,8 @@ async function load(): Promise<void> {
     api.fetchProviderAliases(),
     session.can('members:read') ? fetchMembers() : null,
   ])
-  if (list.status === 401) { session.expire('登录已失效，请重新登录'); loading.value = false; return }
-  if (!list.ok) error.value = list.reason ?? '规则加载失败'
+  if (!list.ok && list.status === 401) { session.expire('登录已失效，请重新登录'); loading.value = false; return }
+  if (!list.ok) error.value = list.error
   else aliases.value = list.data.aliases
   // ⚠️ 人员目录只是为了让「作用范围」能选人；读不到就不给选（表单里明确说明），
   //   不因为一个附带请求失败把整页判定为不可用。
@@ -150,8 +152,8 @@ async function save(): Promise<void> {
     alias: draft.alias.trim(),
   })
   busy.value = false
-  if (result.status === 401) { session.expire('登录已失效，请重新登录'); return }
-  if (!result.ok) { error.value = result.reason ?? '保存失败'; return }
+  if (!result.ok && result.status === 401) { session.expire('登录已失效，请重新登录'); return }
+  if (!result.ok) { error.value = result.error; return }
   showForm.value = false
   ElMessage.success('规则已保存，看板上的口径立即生效')
   await load()
@@ -162,8 +164,8 @@ async function changeStatus(entry: PortalProviderAlias): Promise<void> {
   busy.value = true
   const result = await api.setProviderAliasStatus({ alias_id: entry.alias_id, enabled: !entry.enabled })
   busy.value = false
-  if (result.status === 401) { session.expire('登录已失效，请重新登录'); return }
-  if (!result.ok) { ElMessage.error(result.reason ?? '操作失败'); return }
+  if (!result.ok && result.status === 401) { session.expire('登录已失效，请重新登录'); return }
+  if (!result.ok) { ElMessage.error(result.error); return }
   ElMessage.success(entry.enabled ? '规则已停用，该项回到原始名' : '规则已启用')
   await load()
 }
@@ -180,12 +182,27 @@ async function remove(entry: PortalProviderAlias): Promise<void> {
   busy.value = true
   const result = await api.deleteProviderAlias({ alias_id: entry.alias_id })
   busy.value = false
-  if (result.status === 401) { session.expire('登录已失效，请重新登录'); return }
-  if (!result.ok) { ElMessage.error(result.reason ?? '删除失败'); return }
+  if (!result.ok && result.status === 401) { session.expire('登录已失效，请重新登录'); return }
+  if (!result.ok) { ElMessage.error(result.error); return }
   ElMessage.success('规则已删除')
   await load()
 }
 
+useAssistantForm('provider-aliases', {
+  canOpen: () => canManage.value, isLoading: () => loading.value, isBusy: () => busy.value,
+  isOpen: () => showForm.value, error: () => error.value,
+  open: request => {
+    const entry = assistantFormEntry(request, aliases.value, row => row.alias_id)
+    assertAssistantFormIdentity(request.values, entry, ['scope', 'member_id', 'provider', 'model'])
+    open(entry)
+    const values = request.values
+    if (values.scope === 'global' || values.scope === 'member') draft.scope = values.scope
+    if (values.member_id !== undefined) draft.member_id = String(values.member_id ?? '')
+    if (values.model !== undefined) { draft.target = values.model === null ? 'provider' : 'model'; draft.model = String(values.model ?? '') }
+    if (typeof values.provider === 'string') draft.provider = draft.target === 'model' && values.provider === ANY_PROVIDER ? '' : values.provider
+    if (typeof values.alias === 'string') draft.alias = values.alias
+  },
+})
 onMounted(() => { void load() })
 </script>
 
@@ -239,15 +256,15 @@ onMounted(() => { void load() })
         </el-table-column>
         <el-table-column label="作用对象" width="100">
           <template #default="{ row }">
-            <el-tag :type="isModelRule(row) ? 'warning' : 'primary'" effect="plain">{{ targetOf(row) }}</el-tag>
+            <el-tag :type="isModelRule(rowAlias(row)) ? 'warning' : 'primary'" effect="plain">{{ targetOf(rowAlias(row)) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="匹配的原始值" min-width="220">
-          <template #default="{ row }"><code>{{ sourceOf(row) }}</code></template>
+          <template #default="{ row }"><code>{{ sourceOf(rowAlias(row)) }}</code></template>
         </el-table-column>
         <el-table-column label="归一化后" min-width="180">
           <template #default="{ row }">
-            {{ row.alias }}<span v-if="row.alias === (isModelRule(row) ? row.model : row.provider)" class="muted">（与原始名相同）</span>
+            {{ row.alias }}<span v-if="row.alias === (isModelRule(rowAlias(row)) ? row.model : row.provider)" class="muted">（与原始名相同）</span>
           </template>
         </el-table-column>
         <el-table-column label="状态" width="100">

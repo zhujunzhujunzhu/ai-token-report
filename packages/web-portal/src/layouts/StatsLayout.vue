@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /** 统计页共享筛选与刷新生命周期，离开统计模块即停止轮询。 */
 import { ElAlert, ElButton, ElEmpty, ElIcon, ElSkeleton } from 'element-plus'
-import { computed, onMounted, onUnmounted, watch } from 'vue'
+import { computed, onMounted, onUnmounted, watch, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { Refresh, Clock } from '@element-plus/icons-vue'
 import FilterBar from '../components/FilterBar.vue'
@@ -9,8 +9,10 @@ import UserDetailPanel from '../components/UserDetailPanel.vue'
 import { buildFilter, useDashboardStore, type StatsSection } from '../stores/dashboard.js'
 import { formatFullDateTime } from '../utils/format.js'
 import { refreshIntervalMs, refreshIntervalLabel } from '../utils/refresh.js'
+import { assistantDashboardFilters } from '../utils/assistantNavigation.js'
 const dashboard = useDashboardStore()
 const route = useRoute()
+const navigationError = ref('')
 // 页面副标题只在真正需要补充说明时给（`section` 未登记即不渲染）：
 // 「采集诊断」这类标题已经自明的页面，多一行灰字只是噪音。
 const descriptions: Record<string, string> = {
@@ -30,9 +32,12 @@ function refreshWhenVisible(): void {
     void dashboard.load(true)
 }
 watch(
-  () => route.meta.section,
-  (value) => {
-    if (value) void dashboard.activate(value as StatsSection)
+  () => [route.meta.section, route.fullPath],
+  ([value]) => {
+    navigationError.value = ''
+    if (!value) return
+    try { void dashboard.activate(value as StatsSection, assistantDashboardFilters(route.query)) }
+    catch (err) { navigationError.value = err instanceof Error ? err.message : '页面筛选条件无效' }
   },
   { immediate: true },
 )
@@ -66,7 +71,8 @@ onUnmounted(() => {
       >
     </div>
     <FilterBar />
-    <div class="data-context">
+    <el-alert v-if="navigationError" :title="navigationError" type="error" show-icon :closable="false" />
+    <div v-if="!navigationError" class="data-context">
       <span>{{ dashboard.overview?.range.label || '当前筛选范围' }}</span
       ><span
         ><el-icon><Clock /></el-icon
@@ -90,13 +96,13 @@ onUnmounted(() => {
       :closable="false"
     />
     <el-skeleton
-      v-if="dashboard.loading && !dashboard.overview"
+      v-if="!navigationError && dashboard.loading && !dashboard.overview"
       :rows="10"
       animated
       class="panel loading-panel"
     />
-    <router-view v-else-if="dashboard.overview" />
-    <el-empty v-else-if="!dashboard.loading" description="暂无可展示的数据" />
+    <router-view v-else-if="!navigationError && dashboard.overview" />
+    <el-empty v-else-if="!navigationError && !dashboard.loading" description="暂无可展示的数据" />
     <UserDetailPanel />
   </div>
 </template>

@@ -38,6 +38,8 @@
  *   同一条目录上前者被后者压住（跨作用范围时仍然是**更具体者**优先）。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
+import { useAssistantPageSearch } from '../utils/assistantPageSearch.js'
+import { useAssistantForm, assistantFormEntry, assertAssistantFormIdentity } from '../utils/assistantForms.js'
 import { Delete, Plus, Refresh, Search } from '@element-plus/icons-vue'
 import {
   ElAlert, ElButton, ElCard, ElDialog, ElForm, ElFormItem, ElInput,
@@ -66,7 +68,7 @@ const catalogLoaded = ref(false)
 const loading = ref(false)
 const busy = ref(false)
 const error = ref<string | null>(null)
-const search = ref('')
+const search = useAssistantPageSearch(() => { void load() }, () => loading.value)
 const scopeFilter = ref('')
 const showForm = ref(false)
 const selected = ref<PortalProjectAlias | null>(null)
@@ -172,6 +174,20 @@ async function remove(entry: PortalProjectAlias): Promise<void> {
   await load()
 }
 
+useAssistantForm('project-aliases', {
+  canOpen: () => canManage.value, isLoading: () => loading.value, isBusy: () => busy.value,
+  isOpen: () => showForm.value, error: () => error.value,
+  open: request => {
+    const entry = assistantFormEntry(request, aliases.value, row => row.alias_id)
+    assertAssistantFormIdentity(request.values, entry, ['scope', 'member_id', 'prefix'])
+    open(entry)
+    const values = request.values
+    if (values.scope === 'global' || values.scope === 'member') draft.scope = values.scope
+    if (values.member_id !== undefined) draft.member_id = String(values.member_id ?? '')
+    if (typeof values.prefix === 'string') draft.prefix = values.prefix
+    if (typeof values.alias === 'string') draft.alias = values.alias
+  },
+})
 onMounted(() => { void load() })
 </script>
 

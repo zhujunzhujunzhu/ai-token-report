@@ -1023,6 +1023,52 @@ try {
   const pricingLabels = ['货币单位 / 百万 token', '整数微元', '每百万 token 2 元']
   const pricingMissing = pricingLabels.filter((label) => !pricingHtml.includes(label))
   check(`计价页写明单价的单位与微元口径${pricingMissing.length ? `（缺 ${pricingMissing.join('、')}）` : ''}`, pricingMissing.length === 0)
+  // 新能力须实际执行组件树，避免确认卡与文件按钮漏 import 或渲染旧授权。
+  const { default: ActionCard } = await server.ssrLoadModule('/src/components/AssistantAction.vue')
+  const { default: ArtifactCard } = await server.ssrLoadModule('/src/components/AssistantArtifact.vue')
+  const { default: AttachmentCard } = await server.ssrLoadModule('/src/components/AssistantAttachment.vue')
+  const assistantHtml = await render('/src/views/AssistantView.vue')
+  const { default: SessionList } = await server.ssrLoadModule('/src/components/AssistantSessionList.vue')
+  const sessionListProps = {
+    sessions: Array.from({ length: 1000 }, (_, index) => ({ session_id: `session-${index}`, title: `历史对话 ${index}`, created_at_ms: 1, updated_at_ms: 2, turn_count: 1 })),
+    active: 'session-0', total: 1000, loading: false, hasMore: true, error: '', disabled: false,
+    activity: (id: string) => ({ label: id === 'session-0' ? '进行中 · 2 条排队' : '', running: id === 'session-0' }),
+  }
+  const virtualSessionHtml = await renderToString(createRenderApp({ render: () => h(SessionList, sessionListProps) }))
+  check('千条对话仅渲染视口附近的十行，保留总高度与完整列表序号', (virtualSessionHtml.match(/role="listitem"/g)?.length ?? 0) === 10 && virtualSessionHtml.includes('height:64000px') && virtualSessionHtml.includes('aria-setsize="1000"') && !virtualSessionHtml.includes('历史对话 999'))
+  check('虚拟对话保持当前选择、运行状态、删除入口与分页提示', virtualSessionHtml.includes('aria-current="true"') && virtualSessionHtml.includes('进行中 · 2 条排队') && virtualSessionHtml.includes('删除对话：历史对话 0') && virtualSessionHtml.includes('向下滚动加载更多'))
+  const sessionLoadingHtml = await renderToString(createRenderApp({ render: () => h(SessionList, { ...sessionListProps, sessions: [], loading: true }) }))
+  check('对话首屏加载中不会提前显示空列表', sessionLoadingHtml.includes('正在加载对话') && sessionLoadingHtml.includes('aria-busy="true"') && !sessionLoadingHtml.includes('你的对话会出现在这里'))
+  const sessionErrorHtml = await renderToString(createRenderApp({ render: () => h(SessionList, { ...sessionListProps, error: '读取失败，请重试' }) }))
+  check('对话分页失败保留已加载对话并提供重试', sessionErrorHtml.includes('历史对话 0') && sessionErrorHtml.includes('读取失败，请重试') && sessionErrorHtml.includes('>重试</button>'))
+  const sessionEndHtml = await renderToString(createRenderApp({ render: () => h(SessionList, { ...sessionListProps, hasMore: false }) }))
+  check('对话末页显示已加载全部', sessionEndHtml.includes('已加载全部对话') && !sessionEndHtml.includes('向下滚动加载更多'))
+  check('助手输入框提供多选附件入口并保留输入法快捷键提示', assistantHtml.includes('添加附件') && assistantHtml.includes('type="file"') && assistantHtml.includes('multiple') && assistantHtml.includes('.docx') && assistantHtml.includes('.xlsx') && assistantHtml.includes('.pptx') && assistantHtml.includes('Alt + Enter'))
+  const attachmentHtml = await renderToString(createRenderApp({ render: () => h(AttachmentCard, { sessionId: '私有会话', attachment: { attachment_id: '上传甲', file_name: '<script>说明</script>.docx', media_type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', size_bytes: 2048, kind: 'document', extracted_chars: 1200, note: '内容已截断，仅包含前 60,000 字。' } }) }))
+  check('上传历史显示文件名、容量、解析范围与下载入口，文件名被转义', attachmentHtml.includes('2.0 KB') && attachmentHtml.includes('已解析 1,200 字') && attachmentHtml.includes('前 60,000 字') && attachmentHtml.includes('下载附件') && attachmentHtml.includes('&lt;script&gt;说明&lt;/script&gt;') && !attachmentHtml.includes('<script>说明</script>'))
+  const imageAttachmentHtml = await renderToString(createRenderApp({ render: () => h(AttachmentCard, { sessionId: '私有会话', attachment: { attachment_id: '图甲', file_name: '截图.png', media_type: 'image/png', size_bytes: 512, kind: 'image' } }) }))
+  check('私有图片历史显示可下载文件卡，不产生受保护图片的坏图', imageAttachmentHtml.includes('截图.png') && imageAttachmentHtml.includes('下载附件') && !imageAttachmentHtml.includes('<img'))
+  const capabilityNow = Date.now()
+  const actionFixture = { action_id: 'a', session_id: 's', title: '删除项目规则', description: '原始用量保留，后续查询回落剩余规则', resource: 'projects', operation: 'delete', target_label: '<script>规则甲</script>', expires_at_ms: capabilityNow + 60_000, status: 'pending' }
+  const actionHtml = await renderToString(createRenderApp({ render: () => h(ActionCard, { action: actionFixture }) }))
+  check('助手删除卡显示对象、后果与独立确认按钮', actionHtml.includes('确认删除') && actionHtml.includes('取消操作') && actionHtml.includes('原始用量保留') && actionHtml.includes('在对话中回复同意不会执行'))
+  check('助手动作目标作为文本转义', !actionHtml.includes('<script>规则甲</script>') && actionHtml.includes('&lt;script&gt;规则甲&lt;/script&gt;'))
+  const expiredHtml = await renderToString(createRenderApp({ render: () => h(ActionCard, { action: { ...actionFixture, expires_at_ms: capabilityNow - 1 } }) }))
+  check('历史过期动作不可再次确认', expiredHtml.includes('已过期') && !expiredHtml.includes('确认删除'))
+  const artifactFixture = { artifact_id: 'f', session_id: 's', title: '用量报告', format: 'html', file_name: '用量报告.html', size_bytes: 1024, created_at_ms: capabilityNow, download_path: '/api/v1/assistant/artifacts/f/download', note: '已导出 1 / 200 行。仅本次返回数据；其余行未包含。' }
+  const artifactHtml = await renderToString(createRenderApp({ render: () => h(ArtifactCard, { artifact: artifactFixture }) }))
+  check('HTML 文件默认仅下载，分享说明包含数据与持链接访问语义', artifactHtml.includes('下载文件') && artifactHtml.includes('创建分享链接') && artifactHtml.includes('包含文件中的数据') && artifactHtml.includes('任何持有链接的人') && !artifactHtml.includes('复制链接'))
+  check('文件卡明确说明实际导出范围，不能把部分文件当全量', artifactHtml.includes('已导出 1 / 200 行') && artifactHtml.includes('其余行未包含'))
+  const sharedHtml = await renderToString(createRenderApp({ render: () => h(ArtifactCard, { artifact: { ...artifactFixture, share: { url: 'https://example.test/share/random', expires_at_ms: capabilityNow + 60_000 } } }) }))
+  check('已分享文件显示到期时间、复制与撤销', sharedHtml.includes('复制链接') && sharedHtml.includes('撤销分享') && sharedHtml.includes('到期时间'))
+  const excelHtml = await renderToString(createRenderApp({ render: () => h(ArtifactCard, { artifact: { ...artifactFixture, format: 'xlsx', file_name: '用量报告.xlsx' } }) }))
+  check('Excel 文件可下载并没有 HTML 分享入口', excelHtml.includes('下载文件') && !excelHtml.includes('创建分享链接'))
+  await router.push('/projects?search=' + encodeURIComponent('助手项目甲'))
+  const searchedProjects = await render('/src/views/ProjectsView.vue')
+  const { useAssistantPageSearch } = await server.ssrLoadModule('/src/utils/assistantPageSearch.ts')
+  const searchStateHtml = await renderToString(createRenderApp({ setup: () => { const search = useAssistantPageSearch(); return () => h('span', search.value) } }))
+  // Element Plus 在 mounted 后写入原生 input.value，SSR 不输出该属性，需核对同一搜索状态。
+  check('管理页面读取助手导航搜索条件', searchedProjects.includes('搜索规则') && searchStateHtml.includes('助手项目甲'))
   session.expire()
   await router.push('/analysis')
   check('退出后无法进入统计路由', router.currentRoute.value.name === 'login')

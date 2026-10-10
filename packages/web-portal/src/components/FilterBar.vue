@@ -27,7 +27,7 @@ import {
   ElOptionGroup,
   ElSelect,
 } from 'element-plus'
-import { onUnmounted, reactive, watch } from 'vue'
+import { nextTick, onUnmounted, reactive, watch } from 'vue'
 import { Search, RefreshLeft } from '@element-plus/icons-vue'
 import { useDashboardStore } from '../stores/dashboard.js'
 import { useSessionStore } from '../stores/session.js'
@@ -47,16 +47,22 @@ const draft = reactive({
   providers: [...dashboard.filters.providers],
   sources: [...dashboard.filters.sources],
 })
+let syncingFilters = false
 watch(
   () => dashboard.filters,
-  (value) =>
+  (value) => {
+    syncingFilters = true
     Object.assign(draft, {
       ...value,
+      exactRange: value.exactRange,
       users: [...value.users],
       groups: [...value.groups],
       providers: [...value.providers],
       sources: [...value.sources],
-    }),
+    })
+    // 助手导航已由 store 查询；同步日期控件不能再触发同条件的第二次请求。
+    void nextTick(() => { syncingFilters = false })
+  },
 )
 let selectTimer: ReturnType<typeof setTimeout> | undefined
 /** 此刻的时间范围是否可以直接查询（自定义区间要等起止时间填齐）。 */
@@ -94,6 +100,7 @@ async function reset(): Promise<void> {
 watch(
   () => [draft.customFrom, draft.customTo],
   () => {
+    if (syncingFilters) return
     // 起止时间补齐后自动生效；具名周期下改这两个输入框不发查询。
     if (draft.period === CUSTOM_PERIOD && periodReady()) void apply()
   },
