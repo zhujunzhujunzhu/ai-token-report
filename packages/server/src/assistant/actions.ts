@@ -165,10 +165,11 @@ export class AssistantActions {
     const form: AssistantForm = {
       request_id: randomUUID(), resource, operation, path: definition.path,
       ...(operation === 'update' ? { target_id: String(input.target_id) } : {}),
-      values: merged as AssistantFormValues,
+      // ★ 浏览器从最新目录初始化目标，只预填用户指定字段；旧快照不能盖回并发修改。
+      values: values as AssistantFormValues,
     }
     emit({ type: 'open_form', form })
-    return { ok: true, requested: true, executed: false, form, message: '已请求打开预填表单，尚未保存。用户填写后需点击管理页面的保存按钮。' }
+    return { ok: true, requested: true, executed: false, form, ...(operation === 'update' ? { current_values: merged } : {}), message: '已请求打开预填表单，尚未保存。用户填写后需点击管理页面的保存按钮。' }
   }
   private async plan(principal: Principal, args: AssistantAdminMutation): Promise<{ resource: Resource; operation: Operation; plan: Plan; target?: MutationInput; destructive: boolean }> {
     const input = object(args, ['resource', 'operation', 'target_id', 'values']), resource = resourceOf(input.resource)

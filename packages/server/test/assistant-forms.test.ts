@@ -99,7 +99,7 @@ describe('助手预填表单', () => {
     expect((await call(f, 'GET', 'provider-aliases')).aliases).toHaveLength(1)
     expect((await snapshot(f)).audits).toHaveLength(before.audits.length + 1)
   }))
-  test('编辑精确读取真实目标并保留业务字段，不泄露人员角色或账号', () => using(async f => {
+  test('编辑只预填明确字段，真实完整业务值仅给工具读取，不泄露人员角色或账号', () => using(async f => {
     const group = (await call(f, 'POST', 'groups', { name: '表单组' })).group
     const member = (await call(f, 'POST', 'members', { name: '原姓名', group_ids: [group.group_id], role_ids: [MEMBER_ROLE_ID] })).member
     const provider = (await call(f, 'POST', 'provider-aliases', { scope: 'global', provider: '*', model: 'raw-model', alias: '原模型名' })).alias
@@ -107,17 +107,36 @@ describe('助手预填表单', () => {
     const price = (await call(f, 'POST', 'pricing', priceValues)).price
     const before = await snapshot(f)
     const memberForm = await form(f, { resource: 'members', operation: 'update', target_id: member.member_id, values: { name: '预填新姓名' } })
-    expect(memberForm.values).toEqual({ name: '预填新姓名', group_ids: [group.group_id] })
+    expect(memberForm.values).toEqual({ name: '预填新姓名' })
     expect(JSON.stringify(memberForm)).not.toMatch(/roles|role_ids|account|token|credential|password/)
     const groupForm = await form(f, { resource: 'groups', operation: 'update', target_id: group.group_id })
-    expect(groupForm.values).toEqual({ name: '表单组' })
+    expect(groupForm.values).toEqual({})
     const providerForm = await form(f, { resource: 'provider-aliases', operation: 'update', target_id: provider.alias_id, values: { alias: '预填模型名' } })
-    expect(providerForm.values).toEqual({ scope: 'global', provider: '*', model: 'raw-model', alias: '预填模型名' })
+    expect(providerForm.values).toEqual({ alias: '预填模型名' })
     const projectForm = await form(f, { resource: 'project-aliases', operation: 'update', target_id: project.alias_id })
-    expect(projectForm.values).toMatchObject({ scope: 'member', member_id: member.member_id, prefix: 'example-repository', alias: '原项目名' })
+    expect(projectForm.values).toEqual({})
     const priceForm = await form(f, { resource: 'pricing', operation: 'update', target_id: price.price_id, values: { input_micro_per_ktok: 150, note: null } })
-    expect(priceForm.values).toMatchObject({ ...priceValues, input_micro_per_ktok: 150, note: null })
+    expect(priceForm.values).toEqual({ input_micro_per_ktok: 150, note: null })
+    const result = await f.actions.prepareForm(f.principal, f.session, { resource: 'members', operation: 'update', target_id: member.member_id, values: { name: '新姓名' } }, f.emit) as { current_values: unknown }
+    expect(result.current_values).toEqual({ name: '新姓名', group_ids: [group.group_id] })
     expect(await snapshot(f)).toEqual(before)
+  }))
+  test('生成表单后其他管理员改分组或单价，部分预填不把未指定字段盖回旧值', () => using(async f => {
+    const initialGroup = (await call(f, 'POST', 'groups', { name: '旧分组' })).group
+    const newGroup = (await call(f, 'POST', 'groups', { name: '新分组' })).group
+    const member = (await call(f, 'POST', 'members', { name: '原姓名', group_ids: [initialGroup.group_id], role_ids: [MEMBER_ROLE_ID] })).member
+    const memberForm = await form(f, { resource: 'members', operation: 'update', target_id: member.member_id, values: { name: '请求新姓名' } })
+    await call(f, 'POST', 'members/update', { member_id: member.member_id, expected_version: member.version, group_ids: [newGroup.group_id] })
+    const current = (await call(f, 'GET', 'members')).members.find((row: any) => row.member_id === member.member_id)
+    // 真实页面先从当前目录初始化，再覆盖 SSE 中明确请求的字段。
+    const memberDraft = { name: current.name, group_ids: current.groups.map((group: any) => group.group_id), ...memberForm.values }
+    expect(memberDraft).toEqual({ name: '请求新姓名', group_ids: [newGroup.group_id] })
+    const price = (await call(f, 'POST', 'pricing', priceValues)).price
+    const priceForm = await form(f, { resource: 'pricing', operation: 'update', target_id: price.price_id, values: { note: '只改备注' } })
+    const changedPrice = (await call(f, 'POST', 'pricing', { ...priceValues, output_micro_per_ktok: 350 })).price
+    expect({ ...changedPrice, ...priceForm.values }).toMatchObject({ note: '只改备注', output_micro_per_ktok: 350 })
+    expect(memberForm.values).not.toHaveProperty('group_ids')
+    expect(priceForm.values).not.toHaveProperty('output_micro_per_ktok')
   }))
   test('编辑不能替换归属、原值、币种或生效起点', () => using(async f => {
     const provider = (await call(f, 'POST', 'provider-aliases', { scope: 'global', provider: 'sample-provider', alias: '供应商' })).alias
