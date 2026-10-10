@@ -4,10 +4,11 @@ import { reactive, ref } from 'vue'
 import { ElButton, ElForm, ElFormItem, ElInput, ElSelect, ElOption } from 'element-plus'
 import type { FormInstance, FormRules } from 'element-plus'
 import { validateName, type PortalRole, type PortalGroup, type PortalCreateMemberRequest } from '@ai-token-report/shared'
+import { assistantMemberDraft } from '../utils/assistantForms.js'
 const props = defineProps<{ busy: boolean; roles: PortalRole[]; groups: PortalGroup[]; initialValues?: { name?: string; group_ids?: string[] } }>()
 const emit = defineEmits<{ issue: [input: PortalCreateMemberRequest]; cancel: [] }>()
 const form = ref<FormInstance>()
-const draft = reactive({ name: props.initialValues?.name ?? '', group_ids: [...(props.initialValues?.group_ids ?? [])], role_ids: props.roles.filter((r) => r.code === 'member').map((r) => r.role_id) })
+const draft = reactive({ ...assistantMemberDraft({ name: '', group_ids: [] }, props.initialValues), role_ids: props.roles.filter((r) => r.code === 'member').map((r) => r.role_id) })
 const rules: FormRules = {
   name: [{ required: true, validator: (_rule, value, done) => {
     const result = validateName(String(value)); done(result.ok ? undefined : new Error(result.reason))

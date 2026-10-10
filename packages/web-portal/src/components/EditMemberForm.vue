@@ -16,6 +16,7 @@ import { ElButton, ElForm, ElFormItem, ElInput, ElOption, ElSelect } from 'eleme
 import type { PortalGroup, PortalMember } from '@ai-token-report/shared'
 import type { MemberEditDraft } from '../views/memberEditModel.js'
 import type { RolePickerOption } from '../views/rolesModel.js'
+import { assistantMemberDraft } from '../utils/assistantForms.js'
 
 const props = defineProps<{
   member: PortalMember
@@ -29,8 +30,7 @@ const emit = defineEmits<{ save: [draft: MemberEditDraft]; cancel: [] }>()
 // 打开时把「当前归属」抄进草稿：这里给的就是全量替换后的集合，取消即不提交，
 // 所以不存在「只发变化量」这种需要服务端求差的语义。
 const draft = reactive({
-  name: props.initialValues?.name ?? props.member.name,
-  group_ids: props.initialValues?.group_ids ? [...props.initialValues.group_ids] : props.member.groups.map((group) => group.group_id),
+  ...assistantMemberDraft({ name: props.member.name, group_ids: props.member.groups.map((group) => group.group_id) }, props.initialValues),
   role_ids: props.member.roles.map((role) => role.role_id),
 })
 /**

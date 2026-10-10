@@ -76,14 +76,20 @@ export function createAssistantNavigator() {
 }
 
 /** Router 的取消/中止会 resolve，守卫重定向也不会抛错，必须核对实际页面与查询。 */
-export async function navigateAssistantPage(router: Router, target: ReturnType<typeof assistantNavigationTarget>, signal?: AbortSignal): Promise<void> {
+export async function navigateAssistantPage(router: Router, target: ReturnType<typeof assistantNavigationTarget>, signal?: AbortSignal, beforeResolve?: () => void): Promise<void> {
   if (signal?.aborted) throw new Error('页面跳转已取消')
   // 等异步权限守卫期间可能切会话或停止；临提交前再次检查，防止迟到导航抢走当前页面。
-  const removeGuard = signal ? router.beforeResolve(to => to.path === target.path && signal.aborted ? false : undefined) : undefined
+  let blocked: unknown
+  const removeGuard = signal || beforeResolve ? router.beforeResolve(to => {
+    if (to.path !== target.path) return
+    if (signal?.aborted) return false
+    try { beforeResolve?.() } catch (error) { blocked = error; return false }
+  }) : undefined
   let failure
   try { failure = await router.push(target) }
   catch { throw new Error('页面跳转失败，请重试或从导航栏打开目标页面') }
   finally { removeGuard?.() }
+  if (blocked) throw blocked
   if (isNavigationFailure(failure) && !isNavigationFailure(failure, NavigationFailureType.duplicated))
     throw new Error('页面跳转被取消或中止，请重试或从导航栏打开目标页面')
   const expected = router.resolve(target), actual = router.currentRoute.value

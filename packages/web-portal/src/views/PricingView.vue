@@ -187,7 +187,7 @@ function openForm(row: PortalModelPrice | null = null): void {
   draft.offpeakCacheRead = offpeak ? microToRateText(offpeak.cacheRead) : ''
   draft.offpeakCacheWrite = offpeak ? microToRateText(offpeak.cacheWrite) : ''
   draft.from = row && row.effective_from_ms > 0 ? localInput(row.effective_from_ms) : ''
-  draft.to = row?.effective_to_ms ? localInput(row.effective_to_ms) : ''
+  draft.to = row?.effective_to_ms !== null && row?.effective_to_ms !== undefined ? localInput(row.effective_to_ms) : ''
   draft.note = row?.note ?? ''
   error.value = null
   showForm.value = true

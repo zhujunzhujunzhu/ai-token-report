@@ -3,7 +3,7 @@ import { expect, test } from 'bun:test'
 import { ref } from 'vue'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import type { AssistantForm } from '@ai-token-report/shared'
-import { assistantFormTarget, assistantFormEntry, assistantMemberPrefill, assistantPricingPrefill, assistantPriceTime, assertAssistantFormIdentity, createAssistantFormBroker, createAssistantFormConsumer, waitForAssistantFormReady } from '../src/utils/assistantForms.js'
+import { assistantFormTarget, assistantFormEntry, assistantMemberPrefill, assistantMemberDraft, assistantPricingPrefill, assistantPriceTime, assertAssistantFormIdentity, createAssistantFormBroker, createAssistantFormConsumer, waitForAssistantFormReady } from '../src/utils/assistantForms.js'
 import { navigateAssistantPage } from '../src/utils/assistantNavigation.js'
 
 const targetId = '11111111-1111-4111-8111-111111111111'
@@ -102,6 +102,25 @@ test('已有手填草稿、忙碌、加载失败和目标页面变化时都不�
   }
 })
 
+test('跨页前保护原页面尚未保存的草稿，拒绝切页而非卸载后再检查', async () => {
+  const broker = createAssistantFormBroker(); let navigations = 0, opens = 0
+  const unsubscribe = broker.subscribe('project-aliases', () => {}, () => { throw new Error('已有正在填写的表单，请先保存或取消') })
+  const target = broker.subscribe('provider-aliases', () => { opens++ })
+  await expect(broker.request(form('protect-other-page'), async () => { navigations++ })).rejects.toThrow('已有正在填写')
+  expect(navigations).toBe(0); expect(opens).toBe(0); unsubscribe(); target()
+})
+
+test('等待导航守卫期间用户打开手填草稿，也在提交路由前拦截', async () => {
+  const router = await routerFixture(), broker = createAssistantFormBroker(), entered = deferred(), gate = deferred()
+  let hasDraft = false
+  router.beforeEach(async to => { if (to.path === '/providers') { entered.resolve(); await gate.promise } })
+  const unsubscribe = broker.subscribe('project-aliases', () => {}, () => { if (hasDraft) throw new Error('请先保存正在填写的表单') })
+  const opening = broker.request(form('late-user-draft'), (target, signal, check) => navigateAssistantPage(router, target, signal, check))
+  await entered.promise; hasDraft = true; gate.resolve()
+  await expect(opening).rejects.toThrow('请先保存')
+  expect(router.currentRoute.value.path).toBe('/overview'); unsubscribe()
+})
+
 test('编辑只取真实 ID，已删除记录不能降级创建，相同名称不选第一条', () => {
   const rows = [{ id: targetId, name: '同名', provider: 'dashscope' }, { id: '22222222-2222-4222-8222-222222222222', name: '同名', provider: 'deepseek' }]
   expect(assistantFormEntry({ ...form(), operation: 'update', target_id: rows[1]!.id }, rows, row => row.id)).toBe(rows[1]!)
@@ -117,6 +136,9 @@ test('人员预填仅取姓名分组，保留真实角色且复制数组，空�
   expect(prefill).toEqual({ name: '张三', group_ids: [targetId] })
   expect(prefill.group_ids).not.toBe(ids)
   expect(assistantMemberPrefill({ group_ids: [] })).toEqual({ group_ids: [] })
+  const latestProfile = { name: '当前名称', group_ids: [targetId] }
+  expect(assistantMemberDraft(latestProfile, assistantMemberPrefill({ name: '新姓名' }))).toEqual({ name: '新姓名', group_ids: [targetId] })
+  expect(assistantMemberDraft(latestProfile, assistantMemberPrefill({ group_ids: [] }))).toEqual({ name: '当前名称', group_ids: [] })
 })
 
 test('单价预填保持百万token单位、零单价、基础价和NULL时间语义', () => {
@@ -130,6 +152,9 @@ test('未更改的价格窗口保留原秒与毫秒，主动修改日期才解�
   expect(assistantPriceTime('2026-10-11T12:30', original, input, 0)).toBe(new Date('2026-10-11T12:30').getTime())
   expect(assistantPriceTime('', null, '', null)).toBeNull()
   expect(assistantPriceTime('', undefined, '', 0)).toBe(0)
+  const epochEnd = assistantPricingPrefill({ effective_to_ms: 0 }, ms => new Date(ms).toISOString().slice(0, 16))
+  expect(epochEnd.to).toBe('1970-01-01T00:00')
+  expect(assistantPriceTime(String(epochEnd.to), 0, String(epochEnd.to), null)).toBe(0)
   const prefilled = assistantPricingPrefill({ effective_from_ms: original, effective_to_ms: original + 123_456 }, () => input)
   expect(assistantPriceTime(String(prefilled.from), original, input, 0)).toBe(original)
   expect(assistantPriceTime(String(prefilled.to), original + 123_456, input, null)).toBe(original + 123_456)

@@ -32,7 +32,7 @@ export function assistantFormTarget(form: AssistantForm): { path: string; query:
 
 /** 先等路由确认，再交付给挂载的页面；同页与跨页共用一次性消费语义。 */
 export function createAssistantFormBroker(timeoutMs = 20_000) {
-  interface Subscription { consume: Consumer; controller: AbortController }
+  interface Subscription { consume: Consumer; controller: AbortController; beforeNavigate?: () => void }
   interface Pending { form: AssistantForm; ready: boolean; running: boolean; controller: AbortController; settle: (error?: unknown) => void }
   const subscriptions = new Map<AssistantFormResource, Subscription>()
   const pending = new Map<string, Pending>()
@@ -50,7 +50,7 @@ export function createAssistantFormBroker(timeoutMs = 20_000) {
       void Promise.resolve().then(() => subscriber.consume(entry.form, signal)).then(() => entry.settle(), error => entry.settle(error)).finally(() => signal.removeEventListener('abort', cancelled))
     }
   }
-  function request(form: AssistantForm, navigate: (target: ReturnType<typeof assistantFormTarget>, signal: AbortSignal) => Promise<void>, signal?: AbortSignal): Promise<void> {
+  function request(form: AssistantForm, navigate: (target: ReturnType<typeof assistantFormTarget>, signal: AbortSignal, beforeResolve: () => void) => Promise<void>, signal?: AbortSignal): Promise<void> {
     const target = assistantFormTarget(form)
     const previous = requests.get(form.request_id)
     if (previous) return previous
@@ -72,14 +72,20 @@ export function createAssistantFormBroker(timeoutMs = 20_000) {
     requests.set(form.request_id, promise)
     // 只保留有限的去重标识；草稿在消费或失败后立即释放。
     if (requests.size > 512) for (const id of requests.keys()) { if (!pending.has(id)) { requests.delete(id); break } }
-    void Promise.resolve().then(() => { if (pending.has(form.request_id) && !controller.signal.aborted) return navigate(target, controller.signal) }).then(() => {
+    const protectDrafts = () => { for (const subscriber of subscriptions.values()) subscriber.beforeNavigate?.() }
+    void Promise.resolve().then(() => {
+      if (!pending.has(form.request_id) || controller.signal.aborted) return
+      // 当前页的草稿必须在切页前保护，目标页检查来不及挽回已经卸载的表单。
+      protectDrafts()
+      return navigate(target, controller.signal, protectDrafts)
+    }).then(() => {
       if (!pending.has(form.request_id) || controller.signal.aborted) return
       entry.ready = true; flush(form.resource)
     }, error => entry.settle(error))
     return promise
   }
-  function subscribe(resource: AssistantFormResource, consume: Consumer): () => void {
-    const subscription = { consume, controller: new AbortController() }
+  function subscribe(resource: AssistantFormResource, consume: Consumer, beforeNavigate?: () => void): () => void {
+    const subscription: Subscription = { consume, controller: new AbortController(), beforeNavigate }
     subscriptions.get(resource)?.controller.abort()
     subscriptions.set(resource, subscription); flush(resource)
     return () => { subscription.controller.abort(); if (subscriptions.get(resource) === subscription) subscriptions.delete(resource) }
@@ -89,7 +95,7 @@ export function createAssistantFormBroker(timeoutMs = 20_000) {
 
 const formBroker = createAssistantFormBroker()
 export function openAssistantForm(router: Router, form: AssistantForm, signal?: AbortSignal): Promise<void> {
-  return formBroker.request(form, (target, navigationSignal) => navigateAssistantPage(router, target, navigationSignal), signal)
+  return formBroker.request(form, (target, navigationSignal, protectDrafts) => navigateAssistantPage(router, target, navigationSignal, protectDrafts), signal)
 }
 
 /** 初次目录请求可能仍在进行；不能拿未加载的列表误判目标不存在。 */
@@ -123,13 +129,23 @@ export function createAssistantFormConsumer(currentPath: () => string, options: 
 export function useAssistantForm(resource: AssistantFormResource, options: AssistantFormPageOptions): void {
   const route = useRoute()
   let unsubscribe: (() => void) | undefined
-  onMounted(() => { unsubscribe = formBroker.subscribe(resource, createAssistantFormConsumer(() => route.path, options)) })
+  onMounted(() => { unsubscribe = formBroker.subscribe(resource, createAssistantFormConsumer(() => route.path, options), () => {
+    if (route.path !== ASSISTANT_FORMS.find(item => item.resource === resource)?.path) return
+    if (options.isOpen()) throw new Error('已有正在填写的表单，请先保存或取消后再打开')
+    if (options.isBusy()) throw new Error('页面正在保存，请稍后重试')
+  }) })
   onBeforeUnmount(() => unsubscribe?.())
 }
 
 /** 人员表单仅预填资料，角色继续使用真实人员或普通成员默认值。 */
-export function assistantMemberPrefill(values: AssistantFormValues): { name?: string; group_ids?: string[] } {
+export interface AssistantMemberPrefill { name?: string; group_ids?: string[] }
+export function assistantMemberPrefill(values: AssistantFormValues): AssistantMemberPrefill {
   return { ...(typeof values.name === 'string' ? { name: values.name } : {}), ...(Array.isArray(values.group_ids) ? { group_ids: [...values.group_ids] } : {}) }
+}
+
+/** 未指定的资料使用页面刚读取的现值，不能被模型先前查询的旧快照盖回去。 */
+export function assistantMemberDraft(current: { name: string; group_ids: string[] }, prefill?: AssistantMemberPrefill): { name: string; group_ids: string[] } {
+  return { name: prefill?.name ?? current.name, group_ids: [...(prefill?.group_ids ?? current.group_ids)] }
 }
 
 /** 编辑只认当前目录中的真实 ID；已删除的目标不能退化成创建。 */

@@ -497,7 +497,7 @@ test('表单只从选中会话的实时事件打开，读取历史和后台事�
   const forms: AssistantForm[] = []
   const h = harness({ openForm: form => { forms.push(form) } }), c = h.controller, state = c.current.value
   await c.open('历史会话'); expect(forms).toHaveLength(0)
-  state.prompt = '打开表单'; await c.open(); c.current.value.prompt = '打开表单'
+  await c.open(); c.current.value.prompt = '打开表单'
   const sending = c.submit(); h.accept(0, '实时会话')
   await c.open()
   h.calls[0]!.event({ type: 'open_form', form: requestedForm }); await flush(); expect(forms).toHaveLength(0)
