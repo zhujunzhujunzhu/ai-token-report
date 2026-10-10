@@ -180,7 +180,12 @@ create_file 可以生成 docx/xlsx/html/md/csv/txt 基础文件；统计文件�
         output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
         execute: async (args, execution) => {
           execution.signal.throwIfAborted()
-          return await runAssistantTool(name, '', input.emit, async () => work(args, await authorize(), execution.signal))
+          return await runAssistantTool(name, '', input.emit, async emit => {
+            const value = await work(args, await authorize(), execution.signal)
+            // ★ 弹框和确认卡只发出请求，不能被页面当成已落库的编辑成功。
+            if (name === 'portal_open_form' || (['portal_manage_save', 'portal_manage_mutate'].includes(name) && value && typeof value === 'object' && (value as { pending_confirmation?: unknown }).pending_confirmation === true)) emit({ type: 'tool', tool: name, query: '', status: 202 })
+            return value
+          })
         },
       })
       const network = this.services.network ?? new AssistantNetwork()
