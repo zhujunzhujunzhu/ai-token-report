@@ -173,13 +173,13 @@ onUnmounted(() => { admin.clear() })
       </div>
       <el-skeleton v-if="admin.loading && !admin.roles.length" :rows="5" animated />
       <el-table v-else :data="roles" row-key="role_id" empty-text="暂无符合条件的角色">
-        <el-table-column label="角色名称" min-width="160">
+        <el-table-column prop="name" label="角色名称" min-width="160" sortable>
           <template #default="{ row }">
             <span class="role-name">{{ row.name }}</span>
             <el-tag v-if="row.is_builtin" size="small" type="warning" effect="plain" class="role-badge">内置</el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="code" label="角色标识" min-width="120" />
+        <el-table-column prop="code" label="角色标识" min-width="120" sortable />
         <el-table-column v-if="session.can('members:read')" label="关联人员" width="100">
           <template #default="{ row }">{{ memberCount(row.role_id) }} 人</template>
         </el-table-column>
@@ -191,7 +191,7 @@ onUnmounted(() => { admin.clear() })
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="状态" width="90">
+        <el-table-column prop="status" label="状态" width="90" sortable>
           <template #default="{ row }"><el-tag :type="row.status === 'active' ? 'success' : 'info'">{{ row.status === 'active' ? '启用' : '停用' }}</el-tag></template>
         </el-table-column>
         <el-table-column v-if="canManage" label="操作" width="220" fixed="right">

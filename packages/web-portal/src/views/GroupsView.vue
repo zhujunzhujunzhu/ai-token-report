@@ -115,10 +115,10 @@ onUnmounted(() => { admin.clear() })
       </div>
       <el-skeleton v-if="admin.loading && !admin.groups.length" :rows="5" animated />
       <el-table v-else :data="groups" row-key="group_id" empty-text="暂无符合条件的分组">
-        <el-table-column prop="name" label="分组名称" min-width="180" />
-        <el-table-column label="状态" width="110"><template #default="{ row }"><el-tag :type="row.status === 'active' ? 'success' : 'info'">{{ row.status === 'active' ? '启用' : '停用' }}</el-tag></template></el-table-column>
-        <el-table-column label="创建时间" min-width="170"><template #default="{ row }">{{ formatFullDateTime(row.created_at_ms) }}</template></el-table-column>
-        <el-table-column label="更新时间" min-width="170"><template #default="{ row }">{{ formatFullDateTime(row.updated_at_ms) }}</template></el-table-column>
+        <el-table-column prop="name" label="分组名称" min-width="180" sortable />
+        <el-table-column prop="status" label="状态" width="110" sortable><template #default="{ row }"><el-tag :type="row.status === 'active' ? 'success' : 'info'">{{ row.status === 'active' ? '启用' : '停用' }}</el-tag></template></el-table-column>
+        <el-table-column prop="created_at_ms" label="创建时间" min-width="170" sortable><template #default="{ row }">{{ formatFullDateTime(row.created_at_ms) }}</template></el-table-column>
+        <el-table-column prop="updated_at_ms" label="更新时间" min-width="170" sortable><template #default="{ row }">{{ formatFullDateTime(row.updated_at_ms) }}</template></el-table-column>
         <el-table-column v-if="session.can('groups:manage')" label="操作" width="160" fixed="right">
           <template #default="{ row }"><el-button link type="primary" :disabled="busy" @click="open(rowGroup(row))">编辑</el-button><el-button link :type="row.status === 'active' ? 'danger' : 'primary'" :disabled="busy" @click="changeStatus(rowGroup(row))">{{ row.status === 'active' ? '停用' : '启用' }}</el-button></template>
         </el-table-column>

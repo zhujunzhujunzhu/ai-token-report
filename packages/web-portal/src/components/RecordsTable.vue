@@ -30,8 +30,11 @@ const showCost = computed(() => props.rows.some((row) => row.cost))
  * 在这里收窄一次。行的真实形状由 `/api/v1/stats/records` 决定。
  */
 const rowRecord = (row: unknown): RecordRow => row as RecordRow
+const recordName = (row: RecordRow): string => row.user_name_snapshot ?? userLabel(row.userId)
+const recordSource = (row: RecordRow): string => sourceLabel(row.source)
 </script>
 <template>
+  <p class="muted table-sort-hint">点击列标题可对当前页排序</p>
   <el-table
     :data="rows"
     row-key="eventId"
@@ -62,12 +65,12 @@ const rowRecord = (row: unknown): RecordRow => row as RecordRow
         ></template
       ></el-table-column
     >
-    <el-table-column label="时间" width="135"
+    <el-table-column prop="ts" label="时间" width="135" sortable
       ><template #default="{ row }">{{
         formatDateTime(row.ts)
       }}</template></el-table-column
     >
-    <el-table-column label="署名" min-width="105"
+    <el-table-column prop="user_name_snapshot" label="署名" min-width="105" sortable :sort-by="recordName"
       ><template #default="{ row }">{{
         row.user_name_snapshot ?? userLabel(row.userId)
       }}</template></el-table-column
@@ -91,7 +94,7 @@ const rowRecord = (row: unknown): RecordRow => row as RecordRow
       ⚠️ 原值只在**与展示名不同**时由服务端下发（`providerRaw`），所以这里
       不需要「有没有配规则」的额外状态：字段在就是不一样。
     -->
-    <el-table-column label="厂商" min-width="150" show-overflow-tooltip>
+    <el-table-column prop="provider" label="厂商" min-width="150" show-overflow-tooltip sortable>
       <template #default="{ row }">
         {{ row.provider }}<span v-if="row.providerRaw" class="muted">（{{ row.providerRaw }}）</span>
       </template>
@@ -104,7 +107,7 @@ const rowRecord = (row: unknown): RecordRow => row as RecordRow
       ⚠️ 原值只在**与展示名不同**时由服务端下发（`modelRaw`），所以这里同样
       不需要「有没有配规则」的额外状态：字段在就是不一样。
     -->
-    <el-table-column label="模型" min-width="180" show-overflow-tooltip>
+    <el-table-column prop="model" label="模型" min-width="180" show-overflow-tooltip sortable>
       <template #default="{ row }">
         {{ row.model }}<span v-if="row.modelRaw" class="muted">（{{ row.modelRaw }}）</span>
       </template>
@@ -116,25 +119,25 @@ const rowRecord = (row: unknown): RecordRow => row as RecordRow
         （客户端比服务端新），把它显示成「其他」会让两个不同的客户端看起来是同一个。
       筛选与查询用的始终是原值（`row.source`），页面不翻译后再发出去。
     -->
-    <el-table-column label="来源" min-width="110" show-overflow-tooltip>
+    <el-table-column prop="source" label="来源" min-width="110" show-overflow-tooltip sortable :sort-by="recordSource">
       <template #default="{ row }">{{ sourceLabel(row.source) }}</template>
     </el-table-column>
-    <el-table-column label="未缓存输入" min-width="130" align="right"
+    <el-table-column prop="inputTokens" label="未缓存输入" min-width="130" align="right" sortable
       ><template #default="{ row }">{{
         formatCount(row.inputTokens)
       }}</template></el-table-column
     >
-    <el-table-column label="输出" min-width="100" align="right"
+    <el-table-column prop="outputTokens" label="输出" min-width="100" align="right" sortable
       ><template #default="{ row }">{{
         formatCount(row.outputTokens)
       }}</template></el-table-column
     >
-    <el-table-column label="缓存读" min-width="125" align="right"
+    <el-table-column prop="cacheReadTokens" label="缓存读" min-width="125" align="right" sortable
       ><template #default="{ row }">{{
         formatCount(row.cacheReadTokens)
       }}</template></el-table-column
     >
-    <el-table-column label="计费总量" min-width="135" align="right"
+    <el-table-column prop="totalTokens" label="计费总量" min-width="135" align="right" sortable
       ><template #default="{ row }"
         ><strong>{{ formatCount(row.totalTokens) }}</strong></template
       ></el-table-column

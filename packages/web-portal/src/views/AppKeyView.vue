@@ -301,15 +301,16 @@ onUnmounted(() => { admin.clear() })
         </el-select>
         <span class="muted">共 {{ matched.length }} 把</span>
       </div>
+      <p class="muted table-sort-hint">点击列标题可对当前页排序</p>
       <el-skeleton v-if="admin.appKeysLoading && !admin.appKeys.length" :rows="5" animated />
       <el-table v-else :data="paged.rows" :row-key="rowKey" empty-text="还没有发放过 appKey">
-        <el-table-column label="发给谁" min-width="170"><template #default="{ row }">
+        <el-table-column prop="member.name" label="发给谁" min-width="170" sortable><template #default="{ row }">
           <div class="member-name"><strong>{{ row.member.name }}</strong><el-tag v-if="row.member.status !== 'active'" type="warning" size="small">已停用</el-tag></div>
           <small class="muted">{{ groupLabel(row.member.groups) || '未分组' }}</small>
         </template></el-table-column>
-        <el-table-column label="凭证提示" min-width="140"><template #default="{ row }"><code>{{ tokenHint(row.token.token_prefix) }}</code></template></el-table-column>
+        <el-table-column prop="token.token_prefix" label="凭证提示" min-width="140" sortable><template #default="{ row }"><code>{{ tokenHint(row.token.token_prefix) }}</code></template></el-table-column>
         <el-table-column label="状态 / 到期" min-width="150"><template #default="{ row }">{{ STATE_TEXT[keyState(row.token)] }}<br /><small>{{ row.token.expires_at_ms ? formatFullDateTime(row.token.expires_at_ms) : '长期有效' }}</small></template></el-table-column>
-        <el-table-column label="签发时间" min-width="150"><template #default="{ row }">{{ formatFullDateTime(row.token.created_at_ms) }}</template></el-table-column>
+        <el-table-column prop="token.created_at_ms" label="签发时间" min-width="150" sortable><template #default="{ row }">{{ formatFullDateTime(row.token.created_at_ms) }}</template></el-table-column>
         <el-table-column label="操作" min-width="320"><template #default="{ row }"><div class="row-actions">
           <!-- 轮换要求凭证仍然可用（服务端拒已到期的轮换：换不出明文就等于白换）；
                而「有效期」与「吊销」对已到期的凭证仍要能点 —— 续期是过期的补救，

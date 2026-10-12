@@ -23,6 +23,9 @@ const maxTotal = computed(() =>
 )
 /** 只在确实有金额可展示时才加这一列（空数组 / 无权限都不加）。 */
 const showCost = computed(() => props.rows.some((row) => row.cost))
+// 更换列排序只改变视图，人员名次仍取服务端默认排行，避免把按姓名首位误写成第一名。
+const ranks = computed(() => new Map(props.rows.map((row, index) => [row.key, index + 1])))
+const memberLabel = (row: BreakdownRow): string => row.label ?? userLabel(row.key)
 </script>
 <template>
   <el-table
@@ -33,13 +36,13 @@ const showCost = computed(() => props.rows.some((row) => row.cost))
     @row-click="(row) => $emit('select', row.key)"
   >
     <el-table-column label="排名" width="72"
-      ><template #default="{ $index }"
-        ><span class="rank-number" :class="{ 'rank-leading': $index < 3 }">{{
-          String($index + 1).padStart(2, '0')
+      ><template #default="{ row }"
+        ><span class="rank-number" :class="{ 'rank-leading': (ranks.get(row.key) ?? 0) <= 3 }">{{
+          String(ranks.get(row.key) ?? '—').padStart(2, '0')
         }}</span></template
       ></el-table-column
     >
-    <el-table-column label="成员" min-width="200"
+    <el-table-column prop="label" label="成员" min-width="200" sortable :sort-by="memberLabel"
       ><template #default="{ row }"
         ><el-button
           link
@@ -63,7 +66,7 @@ const showCost = computed(() => props.rows.some((row) => row.cost))
         }}</small></template
       ></el-table-column
     >
-    <el-table-column label="计费总量" min-width="155" align="right"
+    <el-table-column prop="totalTokens" label="计费总量" min-width="155" align="right" sortable
       ><template #default="{ row }"
         ><strong class="tabular">{{
           formatCount(row.totalTokens)
@@ -77,7 +80,7 @@ const showCost = computed(() => props.rows.some((row) => row.cost))
             :style="{ width: (row.totalTokens / maxTotal) * 100 + '%' }"
           /></div></template
     ></el-table-column>
-    <el-table-column label="调用次数" min-width="110" align="right"
+    <el-table-column prop="calls" label="调用次数" min-width="110" align="right" sortable
       ><template #default="{ row }">{{
         formatCount(row.calls)
       }}</template></el-table-column
@@ -100,7 +103,7 @@ const showCost = computed(() => props.rows.some((row) => row.cost))
         </div>
       </template>
     </el-table-column>
-    <el-table-column label="缓存命中率" min-width="115" align="right"
+    <el-table-column prop="cacheHitRate" label="缓存命中率" min-width="115" align="right" sortable
       ><template #default="{ row }"
         ><el-tag type="success" effect="light">{{
           formatPercent(row.cacheHitRate)

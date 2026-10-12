@@ -184,7 +184,7 @@ const onDepth = (value: string | number | boolean | undefined): void =>
           <h2>人员排行</h2>
           <p>点击成员，查看个人趋势与模型分布</p>
         </div>
-        <el-tag type="info" effect="plain">按计费总量排序</el-tag>
+          <el-tag type="info" effect="plain">默认按计费总量排序</el-tag>
       </div></template
     ><RankingTable :rows="dashboard.ranking" @select="dashboard.openUser"
   /></el-card>

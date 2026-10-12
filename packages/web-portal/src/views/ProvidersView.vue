@@ -253,29 +253,29 @@ onMounted(() => { void load() })
       </div>
       <el-skeleton v-if="loading && !aliases.length" :rows="5" animated />
       <el-table v-else :data="rows" row-key="alias_id" empty-text="还没有规则：现在所有供应商与模型都按原始名展示">
-        <el-table-column label="作用范围" width="140">
+        <el-table-column prop="scope" label="作用范围" width="140" sortable>
           <template #default="{ row }">
             <el-tag :type="row.scope === 'global' ? 'info' : 'success'">{{ row.scope === 'global' ? '全局' : '按人员' }}</el-tag>
             <span v-if="row.member_name" class="muted"> {{ row.member_name }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="作用对象" width="100">
+        <el-table-column prop="model" label="作用对象" width="100" sortable :sort-by="targetOf">
           <template #default="{ row }">
             <el-tag :type="isModelRule(rowAlias(row)) ? 'warning' : 'primary'" effect="plain">{{ targetOf(rowAlias(row)) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="匹配的原始值" min-width="220">
+        <el-table-column prop="provider" label="匹配的原始值" min-width="220" sortable :sort-by="sourceOf">
           <template #default="{ row }"><code>{{ sourceOf(rowAlias(row)) }}</code></template>
         </el-table-column>
-        <el-table-column label="归一化后" min-width="180">
+        <el-table-column prop="alias" label="归一化后" min-width="180" sortable>
           <template #default="{ row }">
             {{ row.alias }}<span v-if="row.alias === (isModelRule(rowAlias(row)) ? row.model : row.provider)" class="muted">（与原始名相同）</span>
           </template>
         </el-table-column>
-        <el-table-column label="状态" width="100">
+        <el-table-column prop="enabled" label="状态" width="100" sortable>
           <template #default="{ row }"><el-tag :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '启用' : '停用' }}</el-tag></template>
         </el-table-column>
-        <el-table-column label="更新时间" min-width="170"><template #default="{ row }">{{ formatFullDateTime(row.updated_at_ms) }}</template></el-table-column>
+        <el-table-column prop="updated_at_ms" label="更新时间" min-width="170" sortable><template #default="{ row }">{{ formatFullDateTime(row.updated_at_ms) }}</template></el-table-column>
         <el-table-column v-if="canManage" label="操作" width="190" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" :disabled="busy" @click="open(rowAlias(row))">编辑</el-button>

@@ -430,10 +430,10 @@ onMounted(() => { void load() })
             给某个网关单独配一条同名模型的价即可覆盖它 —— 两条可以共存，专属价优先。
           </p>
           <el-table :data="group.rows" row-key="price_id">
-            <el-table-column label="模型" min-width="200">
+            <el-table-column prop="model" label="模型" min-width="200" sortable>
               <template #default="{ row }"><code>{{ row.model }}</code></template>
             </el-table-column>
-            <el-table-column label="币种" width="90">
+            <el-table-column prop="currency" label="币种" width="90" sortable>
               <template #default="{ row }"><el-tag type="info">{{ row.currency }}</el-tag></template>
             </el-table-column>
             <el-table-column label="输入" min-width="150"><template #default="{ row }">{{ formatUnitPriceMicro(row.input_micro_per_ktok, row.currency) }}</template></el-table-column>
@@ -456,13 +456,13 @@ onMounted(() => { void load() })
                 <span v-else class="muted">不分时段（全天一个价）</span>
               </template>
             </el-table-column>
-            <el-table-column label="生效区间" min-width="230"><template #default="{ row }">{{ spanText(rowPrice(row)) }}</template></el-table-column>
+            <el-table-column prop="effective_from_ms" label="生效区间" min-width="230" sortable><template #default="{ row }">{{ spanText(rowPrice(row)) }}</template></el-table-column>
             <el-table-column label="状态" width="100">
               <template #default="{ row }">
                 <el-tag :type="STATUS_TYPE[statusOf(rowPrice(row))]">{{ STATUS_TEXT[statusOf(rowPrice(row))] }}</el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="备注" min-width="160">
+            <el-table-column prop="note" label="备注" min-width="160" sortable>
               <template #default="{ row }"><span class="muted">{{ row.note || '—' }}</span></template>
             </el-table-column>
             <el-table-column v-if="canManage" label="操作" width="140" fixed="right">

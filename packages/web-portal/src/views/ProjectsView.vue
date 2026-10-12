@@ -234,22 +234,22 @@ onMounted(() => { void load() })
       </div>
       <el-skeleton v-if="loading && !aliases.length" :rows="5" animated />
       <el-table v-else :data="rows" row-key="alias_id" empty-text="还没有规则：现在所有目录都按「目录最后一段」显示">
-        <el-table-column label="作用范围" width="150">
+        <el-table-column prop="scope" label="作用范围" width="150" sortable>
           <template #default="{ row }">
             <el-tag :type="row.scope === 'global' ? 'info' : 'success'">{{ row.scope === 'global' ? '全局' : '按人员' }}</el-tag>
             <span v-if="row.member_name" class="muted"> {{ row.member_name }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="仓库名 / 目录前缀" min-width="260">
+        <el-table-column prop="prefix" label="仓库名 / 目录前缀" min-width="260" sortable>
           <template #default="{ row }"><code>{{ row.prefix }}</code></template>
         </el-table-column>
-        <el-table-column label="归一化后的项目" min-width="180">
+        <el-table-column prop="alias" label="归一化后的项目" min-width="180" sortable>
           <template #default="{ row }">{{ row.alias }}</template>
         </el-table-column>
-        <el-table-column label="状态" width="100">
+        <el-table-column prop="enabled" label="状态" width="100" sortable>
           <template #default="{ row }"><el-tag :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '启用' : '停用' }}</el-tag></template>
         </el-table-column>
-        <el-table-column label="更新时间" min-width="170"><template #default="{ row }">{{ formatFullDateTime(row.updated_at_ms) }}</template></el-table-column>
+        <el-table-column prop="updated_at_ms" label="更新时间" min-width="170" sortable><template #default="{ row }">{{ formatFullDateTime(row.updated_at_ms) }}</template></el-table-column>
         <el-table-column v-if="canManage" label="操作" width="190" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" :disabled="busy" @click="open(rowAlias(row))">编辑</el-button>

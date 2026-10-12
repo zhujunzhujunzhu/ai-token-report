@@ -100,6 +100,7 @@ const emptyText = computed(() =>
  * 在这里收窄一次。行的真实形状由 `/api/v1/stats/breakdown` 决定。
  */
 const rowBreakdown = (row: unknown): BreakdownRow => row as BreakdownRow
+const sortLabelOf = (row: BreakdownRow): string => props.labelOf?.(row) ?? row.key
 </script>
 <template>
   <!--
@@ -123,12 +124,13 @@ const rowBreakdown = (row: unknown): BreakdownRow => row as BreakdownRow
     >
     <span v-else class="muted">共 {{ rows.length }} 行</span>
   </div>
+  <p class="muted table-sort-hint">点击列标题可对当前页排序</p>
   <el-table
     :data="view.paged.rows"
     row-key="key"
     :empty-text="emptyText"
   >
-    <el-table-column :label="dimensionLabel ?? '维度'" min-width="220" show-overflow-tooltip>
+    <el-table-column prop="key" :label="dimensionLabel ?? '维度'" min-width="220" show-overflow-tooltip sortable :sort-by="sortLabelOf">
       <template #default="{ row }">
         <span>{{ labelOf ? labelOf(rowBreakdown(row)) : row.key }}</span>
         <el-tag
@@ -142,32 +144,32 @@ const rowBreakdown = (row: unknown): BreakdownRow => row as BreakdownRow
         >
       </template>
     </el-table-column>
-    <el-table-column label="计费总量" min-width="140" align="right"
+    <el-table-column prop="totalTokens" label="计费总量" min-width="140" align="right" sortable
       ><template #default="{ row }"
         ><strong>{{ formatCount(row.totalTokens) }}</strong></template
       ></el-table-column
     >
-    <el-table-column label="未缓存输入" min-width="130" align="right"
+    <el-table-column prop="inputTokens" label="未缓存输入" min-width="130" align="right" sortable
       ><template #default="{ row }">{{
         formatCount(row.inputTokens)
       }}</template></el-table-column
     >
-    <el-table-column label="输出" min-width="110" align="right"
+    <el-table-column prop="outputTokens" label="输出" min-width="110" align="right" sortable
       ><template #default="{ row }">{{
         formatCount(row.outputTokens)
       }}</template></el-table-column
     >
-    <el-table-column label="缓存读" min-width="130" align="right"
+    <el-table-column prop="cacheReadTokens" label="缓存读" min-width="130" align="right" sortable
       ><template #default="{ row }">{{
         formatCount(row.cacheReadTokens)
       }}</template></el-table-column
     >
-    <el-table-column label="缓存写入" min-width="130" align="right"
+    <el-table-column prop="cacheWriteTokens" label="缓存写入" min-width="130" align="right" sortable
       ><template #default="{ row }">{{
         formatCount(row.cacheWriteTokens)
       }}</template></el-table-column
     >
-    <el-table-column label="调用次数" min-width="100" align="right"
+    <el-table-column prop="calls" label="调用次数" min-width="100" align="right" sortable
       ><template #default="{ row }">{{
         formatCount(row.calls)
       }}</template></el-table-column
@@ -185,7 +187,7 @@ const rowBreakdown = (row: unknown): BreakdownRow => row as BreakdownRow
         </div>
       </template>
     </el-table-column>
-    <el-table-column label="缓存命中率" min-width="110" align="right"
+    <el-table-column prop="cacheHitRate" label="缓存命中率" min-width="110" align="right" sortable
       ><template #default="{ row }">{{
         formatPercent(row.cacheHitRate)
       }}</template></el-table-column
