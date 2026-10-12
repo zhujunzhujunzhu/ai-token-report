@@ -85,7 +85,8 @@ function download() {
 .result-toolbar select { max-width: 130px; padding: 4px 6px; border: 1px solid #e7edf7; border-radius: 6px; color: #68778b; font-size: 10px; background: #fff; }
 .result-chart-kind { font-size: 10px; color: #8b99ad; }
 .result-plot { position: relative; height: 250px; margin: 0 12px 12px; }
-.result-table-scroll { overflow: auto; max-height: 320px; scrollbar-width: thin; overscroll-behavior: contain; }
+/* 分页已限制行数，表格随当前页展开，纵向滚动统一交给对话区域。 */
+.result-table-scroll { overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; overscroll-behavior-x: contain; }
 .result-table-scroll table { width: 100%; border-collapse: collapse; font-size: 11px; }
 .result-table-scroll th { padding: 9px 11px; background: #f6f9ff; color: #8190a6; font-weight: 500; text-align: left; white-space: nowrap; }
 .result-table-scroll td { padding: 10px 11px; border-bottom: 1px solid #eef2f8; color: #53637a; white-space: nowrap; max-width: 250px; overflow: hidden; text-overflow: ellipsis; }

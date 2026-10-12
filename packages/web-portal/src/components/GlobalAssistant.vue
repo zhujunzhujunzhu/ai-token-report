@@ -1,8 +1,11 @@
 <script setup lang="ts">
 /** 公共布局中的浮动助手；页面跳转和收起窗口都不会销毁正在运行的对话。 */
 import { computed, defineAsyncComponent, ref, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
+import { ElConfigProvider } from 'element-plus'
+import { focusableStack } from 'element-plus/es/components/focus-trap/index.mjs'
 import { useSessionStore } from '../stores/session.js'
 import { assistantStatus } from '../api/assistant.js'
+import { ASSISTANT_Z_INDEX, ASSISTANT_POPUP_Z_INDEX, assistantFocusTarget, createAssistantFocusLayer } from '../utils/assistantLayer.js'
 import { Minus, FullScreen, CopyDocument } from '@element-plus/icons-vue'
 import AssistantSymbol from './AssistantSymbol.vue'
 const AssistantView = defineAsyncComponent(() => import('../views/AssistantView.vue'))
@@ -11,6 +14,14 @@ const enabled = ref(false), expanded = ref(false), mounted = ref(false)
 const sidebarOpen = ref(false)
 const left = ref(0), top = ref(0)
 const panel = ref<HTMLElement>()
+const layerRoot = ref<HTMLElement>()
+const focusLayer = createAssistantFocusLayer(focusableStack)
+function coordinateFocus(event: Event) {
+  const target = assistantFocusTarget(event.target, enabled.value ? layerRoot.value : undefined)
+  if (target === 'surface') focusLayer.enter()
+  else if (!target) focusLayer.leave()
+  // 助手的弹出菜单或确认框拥有自己的焦点层，不要反过来暂停它们。
+}
 const maximized = ref(false)
 const viewport = ref({ width: typeof window === 'undefined' ? 1280 : window.innerWidth, height: typeof window === 'undefined' ? 900 : window.innerHeight })
 const customSize = ref<{ width: number; height: number }>()
@@ -150,6 +161,7 @@ watch(() => session.generation, async () => {
   // 捕获元素因身份切换被移除时，丢失捕获事件可能不会回到按钮。
   orbDrag = undefined; orbDragging.value = false; suppressOrbClick = false
   enabled.value = false; expanded.value = false; mounted.value = false; sidebarOpen.value = false; maximized.value = false; customSize.value = undefined
+  focusLayer.leave()
   if (!session.can('stats:read')) return
   const result = await assistantStatus()
   if (generation === session.generation) enabled.value = result.ok && result.data.enabled
@@ -160,34 +172,45 @@ onMounted(() => {
     if (Number.isFinite(saved?.left) && Number.isFinite(saved?.top)) clampOrb(saved)
   } catch { /* 损坏或不可读的位置记录不影响默认入口。 */ }
   window.addEventListener('resize', fitViewport)
+  // 焦点陷阱在 focusout 后延时抢回焦点；捕获阶段先暂停，鼠标与键盘都能切换。
+  document.addEventListener('pointerdown', coordinateFocus, true)
+  document.addEventListener('focusin', coordinateFocus, true)
 })
-onBeforeUnmount(() => window.removeEventListener('resize', fitViewport))
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', fitViewport)
+  document.removeEventListener('pointerdown', coordinateFocus, true)
+  document.removeEventListener('focusin', coordinateFocus, true)
+  focusLayer.leave()
+})
 </script>
 
 <template>
-  <template v-if="enabled">
-    <button class="assistant-orb" :class="{ expanded, dragging: orbDragging }" :style="orbStyle" :aria-expanded="expanded" aria-controls="global-assistant" :aria-label="expanded ? '收起 AI 助手' : '打开 AI 助手'" title="拖动移动，点击开关助手；也可用方向键移动" @pointerdown="startOrbDrag" @pointermove="moveOrbDrag" @pointerup="endOrbDrag" @pointercancel="endOrbDrag" @lostpointercapture="endOrbDrag" @keydown="moveOrbWithKeyboard" @click="clickOrb">
+  <Teleport to="body">
+    <div v-if="enabled" ref="layerRoot" class="assistant-layer">
+    <button class="assistant-orb" :class="{ expanded, dragging: orbDragging }" :style="{ ...orbStyle, zIndex: ASSISTANT_Z_INDEX + 1 }" :aria-expanded="expanded" aria-controls="global-assistant" :aria-label="expanded ? '收起 AI 助手' : '打开 AI 助手'" title="拖动移动，点击开关助手；也可用方向键移动" @pointerdown="startOrbDrag" @pointermove="moveOrbDrag" @pointerup="endOrbDrag" @pointercancel="endOrbDrag" @lostpointercapture="endOrbDrag" @keydown="moveOrbWithKeyboard" @click="clickOrb">
       <AssistantSymbol /><span class="assistant-orb-label">AI</span><span class="assistant-orb-tip" :class="{ 'tip-right': orbPosition && orbPosition.left < viewport.width / 2 }">{{ expanded ? '收起助手' : 'AI 助手' }}</span>
     </button>
-    <section v-if="mounted" v-show="expanded" id="global-assistant" ref="panel" class="assistant-floating" :class="{ maximized }" :style="{ left: `${left}px`, top: `${top}px`, width: `${size.width}px`, height: `${size.height}px` }" role="region" aria-label="AI 助手浮动窗口">
+    <section v-if="mounted" v-show="expanded" id="global-assistant" ref="panel" class="assistant-floating" :class="{ maximized }" :style="{ left: `${left}px`, top: `${top}px`, width: `${size.width}px`, height: `${size.height}px`, zIndex: ASSISTANT_Z_INDEX }" role="region" aria-label="AI 助手浮动窗口">
       <header class="assistant-floating-header" @pointerdown="startDrag" @pointermove="moveDrag" @pointerup="endDrag" @pointercancel="endDrag">
-        <div class="assistant-brand"><span class="assistant-brand-icon"><AssistantSymbol /></span><div><strong>AI 助手<span class="assistant-brand-badge">用量分析</span></strong><small>随时提问，也可以继续操作页面</small></div></div>
+        <div class="assistant-brand"><span class="assistant-brand-icon"><AssistantSymbol /></span><div><strong>AI 助手<span class="assistant-brand-badge">页面助手</span></strong><small>分析用量，也能筛选表格、填写表单</small></div></div>
         <div class="assistant-window-controls"><span class="assistant-drag-handle" aria-hidden="true" title="拖动标题栏移动"><i /><i /><i /><i /><i /><i /></span><button :aria-label="maximized ? '还原助手窗口' : '放大助手窗口'" :title="maximized ? '还原窗口' : '放大窗口'" :aria-pressed="maximized" @click="toggleMaximize"><CopyDocument v-if="maximized" /><FullScreen v-else /></button><button aria-label="收起助手窗口" title="收起助手" @click="expanded = false"><Minus /></button></div>
       </header>
-      <div class="assistant-floating-body"><AssistantView :key="session.generation" floating @sessions-toggle="setSidebar" @form-opened="expanded = false" /></div>
+      <div class="assistant-floating-body"><ElConfigProvider :z-index="ASSISTANT_POPUP_Z_INDEX"><AssistantView :key="session.generation" floating @sessions-toggle="setSidebar" /></ElConfigProvider></div>
       <button v-if="!maximized" class="assistant-resize-handle" aria-label="调整助手窗口大小" title="拖动调整大小，或用方向键调整" @pointerdown.prevent="startResize" @pointermove="moveResize" @pointerup="endResize" @pointercancel="endResize" @lostpointercapture="endResize" @keydown="resizeWithKeyboard"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 13 13 5M10 13l3-3" /></svg></button>
     </section>
-  </template>
+    </div>
+  </Teleport>
 </template>
 
 <style scoped>
+.assistant-layer { display: contents; }
 .assistant-orb {
   position: fixed; right: 24px; bottom: 24px; width: 60px; height: 60px;
   display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px;
   border: 1px solid #ffffff80; border-radius: 50%; color: #fff;
   background: radial-gradient(circle at 30% 15%, #8fb9ff 0, #4b86f5 35%, #3466db 80%);
   box-shadow: 0 0 0 5px #ffffffb3, 0 9px 26px #3275ed40, inset 0 1px 2px #ffffff66;
-  z-index: 1500; cursor: grab; touch-action: none; user-select: none; transition: box-shadow .2s;
+  cursor: grab; touch-action: none; user-select: none; transition: box-shadow .2s;
 }
 .assistant-orb > svg { width: 27px; height: 27px; }
 .assistant-orb-label { font-size: 9px; font-weight: 750; letter-spacing: 1.5px; line-height: 1; }
@@ -200,7 +223,7 @@ onBeforeUnmount(() => window.removeEventListener('resize', fitViewport))
 .assistant-orb:hover .assistant-orb-tip, .assistant-orb:focus-visible .assistant-orb-tip { opacity: 1; transform: translateX(0); }
 .assistant-floating {
   position: fixed;
-  display: flex; flex-direction: column; z-index: 1499; border: 1px solid #e2e9f4; border-radius: 22px;
+  display: flex; flex-direction: column; border: 1px solid #e2e9f4; border-radius: 22px;
   background: #fbfcff; box-shadow: 0 24px 70px #24334b24, 0 4px 16px #24334b0a; overflow: hidden;
 }
 .assistant-floating-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 19px 20px; background: linear-gradient(110deg, #edf3ff, #fff 75%); border-bottom: 1px solid #e8eef7; cursor: move; touch-action: none; user-select: none; flex-shrink: 0; }
