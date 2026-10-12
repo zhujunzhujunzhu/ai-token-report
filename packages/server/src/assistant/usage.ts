@@ -49,12 +49,12 @@ function rangeLabel(params: URLSearchParams): string {
   return `${date(params.get('from'))} — ${date(params.get('to'))}`
 }
 
-export async function queryUsage(stats: StatsRoute, datasets: AssistantDatasets, input: unknown, authorize: () => Promise<Principal>, emit: (event: AssistantEvent) => void) {
+export async function queryUsage(stats: StatsRoute, datasets: AssistantDatasets, input: unknown, authorize: () => Promise<Principal>, emit: (event: AssistantEvent) => void, now = new Date()) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new IdentityError(400, '查询参数需要是对象')
   const args = input as Record<string, unknown>
   if (Object.keys(args).some(key => !(key in usageParameters.properties))) throw new IdentityError(400, '不支持该查询参数')
   if (!['overview', 'breakdown', 'series', 'records'].includes(String(args.view))) throw new IdentityError(400, '查询类型无效')
-  const principal = await authorize(), params = usageRange(args)
+  const principal = await authorize(), params = usageRange(args, now)
   let selectedName: string | undefined
   if (args.member_name !== undefined) {
     if (typeof args.member_name !== 'string' || !args.member_name.trim() || args.member_name.length > 32) throw new IdentityError(400, '请输入完整姓名')
@@ -91,7 +91,7 @@ export async function queryUsage(stats: StatsRoute, datasets: AssistantDatasets,
   let datasetId = output.dataset_id as string, endpoint = String(args.view)
   if (args.compare_period !== undefined) {
     if (args.view !== 'overview') throw new IdentityError(400, '比较周期请使用 overview')
-    const comparison = usageRange({ period: args.compare_period })
+    const comparison = usageRange({ period: args.compare_period }, now)
     for (const [key, value] of params) if (!['from', 'to'].includes(key)) comparison.set(key, value)
     const previous = await queryAssistantStats(stats, await authorize(), 'overview', comparison.toString(), emit, datasets) as Record<string, any>
     if (!previous.dataset_id) return previous
@@ -122,6 +122,7 @@ export async function queryUsage(stats: StatsRoute, datasets: AssistantDatasets,
   const ranked = args.view === 'series' ? [...points].sort((a, b) => Number(b.total_tokens) - Number(a.total_tokens)) : []
   return {
     ...compact, dataset_id: datasetId, status: 'ok', ...(member ? { member } : {}),
+    cost_visibility: current.permissions.includes('cost:read') ? 'authorized' : 'restricted',
     range: { label: rangeLabel(params), from: Number(params.get('from')), to: Number(params.get('to')), timezone: Intl.DateTimeFormat().resolvedOptions().timeZone },
     ...(overview ? { summary: { total_tokens: data.totalTokens, calls: data.calls, sessions: data.sessions, cache_hit_rate: data.cacheHitRate }, metrics_display: metricsDisplay } : {}),
     ...(ranked.length ? { series_summary: { first: points[0], last: points.at(-1), highest: ranked[0], observed_points: points.length, limited: preview.total_rows > points.length } } : {}),

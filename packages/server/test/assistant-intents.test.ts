@@ -21,6 +21,16 @@ test('并将与并把保留修改对象，查询与否定仍不构成授权', ()
   for (const prompt of ['先处理前两个，并将阿里云百炼的部分改为 数字集阿里云', '先查询现有规则，并把这条规则改名为新名称']) expect(assistantWriteIntent(prompt)).toBe(true)
   for (const prompt of ['先查询现有规则，并将查询结果列出来', '先查询现有规则，并把如何修改的步骤告诉我', '先查询现有规则，并将这条规则保留，不要修改']) expect(assistantWriteIntent(prompt)).toBe(false)
 })
+test('填写后明确让助手保存构成授权，等待本人核对保存仍只预填', () => {
+  for (const prompt of ['帮我填写当前表单并保存', '填好后请保存', '帮我填完后直接保存', '请点击保存', '帮我按下保存']) expect(assistantWriteIntent(prompt)).toBe(true)
+  for (const prompt of ['帮我预填，等我核对后保存', '帮我预填，等我核对并保存', '预填后由我点击保存', '填写当前表单但不要保存', '帮我填写当前表单并保存的步骤是什么']) expect(assistantWriteIntent(prompt)).toBe(false)
+})
+test('明确恢复与归档指令和对应按钮点击可授权本轮写入', () => {
+  for (const prompt of ['帮我恢复当前分组', '归档这条规则', '请点击恢复', '帮我按下归档', 'Restore this group', 'Archive this item']) expect(assistantWriteIntent(prompt)).toBe(true)
+})
+test('恢复归档的查询、说明、否定与用户自己操作不授权助手写入', () => {
+  for (const prompt of ['查看已归档规则', '查询恢复过的分组', '如何恢复分组', '不要归档这条规则', '先预填，等我点击恢复', '先预填，由我点击归档']) expect(assistantWriteIntent(prompt)).toBe(false)
+})
 test('文件默认私有；明确分享指令才开放发布工具', () => {
   for (const prompt of ['生成HTML', '不要分享文件', '如何分享HTML', '解释分享链接的规则', '查询公开资料', '查看之前分享的HTML报告', '生成一份介绍公开API的HTML', '给我看看之前的公开链接', '提供说明介绍如何生成分享链接', '只查一下，不要分享']) expect(assistantShareIntent(prompt)).toBe(false)
   for (const prompt of ['生成HTML并分享24小时', '分享刚才的HTML', '再把 HTML 分享给我，有效期24小时', '把刚才这份模型用量整理成 Word、Excel 和 HTML 三个可下载文件，表格要保留同一份真实数据；再把 HTML 分享给我，有效期24小时。', '请给我一个24小时HTML分享链接', '生成HTML并给我一个有效24小时的分享链接', 'Share this report']) expect(assistantShareIntent(prompt)).toBe(true)

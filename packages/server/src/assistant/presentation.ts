@@ -12,6 +12,7 @@ const count = (value: number) => value.toLocaleString('en-US', { maximumFraction
 const metricColumns: Array<Column & { source: string }> = [
   { key: 'total_tokens', source: 'totalTokens', label: '计费总量', format: 'number' },
   { key: 'calls', source: 'calls', label: '调用次数', format: 'number' },
+  { key: 'sessions', source: 'sessions', label: '会话数', format: 'number' },
   { key: 'input_tokens', source: 'inputTokens', label: '未缓存输入', format: 'number' },
   { key: 'output_tokens', source: 'outputTokens', label: '输出', format: 'number' },
   { key: 'cache_read_tokens', source: 'cacheReadTokens', label: '缓存读', format: 'number' },
@@ -31,12 +32,19 @@ function tableOf(rows: Row[], leading: Column[], sourceOf: (row: Row) => Record<
   const metrics = metricColumns.filter(column => rows.some(row => numeric(row[column.source])))
   const columns = [...leading, ...metrics.map(({ source: _source, ...column }) => column)]
   if (rows.some(row => costOf(row.cost) !== null)) columns.push({ key: 'cost', label: '费用（估算）' })
+  // ★ 部分计价的金额不能冒充完整费用；直接保留 API 的缺价规模，不另算覆盖率。
+  const coverage = [
+    { key: 'unpriced_tokens', source: 'unpricedTokens', label: '未计价 Token', format: 'number' as const },
+    { key: 'unpriced_rate', source: 'unpricedRate', label: '未计价 Token 占比', format: 'percent' as const },
+  ].filter(column => rows.some(row => numeric(object(row.cost)[column.source])))
+  columns.push(...coverage.map(({ source: _source, ...column }) => column))
   return {
     columns,
     rows: rows.slice(0, 400).map(row => ({
       ...sourceOf(row),
       ...Object.fromEntries(metrics.map(column => [column.key, cell(row[column.source])])),
       ...(columns.some(column => column.key === 'cost') ? { cost: costOf(row.cost) } : {}),
+      ...Object.fromEntries(coverage.map(column => [column.key, cell(object(row.cost)[column.source])])),
     })),
     total_rows: rows.length,
   }
@@ -58,6 +66,10 @@ export function presentAssistantResult(endpoint: string, query: string, value: u
     result.cards = cards.filter(card => numeric(body[card.key])).map(card => ({ label: card.label, value: card.format(body[card.key] as number) }))
     const cost = costOf(body.cost)
     if (cost !== null) result.cards.push({ label: '费用（估算）', value: cost })
+    const unpricedRate = object(body.cost).unpricedRate
+    if (numeric(unpricedRate)) result.cards.push({ label: '未计价 Token 占比', value: `${(unpricedRate * 100).toFixed(1)}%` })
+    const targets = object(body.cost).unpricedTargets
+    if (Array.isArray(targets) && targets.some(target => typeof target === 'string')) result.note = `未计价目标（接口返回，可能截断）：${targets.filter(target => typeof target === 'string').join('、')}。`
     result.table = tableOf([body], [], () => ({}))
     if (typeof object(body.range).label === 'string') result.description = object(body.range).label as string
   } else if (endpoint === 'series') {

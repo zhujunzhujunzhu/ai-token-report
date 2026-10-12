@@ -269,6 +269,7 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
 | 身份署名 / 归属 | `.agents/skills/identity-attribution/SKILL.md` + `ARCHITECTURE.md` §4.5 |
 | **权限 / 人员管理 / token 发放** | `packages/server/src/identity/` + `docs/数据库重设计.md` + `ARCHITECTURE.md` §4.5.5~§4.5.8；`member-admin.ts` 仅历史兼容测试 |
 | **工程约定**（命令 / 测试位置 / 命名 / 中文注释 / 依赖） | `.agents/skills/repo-conventions/SKILL.md` + `docs/本仓工程约定.md` |
+| **AI 助手默认报表技能 / `/` 菜单 / 管理周报月报 / 多节导出** | `.agents/skills/management-reports/SKILL.md` + `docs/管理报表与默认技能.md`；默认目录在 `shared/src/assistant-skills.ts`，编排在 `server/src/assistant/reports.ts`，复用现有统计鉴权与口径 |
 | 目录分工 / 数据通路 | `ARCHITECTURE.md` |
 | **多客户端来源适配器**（新增一个客户端 / 各来源的日志与四列映射） | `packages/core/src/sources/types.ts` 文件头（三步）+ `docs/Codex会话采集方案.md` + `docs/ClaudeCode会话采集方案.md` + `docs/Trae会话采集方案.md` + `docs/WorkBuddy会话采集方案.md` |
 | 插件方案（历史） | `docs/插件方案.md` |

@@ -248,3 +248,135 @@ test('分页快照导出明确行数、采集时间、查询条件与说明；Ex
     else if (format !== 'csv') expect(bytes.toString()).toContain('导出行数：2 / 1000')
   }
 })
+
+for (const format of ['docx', 'xlsx', 'html', 'md'] as const) test(`${format} 多节报表保留每个授权快照的原值、查询、行数与采集时间`, async () => {
+  const f = await fixture()
+  const query = 'period=last7d&limit=2&offset=4'
+  const snapshot = f.datasets.capture('records', query, { rows: [{ ts: 1700000000000, model: '<script>甲|乙</script>', totalTokens: 11 }, { ts: 1700000001000, model: '模型乙', totalTokens: 22 }], offset: 4, total: 1000 }, owner)
+  const capturedAt = new Date(snapshot.captured_at_ms).toISOString()
+  const artifact = await f.artifacts.create(owner.memberId, f.session, { format, title: '管理报表', dataset_ids: [f.datasetId, snapshot.dataset_id] }, f.datasets, owner)
+  expect(artifact.note).toContain('第 1 节：模型用量分布')
+  expect(artifact.note).toContain('第 2 节：调用明细')
+  expect(artifact.note).toContain('导出行数：1 / 1 行。')
+  expect(artifact.note).toContain('导出行数：2 / 1000 行；仅导出当前快照')
+  expect(artifact.note).toContain(`采集时间：${capturedAt}`)
+  expect(artifact.note).toContain(`报表生成时间：${new Date(f.now()).toISOString()}`)
+  expect(artifact.note).toContain(query)
+  expect(artifact.note).toContain('起始位置 4')
+  const response = await f.artifacts.download(owner.memberId, artifact.artifact_id, owner)
+  const bytes = Buffer.from(await response.arrayBuffer())
+  const text = ['docx', 'xlsx'].includes(format) ? Object.values(unzip(bytes)).join('\n') : bytes.toString()
+  expect(text).toContain('123456789')
+  expect(text).toContain('11')
+  expect(text).toContain('22')
+  expect(text).toContain('模型用量分布')
+  expect(text).toContain('调用明细')
+  expect(text).toContain('导出行数：2 / 1000')
+  expect(text).toContain('起始位置 4')
+  expect(text).toContain('&lt;script&gt;')
+  expect(text).not.toContain('<script>')
+  expect(text).not.toContain(f.root)
+  if (format === 'xlsx') {
+    const entries = unzip(bytes)
+    expect(entries['xl/workbook.xml']).toContain('name="模型用量分布" sheetId="1"')
+    expect(entries['xl/workbook.xml']).toContain('name="调用明细" sheetId="2"')
+    expect(entries['xl/workbook.xml']).toContain('name="说明" sheetId="3"')
+    expect(entries['xl/worksheets/sheet1.xml']).toContain('<v>123456789</v>')
+    expect(entries['xl/worksheets/sheet1.xml']).toContain('t="inlineStr"')
+    expect(entries['xl/worksheets/sheet2.xml']).toContain('<v>11</v>')
+    expect(entries['xl/worksheets/sheet2.xml']).toContain('<row r="2">')
+    expect(entries['xl/worksheets/sheet3.xml']).toContain(`采集时间：${capturedAt}`)
+    expect(text).not.toContain('<f>')
+  } else if (format === 'docx') expect((text.match(/<w:tbl>/g) ?? []).length).toBe(2)
+  else if (format === 'html') expect((text.match(/<section>/g) ?? []).length).toBe(2)
+  else expect(text).toContain('## 调用明细')
+})
+
+test('多节 Excel 同名与非法名称不会覆盖工作表；八个数据集分别保留且都有出处', async () => {
+  const f = await fixture()
+  const snapshots = Array.from({ length: 8 }, (_, index) => f.datasets.capture('breakdown', `by=model&period=last7d&offset=${index}`, { by: 'model', rows: [{ key: `模型${index}`, totalTokens: index + 100 }] }, owner))
+  snapshots[0]!.title = '说明'
+  snapshots[1]!.title = "'A:/非法[名称]*?\\工作表'"
+  snapshots[2]!.title = 'CASE'
+  snapshots[3]!.title = 'case'
+  const artifact = await f.artifacts.create(owner.memberId, f.session, { format: 'xlsx', title: '八维度', dataset_ids: snapshots.map(snapshot => snapshot.dataset_id) }, f.datasets, owner)
+  const entries = unzip(Buffer.from(await (await f.artifacts.download(owner.memberId, artifact.artifact_id, owner)).arrayBuffer()))
+  const names = [...entries['xl/workbook.xml']!.matchAll(/<sheet name="([^"]+)"/g)].map(match => match[1]!)
+  expect(names.length).toBe(9)
+  expect(new Set(names.map(name => name.toLowerCase())).size).toBe(9)
+  expect(names.every(name => name.length <= 31 && !/[\[\]:*?/\\]/.test(name))).toBe(true)
+  expect(names[8]).toBe('说明')
+  for (let index = 0; index < 8; index++) {
+    expect(entries[`xl/worksheets/sheet${index + 1}.xml`]).toContain(`<v>${index + 100}</v>`)
+    expect(artifact.note).toContain(`offset=${index}`)
+  }
+})
+
+test('多数据集参数严格互斥、去重与限额，CSV/TXT 明确要求单个数据集', async () => {
+  const f = await fixture()
+  for (const datasetIds of [null, '', [], [1], [''], [f.datasetId, f.datasetId], Array.from({ length: 9 }, () => randomUUID())]) {
+    await expect(f.artifacts.create(owner.memberId, f.session, { format: 'html', title: '非法', dataset_ids: datasetIds }, f.datasets, owner)).rejects.toThrow('1～8 个不重复')
+  }
+  for (const extra of [{ dataset_id: f.datasetId }, { content: '模型捏造99999' }, { content: '' }]) {
+    await expect(f.artifacts.create(owner.memberId, f.session, { format: 'html', title: '混入', dataset_ids: [f.datasetId], ...extra }, f.datasets, owner)).rejects.toThrow('不能混入')
+  }
+  for (const format of ['csv', 'txt'] as const) {
+    const second = f.datasets.capture('overview', 'period=today', { totalTokens: 7 }, owner)
+    await expect(f.artifacts.create(owner.memberId, f.session, { format, title: '多节', dataset_ids: [f.datasetId, second.dataset_id] }, f.datasets, owner)).rejects.toThrow('仅支持单个数据集')
+    const artifact = await f.artifacts.create(owner.memberId, f.session, { format, title: '单节', dataset_ids: [f.datasetId] }, f.datasets, owner)
+    expect(await (await f.artifacts.download(owner.memberId, artifact.artifact_id, owner)).text()).toContain('123456789')
+  }
+})
+
+test('多节有任一数据集不存在或scope失效，整份拒绝且不产生部分文件', async () => {
+  const f = await fixture()
+  const foreign = f.datasets.capture('overview', 'period=today', { totalTokens: 999 }, other)
+  for (const datasetIds of [[f.datasetId, randomUUID()], [f.datasetId, foreign.dataset_id]]) {
+    await expect(f.artifacts.create(owner.memberId, f.session, { format: 'html', title: '全部拒绝', dataset_ids: datasetIds }, f.datasets, owner)).rejects.toBeInstanceOf(IdentityError)
+    expect(await f.artifacts.list(owner.memberId, f.session, owner)).toEqual([])
+  }
+  const second = f.datasets.capture('overview', 'period=today', { totalTokens: 7 }, owner)
+  const ids = [f.datasetId, second.dataset_id]
+  for (const current of [{ ...owner, permissions: [] }, { ...owner, roleCodes: ['admin'] }, { ...owner, groupIds: ['二组'] }]) {
+    await expect(f.artifacts.create(owner.memberId, f.session, { format: 'xlsx', title: '已失效', dataset_ids: ids }, f.datasets, current)).rejects.toThrow('身份或权限')
+    expect(await f.artifacts.list(owner.memberId, f.session, owner)).toEqual([])
+  }
+})
+
+test('多节 HTML 分享沿用权限与撤销边界，不泄露私有存储位置', async () => {
+  const f = await fixture()
+  const second = f.datasets.capture('overview', 'period=today', { totalTokens: 7 }, owner)
+  const artifact = await f.artifacts.create(owner.memberId, f.session, { format: 'html', title: '私有报表', dataset_ids: [f.datasetId, second.dataset_id] }, f.datasets, owner)
+  const share = await f.artifacts.share(owner.memberId, artifact.artifact_id, { expires_in_hours: 1 }, owner)
+  const response = await f.artifacts.publicShare(tokenOf(share.url), async () => owner)
+  const page = await response.text()
+  expect(response.status).toBe(200)
+  expect(page).toContain('模型用量分布')
+  expect(page).toContain('用量总览')
+  expect(page).not.toContain(f.root)
+  expect(page).not.toContain(owner.memberId)
+  expect(response.headers.get('content-security-policy')).toContain("script-src 'none'")
+  await expect(f.artifacts.download(owner.memberId, artifact.artifact_id, { ...owner, permissions: [] })).rejects.toThrow('身份或权限')
+  expect((await f.artifacts.publicShare(tokenOf(share.url), async () => ({ ...owner, permissions: [] }))).status).toBe(410)
+  await f.artifacts.revoke(owner.memberId, artifact.artifact_id)
+  expect((await f.artifacts.publicShare(tokenOf(share.url))).status).toBe(410)
+})
+
+for (const format of ['docx', 'xlsx', 'html', 'md'] as const) test(`${format} 多节说明保留诊断与概览独有的指标卡，不从表格推算总量`, async () => {
+  const f = await fixture()
+  const diagnostics = f.datasets.capture('diagnostics', 'period=last7d', { totalEvents: 9876543, unattributedEvents: 4313, identityViolations: 678, sessions: 22222, sources: [{ source: 'codex', latestEventTs: 1700000000000, silentForMs: 42 }] }, owner)
+  const overview = f.datasets.capture('overview', 'period=last7d', { totalTokens: 100, sessions: 76543, calls: 9 }, owner)
+  const diagnosticTable = f.datasets.render('table', { dataset_id: diagnostics.dataset_id }, owner)
+  expect(diagnosticTable.cards).toBeUndefined()
+  expect(diagnosticTable.table!.rows[0]).not.toHaveProperty('totalEvents')
+  const artifact = await f.artifacts.create(owner.memberId, f.session, { format, title: '管理诊断', dataset_ids: [diagnostics.dataset_id, overview.dataset_id] }, f.datasets, owner)
+  const expected = ['指标卡：已入库事件：9,876,543', '指标卡：未归属事件：4,313', '指标卡：口径校验异常：678', '指标卡：会话数：22,222', '指标卡：会话数：76,543']
+  const bytes = Buffer.from(await (await f.artifacts.download(owner.memberId, artifact.artifact_id, owner)).arrayBuffer())
+  const entries = ['docx', 'xlsx'].includes(format) ? unzip(bytes) : undefined
+  const content = entries ? Object.values(entries).join('\n') : bytes.toString()
+  for (const value of expected) {
+    expect(artifact.note).toContain(value)
+    expect(content).toContain(value)
+  }
+  if (format === 'xlsx') for (const value of expected) expect(entries!['xl/worksheets/sheet3.xml']).toContain(value)
+})

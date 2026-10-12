@@ -65,6 +65,17 @@ test('登录才可访问助手，拒绝客户端指定身份和目录', async ()
   expect((await call('GET', 'status', 'assistant-admin').then(r => r.json())).retention_days).toBeNull()
 })
 
+test('技能命令走既有鉴权，未知命令在创建会话与调用模型前拒绝', async () => {
+  expect((await call('POST', 'chat', undefined, { prompt: '/report' })).status).toBe(401)
+  const before = await call('GET', 'sessions', 'assistant-admin').then(r => r.json())
+  expect((await call('POST', 'chat', 'assistant-admin', { prompt: '/unknown' })).status).toBe(400)
+  const after = await call('GET', 'sessions', 'assistant-admin').then(r => r.json())
+  expect(after.total).toBe(before.total)
+  const id = await conversationId(await call('POST', 'chat', 'assistant-admin', { prompt: '/weekly 自定义报表条件' }))
+  const stored = await bundle.handler(new Request(`http://localhost/api/v1/assistant/sessions/${id}`, { headers: { Authorization: 'Bearer assistant-admin' } })).then(r => r.json())
+  expect(stored.messages[0].text).toBe('/weekly 自定义报表条件')
+})
+
 test('即时引导通过正式 HTTP 路由鉴权、校验请求并限制方法', async () => {
   expect((await call('POST', 'steer', undefined, { prompt: '继续' })).status).toBe(401)
   expect((await call('POST', 'steer', 'assistant-admin', { prompt: '继续', member_id: '别人' })).status).toBe(400)
@@ -208,10 +219,10 @@ test('真实 DSH agent 在 Bun 与 Node 中均能调用工具并持久化续聊'
   if (!built.success) throw new Error(built.logs.join('\n'))
   const node = resolveNodeBin()
   expect(node).not.toBeNull()
-  for (const [binary, script] of [[process.execPath, entry], [node!, join(root, 'runtime-node', 'verify-assistant-runtime.mjs')]]) for (const protocol of ['deepseek-messages', 'openai-completions', 'openai-responses', 'live-http']) {
-    const args = protocol === 'live-http' ? ['openai-completions', '--live-http'] : [protocol]
+  for (const [binary, script] of [[process.execPath, entry], [node!, join(root, 'runtime-node', 'verify-assistant-runtime.mjs')]]) for (const protocol of ['deepseek-messages', 'openai-completions', 'openai-responses', 'live-http', 'reports-deepseek-messages', 'reports-openai-completions', 'reports-openai-responses']) {
+    const args = protocol === 'live-http' ? ['openai-completions', '--live-http'] : protocol.startsWith('reports-') ? [protocol.slice(8), '--reports'] : [protocol]
     const child = spawnSync(binary!, [script!, ...args], { env: cleanChildEnv(), encoding: 'utf8', windowsHide: true, timeout: 60_000 })
     if (child.status !== 0) throw new Error(child.error?.message ?? child.stdout + child.stderr)
-    expect(child.stdout).toContain(protocol === 'live-http' ? 'LOOPBACK_TEST_OK' : 'DSH_RUNTIME_OK')
+    expect(child.stdout).toContain(protocol === 'live-http' ? 'LOOPBACK_TEST_OK' : protocol.startsWith('reports-') ? 'DSH_REPORTS_OK' : 'DSH_RUNTIME_OK')
   }
 }, 240_000)

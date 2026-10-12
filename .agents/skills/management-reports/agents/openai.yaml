@@ -1,0 +1,6 @@
+interface:
+  display_name: "管理报表"
+  short_description: "按时间与人员、项目、模型等维度整理真实用量，维护默认报表技能与入口"
+  default_prompt: "使用 $management-reports 生成管理报表，明确时间与范围并保留真实数据来源。"
+policy:
+  allow_implicit_invocation: true

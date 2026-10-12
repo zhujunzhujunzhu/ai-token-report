@@ -39,6 +39,18 @@ test('大结果只展示有限真值并明确标识，不把截断当作完整�
   expect(result.note).toContain('共 430 行')
 })
 
+test('部分计价保留服务端的缺价规模和目标，会话数可以随表格导出', () => {
+  const result = presentAssistantResult('overview', '', { totalTokens: 1000, sessions: 9, cost: { pricing: { source: 'server' }, costs: [{ currency: 'CNY', amountMicro: 1_000_000 }], unpricedTokens: 123, unpricedRate: .123, unpricedTargets: ['供应商/模型甲'] } })
+  expect(result.table?.rows[0]?.sessions).toBe(9)
+  expect(result.table?.rows[0]?.unpriced_tokens).toBe(123)
+  expect(result.table?.rows[0]?.unpriced_rate).toBe(.123)
+  expect(result.cards?.find(card => card.label === '未计价 Token 占比')?.value).toBe('12.3%')
+  expect(result.note).toContain('供应商/模型甲')
+  expect(result.note).toContain('可能截断')
+  const restricted = presentAssistantResult('overview', '', { totalTokens: 1000 })
+  expect(restricted.table?.columns.some(column => column.key === 'unpriced_rate')).toBe(false)
+})
+
 test('诊断保持事件新鲜度的语义；厂商目录保留配置来源，不冒充用量', () => {
   const result = presentAssistantResult('diagnostics', 'period=today', { totalEvents: 10, identityViolations: 0, sources: [{ source: 'dsh', calls: 10, totalTokens: 500, latestEventTs: 123, silentForMs: 456 }] })
   expect(result.cards?.find(card => card.label === '口径校验异常')?.value).toBe('0')

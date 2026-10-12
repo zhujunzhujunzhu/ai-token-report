@@ -53,6 +53,14 @@ export class AssistantDatasets {
       columns: snapshot.table!.columns, row_count: snapshot.table!.rows.length, total_rows: snapshot.table!.total_rows, card_names: snapshot.cards?.map(card => card.label) ?? [],
     }))
   }
+  /** 报表模块只能补充服务端确定的标题与证据边界，数据和授权指纹保持原样。 */
+  annotate(datasetId: string, metadata: { title?: string; note?: string }, principal: Principal): void {
+    const entry = this.datasets.get(datasetId)
+    if (!entry) return failure('数据集不存在或已过期，请先查询数据')
+    if (entry.access !== scopeOf(principal)) throw new IdentityError(403, '数据集所属身份或权限已变化，请重新查询')
+    if (metadata.title) entry.snapshot.title = metadata.title
+    if (metadata.note) entry.snapshot.note = [entry.snapshot.note, metadata.note].filter(Boolean).join('\n')
+  }
   render(mode: 'table' | 'echarts' | 'cards', input: unknown, principal: Principal): AssistantResult {
     const raw = object(input)
     if (Object.keys(raw).some(key => !['dataset_id', 'title', 'columns', 'chart', 'cards'].includes(key))) return failure('不支持渲染参数；禁止传入原始数值、HTML 或任意 ECharts option')
