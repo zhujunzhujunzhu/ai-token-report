@@ -1,11 +1,21 @@
 /** 助手表单仅在本次实时请求中交付；草稿不进入地址、持久存储或历史重放。 */
-import { ASSISTANT_FORMS, ANY_PROVIDER, type AssistantForm, type AssistantFormResource, type AssistantFormValues } from '@ai-token-report/shared'
-import { onMounted, onBeforeUnmount, watch } from 'vue'
+import { ASSISTANT_FORMS, ANY_PROVIDER, type AssistantForm, type AssistantFormContext, type AssistantFormResource, type AssistantFormValues } from '@ai-token-report/shared'
+import { onMounted, onBeforeUnmount, shallowRef, watch } from 'vue'
 import { useRoute, type Router } from 'vue-router'
 import { navigateAssistantPage } from './assistantNavigation.js'
 import { microToRateText } from './unitPrice.js'
 
-type Consumer = (form: AssistantForm, signal: AbortSignal) => void | Promise<void>
+/** 本地打开次数只用于防止迟到回答覆盖重开的草稿，绝不发送给服务端。 */
+export interface AssistantFormBinding { context: AssistantFormContext; draftId: number }
+export const activeAssistantForm = shallowRef<AssistantFormBinding | null>(null)
+let draftSequence = 0
+type Consumer = (form: AssistantForm, signal: AbortSignal, binding?: AssistantFormBinding) => void | Promise<void>
+
+/** 相同记录关闭重开也属于另一份草稿；只有发送时捕获的那份才允许续填。 */
+export function canPatchAssistantForm(form: AssistantForm, origin: AssistantFormBinding | undefined, current: AssistantFormBinding | null): boolean {
+  return !!origin && !!current && origin.draftId === current.draftId
+    && [origin.context, current.context].every(context => context.resource === form.resource && context.operation === form.operation && context.target_id === form.target_id)
+}
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const text = (value: unknown): value is string => typeof value === 'string' && value.length <= 2000 && !/[\u0000-\u001f\u007f]/.test(value)
 
@@ -32,8 +42,8 @@ export function assistantFormTarget(form: AssistantForm): { path: string; query:
 
 /** 先等路由确认，再交付给挂载的页面；同页与跨页共用一次性消费语义。 */
 export function createAssistantFormBroker(timeoutMs = 20_000) {
-  interface Subscription { consume: Consumer; controller: AbortController; beforeNavigate?: () => void }
-  interface Pending { form: AssistantForm; ready: boolean; running: boolean; controller: AbortController; settle: (error?: unknown) => void }
+  interface Subscription { consume: Consumer; controller: AbortController; beforeNavigate?: (form: AssistantForm, binding?: AssistantFormBinding) => void }
+  interface Pending { form: AssistantForm; binding?: AssistantFormBinding; ready: boolean; running: boolean; controller: AbortController; settle: (error?: unknown) => void }
   const subscriptions = new Map<AssistantFormResource, Subscription>()
   const pending = new Map<string, Pending>()
   const requests = new Map<string, Promise<void>>()
@@ -47,10 +57,10 @@ export function createAssistantFormBroker(timeoutMs = 20_000) {
       const cancelled = () => entry.settle(new Error('表单请求已取消或页面已关闭'))
       signal.addEventListener('abort', cancelled, { once: true })
       if (signal.aborted) { cancelled(); continue }
-      void Promise.resolve().then(() => subscriber.consume(entry.form, signal)).then(() => entry.settle(), error => entry.settle(error)).finally(() => signal.removeEventListener('abort', cancelled))
+      void Promise.resolve().then(() => subscriber.consume(entry.form, signal, entry.binding)).then(() => entry.settle(), error => entry.settle(error)).finally(() => signal.removeEventListener('abort', cancelled))
     }
   }
-  function request(form: AssistantForm, navigate: (target: ReturnType<typeof assistantFormTarget>, signal: AbortSignal, beforeResolve: () => void) => Promise<void>, signal?: AbortSignal): Promise<void> {
+  function request(form: AssistantForm, navigate: (target: ReturnType<typeof assistantFormTarget>, signal: AbortSignal, beforeResolve: () => void) => Promise<void>, signal?: AbortSignal, binding?: AssistantFormBinding): Promise<void> {
     const target = assistantFormTarget(form)
     const previous = requests.get(form.request_id)
     if (previous) return previous
@@ -61,7 +71,7 @@ export function createAssistantFormBroker(timeoutMs = 20_000) {
       let settled = false
       const abort = () => entry.settle(new Error('表单请求已取消'))
       const timer = setTimeout(() => entry.settle(new Error('打开表单超时，请重试')), timeoutMs)
-      entry = { form: structuredClone(form), ready: false, running: false, controller, settle(error) {
+      entry = { form: structuredClone(form), ...(binding ? { binding: { context: { ...binding.context }, draftId: binding.draftId } } : {}), ready: false, running: false, controller, settle(error) {
         if (settled) return
         settled = true; clearTimeout(timer); signal?.removeEventListener('abort', abort); pending.delete(form.request_id)
         if (error) { controller.abort(); reject(error) } else resolve()
@@ -72,7 +82,7 @@ export function createAssistantFormBroker(timeoutMs = 20_000) {
     requests.set(form.request_id, promise)
     // 只保留有限的去重标识；草稿在消费或失败后立即释放。
     if (requests.size > 512) for (const id of requests.keys()) { if (!pending.has(id)) { requests.delete(id); break } }
-    const protectDrafts = () => { for (const subscriber of subscriptions.values()) subscriber.beforeNavigate?.() }
+    const protectDrafts = () => { for (const subscriber of subscriptions.values()) subscriber.beforeNavigate?.(entry.form, entry.binding) }
     void Promise.resolve().then(() => {
       if (!pending.has(form.request_id) || controller.signal.aborted) return
       // 当前页的草稿必须在切页前保护，目标页检查来不及挽回已经卸载的表单。
@@ -84,7 +94,7 @@ export function createAssistantFormBroker(timeoutMs = 20_000) {
     }, error => entry.settle(error))
     return promise
   }
-  function subscribe(resource: AssistantFormResource, consume: Consumer, beforeNavigate?: () => void): () => void {
+  function subscribe(resource: AssistantFormResource, consume: Consumer, beforeNavigate?: (form: AssistantForm, binding?: AssistantFormBinding) => void): () => void {
     const subscription: Subscription = { consume, controller: new AbortController(), beforeNavigate }
     subscriptions.get(resource)?.controller.abort()
     subscriptions.set(resource, subscription); flush(resource)
@@ -94,8 +104,12 @@ export function createAssistantFormBroker(timeoutMs = 20_000) {
 }
 
 const formBroker = createAssistantFormBroker()
-export function openAssistantForm(router: Router, form: AssistantForm, signal?: AbortSignal): Promise<void> {
-  return formBroker.request(form, (target, navigationSignal, protectDrafts) => navigateAssistantPage(router, target, navigationSignal, protectDrafts), signal)
+export function openAssistantForm(router: Router, form: AssistantForm, signal?: AbortSignal, binding?: AssistantFormBinding): Promise<void> {
+  return formBroker.request(form, async (target, navigationSignal, protectDrafts) => {
+    // 同一草稿续填只更新明确字段，不能顺带清掉用户当前的表格搜索条件。
+    if (binding && router.currentRoute.value.path === target.path) return
+    await navigateAssistantPage(router, target, navigationSignal, protectDrafts)
+  }, signal, binding)
 }
 
 /** 初次目录请求可能仍在进行；不能拿未加载的列表误判目标不存在。 */
@@ -113,28 +127,48 @@ export function waitForAssistantFormReady(isLoading: () => boolean, signal: Abor
 export interface AssistantFormPageOptions {
   canOpen: () => boolean; isLoading: () => boolean; isBusy: () => boolean; isOpen: () => boolean
   error: () => string | null; open: Consumer
+  currentForm?: () => AssistantFormContext | null
+  patch?: Consumer
 }
 /** 等待目录期间也可能停用权限或打开手填草稿，交付时重新检查全部条件。 */
-export function createAssistantFormConsumer(currentPath: () => string, options: AssistantFormPageOptions): Consumer {
-  return async (form, signal) => {
+export function createAssistantFormConsumer(currentPath: () => string, options: AssistantFormPageOptions, currentBinding: () => AssistantFormBinding | null = () => null): Consumer {
+  return async (form, signal, binding) => {
+    assistantFormTarget(form)
     await waitForAssistantFormReady(options.isLoading, signal)
     if (signal.aborted || currentPath() !== form.path) throw new Error('目标页面已关闭，请重新打开表单')
     if (!options.canOpen()) throw new Error('没有填写此管理表单的权限')
-    if (options.isOpen()) throw new Error('已有正在填写的表单，请先保存或取消后再打开')
     if (options.isBusy()) throw new Error('页面正在保存，请稍后重试')
+    if (options.isOpen()) {
+      if (!options.patch || !canPatchAssistantForm(form, binding, currentBinding())) throw new Error('已有正在填写的表单，请先保存或取消后再打开')
+      await options.patch(form, signal, binding)
+      return
+    }
+    // 发送时选中的草稿已关闭，不把迟到的续填降级为重新打开或新建。
+    if (binding) throw new Error('原表单已关闭或切换，请重新提出填写要求')
     if (options.error()) throw new Error('管理目录加载失败，请刷新页面后再打开表单')
     await options.open(form, signal)
   }
 }
 export function useAssistantForm(resource: AssistantFormResource, options: AssistantFormPageOptions): void {
   const route = useRoute()
+  const current = shallowRef<AssistantFormBinding | null>(null)
+  const stop = watch(() => options.currentForm?.() ?? null, context => {
+    if (context && options.isOpen()) {
+      const previous = current.value?.context
+      if (!previous || previous.resource !== context.resource || previous.operation !== context.operation || previous.target_id !== context.target_id) current.value = { context: { ...context }, draftId: ++draftSequence }
+      activeAssistantForm.value = current.value
+    } else {
+      if (activeAssistantForm.value === current.value) activeAssistantForm.value = null
+      current.value = null
+    }
+  }, { immediate: true, flush: 'sync' })
   let unsubscribe: (() => void) | undefined
-  onMounted(() => { unsubscribe = formBroker.subscribe(resource, createAssistantFormConsumer(() => route.path, options), () => {
+  onMounted(() => { unsubscribe = formBroker.subscribe(resource, createAssistantFormConsumer(() => route.path, options, () => current.value), (form, binding) => {
     if (route.path !== ASSISTANT_FORMS.find(item => item.resource === resource)?.path) return
-    if (options.isOpen()) throw new Error('已有正在填写的表单，请先保存或取消后再打开')
+    if (options.isOpen() && (!options.patch || !canPatchAssistantForm(form, binding, current.value))) throw new Error('已有正在填写的表单，请先保存或取消后再打开')
     if (options.isBusy()) throw new Error('页面正在保存，请稍后重试')
   }) })
-  onBeforeUnmount(() => unsubscribe?.())
+  onBeforeUnmount(() => { stop(); unsubscribe?.(); if (activeAssistantForm.value === current.value) activeAssistantForm.value = null })
 }
 
 /** 人员表单仅预填资料，角色继续使用真实人员或普通成员默认值。 */

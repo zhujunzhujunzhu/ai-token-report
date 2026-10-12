@@ -1,8 +1,9 @@
 /** 会话切换、网络流归属与等待队列必须在没有浏览器时也能钉住关键竞态。 */
 import { expect, test } from 'bun:test'
-import type { AssistantDetail, AssistantEvent, AssistantForm, AssistantSession, AssistantSessionPage } from '@ai-token-report/shared'
+import type { AssistantDetail, AssistantEvent, AssistantForm, AssistantFormContext, AssistantPageActionResult, AssistantPageContext, AssistantSession, AssistantSessionPage } from '@ai-token-report/shared'
+import type { AssistantFormBinding } from '../src/utils/assistantForms.js'
 import type { ApiResult } from '../src/api/request.js'
-import { createAssistantConversations, type AssistantConversationHooks } from '../src/utils/assistantConversations.js'
+import { createAssistantConversations, type AssistantConversationHooks, type AssistantPageBinding } from '../src/utils/assistantConversations.js'
 
 function deferred<T>() {
   let resolve!: (value: T) => void, reject!: (reason: unknown) => void
@@ -13,13 +14,13 @@ const session = (id: string, title = id): AssistantSession => ({ session_id: id,
 const sessionPage = (sessions: AssistantSession[] = [], next_cursor: string | null = null, total = sessions.length): ApiResult<AssistantSessionPage> => ({ ok: true, data: { sessions, next_cursor, total } })
 async function flush() { for (let i = 0; i < 8; i++) await Promise.resolve() }
 function harness(overrides: Partial<AssistantConversationHooks> = {}) {
-  const calls: Array<{ prompt: string; sessionId?: string; signal: AbortSignal; event: (event: AssistantEvent) => void; page?: string; files: File[]; result: ReturnType<typeof deferred<void>> }> = []
+  const calls: Array<{ prompt: string; sessionId?: string; signal: AbortSignal; event: (event: AssistantEvent) => void; page?: string; files: File[]; formContext?: AssistantFormContext; pageContext?: AssistantPageContext; result: ReturnType<typeof deferred<void>> }> = []
   const navigations: AssistantEvent[] = [], revoked: string[] = [], guided: string[][] = []
   const hooks: AssistantConversationHooks = {
-    chat: (prompt, sessionId, signal, event, page, files = []) => {
+    chat: (prompt, sessionId, signal, event, page, files = [], formContext, pageContext) => {
       const result = deferred<void>()
       signal.addEventListener('abort', () => result.reject(new Error('aborted')), { once: true })
-      calls.push({ prompt, sessionId, signal, event, page, files, result })
+      calls.push({ prompt, sessionId, signal, event, page, files, formContext, pageContext, result })
       return result.promise
     },
     detail: async id => ({ ok: true, data: { session: session(id), messages: [{ role: 'assistant', text: `历史:${id}` }] } }),
@@ -532,4 +533,92 @@ test('保存成功刷新管理目录，准备确认和打开表单均不能触�
   h.calls[0]!.event({ type: 'tool', tool: 'portal_manage_save', query: '', status: 403, state: 'failed' }); expect(refreshes).toBe(0)
   h.calls[0]!.event({ type: 'tool', tool: 'portal_manage_save', query: '', status: 200, state: 'completed' }); expect(refreshes).toBe(1)
   h.finish(0); await sending; c.dispose()
+})
+
+test('排队消息捕获当时表单标识与打开次数，续填回调沿用原草稿而非后来打开的表单', async () => {
+  const delivered: Array<AssistantFormBinding | undefined> = []
+  const h = harness({ openForm: (_form, _signal, binding) => { delivered.push(binding) } }), c = h.controller
+  c.current.value.prompt = '第一轮'; const first = c.submit('/groups'); h.accept(0, '会话')
+  const binding: AssistantFormBinding = { draftId: 3, context: { resource: 'groups', operation: 'create' } }
+  c.current.value.prompt = '继续填写'; await c.submit('/groups', binding)
+  binding.draftId = 4; binding.context = { resource: 'groups', operation: 'update', target_id: '11111111-1111-4111-8111-111111111111' }
+  // 引导沿用正在运行的上下文，不能丢弃排队续填所绑定的草稿。
+  await c.steerQueued(c.current.value.queue[0]!.id)
+  expect(h.guided).toHaveLength(0); expect(c.current.value.queue).toHaveLength(1)
+  h.finish(0); await first; await flush()
+  expect(h.calls).toHaveLength(1)
+  const next = c.resume(); h.accept(1, '会话')
+  expect(h.calls[1]!.formContext).toEqual({ resource: 'groups', operation: 'create' })
+  h.calls[1]!.event({ type: 'open_form', form: { ...requestedForm, request_id: 'continued' } }); await flush()
+  expect(delivered).toEqual([{ draftId: 3, context: { resource: 'groups', operation: 'create' } }])
+  h.finish(1); await next; c.dispose()
+})
+
+test('页面动作绑定当前轮次，后台对话拒绝操作且如实回传，完成后释放控制器', async () => {
+  const replies: Array<{ request: string; session: string; run: string; result: AssistantPageActionResult }> = []
+  let executed = 0, released = 0
+  const context: AssistantPageContext = { path: '/groups', controls: [{ id: '本地控件', kind: 'fill', label: '搜索分组', effect: 'read' }] }
+  const binding: AssistantPageBinding = { context, execute: async () => { executed++; return { ok: true, page_context: context } }, dispose: () => { released++ } }
+  const h = harness({ pageActionResult: async (request, session, run, result) => { replies.push({ request, session, run, result }) } }), c = h.controller
+  c.current.value.prompt = '筛选分组'; const sending = c.submit('/groups', undefined, binding); h.accept(0, '会话一')
+  expect(h.calls[0]?.pageContext).toEqual(context)
+  h.calls[0]!.event({ type: 'page_action', request_id: '动作一', action: { operation: 'fill', control_id: '本地控件', value: '研发' } }); await flush()
+  expect(replies[0]).toEqual({ request: '动作一', session: '会话一', run: 'run:0', result: { ok: true, page_context: context } })
+  await c.open()
+  h.calls[0]!.event({ type: 'page_action', request_id: '动作二', action: { operation: 'inspect' } }); await flush()
+  expect(executed).toBe(1)
+  expect(replies[1]?.result).toMatchObject({ ok: false, reason: expect.stringContaining('后台任务') })
+  h.finish(0); await sending; expect(released).toBe(1); c.dispose(); expect(released).toBe(1)
+})
+
+test('导航或打开表单完成并重新绑定后，后续页面工具才读取新页面', async () => {
+  for (const kind of ['navigate', 'open_form'] as const) {
+    const transition = deferred<void>(), trace: string[] = []
+    const binding: AssistantPageBinding = { context: { path: '/overview', controls: [] }, execute: async () => { trace.push('inspect'); return { ok: true } }, dispose: () => {}, followNavigation: () => { trace.push('rebind') } }
+    const h = harness({
+      navigate: async (_event, page) => { trace.push('navigate'); await transition.promise; page?.followNavigation?.() },
+      openForm: async () => { trace.push('open'); await transition.promise },
+      pageActionResult: async () => { trace.push('reply') },
+    }), c = h.controller
+    c.current.value.prompt = '打开页面后继续填写'; const sending = c.submit('/overview', undefined, binding); h.accept(0, '会话')
+    h.calls[0]!.event(kind === 'navigate' ? { type: 'navigate', path: '/groups' } : { type: 'open_form', form: requestedForm })
+    h.calls[0]!.event({ type: 'page_action', request_id: '查新页面', action: { operation: 'inspect' } }); await flush()
+    expect(trace).toEqual([kind === 'navigate' ? 'navigate' : 'open'])
+    transition.resolve(); await flush()
+    expect(trace).toEqual([kind === 'navigate' ? 'navigate' : 'open', 'rebind', 'inspect', 'reply'])
+    h.finish(0); await sending; c.dispose()
+  }
+})
+
+test('切换失败阻止后续控件操作，停止期间到达的结果不再回传', async () => {
+  const replies: AssistantPageActionResult[] = [], execution = deferred<AssistantPageActionResult>()
+  let executed = 0
+  const binding: AssistantPageBinding = { context: { path: '/groups', controls: [] }, execute: async () => { executed++; return { ok: true } }, dispose: () => {} }
+  const h = harness({ navigate: async () => { throw new Error('当前草稿未保存') }, pageActionResult: async (_request, _session, _run, result) => { replies.push(result) } }), c = h.controller
+  c.current.value.prompt = '跳转后操作'; const sending = c.submit('/groups', undefined, binding); h.accept(0, '会话')
+  h.calls[0]!.event({ type: 'navigate', path: '/pricing' })
+  h.calls[0]!.event({ type: 'page_action', request_id: '动作', action: { operation: 'inspect' } }); await flush()
+  expect(executed).toBe(0); expect(replies[0]).toEqual({ ok: false, reason: '当前草稿未保存' })
+  // 失败已交给模型后仍可重新查看原页，不能永久卡住当前草稿的纠正操作。
+  h.calls[0]!.event({ type: 'page_action', request_id: '重新检查', action: { operation: 'inspect' } }); await flush()
+  expect(executed).toBe(1); expect(replies[1]).toEqual({ ok: true })
+  h.finish(0); await sending; c.dispose()
+
+  const next = harness({ pageActionResult: async (_request, _session, _run, result) => { replies.push(result) } }), d = next.controller
+  d.current.value.prompt = '读取页面'; const reading = d.submit('/groups', undefined, { ...binding, execute: () => { executed++; return execution.promise } }); next.accept(0, '新会话')
+  next.calls[0]!.event({ type: 'page_action', request_id: '将被取消', action: { operation: 'inspect' } }); await flush()
+  expect(executed).toBe(2)
+  d.stop(); await reading; execution.resolve({ ok: true }); await flush()
+  expect(replies).toHaveLength(2); d.dispose()
+})
+
+test('未接受运行保留页面连接供重试，移除待发送项释放控制器', async () => {
+  let released = 0
+  const binding: AssistantPageBinding = { context: { path: '/groups', controls: [] }, execute: async () => ({ ok: true }), dispose: () => { released++ } }
+  const h = harness(), c = h.controller
+  c.current.value.prompt = '操作页面'; const sending = c.submit('/groups', undefined, binding)
+  h.calls[0]!.result.reject(new Error('服务暂未连接')); await sending
+  expect(released).toBe(0); expect(c.current.value.queue).toHaveLength(1)
+  c.removeQueued(c.current.value.queue[0]!.id)
+  expect(released).toBe(1); c.dispose(); expect(released).toBe(1)
 })

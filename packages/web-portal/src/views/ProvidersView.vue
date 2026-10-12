@@ -40,7 +40,7 @@ import {
   ElSkeleton, ElTable, ElTableColumn, ElTag,
 } from 'element-plus'
 import type { FormInstance, FormRules } from 'element-plus'
-import { ANY_PROVIDER, type PortalMember, type PortalProviderAlias } from '@ai-token-report/shared'
+import { ANY_PROVIDER, type AssistantFormValues, type PortalMember, type PortalProviderAlias } from '@ai-token-report/shared'
 import { fetchMembers } from '../api/admin.js'
 import * as api from '../api/admin.js'
 import { useSessionStore } from '../stores/session.js'
@@ -188,20 +188,25 @@ async function remove(entry: PortalProviderAlias): Promise<void> {
   await load()
 }
 
+function prefillAssistantForm(values: AssistantFormValues): void {
+  assertAssistantFormIdentity(values, selected.value, ['scope', 'member_id', 'provider', 'model'])
+  if (values.scope === 'global' || values.scope === 'member') draft.scope = values.scope
+  if (values.member_id !== undefined) draft.member_id = String(values.member_id ?? '')
+  if (values.model !== undefined) { draft.target = values.model === null ? 'provider' : 'model'; draft.model = String(values.model ?? '') }
+  if (typeof values.provider === 'string') draft.provider = draft.target === 'model' && values.provider === ANY_PROVIDER ? '' : values.provider
+  if (typeof values.alias === 'string') draft.alias = values.alias
+}
 useAssistantForm('provider-aliases', {
   canOpen: () => canManage.value, isLoading: () => loading.value, isBusy: () => busy.value,
   isOpen: () => showForm.value, error: () => error.value,
+  currentForm: () => showForm.value ? { resource: 'provider-aliases', operation: selected.value ? 'update' : 'create', ...(selected.value ? { target_id: selected.value.alias_id } : {}) } : null,
   open: request => {
     const entry = assistantFormEntry(request, aliases.value, row => row.alias_id)
     assertAssistantFormIdentity(request.values, entry, ['scope', 'member_id', 'provider', 'model'])
     open(entry)
-    const values = request.values
-    if (values.scope === 'global' || values.scope === 'member') draft.scope = values.scope
-    if (values.member_id !== undefined) draft.member_id = String(values.member_id ?? '')
-    if (values.model !== undefined) { draft.target = values.model === null ? 'provider' : 'model'; draft.model = String(values.model ?? '') }
-    if (typeof values.provider === 'string') draft.provider = draft.target === 'model' && values.provider === ANY_PROVIDER ? '' : values.provider
-    if (typeof values.alias === 'string') draft.alias = values.alias
+    prefillAssistantForm(request.values)
   },
+  patch: request => prefillAssistantForm(request.values),
 })
 onMounted(() => { void load() })
 </script>

@@ -3,7 +3,7 @@ import { expect, test } from 'bun:test'
 import { ref } from 'vue'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import type { AssistantForm } from '@ai-token-report/shared'
-import { assistantFormTarget, assistantFormEntry, assistantMemberPrefill, assistantMemberDraft, assistantPricingPrefill, assistantPriceTime, assertAssistantFormIdentity, createAssistantFormBroker, createAssistantFormConsumer, waitForAssistantFormReady } from '../src/utils/assistantForms.js'
+import { assistantFormTarget, assistantFormEntry, assistantMemberPrefill, assistantMemberDraft, assistantPricingPrefill, assistantPriceTime, assertAssistantFormIdentity, canPatchAssistantForm, createAssistantFormBroker, createAssistantFormConsumer, waitForAssistantFormReady, type AssistantFormBinding } from '../src/utils/assistantForms.js'
 import { navigateAssistantPage } from '../src/utils/assistantNavigation.js'
 
 const targetId = '11111111-1111-4111-8111-111111111111'
@@ -158,4 +158,64 @@ test('未更改的价格窗口保留原秒与毫秒，主动修改日期才解�
   const prefilled = assistantPricingPrefill({ effective_from_ms: original, effective_to_ms: original + 123_456 }, () => input)
   expect(assistantPriceTime(String(prefilled.from), original, input, 0)).toBe(original)
   expect(assistantPriceTime(String(prefilled.to), original + 123_456, input, null)).toBe(original + 123_456)
+})
+
+test('续填只合并指定字段，保留手工填写内容；校验报错后仍能纠正当前草稿', async () => {
+  const binding: AssistantFormBinding = { draftId: 1, context: { resource: 'provider-aliases', operation: 'update', target_id: targetId } }
+  const draft = { provider: '用户已填写的供应商', alias: '旧名称' }
+  let opens = 0, saves = 0
+  const consumer = createAssistantFormConsumer(() => '/providers', {
+    canOpen: () => true, isLoading: () => false, isBusy: () => false, isOpen: () => true, error: () => '此前保存校验失败',
+    open: () => { opens++ }, patch: request => { Object.assign(draft, request.values) },
+  }, () => binding)
+  const request = { ...form('patch', { alias: '新名称' }), operation: 'update' as const, target_id: targetId }
+  await consumer(request, new AbortController().signal, binding)
+  expect(draft).toEqual({ provider: '用户已填写的供应商', alias: '新名称' })
+  expect(opens).toBe(0); expect(saves).toBe(0)
+  // 同一请求重复交付只能处理一次，续填也沿用 broker 去重。
+  const broker = createAssistantFormBroker()
+  let patches = 0
+  const unsubscribe = broker.subscribe('provider-aliases', () => { patches++ }, (actual, origin) => { if (!canPatchAssistantForm(actual, origin, binding)) throw new Error('另一份草稿') })
+  await broker.request(request, async () => {}, undefined, binding)
+  await broker.request(request, async () => {}, undefined, binding)
+  expect(patches).toBe(1); unsubscribe()
+})
+
+test('不同记录、关闭重开、发送后才打开的草稿与秘密字段都不能被迟到回答覆盖', async () => {
+  const binding: AssistantFormBinding = { draftId: 7, context: { resource: 'provider-aliases', operation: 'update', target_id: targetId } }
+  const request = { ...form('stale', { alias: '新名称' }), operation: 'update' as const, target_id: targetId }
+  let current: AssistantFormBinding | null = binding, isOpen = true, patches = 0, opens = 0
+  const consumer = createAssistantFormConsumer(() => '/providers', {
+    canOpen: () => true, isLoading: () => false, isBusy: () => false, isOpen: () => isOpen, error: () => null,
+    open: () => { opens++ }, patch: () => { patches++ },
+  }, () => current)
+  await expect(Promise.resolve(consumer(request, new AbortController().signal))).rejects.toThrow('已有正在填写')
+  current = { ...binding, draftId: 8 }
+  await expect(Promise.resolve(consumer(request, new AbortController().signal, binding))).rejects.toThrow('已有正在填写')
+  current = binding
+  await expect(Promise.resolve(consumer({ ...request, target_id: '22222222-2222-4222-8222-222222222222' }, new AbortController().signal, binding))).rejects.toThrow('已有正在填写')
+  await expect(Promise.resolve(consumer({ ...request, values: { password: 'secret' } }, new AbortController().signal, binding))).rejects.toThrow('不允许填写')
+  isOpen = false; current = null
+  await expect(Promise.resolve(consumer(request, new AbortController().signal, binding))).rejects.toThrow('原表单已关闭')
+  expect(patches).toBe(0); expect(opens).toBe(0)
+})
+
+test('续填等待目录期间关闭重开、撤销权限或开始保存，交付前再次检查', async () => {
+  const binding: AssistantFormBinding = { draftId: 10, context: { resource: 'provider-aliases', operation: 'create' } }
+  for (const change of ['reopen', 'permission', 'busy']) {
+    const loading = ref(true), busy = ref(false), permission = ref(true)
+    let current = binding, patches = 0
+    const consumer = createAssistantFormConsumer(() => '/providers', {
+      canOpen: () => permission.value, isLoading: () => loading.value, isBusy: () => busy.value, isOpen: () => true, error: () => null,
+      open: () => {}, patch: () => { patches++ },
+    }, () => current)
+    const pending = consumer(form('loading-patch'), new AbortController().signal, binding)
+    await flush()
+    if (change === 'reopen') current = { ...binding, draftId: 11 }
+    if (change === 'permission') permission.value = false
+    if (change === 'busy') busy.value = true
+    loading.value = false
+    await expect(Promise.resolve(pending)).rejects.toThrow()
+    expect(patches).toBe(0)
+  }
 })

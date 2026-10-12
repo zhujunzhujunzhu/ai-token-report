@@ -349,6 +349,7 @@ export function createApp(deps: AppDeps): Hono {
     app.delete('/api/v1/assistant/sessions/:id', c => dispatch(c, `sessions/${c.req.param('id')}`))
     app.post('/api/v1/assistant/chat', c => dispatch(c, 'chat'))
     app.post('/api/v1/assistant/steer', c => dispatch(c, 'steer'))
+    app.post('/api/v1/assistant/page-action-result', c => dispatch(c, 'page-action-result'))
     app.post('/api/v1/assistant/actions/:id/confirm', c => dispatch(c, 'actions/' + c.req.param('id') + '/confirm'))
     app.get('/api/v1/assistant/artifacts/:id/download', c => dispatch(c, 'artifacts/' + c.req.param('id') + '/download'))
     app.post('/api/v1/assistant/artifacts/:id/share', c => dispatch(c, 'artifacts/' + c.req.param('id') + '/share'))

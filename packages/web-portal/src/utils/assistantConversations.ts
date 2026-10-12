@@ -4,17 +4,27 @@
  */
 import { computed, markRaw, reactive, ref, watch } from 'vue'
 import { ASSISTANT_SESSION_PAGE_SIZE } from '@ai-token-report/shared'
-import type { AssistantArtifact, AssistantDetail, AssistantEvent, AssistantForm, AssistantMessage, AssistantPendingAction, AssistantSession, AssistantSessionPage, AssistantToolEvent } from '@ai-token-report/shared'
+import type { AssistantArtifact, AssistantDetail, AssistantEvent, AssistantForm, AssistantMessage, AssistantPageContext, AssistantPageOperation, AssistantPageActionResult, AssistantPendingAction, AssistantSession, AssistantSessionPage, AssistantToolEvent } from '@ai-token-report/shared'
 import type { ApiResult } from '../api/request.js'
 import { finishAssistantTools, recordAssistantTool } from './assistantActivity.js'
 import { assistantAttachmentKind } from './assistantAttachments.js'
+import type { AssistantFormBinding } from './assistantForms.js'
 
 export interface AssistantPendingFile { id: number; file: File; preview?: string }
+/** 页面控制器只存在本地这一轮，服务端只接收其有界控件目录。 */
+export interface AssistantPageBinding {
+  context: AssistantPageContext
+  execute: (action: AssistantPageOperation, signal: AbortSignal) => Promise<AssistantPageActionResult>
+  dispose: () => void
+  followNavigation?: () => void
+}
 export interface AssistantQueuedMessage {
   id: number
   prompt: string
   files: AssistantPendingFile[]
   page?: string
+  formBinding?: AssistantFormBinding
+  pageBinding?: AssistantPageBinding
 }
 export interface AssistantConversationState {
   key: string
@@ -36,12 +46,13 @@ export interface AssistantConversationState {
 export type AssistantConversationSession = AssistantSession & { local?: boolean }
 type NavigationEvent = Extract<AssistantEvent, { type: 'navigate' }>
 export interface AssistantConversationHooks {
-  chat: (prompt: string, sessionId: string | undefined, signal: AbortSignal, onEvent: (event: AssistantEvent) => void, page?: string, files?: File[]) => Promise<void>
+  chat: (prompt: string, sessionId: string | undefined, signal: AbortSignal, onEvent: (event: AssistantEvent) => void, page?: string, files?: File[], formContext?: AssistantFormBinding['context'], pageContext?: AssistantPageContext) => Promise<void>
   detail: (id: string) => Promise<ApiResult<AssistantDetail>>
   sessions: (params: { limit: number; cursor?: string }) => Promise<ApiResult<AssistantSessionPage>>
   steer?: (prompt: string, sessionId: string, runId: string, signal: AbortSignal) => Promise<void>
-  navigate?: (event: NavigationEvent) => void | Promise<void>
-  openForm?: (form: AssistantForm, signal: AbortSignal) => void | Promise<void>
+  navigate?: (event: NavigationEvent, binding?: AssistantPageBinding, signal?: AbortSignal) => void | Promise<void>
+  openForm?: (form: AssistantForm, signal: AbortSignal, binding?: AssistantFormBinding) => void | Promise<void>
+  pageActionResult?: (requestId: string, sessionId: string, runId: string, result: AssistantPageActionResult, signal: AbortSignal) => Promise<void>
   managementChanged?: () => void
   revokePreview?: (url: string) => void
 }
@@ -53,6 +64,7 @@ interface Run {
   accepted: boolean
   terminal: boolean
   failed: boolean
+  pageTransition?: Promise<void>
 }
 
 export function createAssistantConversations(hooks: AssistantConversationHooks) {
@@ -172,10 +184,10 @@ export function createAssistantConversations(hooks: AssistantConversationHooks) 
     loads.set(state.key, promise)
     return promise
   }
-  function snapshot(state: AssistantConversationState, page?: string): AssistantQueuedMessage | undefined {
+  function snapshot(state: AssistantConversationState, page?: string, formBinding?: AssistantFormBinding, pageBinding?: AssistantPageBinding): AssistantQueuedMessage | undefined {
     const prompt = state.prompt.trim()
     if (!prompt && !state.pendingFiles.length) return undefined
-    const item = { id: ++queueSequence, prompt, files: state.pendingFiles, page }
+    const item = { id: ++queueSequence, prompt, files: state.pendingFiles, page, ...(formBinding ? { formBinding: { context: { ...formBinding.context }, draftId: formBinding.draftId } } : {}), ...(pageBinding ? { pageBinding: markRaw(pageBinding) } : {}) }
     state.prompt = ''; state.pendingFiles = []; state.attachmentError = ''
     return item
   }
@@ -224,10 +236,41 @@ export function createAssistantConversations(hooks: AssistantConversationHooks) 
       run.reply = reactive<AssistantMessage>({ role: 'assistant', text: '' })
       state.messages.push(run.reply)
     }
+    else if (event.type === 'page_action' && hooks.pageActionResult && state.sessionId && state.runId) {
+      const sessionId = state.sessionId, runId = state.runId
+      void Promise.resolve().then(async () => {
+        let result: AssistantPageActionResult
+        // 导航和打开表单只发送事件；页面工具必须等 Vue 完成切换后再读取新控件。
+        const transition = run.pageTransition
+        try { await transition }
+        catch (err) {
+          if (run.pageTransition === transition) run.pageTransition = undefined
+          result = { ok: false, reason: reason(err, '页面尚未准备好') }
+          if (!run.controller.signal.aborted && alive(state)) await hooks.pageActionResult!(event.request_id, sessionId, runId, result, run.controller.signal)
+          return
+        }
+        if (run.pageTransition === transition) run.pageTransition = undefined
+        if (run.controller.signal.aborted || !alive(state)) return
+        if (selected.value !== state.key) result = { ok: false, reason: '已切换到其他对话，后台任务不能操作当前页面' }
+        else if (!run.item.pageBinding) result = { ok: false, reason: '本次请求未连接页面，请重新发送页面操作要求' }
+        else {
+          try { result = await run.item.pageBinding.execute(event.action, run.controller.signal) }
+          catch (err) { result = { ok: false, reason: reason(err, '页面操作失败') } }
+        }
+        if (!run.controller.signal.aborted && alive(state)) await hooks.pageActionResult!(event.request_id, sessionId, runId, result, run.controller.signal)
+      }).catch(err => {
+        if (!run.controller.signal.aborted && alive(state)) state.error = reason(err, '页面操作回传失败')
+      })
+    }
     else if (event.type === 'navigate' && selected.value === state.key && hooks.navigate) {
       // 后台任务可以更新自己的内容，但不能把用户正在操作的页面抢走。
-      try { void Promise.resolve(hooks.navigate(event)).catch(err => { if (alive(state) && runs.get(state.key) === run) state.error = reason(err, '页面跳转失败') }) }
-      catch (err) { state.error = reason(err, '页面跳转条件无效') }
+      const previous = run.pageTransition
+      const navigate = () => {
+        if (!run.controller.signal.aborted && selected.value === state.key) return hooks.navigate!(event, run.item.pageBinding, run.controller.signal)
+      }
+      try { run.pageTransition = previous ? previous.then(navigate) : Promise.resolve(navigate()) }
+      catch (err) { run.pageTransition = Promise.reject(err) }
+      void run.pageTransition.catch(err => { if (alive(state) && runs.get(state.key) === run) state.error = reason(err, '页面跳转失败') })
     }
     else if (event.type === 'open_form' && selected.value === state.key && hooks.openForm) {
       // 表单属于当前实时请求；切到其它会话或停止后，迟到交付必须取消。
@@ -235,9 +278,13 @@ export function createAssistantConversations(hooks: AssistantConversationHooks) 
       formControllers.add(controller)
       const stopWatching = watch(selected, key => { if (key !== state.key) abort() }, { flush: 'sync' })
       run.controller.signal.addEventListener('abort', abort, { once: true })
-      void Promise.resolve().then(() => {
-        if (!controller.signal.aborted) return hooks.openForm!(event.form, controller.signal)
-      }).catch(err => {
+      const previous = run.pageTransition
+      run.pageTransition = Promise.resolve(previous).then(async () => {
+        if (!controller.signal.aborted) return hooks.openForm!(event.form, controller.signal, run.item.formBinding)
+      }).then(() => {
+        if (!controller.signal.aborted) run.item.pageBinding?.followNavigation?.()
+      })
+      void run.pageTransition.catch(err => {
         // 打开表单可能晚于 SSE done；仍应把真实失败交给所属会话，不能静默丢弃。
         if (!controller.signal.aborted && alive(state) && (!runs.has(state.key) || runs.get(state.key) === run)) state.error = reason(err, '打开填写表单失败')
       }).finally(() => { formControllers.delete(controller); stopWatching(); run.controller.signal.removeEventListener('abort', abort) })
@@ -250,6 +297,7 @@ export function createAssistantConversations(hooks: AssistantConversationHooks) 
       // 本轮未入库时保留完整待发附件；后续编辑的草稿仍留在编辑区，不相互覆盖。
       state.queue.unshift(run.item)
     } else release(run.item.files)
+    if (run.accepted) run.item.pageBinding?.dispose()
     finishAssistantTools(state.sources)
     runs.delete(state.key); state.sending = false; state.uploading = false; state.runId = undefined
     if (run.failed || run.controller.signal.aborted) state.queuePaused = true
@@ -263,7 +311,7 @@ export function createAssistantConversations(hooks: AssistantConversationHooks) 
     runs.set(state.key, run); state.sending = true; state.uploading = !!item.files.length; state.error = ''; state.sources = []
     state.messages.push(user, reply)
     try {
-      await hooks.chat(item.prompt, state.sessionId, run.controller.signal, event => receive(state, run, event), item.page, item.files.map(file => file.file))
+      await hooks.chat(item.prompt, state.sessionId, run.controller.signal, event => receive(state, run, event), item.page, item.files.map(file => file.file), item.formBinding?.context, item.pageBinding?.context)
       if (!run.terminal && !run.controller.signal.aborted) throw new Error('助手连接中断，请重新打开会话查看已保存的回答')
     } catch (err) {
       if (alive(state) && runs.get(state.key) === run) { run.failed = true; state.error = run.controller.signal.aborted ? '对话已停止' : reason(err, '助手请求失败') }
@@ -275,10 +323,10 @@ export function createAssistantConversations(hooks: AssistantConversationHooks) 
       }
     }
   }
-  function submit(page?: string): Promise<void> {
+  function submit(page?: string, formBinding?: AssistantFormBinding | null, pageBinding?: AssistantPageBinding): Promise<void> {
     const state = current.value
     if (disposed || state.loading) return Promise.resolve()
-    const item = snapshot(state, page)
+    const item = snapshot(state, page, formBinding ?? undefined, pageBinding)
     if (!item) return Promise.resolve()
     state.queue.push(item)
     // 只有显式继续才解除“停止/失败”的暂停，排队提交不会悄悄重开被停止的任务。
@@ -286,7 +334,7 @@ export function createAssistantConversations(hooks: AssistantConversationHooks) 
   }
   function removeQueued(id: number): void {
     const state = current.value, index = state.queue.findIndex(item => item.id === id)
-    if (index >= 0) release(state.queue.splice(index, 1)[0]!.files)
+    if (index >= 0) { const item = state.queue.splice(index, 1)[0]!; release(item.files); item.pageBinding?.dispose() }
   }
   function resume(): Promise<void> {
     const state = current.value
@@ -303,6 +351,7 @@ export function createAssistantConversations(hooks: AssistantConversationHooks) 
     steeringControllers.get(state.key)?.abort()
   }
   async function guide(state: AssistantConversationState, item: AssistantQueuedMessage, onStart?: () => void): Promise<boolean> {
+    if (item.formBinding) { state.error = '表单续填请排队发送，当前运行使用的是此前的表单'; return false }
     if (!state.sending || !state.sessionId || !state.runId || !hooks.steer || runs.get(state.key)?.controller.signal.aborted) { state.error = '当前对话尚未准备好接收引导，请稍后重试或排队发送'; return false }
     if (item.files.length || !item.prompt) { state.attachmentError = '立即引导仅支持文字，附件请排队发送'; return false }
     if (state.steering) return false
@@ -337,15 +386,15 @@ export function createAssistantConversations(hooks: AssistantConversationHooks) 
     if (state.steering || item.files.length || !state.sending || !state.runId) { await guide(state, item); return }
     // 引导请求与本轮结束可同时发生，先从 FIFO 取出才不会把同一条消息投递两遍。
     state.queue.splice(index, 1)
-    if (await guide(state, item)) { release(item.files); void startNext(state) }
+    if (await guide(state, item)) { release(item.files); item.pageBinding?.dispose(); void startNext(state) }
     else if (alive(state)) { state.queue.splice(Math.min(index, state.queue.length), 0, item); state.queuePaused = true }
   }
   function releaseState(state: AssistantConversationState): void {
     runs.get(state.key)?.controller.abort(); steeringControllers.get(state.key)?.abort()
     release(state.pendingFiles)
-    for (const item of state.queue) release(item.files)
+    for (const item of state.queue) { release(item.files); item.pageBinding?.dispose() }
     const run = runs.get(state.key)
-    if (run) release(run.item.files)
+    if (run) { release(run.item.files); run.item.pageBinding?.dispose() }
     runs.delete(state.key); steeringControllers.delete(state.key); loaded.delete(state.key)
     state.sending = false; state.uploading = false; state.steering = false; state.runId = undefined
   }

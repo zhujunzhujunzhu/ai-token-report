@@ -46,7 +46,7 @@ import {
   ElMessage, ElMessageBox, ElOption, ElSelect, ElSkeleton, ElTable, ElTableColumn, ElTag,
 } from 'element-plus'
 import type { FormInstance, FormRules } from 'element-plus'
-import type { PortalMember, PortalProjectAlias } from '@ai-token-report/shared'
+import type { AssistantFormValues, PortalMember, PortalProjectAlias } from '@ai-token-report/shared'
 import { fetchMembers } from '../api/admin.js'
 import * as api from '../api/admin.js'
 import { fetchProjectCwds } from '../api/portal.js'
@@ -174,19 +174,24 @@ async function remove(entry: PortalProjectAlias): Promise<void> {
   await load()
 }
 
+function prefillAssistantForm(values: AssistantFormValues): void {
+  assertAssistantFormIdentity(values, selected.value, ['scope', 'member_id', 'prefix'])
+  if (values.scope === 'global' || values.scope === 'member') draft.scope = values.scope
+  if (values.member_id !== undefined) draft.member_id = String(values.member_id ?? '')
+  if (typeof values.prefix === 'string') draft.prefix = values.prefix
+  if (typeof values.alias === 'string') draft.alias = values.alias
+}
 useAssistantForm('project-aliases', {
   canOpen: () => canManage.value, isLoading: () => loading.value, isBusy: () => busy.value,
   isOpen: () => showForm.value, error: () => error.value,
+  currentForm: () => showForm.value ? { resource: 'project-aliases', operation: selected.value ? 'update' : 'create', ...(selected.value ? { target_id: selected.value.alias_id } : {}) } : null,
   open: request => {
     const entry = assistantFormEntry(request, aliases.value, row => row.alias_id)
     assertAssistantFormIdentity(request.values, entry, ['scope', 'member_id', 'prefix'])
     open(entry)
-    const values = request.values
-    if (values.scope === 'global' || values.scope === 'member') draft.scope = values.scope
-    if (values.member_id !== undefined) draft.member_id = String(values.member_id ?? '')
-    if (typeof values.prefix === 'string') draft.prefix = values.prefix
-    if (typeof values.alias === 'string') draft.alias = values.alias
+    prefillAssistantForm(request.values)
   },
+  patch: request => prefillAssistantForm(request.values),
 })
 onMounted(() => { void load() })
 </script>

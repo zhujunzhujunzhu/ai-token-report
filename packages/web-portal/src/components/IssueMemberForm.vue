@@ -1,14 +1,26 @@
 <script setup lang="ts">
 /** 人员建档与凭证签发分开；角色和分组只能来自服务端目录。 */
-import { reactive, ref } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { ElButton, ElForm, ElFormItem, ElInput, ElSelect, ElOption } from 'element-plus'
 import type { FormInstance, FormRules } from 'element-plus'
 import { validateName, type PortalRole, type PortalGroup, type PortalCreateMemberRequest } from '@ai-token-report/shared'
-import { assistantMemberDraft } from '../utils/assistantForms.js'
+import { assistantMemberDraft, type AssistantMemberPrefill } from '../utils/assistantForms.js'
 const props = defineProps<{ busy: boolean; roles: PortalRole[]; groups: PortalGroup[]; initialValues?: { name?: string; group_ids?: string[] } }>()
 const emit = defineEmits<{ issue: [input: PortalCreateMemberRequest]; cancel: [] }>()
 const form = ref<FormInstance>()
 const draft = reactive({ ...assistantMemberDraft({ name: '', group_ids: [] }, props.initialValues), role_ids: props.roles.filter((r) => r.code === 'member').map((r) => r.role_id) })
+// 新建资料只允许沿用普通成员默认角色，不能把手选的更高权限随助手填写一起提交。
+const assistantSubmitSafe = computed(() => {
+  const defaults = props.roles.filter(role => role.code === 'member').map(role => role.role_id)
+  return draft.role_ids.length === defaults.length && defaults.every(id => draft.role_ids.includes(id))
+})
+/** 不重建表单，避免助手改姓名时把用户已经选择的角色和分组清回默认值。 */
+function applyPrefill(values: AssistantMemberPrefill): void {
+  if (props.busy) throw new Error('页面正在保存，请稍后重试')
+  if (values.name !== undefined) draft.name = values.name
+  if (values.group_ids !== undefined) draft.group_ids = [...values.group_ids]
+}
+defineExpose({ applyPrefill })
 const rules: FormRules = {
   name: [{ required: true, validator: (_rule, value, done) => {
     const result = validateName(String(value)); done(result.ok ? undefined : new Error(result.reason))
@@ -23,7 +35,7 @@ async function submit(): Promise<void> {
 }
 </script>
 <template>
-  <el-form ref="form" :model="draft" :rules="rules" label-position="top" :disabled="busy" @submit.prevent="submit">
+  <el-form ref="form" :model="draft" :rules="rules" label-position="top" :disabled="busy" :data-assistant-submit-safe="assistantSubmitSafe ? 'true' : 'false'" @submit.prevent="submit">
     <el-form-item label="姓名" prop="name"><el-input v-model="draft.name" maxlength="32" autocomplete="off" /></el-form-item>
     <el-form-item label="分组"><el-select v-model="draft.group_ids" multiple filterable clearable collapse-tags collapse-tags-tooltip placeholder="未分组（可多选）" aria-label="选择分组">
       <el-option v-for="group in groups.filter(g => g.status === 'active')" :key="group.group_id" :value="group.group_id" :label="group.name" />

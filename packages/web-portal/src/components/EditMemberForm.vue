@@ -11,12 +11,12 @@
  * ⚠️ 草稿由 `props.member` 初始化一次，所以调用方必须给这个组件挂
  *   `:key="member.member_id"` —— 否则换一个人打开时还是上一个人的草稿。
  */
-import { reactive } from 'vue'
+import { computed, reactive } from 'vue'
 import { ElButton, ElForm, ElFormItem, ElInput, ElOption, ElSelect } from 'element-plus'
 import type { PortalGroup, PortalMember } from '@ai-token-report/shared'
 import type { MemberEditDraft } from '../views/memberEditModel.js'
 import type { RolePickerOption } from '../views/rolesModel.js'
-import { assistantMemberDraft } from '../utils/assistantForms.js'
+import { assistantMemberDraft, type AssistantMemberPrefill } from '../utils/assistantForms.js'
 
 const props = defineProps<{
   member: PortalMember
@@ -33,6 +33,15 @@ const draft = reactive({
   ...assistantMemberDraft({ name: props.member.name, group_ids: props.member.groups.map((group) => group.group_id) }, props.initialValues),
   role_ids: props.member.roles.map((role) => role.role_id),
 })
+// ★ 助手提交资料不能附带用户手改的角色；角色变化必须仍由用户核对并保存。
+const assistantSubmitSafe = computed(() => draft.role_ids.length === props.member.roles.length && props.member.roles.every(role => draft.role_ids.includes(role.role_id)))
+/** 助手续填只改明确要求的业务字段，保留用户未提交的分组与角色选择。 */
+function applyPrefill(values: AssistantMemberPrefill): void {
+  if (props.busy) throw new Error('页面正在保存，请稍后重试')
+  if (values.name !== undefined) draft.name = values.name
+  if (values.group_ids !== undefined) draft.group_ids = [...values.group_ids]
+}
+defineExpose({ applyPrefill })
 /**
  * 姓名合法性刻意**不在这里**判：判据（含那句中文原因）只有一份，在
  * `memberEditModel.ts`，本组件只负责把草稿交出去。
@@ -43,7 +52,7 @@ function submit(): void {
 }
 </script>
 <template>
-  <el-form label-position="top" :disabled="busy" @submit.prevent="submit">
+  <el-form label-position="top" :disabled="busy" :data-assistant-submit-safe="assistantSubmitSafe ? 'true' : 'false'" @submit.prevent="submit">
     <el-form-item label="姓名"><el-input v-model="draft.name" maxlength="32" autocomplete="off" /></el-form-item>
     <el-form-item label="分组">
       <el-select v-model="draft.group_ids" multiple filterable clearable collapse-tags collapse-tags-tooltip placeholder="未分组（可多选）" aria-label="选择分组">

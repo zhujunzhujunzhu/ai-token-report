@@ -124,16 +124,47 @@ export const ASSISTANT_FORMS = [
 ] as const
 export type AssistantFormResource = typeof ASSISTANT_FORMS[number]['resource']
 export type AssistantFormValues = Record<string, string | number | boolean | null | string[]>
-export interface AssistantFormRequest {
+/** 本轮打开的表单只传身份引用，不读取或传输尚未保存的字段、账号或凭证。 */
+export interface AssistantFormContext {
   resource: AssistantFormResource
   operation: 'create' | 'update'
   target_id?: string
+}
+export interface AssistantFormRequest extends AssistantFormContext {
   values?: AssistantFormValues
 }
 export interface AssistantForm extends AssistantFormRequest {
   request_id: string
   path: string
   values: AssistantFormValues
+}
+/** 页面只公开有限控件描述，浏览器保管控件引用，不接受模型提供的选择器或脚本。 */
+export interface AssistantPageControl {
+  id: string
+  kind: 'click' | 'fill' | 'toggle'
+  label: string
+  effect: 'read' | 'write'
+  value?: string | boolean
+}
+export interface AssistantPageContext {
+  path: string
+  controls: AssistantPageControl[]
+}
+export type AssistantPageOperation =
+  | { operation: 'inspect' }
+  | { control_id: string; operation: 'click' | 'fill' | 'toggle'; value?: string | boolean }
+/** 成功由当前浏览器确认，返回新控件快照让下一次操作重新选择目标。 */
+export interface AssistantPageActionResult {
+  ok: boolean
+  reason?: string
+  page_context?: AssistantPageContext
+  form_context?: AssistantFormContext | null
+}
+export interface AssistantPageActionReply {
+  session_id: string
+  run_id: string
+  request_id: string
+  result: AssistantPageActionResult
 }
 export type AssistantEvent =
   | { type: 'session'; session: AssistantSession; run_id?: string }
@@ -146,6 +177,7 @@ export type AssistantEvent =
   | { type: 'artifact'; artifact: AssistantArtifact }
   | { type: 'navigate'; path: string; filters?: Record<string, string>; search?: string }
   | { type: 'open_form'; form: AssistantForm }
+  | { type: 'page_action'; request_id: string; action: AssistantPageOperation }
   | { type: 'done' }
   | { type: 'error'; reason: string }
 /** 一次工具调用的开始与结束共用 ID；旧历史事件没有 state/id 时按已完成处理。 */

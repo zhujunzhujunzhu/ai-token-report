@@ -10,15 +10,20 @@ import { ASSISTANT_ENDPOINTS } from '../src/assistant/tools.js'
 import type { AssistantProtocol } from '../src/assistant/config.js'
 import type { StatsRoute } from '../src/stats-route.js'
 import type { Principal } from '../src/identity/types.js'
-import type { AssistantEvent } from '@ai-token-report/shared'
+import type { AssistantEvent, AssistantPageContext, AssistantPageOperation } from '@ai-token-report/shared'
 import type { PreparedAssistantAttachment } from '../src/assistant/attachments.js'
 import type { AssistantActions } from '../src/assistant/actions.js'
 import type { AssistantArtifacts } from '../src/assistant/artifacts.js'
+import { AssistantArtifacts as ReportArtifacts } from '../src/assistant/artifacts.js'
+import { AssistantStore } from '../src/assistant/store.js'
 
 const protocol = (process.argv[2] ?? 'deepseek-messages') as AssistantProtocol
 const liveHTTP = process.argv.includes('--live-http')
 const attachmentsHTTP = process.argv.includes('--attachments')
 const steeringHTTP = process.argv.includes('--steering')
+const reportsHTTP = process.argv.includes('--reports')
+const formContextHTTP = process.argv.includes('--form-context')
+const pageActionsHTTP = process.argv.includes('--page-actions')
 const directory = mkdtempSync(join(tmpdir(), 'atr-dsh-runtime-'))
 const requests: any[] = []
 let textStreamOpen = false, sawLiveText = false
@@ -43,7 +48,15 @@ const fixture = createServer(async (req, res) => {
     6: ['portal_navigate', { path: '/analysis' }],
     8: ['render_echarts', { dataset_id, chart: { kind: 'pie', x_key: 'dimension', y_keys: ['total_tokens'] } }],
   }
-  if (attachmentsHTTP || steeringHTTP) for (const key of Object.keys(scheduled)) delete scheduled[Number(key)]
+  if (attachmentsHTTP || steeringHTTP || reportsHTTP || formContextHTTP || pageActionsHTTP) for (const key of Object.keys(scheduled)) delete scheduled[Number(key)]
+  if (pageActionsHTTP) {
+    scheduled[1] = ['portal_page_state', {}]
+    scheduled[2] = ['portal_page_action', { control_id: 'fresh-filter', operation: 'fill', value: 'fixture' }]
+    scheduled[3] = ['portal_page_action', { control_id: 'initial-filter', operation: 'fill', value: 'stale' }]
+    scheduled[4] = ['portal_page_action', { control_id: 'save', operation: 'click' }]
+    scheduled[6] = ['portal_page_action', { control_id: 'save', operation: 'click' }]
+  }
+  if (reportsHTTP) scheduled[1] = ['generate_management_report', { preset: 'weekly', dimensions: ['model'], format: 'html' }]
   if (liveHTTP) {
     delete scheduled[6]; delete scheduled[8]
     scheduled[7] = ['render_echarts', { dataset_id, chart: { kind: 'pie', x_key: 'dimension', y_keys: ['total_tokens'] } }]
@@ -94,11 +107,80 @@ await new Promise<void>(done => fixture.listen(0, '127.0.0.1', done))
 const port = (fixture.address() as { port: number }).port
 process.env.ATR_ASSISTANT_TEST_KEY = 'fixture-key'
 // ★ SQL 与鉴权由 assistant.test.ts 实跑；本文件钉模型协议和公开 DSH 调用链。
-const stats = { async handle() { return { status: 200, body: { by: 'model', rows: [{ key: 'fixture-model', totalTokens: 50 }, { key: 'fixture-other', totalTokens: 20 }] } } } } as unknown as StatsRoute
+const stats = { async handle(endpoint: string, params: URLSearchParams) {
+  if (endpoint === 'overview') return { status: 200, body: { totalTokens: 70, calls: 2, sessions: 2, inputTokens: 20, outputTokens: 10, cacheReadTokens: 40, cacheWriteTokens: 0, cacheHitRate: 2 / 3 } }
+  if (endpoint === 'series') return { status: 200, body: { points: [{ bucket: new Date(Number(params.get('from'))).toLocaleDateString('sv-SE'), totalTokens: 70, calls: 2 }] } }
+  return { status: 200, body: { by: 'model', rows: [{ key: 'fixture-model', totalTokens: 50 }, { key: 'fixture-other', totalTokens: 20 }] } }
+} } as unknown as StatsRoute
 const engine = new DshAssistantEngine(stats, { model: 'fixture-model', protocol, baseUrl: 'http://127.0.0.1:' + port + (protocol === 'deepseek-messages' ? '' : '/v1'), apiKeyEnv: 'ATR_ASSISTANT_TEST_KEY' })
 const events: AssistantEvent[] = []
 try {
-  if (liveHTTP) {
+  if (pageActionsHTTP) {
+    const principal = { memberId: randomUUID(), name: '页面操作夹具', permissions: ['stats:read', 'groups:manage'], roleCodes: ['admin'], groupIds: [], groupNames: [], auth: { kind: 'token', tokenId: randomUUID() } } as Principal
+    const initial: AssistantPageContext = { path: '/groups', controls: [{ id: 'initial-filter', kind: 'fill', label: '初始筛选框', effect: 'read' }, { id: 'save', kind: 'click', label: '保存', effect: 'write' }] }
+    const current: AssistantPageContext = { path: '/groups', controls: [{ id: 'fresh-filter', kind: 'fill', label: '当前筛选框', effect: 'read' }, { id: 'save', kind: 'click', label: '保存', effect: 'write' }] }
+    const operated: AssistantPageOperation[] = []
+    const operatePage = async (operation: AssistantPageOperation) => {
+      operated.push(operation)
+      if (operation.operation === 'click') return { ok: false, reason: '模拟保存校验失败', page_context: current, form_context: null }
+      return { ok: true, page_context: current, form_context: null }
+    }
+    const sessionId = randomUUID()
+    await engine.run({ sessionId, directory, principal, page: '/groups', pageContext: initial, operatePage, prompt: '查看当前页面并填写筛选', signal: AbortSignal.timeout(30_000), emit: event => events.push(event) })
+    assert.equal(requests.length, 5)
+    assert.deepEqual(operated, [{ operation: 'inspect' }, { control_id: 'fresh-filter', operation: 'fill', value: 'fixture' }], '过期控件与未授权的保存不能发给浏览器')
+    const names = requests[0].tools.map((tool: any) => tool.name ?? tool.function?.name)
+    assert(names.includes('portal_page_state') && names.includes('portal_page_action'))
+    assert(JSON.stringify(requests[0]).includes('untrusted_page_controls'))
+    assert(events.some(event => event.type === 'tool' && event.tool === 'portal_page_action' && event.status === 409 && event.state === 'failed'))
+    assert(events.some(event => event.type === 'tool' && event.tool === 'portal_page_action' && event.status === 403 && event.state === 'failed'))
+    await engine.run({ sessionId, directory, principal, page: '/groups', pageContext: current, operatePage, prompt: '帮我填写当前表单并保存', signal: AbortSignal.timeout(30_000), emit: event => events.push(event) })
+    assert.equal(operated.length, 3)
+    assert.deepEqual(operated.at(-1), { control_id: 'save', operation: 'click' })
+    assert(JSON.stringify(requests[6]).includes('模拟保存校验失败'), '浏览器失败必须按原状态回给模型，不能伪装成功')
+    console.log('DSH_PAGE_ACTIONS_OK: ' + protocol + '，实际页面工具、最新控件与本轮写入授权')
+  } else if (formContextHTTP) {
+    const principal = { memberId: randomUUID(), name: '表单上下文夹具', permissions: ['stats:read', 'groups:manage'], roleCodes: ['admin'], groupIds: [], groupNames: [], auth: { kind: 'token', tokenId: randomUUID() } } as Principal
+    const actions = { async query() { throw new Error('只读提问不应查询表单目标') }, async prepareForm() { throw new Error('只读提问不应打开表单') }, async mutate() { throw new Error('表单身份不能授权写入') } } as unknown as AssistantActions
+    const contextual = new DshAssistantEngine(stats, { model: 'fixture-model', protocol, baseUrl: 'http://127.0.0.1:' + port + (protocol === 'deepseek-messages' ? '' : '/v1'), apiKeyEnv: 'ATR_ASSISTANT_TEST_KEY' }, { actions })
+    const sessionId = randomUUID(), targetId = randomUUID()
+    await contextual.run({ sessionId, directory, principal, page: '/groups', formContext: { resource: 'groups', operation: 'update', target_id: targetId }, prompt: '查询今天用量', signal: AbortSignal.timeout(30_000), emit: event => events.push(event) })
+    assert.equal(requests.length, 1)
+    const names = requests[0].tools.map((tool: any) => tool.name ?? tool.function?.name)
+    assert(names.includes('portal_open_form'))
+    assert(!names.includes('portal_manage_save') && !names.includes('portal_manage_mutate'), '表单上下文不能扩大用户本轮写入授权')
+    assert(JSON.stringify(requests[0]).includes(targetId), '实际模型应收到当前表单身份引用')
+    assert(JSON.stringify(requests[0]).includes('untrusted_form_reference'), '身份引用必须明确标为不可信')
+    await contextual.run({ sessionId, directory, principal, page: '/groups', prompt: '再查今天用量', signal: AbortSignal.timeout(30_000), emit: event => events.push(event) })
+    const second = requests[1]
+    const users = (second.messages ?? second.input).filter((message: any) => message.role === 'user')
+    assert(JSON.stringify(users.at(-1)).includes('CURRENT_FORM_CONTEXT'))
+    assert(JSON.stringify(users.at(-1)).includes('\\"form\\":null'), '新轮次必须使历史表单引用失效')
+    assert(!JSON.stringify(users.at(-1)).includes(targetId))
+    console.log('DSH_FORM_CONTEXT_OK: ' + protocol + '，当前表单身份、续聊过期及写入授权隔离')
+  } else if (reportsHTTP) {
+    const principal = { memberId: randomUUID(), name: '报表夹具成员', permissions: ['stats:read'], roleCodes: ['member'], groupIds: [], groupNames: [], auth: { kind: 'token', tokenId: randomUUID() } } as Principal
+    const privateRoot = join(directory, 'private'), store = new AssistantStore(privateRoot)
+    const detail = await store.create(principal.memberId)
+    const artifacts = new ReportArtifacts(privateRoot)
+    const reports = new DshAssistantEngine(stats, { model: 'fixture-model', protocol, baseUrl: 'http://127.0.0.1:' + port + (protocol === 'deepseek-messages' ? '' : '/v1'), apiKeyEnv: 'ATR_ASSISTANT_TEST_KEY' }, { artifacts })
+    await reports.run({ sessionId: detail.session.session_id, directory, principal, prompt: '/weekly', signal: AbortSignal.timeout(30_000), emit: event => events.push(event) })
+    assert.equal(requests.length, 2, '报表工具返回后应直接回答，不重复查数或导出')
+    const names = requests[0].tools.map((tool: any) => tool.name ?? tool.function?.name)
+    assert(names.includes('generate_management_report'))
+    assert(!names.includes('portal_manage_save') && !names.includes('share_html'), '默认报表技能不能挂载写入或分享')
+    assert(JSON.stringify(requests[0]).includes('上周'), '只给命令时应实际传入技能默认请求')
+    const generated = events.filter(event => event.type === 'artifact')
+    if (generated.length !== 1) console.error(JSON.stringify(events))
+    assert.equal(generated.length, 1, '真实 DSH 代理应产生一个私有报表文件')
+    const html = await (await artifacts.download(principal.memberId, generated[0]!.artifact.artifact_id, principal)).text()
+    assert(html.includes('日用量趋势') && html.includes('模型用量分布'))
+    assert(html.includes('70') && html.includes('50') && html.includes('20'))
+    assert(html.includes('当前身份没有金额读取权限'))
+    assert.equal(generated[0]!.artifact.share, undefined)
+    assert(events.some(event => event.type === 'tool' && event.tool === 'generate_management_report' && event.state === 'completed'))
+    console.log('DSH_REPORTS_OK: ' + protocol + '，默认技能、真实工具执行、多节文件及私有权限')
+  } else if (liveHTTP) {
     Object.assign(process.env, { ATR_ASSISTANT_MODEL: 'fixture-model', ATR_ASSISTANT_PROTOCOL: protocol, ATR_ASSISTANT_BASE_URL: 'http://127.0.0.1:' + port + (protocol === 'deepseek-messages' ? '' : '/v1'), ATR_ASSISTANT_API_KEY_ENV: 'ATR_ASSISTANT_TEST_KEY', ATR_ASSISTANT_VERIFICATION_SOURCE: 'loopback' })
     await import('./verify-assistant-live.js')
   } else if (steeringHTTP) {
@@ -189,7 +271,7 @@ try {
   assert(activity.some(event => event.state === 'running'))
   assert(activity.filter(event => event.state === 'running').every(event => activity.some(ended => ended.call_id === event.call_id && ended.state === 'completed')))
   const names = requests[0].tools.map((t: any) => t.name ?? t.function?.name).sort()
-  assert.deepEqual(names, [...ASSISTANT_ENDPOINTS.map(e => 'stats_' + e), 'query_usage', 'portal_navigate', 'list_datasets', 'render_table', 'render_echarts', 'render_cards', 'web_search', 'web_read'].sort())
+  assert.deepEqual(names, [...ASSISTANT_ENDPOINTS.map(e => 'stats_' + e), 'generate_management_report', 'query_usage', 'portal_navigate', 'list_datasets', 'render_table', 'render_echarts', 'render_cards', 'web_search', 'web_read'].sort())
   assert(!names.includes('portal_manage_mutate') && !names.includes('share_html'), '纯查询不能提供编辑或分享工具')
   assert(JSON.stringify(requests.at(-1)).includes('首次问题标记'))
   assert(JSON.stringify(requests.at(-1)).includes('续聊问题标记'))

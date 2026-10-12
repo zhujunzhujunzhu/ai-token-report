@@ -8,6 +8,11 @@ import type { AssistantEngine, AssistantServices } from './assistant/runtime.js'
 import { AssistantRuntimeError } from './assistant/runtime-error.js'
 import { prepareAssistantAttachments, type PreparedAssistantAttachment } from './assistant/attachments.js'
 import { assistantWriteIntent, assistantShareIntent } from './assistant/intents.js'
+import { resolveAssistantSkill } from './assistant/skills.js'
+import { validateAssistantFormContext } from './assistant/form-context.js'
+import { validateAssistantPageContext } from './assistant/page-context.js'
+import { AssistantPageBridge } from './assistant/page-bridge.js'
+import { identitySnapshotHash } from './identity/repository.js'
 
 interface ActiveRun {
   memberId: string
@@ -15,6 +20,8 @@ interface ActiveRun {
   runId: string
   prompt: string
   controller: AbortController
+  authenticationHash: string
+  pageBridge?: AssistantPageBridge
   submitSteering?: (prompt: string) => void
 }
 
@@ -91,6 +98,19 @@ export class AssistantRoute {
         } finally { this.busy.delete(memberId); this.refreshMember(memberId) }
       }
       if (!this.engine) return result({ ok: false, reason: '管理员尚未启用 DSH 助手' }, 503)
+      if (action === 'page-action-result' && method === 'POST') {
+        if (!body || typeof body !== 'object' || Array.isArray(body)) throw new IdentityError(400, '页面回复需要是对象')
+        const input = body as Record<string, unknown>
+        const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+        if (Object.keys(input).some(key => !['session_id', 'run_id', 'request_id', 'result'].includes(key)) || [input.session_id, input.run_id, input.request_id].some(id => typeof id !== 'string' || !uuid.test(id))) throw new IdentityError(400, '请指定有效的会话、本轮与页面请求 ID')
+        const sessionId = input.session_id as string
+        await this.store.assertAccess(principal, sessionId)
+        const run = this.runs.get(this.sessionKey(memberId, sessionId))
+        // ★ 同成员的另一枚 token 或另一个登录会话也不能接管已发出的浏览器动作。
+        if (!run || run.runId !== input.run_id || run.authenticationHash !== identitySnapshotHash(principal.auth) || !run.pageBridge || run.controller.signal.aborted) throw new IdentityError(409, '页面请求不属于当前运行与登录身份')
+        run.pageBridge.respond(input.request_id as string, input.result, principal)
+        return result({ ok: true })
+      }
       if (action === 'steer' && method === 'POST') {
         if (!body || typeof body !== 'object' || Array.isArray(body)) throw new IdentityError(400, '引导请求需要是对象')
         const input = body as Record<string, unknown>
@@ -101,8 +121,10 @@ export class AssistantRoute {
         if (!run || run.runId !== input.run_id || run.controller.signal.aborted || !run.submitSteering) return result({ ok: false, reason: '这一轮已结束，请将消息排队发送' }, 409)
         if (this.engine.supportsSteering !== true) return result({ ok: false, reason: '当前助手不支持即时引导，请将消息排队发送' }, 409)
         const prompt = input.prompt.trim()
-        if ((assistantWriteIntent(prompt) && !assistantWriteIntent(run.prompt)) || (assistantShareIntent(prompt) && !assistantShareIntent(run.prompt))) return result({ ok: false, reason: '新的修改或分享请求需要独立授权，请将消息排队发送' }, 409)
-        run.submitSteering(prompt)
+        const request = resolveAssistantSkill(prompt).request
+        const originalRequest = resolveAssistantSkill(run.prompt).request
+        if ((assistantWriteIntent(request) && !assistantWriteIntent(originalRequest)) || (assistantShareIntent(request) && !assistantShareIntent(originalRequest))) return result({ ok: false, reason: '新的修改或分享请求需要独立授权，请将消息排队发送' }, 409)
+        run.submitSteering(request)
         return result({ ok: true, session_id: run.sessionId, run_id: run.runId })
       }
       if (action === 'sessions' && method === 'GET') {
@@ -142,17 +164,24 @@ export class AssistantRoute {
         const input: Record<string, unknown> = {}
         form.forEach((value, key) => {
           if (key === 'files' && typeof value !== 'string') { files.push(value); return }
-          if (!['prompt', 'session_id', 'page'].includes(key) || typeof value !== 'string' || key in input) throw new IdentityError(400, '仅支持问题、会话、页面与文件，文字字段不能重复')
-          input[key] = value
+          if (!['prompt', 'session_id', 'page', 'form_context', 'page_context'].includes(key) || typeof value !== 'string' || key in input) throw new IdentityError(400, '仅支持问题、会话、页面、页面或表单上下文与文件，文字字段不能重复')
+          if (key === 'form_context' || key === 'page_context') {
+            try { input[key] = JSON.parse(value) }
+            catch { throw new IdentityError(400, `${key} 需要是有效 JSON 对象`) }
+          } else input[key] = value
         })
         body = input
       }
       if (!body || typeof body !== 'object' || Array.isArray(body)) throw new IdentityError(400, '请求体需要是对象')
       const input = body as Record<string, unknown>
-      if (Object.keys(input).some(k => !['prompt', 'session_id', 'page'].includes(k))) throw new IdentityError(400, '仅支持 prompt、session_id 与 page')
+      if (Object.keys(input).some(k => !['prompt', 'session_id', 'page', 'form_context', 'page_context'].includes(k))) throw new IdentityError(400, '仅支持 prompt、session_id、page、form_context 与 page_context')
       if (input.page !== undefined && !ASSISTANT_PAGES.some(page => page.path === input.page)) throw new IdentityError(400, '当前页面无效')
+      if (input.page_context !== undefined && input.page === undefined) throw new IdentityError(400, '页面控件需要指定当前页面')
+      const formContext = validateAssistantFormContext(input.form_context, input.page, principal)
+      const pageContext = validateAssistantPageContext(input.page_context, input.page, principal)
       if (files.length && (input.prompt === undefined || input.prompt === '')) input.prompt = '请分析上传的附件。'
       if (typeof input.prompt !== 'string' || (!input.prompt.trim() && !files.length) || input.prompt.length > 4096) throw new IdentityError(400, '问题需要为 1～4096 个字符')
+      resolveAssistantSkill(input.prompt)
       if (input.session_id !== undefined && typeof input.session_id !== 'string') throw new IdentityError(400, 'session_id 必须是字符串')
       const sessionId = input.session_id as string | undefined ?? randomUUID()
       this.store.sessionPath(memberId, sessionId)
@@ -161,10 +190,10 @@ export class AssistantRoute {
       if (this.runs.size >= 4) return result({ ok: false, reason: '助手繁忙，请稍后重试' }, 429)
       const controller = new AbortController()
       const prompt = input.prompt.trim() || '请分析上传的附件。'
-      const run: ActiveRun = { memberId, sessionId, runId: randomUUID(), prompt, controller }
+      const run: ActiveRun = { memberId, sessionId, runId: randomUUID(), prompt, controller, authenticationHash: identitySnapshotHash(principal.auth) }
       // ★ 先预占再解析附件和读库，一会话一运行的约束不能依赖异步操作完成顺序。
       this.runs.set(key, run); this.refreshMember(memberId)
-      const release = () => { this.runs.delete(key); this.controllers.delete(controller); this.refreshMember(memberId) }
+      const release = () => { run.pageBridge?.close(); this.runs.delete(key); this.controllers.delete(controller); this.refreshMember(memberId) }
       let detail
       let attachments: PreparedAssistantAttachment[]
       try {
@@ -190,7 +219,7 @@ export class AssistantRoute {
           const responseActions: AssistantPendingAction[] = []
           const responseArtifacts: AssistantArtifact[] = []
           const emit = (event: AssistantEvent) => {
-            if (controller.signal.aborted && ['text', 'result', 'action', 'artifact', 'navigate', 'open_form'].includes(event.type)) return
+            if (controller.signal.aborted && ['text', 'result', 'action', 'artifact', 'navigate', 'open_form', 'page_action'].includes(event.type)) return
             if (event.type === 'result') responseResults.push(event.result)
             if (event.type === 'action') responseActions.push(event.action)
             if (event.type === 'artifact') {
@@ -229,6 +258,15 @@ export class AssistantRoute {
           }, 15_000)
           const timeout = setTimeout(abort, 120_000)
           let completed = false
+          const authorizeRun = async () => {
+            const current = await authorizeDatabase(this.identity, auth, 'stats:read', { unregistered: '服务端尚未初始化人员', missingToken: '请先登录' })
+            if (!current.ok) { controller.abort(); throw new IdentityError(current.status, current.reason) }
+            try { await this.store.assertAccess(current.viewer, detail.session.session_id) }
+            catch (error) { controller.abort(); throw error }
+            return current.viewer
+          }
+          const pageBridge = new AssistantPageBridge(pageContext, input.page as string | undefined, controller.signal, emit, authorizeRun, assistantWriteIntent(resolveAssistantSkill(prompt).request))
+          run.pageBridge = pageBridge
           const task = (async () => {
             try {
               detail.session.turn_count++
@@ -238,17 +276,11 @@ export class AssistantRoute {
               await this.store.save(memberId, detail)
               emit({ type: 'session', session: detail.session, run_id: run.runId })
               if (attachments.length) emit({ type: 'attachments', attachments: attachments.map(item => item.metadata) })
-              await engine.run({ sessionId: detail.session.session_id, directory: this.store.sessionPath(memberId, detail.session.session_id), prompt, ...(attachments.length ? { attachments } : {}), page: input.page as string | undefined, principal, signal: controller.signal, emit, subscribeSteering: accept => {
+              await engine.run({ sessionId: detail.session.session_id, directory: this.store.sessionPath(memberId, detail.session.session_id), prompt, ...(attachments.length ? { attachments } : {}), page: input.page as string | undefined, ...(formContext ? { formContext } : {}), ...(pageContext ? { pageContext } : {}), operatePage: operation => pageBridge.operate(operation), principal, signal: controller.signal, emit, subscribeSteering: accept => {
                 deliverSteering = accept
                 for (const prompt of pendingSteering.splice(0)) accept(prompt)
                 return () => { deliverSteering = undefined; run.submitSteering = undefined }
-              }, authorize: async () => {
-                const current = await authorizeDatabase(this.identity, auth, 'stats:read', { unregistered: '服务端尚未初始化人员', missingToken: '请先登录' })
-                if (!current.ok) { controller.abort(); throw new IdentityError(current.status, current.reason) }
-                try { await this.store.assertAccess(current.viewer, detail.session.session_id) }
-                catch (error) { controller.abort(); throw error }
-                return current.viewer
-              } })
+              }, authorize: authorizeRun })
               completed = true
             } catch (err) {
               // ★ 终止分类足够定位输出截断；原始模型错误可能含凭证、正文或思考，不能直接写日志。

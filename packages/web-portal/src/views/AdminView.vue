@@ -32,6 +32,8 @@ const session = useSessionStore(), admin = useMembersStore()
 const search = useAssistantPageSearch(() => { void admin.load('members') }, () => admin.loading), role = ref(''), showIssue = ref(false)
 const selected = ref<PortalMember | null>(null)
 const formInitialValues = ref<{ name?: string; group_ids?: string[] }>()
+const issueForm = ref<InstanceType<typeof IssueMemberForm>>()
+const editForm = ref<InstanceType<typeof EditMemberForm>>()
 const dialog = ref<'edit' | 'login' | null>(null)
 /**
  * 本地「提交中」标记。
@@ -110,6 +112,8 @@ useAssistantForm('members', {
   canOpen: () => session.can('members:manage'),
   isLoading: () => admin.loading, isBusy: () => !!admin.busyId || saving.value,
   isOpen: () => showIssue.value || dialog.value !== null, error: () => admin.error,
+  currentForm: () => showIssue.value ? { resource: 'members', operation: 'create' }
+    : dialog.value === 'edit' && selected.value ? { resource: 'members', operation: 'update', target_id: selected.value.member_id } : null,
   open: request => {
     const member = assistantFormEntry(request, admin.members, row => row.member_id)
     if (member) { open(member, 'edit'); formInitialValues.value = assistantMemberPrefill(request.values) }
@@ -117,6 +121,11 @@ useAssistantForm('members', {
       if (!session.can('roles:assign')) throw new Error('添加成员需要分配普通成员角色的权限')
       openIssue(); formInitialValues.value = assistantMemberPrefill(request.values)
     }
+  },
+  patch: request => {
+    const activeForm = showIssue.value ? issueForm.value : dialog.value === 'edit' ? editForm.value : undefined
+    if (!activeForm) throw new Error('人员表单尚未就绪，请稍后重试')
+    activeForm.applyPrefill(assistantMemberPrefill(request.values))
   },
 })
 onMounted(() => { void admin.load('members') })
@@ -131,12 +140,12 @@ onUnmounted(() => { admin.clear() })
       <el-skeleton v-if="admin.loading && !admin.members.length" :rows="5" animated />
       <MemberTable v-else :members="members" :current-id="session.identity?.member_id ?? null" :busy="busy" :permissions="session.identity?.permissions ?? []" @edit="open($event, 'edit')" @login="open($event, 'login')" @status="changeStatus($event)" @login-status="changeStatus($event, true)" />
     </el-card>
-    <el-dialog v-model="showIssue" title="添加团队成员" width="min(500px, 94vw)" destroy-on-close :close-on-click-modal="false" :show-close="!busy" :close-on-press-escape="!busy"><el-alert v-if="admin.error" :title="admin.error" type="error" :closable="false" /><IssueMemberForm :busy="busy" :roles="admin.roles" :groups="admin.groups" :initial-values="formInitialValues" @issue="create" @cancel="showIssue = false" /></el-dialog>
+    <el-dialog v-model="showIssue" title="添加团队成员" width="min(500px, 94vw)" destroy-on-close :close-on-click-modal="false" :show-close="!busy" :close-on-press-escape="!busy"><el-alert v-if="admin.error" :title="admin.error" type="error" :closable="false" /><IssueMemberForm ref="issueForm" :busy="busy" :roles="admin.roles" :groups="admin.groups" :initial-values="formInitialValues" @issue="create" @cancel="showIssue = false" /></el-dialog>
     <el-dialog :model-value="dialog !== null" :title="({ edit: '编辑资料', login: '设置登录' }[dialog ?? 'edit']) + ' · ' + (selected?.name ?? '')" width="min(500px, 94vw)" destroy-on-close :close-on-click-modal="false" :show-close="!busy" :close-on-press-escape="!busy" @close="close">
       <template v-if="selected">
         <el-alert v-if="admin.error" :title="admin.error" type="error" :closable="false" />
         <LoginAccountForm v-if="dialog === 'login'" :key="selected.member_id" :member="selected" :busy="busy" @save="saveLogin" @cancel="close" />
-        <EditMemberForm v-else :key="selected.member_id" :member="selected" :groups="admin.groups" :role-options="roleOptions" :can-assign-roles="canAssignRoles" :busy="busy" :initial-values="formInitialValues" @save="saveEdit" @cancel="close" />
+        <EditMemberForm v-else ref="editForm" :key="selected.member_id" :member="selected" :groups="admin.groups" :role-options="roleOptions" :can-assign-roles="canAssignRoles" :busy="busy" :initial-values="formInitialValues" @save="saveEdit" @cancel="close" />
       </template>
     </el-dialog>
   </div>

@@ -1,6 +1,6 @@
 /** 助手的 POST SSE 客户端，沿用 Cookie、自定义同源请求头与部署前缀。 */
 import { ASSISTANT_SESSION_PAGE_SIZE } from '@ai-token-report/shared'
-import type { AssistantArtifact, AssistantAttachment, AssistantPendingAction, AssistantDetail, AssistantEvent, AssistantSessionPage, AssistantStatus } from '@ai-token-report/shared'
+import type { AssistantArtifact, AssistantAttachment, AssistantFormContext, AssistantPageContext, AssistantPageActionResult, AssistantPendingAction, AssistantDetail, AssistantEvent, AssistantSessionPage, AssistantStatus } from '@ai-token-report/shared'
 import { post, request, withBase } from './request.js'
 
 export const assistantStatus = () => request<AssistantStatus>('/api/v1/assistant/status')
@@ -10,6 +10,13 @@ export function assistantSessions(params: { limit?: number; cursor?: string } = 
   return request<AssistantSessionPage>(`/api/v1/assistant/sessions?${query}`)
 }
 export const assistantDetail = (id: string) => request<AssistantDetail>(`/api/v1/assistant/sessions/${encodeURIComponent(id)}`)
+/** 页面操作结果只回给本次实时运行，不允许替其它会话完成待处理指令。 */
+export async function reportAssistantPageAction(requestId: string, sessionId: string, runId: string, result: AssistantPageActionResult, signal: AbortSignal): Promise<void> {
+  await checked(await fetch(withBase('/api/v1/assistant/page-action-result'), {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Portal-Request': '1' }, credentials: 'same-origin', signal,
+    body: JSON.stringify({ request_id: requestId, session_id: sessionId, run_id: runId, result }),
+  }))
+}
 /** 引导当前运行通过原 SSE 回显，不能另开一条对话或重复插入消息。 */
 export async function steerAssistant(prompt: string, sessionId: string, runId: string, signal: AbortSignal): Promise<void> {
   await checked(await fetch(withBase('/api/v1/assistant/steer'), {
@@ -88,7 +95,7 @@ export async function consumeAssistantStream(stream: ReadableStream<Uint8Array>,
     if (!terminal) throw new Error('助手连接中断，请重新打开会话查看已保存的回答')
   } finally { reader.releaseLock() }
 }
-export async function chatAssistant(prompt: string, sessionId: string | undefined, signal: AbortSignal, onEvent: (event: AssistantEvent) => void, page?: string, files: File[] = []): Promise<void> {
+export async function chatAssistant(prompt: string, sessionId: string | undefined, signal: AbortSignal, onEvent: (event: AssistantEvent) => void, page?: string, files: File[] = [], formContext?: AssistantFormContext, pageContext?: AssistantPageContext): Promise<void> {
   let body: BodyInit
   const headers: Record<string, string> = { 'X-Portal-Request': '1' }
   if (files.length) {
@@ -96,10 +103,12 @@ export async function chatAssistant(prompt: string, sessionId: string | undefine
     form.set('prompt', prompt)
     if (sessionId) form.set('session_id', sessionId)
     if (page) form.set('page', page)
+    if (formContext) form.set('form_context', JSON.stringify(formContext))
+    if (pageContext) form.set('page_context', JSON.stringify(pageContext))
     for (const file of files) form.append('files', file, file.name)
     body = form
     // 浏览器必须自行生成 multipart 的 boundary，显式 Content-Type 会让附件无法解析。
-  } else { headers['Content-Type'] = 'application/json'; body = JSON.stringify({ prompt, session_id: sessionId, page }) }
+  } else { headers['Content-Type'] = 'application/json'; body = JSON.stringify({ prompt, session_id: sessionId, page, ...(formContext ? { form_context: formContext } : {}), ...(pageContext ? { page_context: pageContext } : {}) }) }
   const response = await checked(await fetch(withBase('/api/v1/assistant/chat'), {
     method: 'POST', headers,
     credentials: 'same-origin', signal, body,

@@ -58,7 +58,7 @@ import {
 } from 'element-plus'
 import type { FormInstance, FormRules } from 'element-plus'
 import { ANY_PROVIDER, PRICE_SCHEDULES, formatUnitPriceMicro, offpeakConfigError } from '@ai-token-report/shared'
-import type { PortalModelPrice } from '@ai-token-report/shared'
+import type { AssistantFormValues, PortalModelPrice } from '@ai-token-report/shared'
 import * as api from '../api/admin.js'
 import { useSessionStore } from '../stores/session.js'
 import { formatFullDateTime } from '../utils/format.js'
@@ -346,17 +346,23 @@ async function remove(row: PortalModelPrice): Promise<void> {
   await load()
 }
 
+function prefillAssistantForm(values: AssistantFormValues): void {
+  assertAssistantFormIdentity(values, selected.value, ['provider', 'model', 'currency', 'effective_from_ms'])
+  Object.assign(draft, assistantPricingPrefill(values, localInput))
+  if (typeof values.effective_from_ms === 'number') exactFormRange.value.from = values.effective_from_ms
+  if (values.effective_to_ms === null || typeof values.effective_to_ms === 'number') exactFormRange.value.to = values.effective_to_ms
+}
 useAssistantForm('pricing', {
   canOpen: () => canManage.value, isLoading: () => loading.value, isBusy: () => busy.value,
   isOpen: () => showForm.value, error: () => error.value,
+  currentForm: () => showForm.value ? { resource: 'pricing', operation: selected.value ? 'update' : 'create', ...(selected.value ? { target_id: selected.value.price_id } : {}) } : null,
   open: request => {
     const entry = assistantFormEntry(request, prices.value, row => row.price_id)
     assertAssistantFormIdentity(request.values, entry, ['provider', 'model', 'currency', 'effective_from_ms'])
     openForm(entry)
-    Object.assign(draft, assistantPricingPrefill(request.values, localInput))
-    if (typeof request.values.effective_from_ms === 'number') exactFormRange.value.from = request.values.effective_from_ms
-    if (request.values.effective_to_ms === null || typeof request.values.effective_to_ms === 'number') exactFormRange.value.to = request.values.effective_to_ms
+    prefillAssistantForm(request.values)
   },
+  patch: request => prefillAssistantForm(request.values),
 })
 onMounted(() => { void load() })
 </script>

@@ -61,7 +61,11 @@ ATR_ASSISTANT_MODEL=<服务端真实模型 ID>
 
 `portal_manage_query` 查询当前身份有权查看的人员、分组、角色、供应商模型规则、项目规则与模型单价。`portal_manage_save` 在本轮用户明确要求直接新增、修改、保存或写入时挂载，通过生产管理路由直接保存，复用 shared schema、事务审计、版本与最后管理员护栏，不直接写 SQL。支持人员姓名/分组归属、分组名称、归一化规则和模型单价；更新前精确查询目标 ID，不允许替换规则业务键而偷偷新建。“是的直接帮我新建两条”等肯定续聊可以启用写入，纯“是的”、查询、否定与填写弹框请求不能授权直接保存。供应商归一化的每个原值分别保存一条映射，`provider` 是原值，`alias` 是统一名称。既有 `portal_manage_mutate` 保留兼容，并承接删除和启停。角色权限、登录账号和完整凭证操作仍打开对应管理页；原始用量没有任意编辑或删除入口。
 
-`portal_open_form` 请求浏览器打开人员、分组、供应商模型规则、项目规则或模型单价的现有新建/编辑弹框，允许部分预填；用户可以修改补齐后点击页面原有保存按钮。工具本身不写入数据库，返回 `executed:false` 与等待填写保存状态。更新表单必须提供查询得到的精确 `target_id`，服务端读取真实对象并保留不可变业务键；秘密、账号、角色与权限不能预填。每次调用重新校验当前权限，页面保存时仍由管理接口鉴权。SSE 的 `open_form` 只交给当前实时对话；预填值仅保存在浏览器内存，不放到网址或本地持久存储，查看历史不会重开弹框。已打开的编辑草稿不会被新请求覆盖；被路由权限守卫拦截时清理待打开请求。
+`portal_open_form` 请求浏览器打开人员、分组、供应商模型规则、项目规则或模型单价的现有新建/编辑弹框，允许部分预填；用户可以修改补齐后点击页面原有保存按钮。工具本身不写入数据库，返回 `executed:false` 与等待填写保存状态。更新表单必须提供查询得到的精确 `target_id`，服务端读取真实对象并保留不可变业务键；秘密、账号、角色与权限不能预填。每次调用重新校验当前权限，页面保存时仍由管理接口鉴权。SSE 的 `open_form` 只交给当前实时对话；预填值仅保存在浏览器内存，不放到网址或本地持久存储，查看历史不会重开弹框。继续填写时只更新明确给出的字段，保留其它手动草稿；请求绑定提交时的表单和本地打开次数，关闭重开后的迟到结果不能覆盖新草稿。另一个表单尚未关闭时拒绝打开；被路由权限守卫拦截时清理待打开请求。
+
+`portal_page_state` 与 `portal_page_action` 操作当前页面的可见控件，支持搜索、筛选、排序、翻页、勾选、下拉选项、日期控件和表单填写。模型只接收有界的控件标签、类型及短期 ID，不接收 DOM、选择器、表单值或脚本；点击和填写由浏览器复用现有 Vue 控件。每步通过 SSE 请求当前前台会话执行，浏览器回传实际结果和最新控件，再允许下一步；导航或打开表单完成后才检查新页面。已切换、禁用、换行、关闭重开的控件标识失效，后台对话不能操作前台页面。表格的排序入口沿用 Element Plus；服务端分页表仅排序当前页，并在页面注明。
+
+当前轮明确要求保存或修改时，页面工具才可点击现有保存按钮，沿用页面校验和管理 API 权限；填写后由用户保存的要求不授权提交。角色、权限、账号、密码和 appKey 交付控件不提供给页面工具，人员保存还检查草稿角色没有变化。删除、停用等点击只能打开原有人工确认；确认框出现后暂停页面操作，最终确认由用户完成。回传“已点击提交”不会当作入库证明，助手应检查表单、错误提示与后续列表。页面控件标签是不可信信息，不能增加本轮授权。回传接口绑定登录身份、会话、运行与单次请求，过期、取消和重复回传均拒绝。
 
 删除规则/单价与停用人员/分组/规则先生成独立确认卡，不立即写入。卡片显示具体对象和后果，用户必须点击“确认删除”或“确认停用”；聊天中的同意不会执行。服务端动作绑定人员、登录会话、对话、目标快照，默认 10 分钟有效，单次消费；确认时重新鉴权并在事务内核对目标快照。取消、过期、对象变化、权限变化、重复确认均不会执行原计划。人员与分组无物理删除；停用人员会关闭登录并吊销现有凭证，重新启用不会自动恢复它们。已挂载管理页在编辑或确认成功后重新取数。
 
@@ -125,6 +129,8 @@ bun test packages/web-portal/test/assistant-markdown.test.ts
 bun test packages/web-portal/test/assistant-csv.test.ts
 bun test packages/web-portal/test/assistant-capabilities.test.ts packages/web-portal/test/assistant-navigation.test.ts
 bun test packages/web-portal/test/assistant-forms.test.ts
+bun test packages/web-portal/test/assistant-page-controls.test.ts packages/web-portal/test/assistant-page-actions.test.ts packages/web-portal/test/assistant-layer.test.ts
+bun test packages/server/test/assistant-page-actions.test.ts packages/server/test/assistant-form-context.test.ts
 bun run packages/server/verify/verify-assistant-runtime.ts
 bun run packages/server/verify/verify-assistant-runtime.ts openai-completions
 bun run packages/server/verify/verify-assistant-runtime.ts openai-responses

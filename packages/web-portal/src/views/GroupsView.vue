@@ -15,7 +15,7 @@ import {
   ElMessage, ElMessageBox, ElOption, ElSelect, ElSkeleton, ElTable, ElTableColumn, ElTag,
 } from 'element-plus'
 import type { FormInstance, FormRules } from 'element-plus'
-import type { PortalGroup } from '@ai-token-report/shared'
+import type { AssistantFormValues, PortalGroup } from '@ai-token-report/shared'
 import { useMembersStore } from '../stores/members.js'
 import { useSessionStore } from '../stores/session.js'
 import * as api from '../api/admin.js'
@@ -78,10 +78,15 @@ async function changeStatus(group: PortalGroup): Promise<void> {
     }), group.group_id)) ElMessage.success(enabling ? '分组已启用' : '分组已停用')
   } catch { /* 用户取消。 */ }
 }
+function prefillAssistantForm(values: AssistantFormValues): void {
+  if (typeof values.name === 'string') draft.name = values.name
+}
 useAssistantForm('groups', {
   canOpen: () => session.can('groups:manage'), isLoading: () => admin.loading, isBusy: () => !!admin.busyId,
   isOpen: () => showForm.value, error: () => admin.error,
-  open: request => { open(assistantFormEntry(request, admin.groups, row => row.group_id)); if (typeof request.values.name === 'string') draft.name = request.values.name },
+  currentForm: () => showForm.value ? { resource: 'groups', operation: selected.value ? 'update' : 'create', ...(selected.value ? { target_id: selected.value.group_id } : {}) } : null,
+  open: request => { open(assistantFormEntry(request, admin.groups, row => row.group_id)); prefillAssistantForm(request.values) },
+  patch: request => prefillAssistantForm(request.values),
 })
 onMounted(() => { void admin.load('groups') })
 onUnmounted(() => { admin.clear() })
