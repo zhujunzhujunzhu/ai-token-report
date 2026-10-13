@@ -13,13 +13,14 @@ import { validateAssistantConfig, type DshAssistantConfig } from './config.js'
 import { assistantPiProfile } from './request-profile.js'
 import { AssistantRuntimeError } from './runtime-error.js'
 import { queryUsage, usageParameters } from './usage.js'
-import { assistantReportGuidance, resolveAssistantSkill } from './skills.js'
+import { assistantReportGuidance, resolveAssistantSkill, type ResolvedCustomSkill } from './skills.js'
 import { generateManagementReport, reportParameters } from './reports.js'
 import { AssistantNetwork } from './network.js'
 import { assistantNavigation } from './navigation.js'
 import { assistantWriteIntent, assistantShareIntent } from './intents.js'
 import { replaceAssistantFile } from './atomic-file.js'
 import type { AssistantActions } from './actions.js'
+import type { AssistantSkillStore } from './skill-store.js'
 import type { AssistantArtifacts } from './artifacts.js'
 import type { PreparedAssistantAttachment } from './attachments.js'
 import { assistantFormContextMessage, validateAssistantFormContext } from './form-context.js'
@@ -34,6 +35,13 @@ export interface AssistantRun {
   page?: string
   formContext?: AssistantFormContext
   pageContext?: AssistantPageContext
+  /**
+   * 当前成员可见的自定义技能（自己的私有技能 + 全部公开技能）。
+   *
+   * ★ 由 HTTP 边界用**服务端身份**读出来后传入，不从浏览器请求体取：
+   *   客户端提交的技能清单等于让调用者自己决定「这个命令是什么」。
+   */
+  skills?: readonly ResolvedCustomSkill[]
   operatePage?(operation: AssistantPageOperation): Promise<AssistantPageActionResult>
   principal: Principal
   signal: AbortSignal
@@ -43,14 +51,14 @@ export interface AssistantRun {
   subscribeSteering?(accept: (prompt: string) => void): () => void
 }
 export interface AssistantEngine { readonly supportsImages?: boolean; readonly supportsSteering?: boolean; run(input: AssistantRun): Promise<void> }
-export interface AssistantServices { actions?: AssistantActions; artifacts?: AssistantArtifacts; network?: AssistantNetwork }
+export interface AssistantServices { actions?: AssistantActions; artifacts?: AssistantArtifacts; network?: AssistantNetwork; skills?: AssistantSkillStore }
 
 export class DshAssistantEngine implements AssistantEngine {
   constructor(private stats: StatsRoute, private config: DshAssistantConfig, private services: AssistantServices = {}) { this.config = validateAssistantConfig(config) }
   get supportsImages(): boolean { return this.config.supportsImages === true }
   get supportsSteering(): boolean { return true }
   async run(input: AssistantRun): Promise<void> {
-    const skillRequest = resolveAssistantSkill(input.prompt)
+    const skillRequest = resolveAssistantSkill(input.prompt, input.skills)
     const formContext = validateAssistantFormContext(input.formContext, input.page, input.principal)
     let pageContext = validateAssistantPageContext(input.pageContext, input.page, input.principal)
     if (!this.supportsImages && input.attachments?.some(attachment => attachment.image)) throw new IdentityError(415, '当前助手模型未启用图片理解，请启用视觉模型后再上传图片')
@@ -125,7 +133,7 @@ export class DshAssistantEngine implements AssistantEngine {
       await scope.plugin(projections.default)
       await scope.plugin(prompts.default, {
         includeHarnessIdentity: false, includeRuntimeContext: false,
-        personaPrefix: assistantReportGuidance(input.prompt) + `你是 AI Token 平台的数据与操作助手。当前北京时间 ${new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' })}，时区 Asia/Shanghai。当前页面 ${input.page ?? '/overview'}；当前用户 ${input.principal.name}，数据范围 ${input.principal.roleCodes.includes('admin') ? '可查部门授权数据' : '仅本人'}。
+        personaPrefix: assistantReportGuidance(input.prompt, input.skills) + `你是 AI Token 平台的数据与操作助手。当前北京时间 ${new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' })}，时区 Asia/Shanghai。当前页面 ${input.page ?? '/overview'}；当前用户 ${input.principal.name}，数据范围 ${input.principal.roleCodes.includes('admin') ? '可查部门授权数据' : '仅本人'}。
 用最少工具准确回答。常规统计优先 query_usage：一次完成姓名解析、时间范围、查询与可选展示。用户提到姓名就传完整 member_name；今年=year，本月=month，上月=lastmonth，本周=week，昨天=yesterday。明确的时间永远优先于默认最近七天。不要先查最近七天推测人员或当前日期，不猜 member_id。模型标识保留用户给出的完整名称，包含“模型”等字时也不能删掉；模型筛选按平台包含匹配的语义，不把关键词匹配声称为精确唯一模型。默认未指定人员时按当前授权范围；“我”传 member_name="我"。续聊的“他/她/刚才那个人”沿用已经确定的人员；没有确定时先问清楚。同名、未找到或无权限，直接说明并停止，不能换个范围查出数字充当答案。
 总量问题用 view=overview、display=cards；排行/按模型等分布用 view=breakdown、by 对应维度，默认 display=table；趋势用 view=series、display=line。这是意图选择原则，不是接口固定图形：用户指定图形就用 display 对应类型，也可以省略 display 只回答；overview 不适合饼图，单个总量没有份额。两期比较用 overview 与 compare_period，display=table 或 bar。查询已 rendered 就不要再调用渲染工具；同一答案一般只需要一次 query_usage，获得结果后直接结束。改图时优先复用对话里的 dataset_id；只有无法确认时再 list_datasets，不重复取数。
 回答使用简洁 Markdown，先给具体数字和结论（常规回答1至3句，约100字），再注明人员、时间范围和来源。时间直接引用 range.label，不自行换算毫秒或推算日期；metrics_display 是已格式化的真实指标，直接引用，不重新计算缓存比率。趋势可引用 series_summary 的真实首尾和峰值。不要只说“我先查一下”，不要复述工具步骤，不要在简单问题上连续探索。表格已展示时不重复写Markdown表格或逐行复述，明细只说明展示条数和分页状态，不额外计算行合计；不要每次结尾都询问是否继续分析。只描述数据支持的事实，没有比较基准不评价用量“很低/很高”或成本效率。完整数值以工具返回为准，不用笼统的“约几千”替代精确值。无数据明确说明当前范围内已入库用量为0，不推断没有使用过。部分行/分页/截断必须说明，不把子集当整体。未计价表示金额未知，既不能断言零元，也不能断言“非零”或“有费用”；不要把“不等于零”解释成已知大于零。不同币种不能相加；已计价的费用也只是估算。
@@ -204,7 +212,7 @@ create_file 可以生成 docx/xlsx/html/md/csv/txt 基础文件；统计文件�
       if (input.operatePage) {
         const operate = async (args: unknown, principal: Principal) => {
           pageContext = validateAssistantPageContext(pageContext, undefined, principal)
-          const operation = validateAssistantPageOperation(args, pageContext, assistantWriteIntent(skillRequest.request))
+          const operation = validateAssistantPageOperation(args, pageContext, assistantWriteIntent(skillRequest.intent))
           const result = validateAssistantPageActionResult(await input.operatePage!(operation), principal, pageContext?.path ?? input.page)
           if (result.page_context) pageContext = result.page_context
           return result
@@ -246,7 +254,8 @@ create_file 可以生成 docx/xlsx/html/md/csv/txt 基础文件；统计文件�
           { type: 'object', properties: { resource: { type: 'string', enum: ASSISTANT_FORMS.map(form => form.resource) }, operation: { type: 'string', enum: ['create', 'update'] }, target_id: { type: 'string' }, values: { type: 'object', additionalProperties: true } }, required: ['resource', 'operation'], additionalProperties: false },
           async (args, principal) => await this.services.actions!.prepareForm(principal, input.sessionId, args as AssistantFormRequest, input.emit))
         // ★ 外部资料不能扩大本轮操作范围，只有用户本轮明确提出写入才挂载修改工具。
-        if (assistantWriteIntent(skillRequest.request)) {
+        //   这里用 intent 而不是 request：自定义技能的草稿可能是别人保存的公开内容。
+        if (assistantWriteIntent(skillRequest.intent)) {
           register('portal_manage_save', '通过后台管理接口直接新建(create)或修改(update)并保存，成功返回executed:true。update前query精确取得target_id，只变用户指定字段，身份字段不可修改。members只name/group_ids；groups只name。供应商规则values为scope(global/member)/member_id/provider(原值)/model(模型规则才填)/alias(统一名称)/enabled，一条原值一条映射。项目规则scope/member_id/prefix/alias/enabled。单价provider/model/currency(CNY/USD)、四种*_micro_per_ktok非负整数微元/千Token（1元/百万Token=1000微元/千Token）、effective_from_ms/effective_to_ms(毫秒，null长期)、note及非高峰价字段。禁止密码、角色权限、token和原始用量写入。打开弹框让用户填写用portal_open_form，不自动保存。',
             { type: 'object', properties: { resource: { type: 'string', enum: ASSISTANT_FORMS.map(form => form.resource) }, operation: { type: 'string', enum: ['create', 'update'] }, target_id: { type: 'string' }, values: { type: 'object', additionalProperties: true } }, required: ['resource', 'operation'], additionalProperties: false },
             async (args, principal) => {
@@ -269,7 +278,7 @@ create_file 可以生成 docx/xlsx/html/md/csv/txt 基础文件；统计文件�
             input.emit({ type: 'artifact', artifact })
             return { created: true, ...artifact }
           })
-        if (assistantShareIntent(skillRequest.request)) register('share_html', '仅用户本轮主动要求分享HTML才使用。持链接者可看到文件内容。artifact_id必须来自已生成HTML；expires_in_hours是1～720小时，用户未指定默认24小时。链接可在文件卡撤销。',
+        if (assistantShareIntent(skillRequest.intent)) register('share_html', '仅用户本轮主动要求分享HTML才使用。持链接者可看到文件内容。artifact_id必须来自已生成HTML；expires_in_hours是1～720小时，用户未指定默认24小时。链接可在文件卡撤销。',
           { type: 'object', properties: { artifact_id: { type: 'string' }, expires_in_hours: { type: 'integer', minimum: 1, maximum: 720 } }, required: ['artifact_id'], additionalProperties: false },
           async (args, principal) => {
             const raw = args as { artifact_id?: string; expires_in_hours?: number }

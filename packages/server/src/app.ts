@@ -343,6 +343,9 @@ export function createApp(deps: AppDeps): Hono {
       return deps.assistantRoute!.handle(c.req.method, action, await portalAuthorization(c), parsed.value, c.req.raw.signal, new URL(c.req.url).searchParams)
     }
     app.get('/api/v1/assistant/status', c => dispatch(c, 'status'))
+    app.get('/api/v1/assistant/skills', c => dispatch(c, 'skills'))
+    app.post('/api/v1/assistant/skills', c => dispatch(c, 'skills'))
+    app.delete('/api/v1/assistant/skills/:id', c => dispatch(c, 'skills/' + c.req.param('id')))
     app.get('/api/v1/assistant/sessions', c => dispatch(c, 'sessions'))
     app.get('/api/v1/assistant/sessions/:id', c => dispatch(c, `sessions/${c.req.param('id')}`))
     app.get('/api/v1/assistant/sessions/:id/attachments/:attachmentId/download', c => dispatch(c, `sessions/${c.req.param('id')}/attachments/${c.req.param('attachmentId')}/download`))

@@ -9,6 +9,7 @@ import { AssistantRuntimeError } from './assistant/runtime-error.js'
 import { prepareAssistantAttachments, type PreparedAssistantAttachment } from './assistant/attachments.js'
 import { assistantWriteIntent, assistantShareIntent } from './assistant/intents.js'
 import { resolveAssistantSkill } from './assistant/skills.js'
+import type { ResolvedCustomSkill } from './assistant/skills.js'
 import { validateAssistantFormContext } from './assistant/form-context.js'
 import { validateAssistantPageContext } from './assistant/page-context.js'
 import { AssistantPageBridge } from './assistant/page-bridge.js'
@@ -19,6 +20,8 @@ interface ActiveRun {
   sessionId: string
   runId: string
   prompt: string
+  /** ★ 本轮开始时该成员可见的自定义技能；后续引导沿用同一份，避免中途换技能。 */
+  skills: readonly ResolvedCustomSkill[]
   controller: AbortController
   authenticationHash: string
   pageBridge?: AssistantPageBridge
@@ -43,6 +46,10 @@ export class AssistantRoute {
   }
   private sessionKey(memberId: string, sessionId: string): string { return `${memberId}/${sessionId}` }
   private activeSessions(memberId: string): Set<string> { return new Set([...this.runs.values()].filter(run => run.memberId === memberId).map(run => run.sessionId)) }
+  /** ★ 自定义技能按**服务端身份**读取：浏览器提交的技能清单不能决定命令含义。 */
+  private async visibleSkills(memberId: string): Promise<readonly ResolvedCustomSkill[]> {
+    return this.services.skills ? await this.services.skills.snapshot(memberId) : []
+  }
   private refreshMember(memberId: string): void {
     if (this.busy.has(memberId) || [...this.runs.values()].some(run => run.memberId === memberId) || [...this.deleting].some(key => key.startsWith(memberId + '/'))) this.activeMembers.add(memberId)
     else this.activeMembers.delete(memberId)
@@ -65,6 +72,19 @@ export class AssistantRoute {
     const result = (data: unknown, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store' } })
     try {
       if (action === 'status' && method === 'GET') return result({ enabled: !!this.engine, supports_images: this.engine?.supportsImages === true, supports_steering: this.engine?.supportsSteering === true, retains_history: true, retention_days: this.store.retentionDays })
+      // ★ 技能目录比对话更基础：管理员没启用助手时仍然允许查看/整理自己保存的草稿。
+      if (action === 'skills') {
+        if (!this.services.skills) return result({ ok: false, reason: '助手技能目录未启用' }, 503)
+        if (method === 'GET') return result(await this.services.skills.list(principal))
+        if (method === 'POST') return result({ skill: await this.services.skills.create(principal, body) })
+        return result({ ok: false, reason: '助手接口不存在' }, 404)
+      }
+      const skillMatch = /^skills\/([^/]+)$/.exec(action)
+      if (skillMatch && method === 'DELETE') {
+        if (!this.services.skills) return result({ ok: false, reason: '助手技能目录未启用' }, 503)
+        await this.services.skills.remove(principal, skillMatch[1]!)
+        return result({ ok: true })
+      }
       const attachmentMatch = /^sessions\/([^/]+)\/attachments\/([^/]+)\/download$/.exec(action)
       if (method === 'GET' && attachmentMatch) return await this.store.downloadAttachment(principal, attachmentMatch[1]!, attachmentMatch[2]!)
       const artifactMatch = /^artifacts\/([^/]+)\/(download|share|revoke)$/.exec(action)
@@ -121,10 +141,11 @@ export class AssistantRoute {
         if (!run || run.runId !== input.run_id || run.controller.signal.aborted || !run.submitSteering) return result({ ok: false, reason: '这一轮已结束，请将消息排队发送' }, 409)
         if (this.engine.supportsSteering !== true) return result({ ok: false, reason: '当前助手不支持即时引导，请将消息排队发送' }, 409)
         const prompt = input.prompt.trim()
-        const request = resolveAssistantSkill(prompt).request
-        const originalRequest = resolveAssistantSkill(run.prompt).request
-        if ((assistantWriteIntent(request) && !assistantWriteIntent(originalRequest)) || (assistantShareIntent(request) && !assistantShareIntent(originalRequest))) return result({ ok: false, reason: '新的修改或分享请求需要独立授权，请将消息排队发送' }, 409)
-        run.submitSteering(request)
+        const steering = resolveAssistantSkill(prompt, run.skills)
+        // ★ 授权一律只看用户自己敲的正文（intent），不看技能保存的草稿。
+        const original = resolveAssistantSkill(run.prompt, run.skills)
+        if ((assistantWriteIntent(steering.intent) && !assistantWriteIntent(original.intent)) || (assistantShareIntent(steering.intent) && !assistantShareIntent(original.intent))) return result({ ok: false, reason: '新的修改或分享请求需要独立授权，请将消息排队发送' }, 409)
+        run.submitSteering(steering.request)
         return result({ ok: true, session_id: run.sessionId, run_id: run.runId })
       }
       if (action === 'sessions' && method === 'GET') {
@@ -181,7 +202,9 @@ export class AssistantRoute {
       const pageContext = validateAssistantPageContext(input.page_context, input.page, principal)
       if (files.length && (input.prompt === undefined || input.prompt === '')) input.prompt = '请分析上传的附件。'
       if (typeof input.prompt !== 'string' || (!input.prompt.trim() && !files.length) || input.prompt.length > 4096) throw new IdentityError(400, '问题需要为 1～4096 个字符')
-      resolveAssistantSkill(input.prompt)
+      // ★ 自定义技能在创建会话与调用模型**之前**按服务端身份读出来；未知命令照旧在写盘前拒绝。
+      const skills = await this.visibleSkills(memberId)
+      resolveAssistantSkill(input.prompt, skills)
       if (input.session_id !== undefined && typeof input.session_id !== 'string') throw new IdentityError(400, 'session_id 必须是字符串')
       const sessionId = input.session_id as string | undefined ?? randomUUID()
       this.store.sessionPath(memberId, sessionId)
@@ -190,7 +213,7 @@ export class AssistantRoute {
       if (this.runs.size >= 4) return result({ ok: false, reason: '助手繁忙，请稍后重试' }, 429)
       const controller = new AbortController()
       const prompt = input.prompt.trim() || '请分析上传的附件。'
-      const run: ActiveRun = { memberId, sessionId, runId: randomUUID(), prompt, controller, authenticationHash: identitySnapshotHash(principal.auth) }
+      const run: ActiveRun = { memberId, sessionId, runId: randomUUID(), prompt, skills, controller, authenticationHash: identitySnapshotHash(principal.auth) }
       // ★ 先预占再解析附件和读库，一会话一运行的约束不能依赖异步操作完成顺序。
       this.runs.set(key, run); this.refreshMember(memberId)
       const release = () => { run.pageBridge?.close(); this.runs.delete(key); this.controllers.delete(controller); this.refreshMember(memberId) }
@@ -265,7 +288,7 @@ export class AssistantRoute {
             catch (error) { controller.abort(); throw error }
             return current.viewer
           }
-          const pageBridge = new AssistantPageBridge(pageContext, input.page as string | undefined, controller.signal, emit, authorizeRun, assistantWriteIntent(resolveAssistantSkill(prompt).request))
+          const pageBridge = new AssistantPageBridge(pageContext, input.page as string | undefined, controller.signal, emit, authorizeRun, assistantWriteIntent(resolveAssistantSkill(prompt, skills).intent))
           run.pageBridge = pageBridge
           const task = (async () => {
             try {
@@ -276,7 +299,7 @@ export class AssistantRoute {
               await this.store.save(memberId, detail)
               emit({ type: 'session', session: detail.session, run_id: run.runId })
               if (attachments.length) emit({ type: 'attachments', attachments: attachments.map(item => item.metadata) })
-              await engine.run({ sessionId: detail.session.session_id, directory: this.store.sessionPath(memberId, detail.session.session_id), prompt, ...(attachments.length ? { attachments } : {}), page: input.page as string | undefined, ...(formContext ? { formContext } : {}), ...(pageContext ? { pageContext } : {}), operatePage: operation => pageBridge.operate(operation), principal, signal: controller.signal, emit, subscribeSteering: accept => {
+              await engine.run({ sessionId: detail.session.session_id, directory: this.store.sessionPath(memberId, detail.session.session_id), prompt, skills, ...(attachments.length ? { attachments } : {}), page: input.page as string | undefined, ...(formContext ? { formContext } : {}), ...(pageContext ? { pageContext } : {}), operatePage: operation => pageBridge.operate(operation), principal, signal: controller.signal, emit, subscribeSteering: accept => {
                 deliverSteering = accept
                 for (const prompt of pendingSteering.splice(0)) accept(prompt)
                 return () => { deliverSteering = undefined; run.submitSteering = undefined }

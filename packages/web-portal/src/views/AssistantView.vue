@@ -4,13 +4,14 @@ import { computed, ref, onMounted, onBeforeUnmount, watch, nextTick, useId } fro
 import { useRoute, useRouter } from 'vue-router'
 import { ElAlert, ElButton, ElInput, ElMessageBox } from 'element-plus'
 import { ArrowUp, ArrowDown, ChatDotRound, Plus, ArrowRight, DataAnalysis, Position, Close, Paperclip, Document, Picture } from '@element-plus/icons-vue'
-import { ASSISTANT_ATTACHMENT_LIMITS, assistantWriteIntent, type AssistantArtifact, type AssistantPendingAction, type AssistantStatus, type AssistantToolEvent } from '@ai-token-report/shared'
+import { ASSISTANT_ATTACHMENT_LIMITS, assistantWriteIntent, type AssistantArtifact, type AssistantCustomSkill, type AssistantPendingAction, type AssistantStatus, type AssistantToolEvent } from '@ai-token-report/shared'
 import AssistantSymbol from '../components/AssistantSymbol.vue'
 import AssistantResultCard from '../components/AssistantResult.vue'
 import AssistantActionCard from '../components/AssistantAction.vue'
 import AssistantArtifactCard from '../components/AssistantArtifact.vue'
 import AssistantAttachmentCard from '../components/AssistantAttachment.vue'
 import AssistantSessionList from '../components/AssistantSessionList.vue'
+import AssistantSkillDialog from '../components/AssistantSkillDialog.vue'
 import { createAssistantNavigator, navigateAssistantPage } from '../utils/assistantNavigation.js'
 import { activeAssistantForm, openAssistantForm } from '../utils/assistantForms.js'
 import { assistantPageActions, assistantFormLabels } from '../utils/assistantPageActions.js'
@@ -22,10 +23,10 @@ import { renderAssistantMarkdown } from '../utils/assistantMarkdown.js'
 import { assistantNavigationActivity } from '../utils/assistantActivity.js'
 import { handleAssistantComposerKeydown } from '../utils/assistantComposer.js'
 import { createAssistantScrollState } from '../utils/assistantScroll.js'
-import { assistantSkillDraft, assistantSkillMove, assistantSkillMenuHeight, assistantSkillOptions, assistantSkillQuery, handleAssistantSkillKeydown, type AssistantSkillOption } from '../utils/assistantSkills.js'
+import { assistantSkillDraft, assistantSkillMove, assistantSkillMenuHeight, assistantSkillMenuOptions, assistantSkillOptions, assistantSkillQuery, assistantLocalCommand, assistantSkillBadge, handleAssistantSkillKeydown, type AssistantSkillMenuOption } from '../utils/assistantSkills.js'
 import { createAssistantConversations, type AssistantPendingFile } from '../utils/assistantConversations.js'
 import { assistantAttachmentAccept, assistantAttachmentError, assistantAttachmentKind, assistantAttachmentSize, assistantCanSend } from '../utils/assistantAttachments.js'
-import { assistantStatus, assistantSessions, assistantDetail, chatAssistant, deleteAssistantSession, steerAssistant, reportAssistantPageAction } from '../api/assistant.js'
+import { assistantStatus, assistantSessions, assistantDetail, assistantSkills, chatAssistant, deleteAssistantSession, steerAssistant, reportAssistantPageAction } from '../api/assistant.js'
 const props = defineProps<{ floating?: boolean }>()
 const emit = defineEmits<{ 'sessions-toggle': [open: boolean]; 'form-opened': [] }>()
 const route = useRoute(), router = useRouter()
@@ -55,6 +56,10 @@ const composerHasFocus = ref(false)
 const composerComposing = ref(false)
 let skillMenuResize: ResizeObserver | undefined
 const status = ref<AssistantStatus | null>(null)
+/** 当前身份可见的自定义技能（自己的私有技能 + 全部公开技能），由服务端过滤后下发。 */
+const customSkills = ref<AssistantCustomSkill[]>([])
+const skillCatalogError = ref('')
+const skillDialogOpen = ref(false)
 const conversations = createAssistantConversations({
   chat: chatAssistant, detail: assistantDetail, sessions: assistantSessions, steer: steerAssistant,
   navigate: async (event, binding, signal) => {
@@ -84,7 +89,7 @@ const attachmentError = computed({ get: () => current.value.attachmentError, set
 const dragging = ref(false)
 let attachmentSequence = 0
 const composerDisabled = computed(() => !status.value?.enabled || loading.value)
-const skills = computed(() => assistantSkillOptions(prompt.value))
+const skills = computed(() => assistantSkillOptions(prompt.value, assistantSkillMenuOptions(customSkills.value)))
 const skillMenuOpen = computed(() => !composerDisabled.value && composerHasFocus.value && !composerComposing.value && !skillMenuDismissed.value && assistantSkillQuery(prompt.value) !== null)
 const activeSkillId = computed(() => skillMenuOpen.value && skills.value[skillSelection.value] ? `${skillMenuId}-${skills.value[skillSelection.value]!.id}` : undefined)
 const attachmentAccept = computed(() => assistantAttachmentAccept(status.value?.supports_images))
@@ -112,11 +117,24 @@ const suggestions = [
   { title: '打开调用明细', detail: '让助手带你到需要的页面', prompt: '打开调用明细页面', icon: Position },
 ]
 function suggest(value: string) { prompt.value = value; composer.value?.focus() }
-function selectSkill(skill: AssistantSkillOption) {
+function selectSkill(skill: AssistantSkillMenuOption) {
+  // ★ 动作条目（/create-skill）由浏览器直接打开表单，不填入草稿、从不发给模型。
+  if (skill.kind === 'action') { skillMenuDismissed.value = true; skillDialogOpen.value = true; return }
   // ★ 技能选择只填入可编辑草稿；确认时间、范围后仍由用户发送或排队。
   prompt.value = assistantSkillDraft(skill)
   skillMenuDismissed.value = true
   void nextTick(() => { composer.value?.focus(); composer.value?.textarea?.setSelectionRange(prompt.value.length, prompt.value.length) })
+}
+/** 目录失败只影响自定义技能，内置技能照旧可用；错误在弹框里如实显示。 */
+async function loadSkills() {
+  const result = await assistantSkills()
+  if (result.ok) { customSkills.value = result.data.skills; skillCatalogError.value = '' }
+  else skillCatalogError.value = `自定义技能暂时读取失败：${result.error}。内置技能不受影响，可稍后重新打开本弹框。`
+}
+function skillCreated(skill: AssistantCustomSkill) {
+  // 保存成功后把新命令填进输入框：用户接着补时间、人员等条件即可，不必再翻菜单。
+  prompt.value = `${skill.command} `
+  void nextTick(() => composer.value?.focus())
 }
 function moveSkill(direction: -1 | 1) {
   skillSelection.value = assistantSkillMove(skillSelection.value, direction, skills.value.length)
@@ -228,6 +246,8 @@ async function remove(id: string) {
 }
 async function send() {
   if (!canSend.value) return
+  // ★ `/create-skill` 是浏览器本地命令：整段草稿就是它时打开表单，绝不发给模型。
+  if (assistantLocalCommand(prompt.value)) { skillDialogOpen.value = true; return }
   const state = current.value, owner = state.key
   let pendingController: ReturnType<typeof createAssistantPageController> | undefined
   try {
@@ -300,7 +320,8 @@ onMounted(async () => {
     if (transcript.value) transcriptResize.observe(transcript.value)
     if (transcriptContent.value) transcriptResize.observe(transcriptContent.value)
   }
-  const result = await assistantStatus()
+  // 技能目录与助手状态互不依赖，同时取；目录失败不影响对话本身。
+  const [result] = await Promise.all([assistantStatus(), loadSkills()])
   if (result.ok) { status.value = result.data; if (status.value.enabled) await conversations.refresh() }
   else error.value = result.error
 })
@@ -383,10 +404,10 @@ watch(() => [messages.value.length, messages.value.at(-1)?.text, messages.value.
             <button v-for="action in pageActions" :key="action.label" type="button" :disabled="composerDisabled || !!prompt.trim()" @click="suggest(action.prompt)">{{ action.label }}</button>
           </div>
           <div v-if="skillMenuOpen" class="assistant-skills">
-            <div ref="skillMenuHeading" class="assistant-skills-heading"><strong>默认管理技能</strong><span>↑ ↓ 选择 · Enter / Tab 填入 · Esc 关闭</span></div>
-            <div :id="skillMenuId" ref="skillMenu" class="assistant-skills-options" :style="{ maxHeight: `${skillMenuHeight}px` }" role="listbox" aria-label="管理报表技能">
-              <button v-for="(skill, index) in skills" :id="`${skillMenuId}-${skill.id}`" :key="skill.id" type="button" role="option" :aria-selected="index === skillSelection" tabindex="-1" @mousedown.prevent @click="selectSkill(skill)" @mousemove="skillSelection = index"><span class="assistant-skill-command">{{ skill.command }}</span><span class="assistant-skill-description"><strong>{{ skill.title }}</strong><small>{{ skill.description }}</small></span></button>
-              <p v-if="!skills.length" class="assistant-skills-empty">没有匹配的技能，试试 /report 或输入中文关键词。</p>
+            <div ref="skillMenuHeading" class="assistant-skills-heading"><strong>技能</strong><span>↑ ↓ 选择 · Enter / Tab 填入 · Esc 关闭</span></div>
+            <div :id="skillMenuId" ref="skillMenu" class="assistant-skills-options" :style="{ maxHeight: `${skillMenuHeight}px` }" role="listbox" aria-label="助手技能">
+              <button v-for="(skill, index) in skills" :id="`${skillMenuId}-${skill.id}`" :key="skill.id" type="button" role="option" :aria-selected="index === skillSelection" tabindex="-1" @mousedown.prevent @click="selectSkill(skill)" @mousemove="skillSelection = index"><span class="assistant-skill-command">{{ skill.command }}</span><span class="assistant-skill-description"><strong>{{ skill.title }}<em v-if="assistantSkillBadge(skill)" class="assistant-skill-badge">{{ assistantSkillBadge(skill) }}</em></strong><small>{{ skill.description }}</small></span></button>
+              <p v-if="!skills.length" class="assistant-skills-empty">没有匹配的技能，试试 /report，或输入 /create-skill 新建一条。</p>
             </div>
           </div>
         <form class="assistant-composer" :class="{ dragging }" @submit.prevent="send" @dragover="dragOver" @dragleave="dragLeave" @drop="dropFiles">
@@ -400,7 +421,7 @@ watch(() => [messages.value.length, messages.value.at(-1)?.text, messages.value.
               <button type="button" class="assistant-file-remove" :disabled="composerDisabled" :aria-label="`移除附件 ${item.file.name}`" @click="removeFile(item)"><Close /></button>
             </div>
           </div>
-          <el-input ref="composer" v-model="prompt" type="textarea" :autosize="{ minRows: 3, maxRows: 8 }" resize="vertical" maxlength="4096" :placeholder="sending ? '继续输入，默认排队；输入 / 选择管理技能…' : '输入问题，或输入 / 选择管理报表技能…'" :disabled="composerDisabled" aria-label="问题" :aria-describedby="composerShortcutsId" :aria-expanded="skillMenuOpen" :aria-controls="skillMenuOpen ? skillMenuId : undefined" :aria-activedescendant="activeSkillId" aria-autocomplete="list" @focus="composerHasFocus = true" @blur="composerHasFocus = false" @compositionstart="composerComposing = true" @compositionend="composerComposing = false" @keydown="composerKeydown" @paste="pasteImage" />
+          <el-input ref="composer" v-model="prompt" type="textarea" :autosize="{ minRows: 3, maxRows: 8 }" resize="vertical" maxlength="4096" :placeholder="sending ? '继续输入，默认排队；输入 / 选择技能…' : '输入问题，或输入 / 选择技能（含自定义技能）…'" :disabled="composerDisabled" aria-label="问题" :aria-describedby="composerShortcutsId" :aria-expanded="skillMenuOpen" :aria-controls="skillMenuOpen ? skillMenuId : undefined" :aria-activedescendant="activeSkillId" aria-autocomplete="list" @focus="composerHasFocus = true" @blur="composerHasFocus = false" @compositionstart="composerComposing = true" @compositionend="composerComposing = false" @keydown="composerKeydown" @paste="pasteImage" />
           <p v-if="attachmentError" class="assistant-attachment-error" role="alert">{{ attachmentError }}</p>
           <div class="assistant-actions"><button class="assistant-attach" type="button" :disabled="composerDisabled" :title="`添加附件：${attachmentLimitsHint}；支持拖入与粘贴图片`" aria-label="添加附件" @click="fileInput?.click()"><Paperclip /><span>附件</span></button><div class="assistant-input-hints"><span :id="composerShortcutsId">{{ sending ? 'Enter 排队' : 'Enter 发送' }} · Alt + Enter 换行</span><span v-if="prompt.length">{{ prompt.length }} / 4096</span></div><div class="assistant-send-controls"><el-button v-if="sending" class="assistant-stop" @click="conversations.stop()"><span class="assistant-stop-icon" />停止</el-button><el-button v-if="sending" class="assistant-steer" :disabled="!canSteer" :loading="current.steering" :title="pendingFiles.length ? '附件请排队发送；即时引导支持文字' : '在当前运行的下一步应用，保留已输出内容'" @click="steer">立即引导</el-button><el-button class="assistant-send" type="primary" native-type="submit" :disabled="!canSend">{{ sending ? '排队发送' : '发送' }}<ArrowUp /></el-button></div></div>
           <div v-if="dragging" class="assistant-drop-hint" aria-hidden="true"><Paperclip />松开即可添加附件</div>
@@ -413,6 +434,8 @@ watch(() => [messages.value.length, messages.value.at(-1)?.text, messages.value.
         </div>
       </section>
     </div>
+    <!-- ★ 新建/管理自定义技能：/create-skill 与菜单「新建技能」都打开这个表单，不经过模型。 -->
+    <AssistantSkillDialog v-model="skillDialogOpen" :skills="customSkills" :load-error="skillCatalogError" @changed="loadSkills" @created="skillCreated" />
   </div>
 </template>
 
@@ -539,6 +562,7 @@ watch(() => [messages.value.length, messages.value.at(-1)?.text, messages.value.
 .assistant-skill-command { min-width: 68px; color: #3275ed; font-size: 11px; line-height: 1.8; font-family: ui-monospace, monospace; }
 .assistant-skill-description { min-width: 0; }
 .assistant-skill-description strong { display: block; color: #465e7f; font-size: 12px; line-height: 1.6; font-weight: 500; }
+.assistant-skill-badge { margin-left: 6px; padding: 1px 5px; border-radius: 5px; background: #eef4ff; color: #5b82c4; font-size: 10px; font-style: normal; font-weight: 400; }
 .assistant-skill-description small { display: block; margin-top: 3px; color: #8294ae; font-size: 10px; line-height: 1.6; overflow-wrap: anywhere; }
 .assistant-skills-empty { margin: 0; padding: 14px 10px; color: #8b9bb1; font-size: 11px; line-height: 1.7; }
 .assistant-composer { position: relative; flex-shrink: 0; max-height: min(400px, 55dvh); overflow-y: auto; border: 1px solid #dce6f6; border-radius: 15px; background: #fff; padding: 11px 12px 9px; box-shadow: 0 4px 14px #24334b04; transition: border-color .2s, box-shadow .2s; }

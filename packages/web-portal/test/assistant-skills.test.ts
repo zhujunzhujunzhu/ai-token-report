@@ -1,28 +1,59 @@
-/** 斜杠菜单回归：搜索真实目录，选择只写草稿，输入法与原发送快捷键互不干扰。 */
+/** 斜杠菜单回归：内置技能 + 自定义技能 + 本地动作，选择只写草稿，输入法与原发送快捷键互不干扰。 */
 import { expect, test } from 'bun:test'
-import { ASSISTANT_SKILLS } from '@ai-token-report/shared'
-import { assistantSkillQuery, assistantSkillOptions, assistantSkillDraft, assistantSkillMove, assistantSkillMenuHeight, handleAssistantSkillKeydown } from '../src/utils/assistantSkills.js'
+import { ASSISTANT_SKILLS, ASSISTANT_SKILL_ACTIONS, type AssistantCustomSkill } from '@ai-token-report/shared'
+import { assistantSkillQuery, assistantSkillOptions, assistantSkillMenuOptions, assistantSkillDraft, assistantSkillBadge, assistantLocalCommand, assistantSkillMove, assistantSkillMenuHeight, handleAssistantSkillKeydown } from '../src/utils/assistantSkills.js'
 import { handleAssistantComposerKeydown } from '../src/utils/assistantComposer.js'
 
-test('斜杠展示默认技能，支持命令与中文需求搜索', () => {
-  expect(assistantSkillOptions('/').map(item => item.command)).toEqual(ASSISTANT_SKILLS.map(item => item.command))
+const customSkill = (overrides: Partial<AssistantCustomSkill> = {}): AssistantCustomSkill => ({
+  skill_id: '11111111-1111-4111-8111-111111111111', command: '/weekly-cost', title: '上周费用', description: '按供应商看上周费用估算',
+  prompt: '生成上周的费用分析报表，按供应商分布，导出 Excel', visibility: 'private', mine: true, can_delete: true, created_at_ms: 1, updated_at_ms: 2, ...overrides,
+})
+
+test('斜杠展示内置技能、自定义技能与新建技能动作，支持命令与中文需求搜索', () => {
+  expect(assistantSkillOptions('/').map(item => item.command)).toEqual([...ASSISTANT_SKILLS.map(skill => skill.command), ...ASSISTANT_SKILL_ACTIONS.map(action => action.command)])
   expect(assistantSkillOptions('/REPORT').some(item => item.command === '/report')).toBe(true)
   for (const skill of ASSISTANT_SKILLS) {
     expect(assistantSkillOptions(`/${skill.title}`).some(item => item.id === skill.id)).toBe(true)
-    expect(assistantSkillDraft(skill)).toBe(`${skill.command} ${skill.prompt}`)
+    expect(assistantSkillDraft(assistantSkillMenuOptions()[ASSISTANT_SKILLS.indexOf(skill)]!)).toBe(`${skill.command} ${skill.prompt}`)
   }
   expect(assistantSkillOptions('/不存在的技能')).toEqual([])
 })
 
+test('自定义技能进入菜单：命令、标题与说明都能搜到，并按可见范围带标记', () => {
+  const options = assistantSkillMenuOptions([customSkill(), customSkill({ skill_id: '22222222-2222-4222-8222-222222222222', command: '/team-cost', title: '部门费用', description: '按供应商看上月费用估算', visibility: 'public', mine: false, can_delete: false, owner_name: '成员甲' })])
+  const menu = assistantSkillOptions('/', options)
+  expect(menu.map(item => item.command)).toEqual([...ASSISTANT_SKILLS.map(skill => skill.command), '/weekly-cost', '/team-cost', '/create-skill'])
+  expect(assistantSkillOptions('/上周费用', options).map(item => item.command)).toEqual(['/weekly-cost'])
+  expect(assistantSkillOptions('/部门费用', options).map(item => item.command)).toEqual(['/team-cost'])
+  expect(assistantSkillOptions('/供应商看上周', options).map(item => item.command)).toEqual(['/weekly-cost'])
+  expect(assistantSkillOptions('/team', options).map(item => item.command)).toEqual(['/team-cost'])
+  expect(assistantSkillOptions('/create', options).map(item => item.command)).toEqual(['/create-skill'])
+  expect(assistantSkillBadge(menu[menu.length - 1]!)).toBe('打开表单')
+  expect(assistantSkillBadge(assistantSkillOptions('/weekly-cost', options)[0]!)).toBe('仅自己')
+  expect(assistantSkillBadge(assistantSkillOptions('/team-cost', options)[0]!)).toBe('部门共享')
+  expect(assistantSkillBadge(assistantSkillOptions('/report', options)[0]!)).toBe('')
+  // 选中自定义技能填入它保存的草稿；动作条目只填命令本身。
+  expect(assistantSkillDraft(assistantSkillOptions('/weekly-cost', options)[0]!)).toBe('/weekly-cost 生成上周的费用分析报表，按供应商分布，导出 Excel')
+  expect(assistantSkillDraft(assistantSkillOptions('/create-skill', options)[0]!)).toBe('/create-skill')
+  expect(assistantSkillMenuOptions([customSkill()])[ASSISTANT_SKILLS.length]!.canDelete).toBe(true)
+})
+
+test('浏览器本地命令只在整段草稿就是该命令时命中，带条件的写法交给服务端解释', () => {
+  expect(assistantLocalCommand('/create-skill')).toBe('/create-skill')
+  expect(assistantLocalCommand('  /create-skill \n')).toBe('/create-skill')
+  for (const prompt of ['/create-skill 帮我建一个', '/report', '新建技能', '', '/create-skills']) expect(assistantLocalCommand(prompt)).toBeNull()
+})
+
 test('带参数的命令、正文路径、URL 和多行正文不打开技能菜单', () => {
-  for (const prompt of ['/report 本月按项目', '查看 /report', 'https://example.test/report', '/report\n本月', '/api/v1/stats', '普通问题']) {
+  const options = assistantSkillMenuOptions([customSkill()])
+  for (const prompt of ['/report 本月按项目', '查看 /report', 'https://example.test/report', '/report\n本月', '/api/v1/stats', '普通问题', '/weekly-cost 本月']) {
     expect(assistantSkillQuery(prompt)).toBeNull()
-    expect(assistantSkillOptions(prompt)).toEqual([])
+    expect(assistantSkillOptions(prompt, options)).toEqual([])
   }
   expect(assistantSkillQuery('  /week')).toBe('week')
 })
 
-function press(overrides: Partial<Parameters<typeof handleAssistantSkillKeydown>[0]> = {}, menu = { open: true, count: 7 }) {
+function press(overrides: Partial<Parameters<typeof handleAssistantSkillKeydown>[0]> = {}, menu = { open: true, count: 8 }) {
   let selected = 0, closed = 0, sent = 0, lines = 0, prevented = false
   const moved: number[] = []
   const event = { key: 'Enter', altKey: false, ctrlKey: false, metaKey: false, shiftKey: false, isComposing: false, keyCode: 13, repeat: false, preventDefault: () => { prevented = true }, ...overrides }
@@ -40,8 +71,8 @@ test('Enter 和 Tab 选择草稿且不发送；按住回车不重复选择', () 
 test('方向键循环选择，Escape 关闭而不发送', () => {
   expect(press({ key: 'ArrowDown' }).moved).toEqual([1])
   expect(press({ key: 'ArrowUp' }).moved).toEqual([-1])
-  expect(assistantSkillMove(0, -1, 7)).toBe(6)
-  expect(assistantSkillMove(6, 1, 7)).toBe(0)
+  expect(assistantSkillMove(0, -1, 8)).toBe(7)
+  expect(assistantSkillMove(7, 1, 8)).toBe(0)
   expect(assistantSkillMove(0, 1, 0)).toBe(0)
   expect(press({ key: 'Escape' })).toMatchObject({ closed: 1, selected: 0, sent: 0, handled: true })
 })

@@ -43,6 +43,7 @@ import { isBunRuntime, serveWithPortRetry, type RequestHandler } from './runtime
 import { StatsRoute } from './stats-route.js'
 import { AssistantRoute } from './assistant-route.js'
 import { AssistantStore } from './assistant/store.js'
+import { AssistantSkillStore } from './assistant/skill-store.js'
 import { DshAssistantEngine, type AssistantEngine } from './assistant/runtime.js'
 import { assistantConfigFromEnv, type DshAssistantConfig } from './assistant/config.js'
 import { AssistantArtifacts } from './assistant/artifacts.js'
@@ -326,6 +327,8 @@ export async function createHandlerFor(options: ServerOptions = {}): Promise<Han
   const assistantServices = {
     // ★ 列表必须和匿名访问一样复验数据库中的主人权限，不能把窄 scope 的凭证当作主人全量权限。
     artifacts: new AssistantArtifacts(assistantStore.root, options.portalOrigin ?? process.env.ATR_PORTAL_ORIGIN, Date.now, identityStore ? memberId => identityStore.memberAccess(memberId) : undefined),
+    // 自定义技能与对话同级存放（见 skill-store.ts 顶部的取舍说明）。
+    skills: new AssistantSkillStore(assistantStore.root),
     ...(databaseAdminRoute ? { actions: new AssistantActions(databaseAdminRoute, assistantStore) } : {}),
   }
   const assistantConfig = options.assistant ?? assistantConfigFromEnv()
