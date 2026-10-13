@@ -327,6 +327,30 @@ test('表格只发送安全名称与行号，原始目录和凭证提示不发�
   f.controller.dispose()
 })
 
+// ⚠️ 项目页与供应商模型页的行结构一模一样（名字行 + 展开区），只是名称列的表头文案不同
+//   （「归一化后的项目」/「归一化后的名字」，白名单里各有一条）—— 所以同一条判断两页都要成立：
+//   漏掉哪一页，那一页展开区里的按钮就会只剩「第 N 行」，助手再也分不清它属于哪个名字。
+for (const page of [{ path: '/projects', header: '归一化后的项目' }, { path: '/providers', header: '归一化后的名字' }]) {
+  test(`展开区里的规则按钮借上一行的名称，行号仍按展开行自己算（${page.path}）`, () => {
+    const f = fixture(page.path), table = f.document.element('table'), header = f.document.element('thead')
+    header.append(f.document.element('th', { class: 'el-table_1_column_1' }, page.header))
+    const body = f.document.element('tbody'), row = f.document.element('tr'), name = f.document.element('td', { class: 'el-table_1_column_1' }), actions = f.document.element('td')
+    name.append(f.document.element('strong', {}, '项目甲'), f.document.element('span', {}, ' 6 条规则'))
+    actions.append(f.document.element('button', {}, '添加路径')); row.append(name, actions)
+    // 展开内容那一行没有任何列（真实 DOM 里就是 `td.el-table__cell.el-table__expanded-cell`）。
+    const expanded = f.document.element('tr'), cell = f.document.element('td', { class: 'el-table__cell el-table__expanded-cell' })
+    for (const label of ['编辑', '停用', '删除']) cell.append(f.document.element('button', {}, label))
+    expanded.append(cell); body.append(row, expanded); table.append(header, body); f.page.append(table)
+    expect(f.controller.capture().controls.map(item => item.label)).toEqual([
+      '第 1 行（项目甲） · 添加路径',
+      '第 2 行（项目甲） · 编辑',
+      '第 2 行（项目甲） · 停用',
+      '第 2 行（项目甲） · 删除',
+    ])
+    f.controller.dispose()
+  })
+}
+
 test('超过 512 个历史绑定会淘汰旧标识，重新出现的旧元素得到新 ID', async () => {
   const f = fixture(), original = f.document.element('button', {}, '原入口'), shelf = f.document.element('div')
   shelf.append(original); f.page.append(shelf)

@@ -830,3 +830,99 @@ describe('本地金额（估算）', () => {
     expect(scan.cost.costs[0]!.amountMicro).toBe(680)
   })
 })
+
+/**
+ * 本地页的**项目名称别名**（`<数据目录>/project-aliases.txt`）。
+ *
+ * ★ 同一份文件被四种离线形态共用（本地页 / CLI / 插件面板 / `token_usage`），
+ *   所以这里钉的是「本地页确实读了那一份」以及「金额跟着折后的键走」——
+ *   后者错了不会报错，只会让明细表里那一行的费用列**整块缺席**。
+ */
+describe('本地页：项目名称别名', () => {
+  const dataDir = (): string => join(home, 'token-report')
+  const REPO_ROOT = 'D:\\Coding\\my-project'
+  const REPO_SUB = 'D:\\Coding\\my-project\\packages\\core'
+
+  function writeAliases(text: string): void {
+    mkdirSync(dataDir(), { recursive: true })
+    writeFileSync(join(dataDir(), 'project-aliases.txt'), text)
+  }
+
+  function aliasRouter(): LocalStatsRouter {
+    return new LocalStatsRouter(new CoreStatsProvider(sessionsRoot, dbPath), { dataDir: dataDir() })
+  }
+
+  /** 一段带 cwd 的用量：仓库根 + 子目录各一个会话。 */
+  function writeAliasedSessions(): void {
+    writeSession('proj-root', 'sess-root', [
+      { seq: 1, ts: todayAt(10), provider: 'dashscope', model: 'm-1', input: 100, output: 20, cacheRead: 900, cwd: REPO_ROOT },
+    ])
+    writeSession('proj-sub', 'sess-sub', [
+      { seq: 1, ts: todayAt(11), provider: 'dashscope', model: 'm-1', input: 300, output: 40, cacheRead: 700, cwd: REPO_SUB },
+    ])
+  }
+
+  type BreakdownBody = {
+    rows: {
+      key: string
+      totalTokens: number
+      calls: number
+      cost?: { costs: { currency: string; amountMicro: number; tokens: number }[]; totalTokens: number; unpricedTokens: number }
+    }[]
+  }
+
+  test('没配别名：按 cwd 最后一段分成两行', async () => {
+    writeAliasedSessions()
+    const res = await aliasRouter().breakdown(params({ period: 'today', by: 'project' }))
+    expect(res.status).toBe(200)
+    const body = res.body as unknown as BreakdownBody
+    expect(body.rows.map((row) => row.key).sort()).toEqual(['core', 'my-project'])
+  })
+
+  test('★ 配了别名：折成一行，会话按折后去重（总量不变）', async () => {
+    writeAliasedSessions()
+    writeAliases(`presales-kb-parent = ${REPO_ROOT}\n`)
+    const body = (await aliasRouter().breakdown(params({ period: 'today', by: 'project' })))
+      .body as unknown as BreakdownBody
+    expect(body.rows.map((row) => row.key)).toEqual(['presales-kb-parent'])
+    expect(body.rows[0]!.calls).toBe(2)
+    expect(body.rows[0]!.totalTokens).toBe(2060)
+  })
+
+  test('★ 金额跟着折后的键走（明细表那一行的费用列不许缺席）', async () => {
+    writeAliasedSessions()
+    writeAliases(`presales-kb-parent = ${REPO_ROOT}\n`)
+    // 金额只在「配置过上报」时下发 —— 先署名（与本地页配置弹框写的是同一份文件）
+    const signed = writeIdentity(join(dataDir(), 'identity.json'), { name: '张三', token: 'atr-alias-test' })
+    if (!signed.ok) throw new Error('署名夹具写入失败')
+    writePricingSnapshot(join(dataDir(), 'pricing.json'), {
+      syncedAtMs: 1_700_000_000_000,
+      endpoint: 'http://portal.example/api/v1/stats/pricing',
+      prices: [{
+        provider: 'dashscope', model: 'm-1', currency: 'CNY',
+        inputMicroPerKtok: 1000, outputMicroPerKtok: 2000,
+        cacheReadMicroPerKtok: 100, cacheWriteMicroPerKtok: 0,
+        effectiveFromMs: 0, effectiveToMs: null,
+      }],
+    })
+
+    const body = (await aliasRouter().breakdown(params({ period: 'today', by: 'project' })))
+      .body as unknown as BreakdownBody
+    const row = body.rows.find((r) => r.key === 'presales-kb-parent')!
+    expect(row.cost).toBeDefined()
+    // 两条事件的金额之和：input 400×1000 + output 60×2000 + cacheRead 1600×100（微元/千）= 680
+    expect(row.cost!.costs).toEqual([{ currency: 'CNY', amountMicro: 680, tokens: 2060 }])
+    // token 数来自两条独立路径（SQL 聚合 vs 逐条取价），对得上才说明键真的命中了
+    expect(row.cost!.totalTokens).toBe(row.totalTokens)
+    expect(row.cost!.unpricedTokens).toBe(0)
+  })
+
+  test('别名文件坏了：整份不生效，退化成 cwd 最后一段（不报错、不半份生效）', async () => {
+    writeAliasedSessions()
+    writeAliases(`presales-kb-parent = ${REPO_ROOT}\n这行忘了等号\n`)
+    const res = await aliasRouter().breakdown(params({ period: 'today', by: 'project' }))
+    expect(res.status).toBe(200)
+    const body = res.body as unknown as BreakdownBody
+    expect(body.rows.map((row) => row.key).sort()).toEqual(['core', 'my-project'])
+  })
+})
