@@ -488,6 +488,23 @@ describe('服务与工具的形状', () => {
     expect(Object.keys(tools).sort()).toEqual([TOOL_NAME, `${TOOL_NAME}_diagnostics`].sort())
   })
 
+  test('★ 工具认 `source` 参数，且未注册的来源**当场给提示**（不安静地查出 0）', async () => {
+    signIdentity()
+    const { ctx, provided } = fakeCtx()
+    const net = interceptFetch(() => okResponse())
+    apply(ctx, { appKey: 'atr-key', dshHome: home, dataDir, outbox: { dir: join(home, 'outbox') } })
+
+    const tool = (provided['tokenReportTools'] as Record<string, { parameters: Record<string, string>; run(raw: Record<string, unknown>): Promise<string> }>)[TOOL_NAME]!
+    // 参数说明里必须列出来 —— 不列出来 Agent 就不知道有这个筛选
+    expect(tool.parameters['source']).toContain('全部来源')
+    // ⚠️ 这两个分支在**查询之前**就返回，所以不会去扫真实日志
+    const unknown = await tool.run({ source: 'bogus' })
+    expect(unknown).toContain('未注册的来源：bogus')
+    expect(unknown).toContain('用 all 表示全部')
+    const typo = await tool.run({ source: 'codex, Codex' })
+    expect(typo).toContain('未注册的来源：Codex')
+  })
+
   test('★ 服务暴露的 config 里不含 appKey', () => {
     signIdentity()
     const { ctx, provided } = fakeCtx()

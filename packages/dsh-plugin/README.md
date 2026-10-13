@@ -10,6 +10,7 @@
 - 💰 **费用（估算）** —— 按本机单价快照现算；**未计价的用量写「未计价」而不是 `¥0.00`**，金额**绝不跨币种相加**
 - 🔗 **多套 DSH 并集** —— 命令行版与 DSH Desktop 的会话日志一起统计；互为镜像的会话按 `event_id` 去重，只算一次
 - 🔌 **本机客户端全覆盖** —— DSH / Codex / Claude Code / Trae（国际版与国内版）/ WorkBuddy **缺省就一起统计、也一起上报**；装了哪个就有哪个，不用配置
+- 🔍 **按来源筛选** —— 工具栏下拉默认「全部来源」（= 什么参数都不带，与以前逐字节相同）；想看「这些几乎全是 Codex 跑的」就选一个客户端，整块面板只算它
 - 📤 **实时上报 + 历史补报** —— 异步批量、磁盘 outbox、断网续传；服务端按事件 ID 去重，重复投递无害
 - 🤖 **Agent 可查询** —— `token_usage` / `token_usage_diagnostics` 工具，以及供其它插件调用的 `ctx.tokenReport` 服务
 - 🔒 **不采集对话内容** —— 只取 token 数值、模型名、工作目录与轮次等统计字段
@@ -96,33 +97,41 @@ dsh --profile web --no-open
 
 ## 在 DSH Desktop（桌面端）上安装
 
-桌面端与命令行版走的是**同一条装配路**，只是 home 与 profile 换成了 Desktop 自己那套；
-但桌面端的**图形入口装不了本插件**，所以下面给的是命令行步骤。
+桌面端有**两条装法**，同一套装配结果：
+
+1. **界面里装（推荐）**：侧栏「插件」→「**+ 添加插件**」→ 填包名 → 「安装」→ 「立即启用」→ 重启 Desktop。
+2. **命令行装**：用 Desktop 自带的 `dsh` 与它自己的 pnpm 走一遍 `dsh plugin --profile web add …`（headless / 排障 / 界面装不上时用，见下方「命令行安装」）。
 
 > 同一套步骤的交付版在仓库的 `docs/桌面端安装交付清单.md`（逐条命令 + 核对 + 回滚，
 > 文件不在 npm 包里，所以这里只写路径）；本节是它的说明版。
 
-### 为什么不能用桌面端的插件界面装
+### 界面安装（侧栏「插件」）
 
-| 入口 | 能不能装 | 原因 |
-|---|---|---|
-| 侧边栏「插件」（社区插件市场 `dshmarket`） | ❌ | 市场**只允许安装 [awesome-dsh-plugin](https://awesome-dsh-plugin.com) 精选列表内的来源，其它一律拒绝**（其 README 明写）。实测该目录 `plugins.json`（约 5 MB）里 `token-report` **0 命中** |
-| 上游「插件」管理页（`@deepseek-ai/dsh-plugin-manager`） | ⚠️ 未实测 | 它接受 npm 包名 / 本地路径 / tarball / git，但在 Desktop 上包操作归 Desktop shell 所有，会走下面的 generation 管线 |
+> 这个页面是 Desktop 随包的官方插件管理器 `@deepseek-ai/dsh-client-ui-plugin-manager`（本机 Desktop 里实测存在，版本 `0.1.7-rc.2`；
+> 侧栏那个「插件」入口与「添加插件」按钮的文案都出自它）。**别与社区市场 `dshmarket` 搞混** ——
+> 本机 profile 里两者都装着，但后者的入口叫「**插件市场**」（另一条侧栏项 + 设置里一张卡片）。
+> 管理器的完整行为以它自己的 README 为准 —— 下面是**与装本插件相关**的那几条，引号里的文案都是从它客户端产物里逐字核出来的。
 
-想让同事在界面里一键装，唯一途径是把包 PR 进 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) 精选列表。
+| 步骤 | 说明 |
+|---|---|
+| ① 侧栏「插件」 | 页面顶部「**官方**」是随 Desktop 提供、默认关闭的组合包；「**已安装**」是当前 profile 持有的组合包。 |
+| ② 点「**添加插件**」 | 对话框标题与按钮同名，输入框标签「**包名或地址**」，说明是「输入插件的包名、GitHub 仓库地址或本地目录路径」。**我们要填的就是包名**：`dsh-plugin-token-report`（要钉版本就写 `dsh-plugin-token-report@1.0.0`）。旁边「**插件安装引导和示例**」里的「包名」一栏写得很直白：「插件包名即 npm 包名……社区插件的 README 安装命令中 `dsh plugin add` 或 `pnpm add` 之后的部分」，不确定就点「**填入示例**」。 |
+| ③ 「**安装源**」（可跳过） | 只决定**这次去哪个 npm 源问**：「默认安装源」／「npm 官方源」／「中国大陆镜像源」／「自定义地址」（私有源要登录就把凭据放在本机 `~/.npmrc`）。**选择只记在本浏览器的 `localStorage` 里**；`dsh plugin` 命令走的是 Host 配置的注册表 —— 所以在界面里换过源，不影响命令行。 |
+| ④ 点「**安装**」 | Host 先问清 spec 指向什么（`pluginManager.inspect`），再跑 pnpm。被拒时输入框下方给一句话，其中与本插件有关的那条是「**这个包没有声明组合包，无法作为插件安装**」—— 本包自 `0.9.0` 起带 `cordis.patch.yml`，不会撞上它（见下方第二个坑）。 |
+| ⑤ 点「**立即启用**」 | 装完给一次启用机会：启用新组合包／直接关闭对话框（**关闭 = 已安装但关闭**，插件不会生效）。装完点它最省事。 |
+| ⑥ 重启 DSH Desktop | 管理器自己就写着「**更改将在下次启动生效**」。重启后面板出现在输入框上方（默认位置）即装好。 |
 
-### 桌面端与命令行版的四个差别
+**升级与回退**：界面里**没有版本选择器**，spec 就是输入框里那一行（`@1.0.0` 才是钉版本）——
+官方管理器的 README 明写：profile 安装的插件**通过卸载后重新安装来升级**（安装后暂不支持自动更新）。
+所以升级 = 「**卸载**」（会要求确认）→ 「添加插件」填新版 → 「立即启用」→ 重启；命令行 `add` 同 version 也换不了版本。
+一次只能跑一个安装 spec。
 
-| | 命令行版 | DSH Desktop |
-|---|---|---|
-| DSH home | `~/.dsh`（或 `$DSH_HOME`） | `%APPDATA%\dsh-desktop\harness`（macOS：`~/Library/Application Support/dsh-desktop/harness`） |
-| profile | 任意 | **只有 `web`** —— Desktop 只暴露这一个，别的名字直接抛错 |
-| 宿主 | 你自己装的 `dsh` | Desktop **自带一整套** harness，在 `<安装目录>\resources\app.asar.unpacked\node_modules\` 下（本机实测 `@deepseek-ai/dsh` = `0.1.7-rc.2`、`@deepseek-ai/cordis` = `4.0.4`、随包 Node `v24.9.0`） |
-| 包操作 | 你调 `dsh plugin …` | Desktop 启动时会做 profile maintenance：把非市场来源的插件迁成**不可变 generation**（`.generations/live/<...>`，一次 rename 上线），并写 `dsh.desktop.generationProjection` 与 `pnpm.overrides`；迁移失败会写 `profiles/web/.generations-deferred.json` 并**冻结**该迁移 |
+> 装之前请看一眼对话框里那句安全提示（大意：插件在本机以你的权限运行，来源不明的插件可能损坏 DSH 或读取你的数据）——
+> 这也是为什么本插件只从 npm 上那个固定包名安装，不推荐从第三方链接装同名包。
 
-其余一律相同：数据目录仍是 `~/.ai-token-report`，**与命令行版共用**（身份 / appKey 填一次两边都生效，见上方「多套 DSH 并存」）；会话日志按本机全部 DSH 的**并集**统计。
+### 命令行安装（headless / 排障）
 
-### 步骤
+界面装不了（宿主没有受管 profile、pnpm 被拦、装完没生效要排障）时，用 Desktop 自带的 `dsh` 与它自己的 pnpm 走一遍。步骤 ①~⑥ 来自**仓内实测记录**（只在版本号上按本次发布改成 `1.0.0`）：
 
 **① 退出 DSH Desktop**（要写 profile 与 `node_modules`）。
 
@@ -148,7 +157,7 @@ node $desktopDsh plugin --profile web add dsh-plugin-token-report@latest
 
 # 本地 tarball：未发布的版本 / 离线分发。
 #   ★ 路径用正斜杠，反斜杠会报 ERR_UNSUPPORTED_ESM_URL_SCHEME；下面的版本号按实际 tarball 替换。
-node $desktopDsh plugin --profile web add file:D:/path/to/dsh-plugin-token-report-0.9.0.tgz
+node $desktopDsh plugin --profile web add file:D:/path/to/dsh-plugin-token-report-1.0.0.tgz
 ```
 
 `add` 会自动在 `profiles/web/package.json` 的 `dsh.profile.bundles` 里登记包名；**不要再手动 `insert`**。
@@ -158,11 +167,22 @@ node $desktopDsh plugin --profile web add file:D:/path/to/dsh-plugin-token-repor
 **⑤ 核对**（只读，不起服务）：
 
 ```powershell
-node $desktopDsh plugin --profile web list              # 本机实测：dsh-plugin-token-report@0.9.0
+node $desktopDsh plugin --profile web list              # 期望：dsh-plugin-token-report@1.0.0
 node $desktopDsh --profile web --dump-config | Select-String token-report
 ```
 
 **⑥ 重启 DSH Desktop。** 面板出现即装好（默认输入框上方；位置在面板「配置」里改，保存即生效）。
+
+### 桌面端与命令行版的四个差别
+
+| | 命令行版 | DSH Desktop |
+|---|---|---|
+| DSH home | `~/.dsh`（或 `$DSH_HOME`） | `%APPDATA%\dsh-desktop\harness`（macOS：`~/Library/Application Support/dsh-desktop/harness`） |
+| profile | 任意 | **只有 `web`** —— Desktop 只暴露这一个，别的名字直接抛错 |
+| 宿主 | 你自己装的 `dsh` | Desktop **自带一整套** harness，在 `<安装目录>\resources\app.asar.unpacked\node_modules\` 下（本机实测 `@deepseek-ai/dsh` = `0.1.7-rc.2`、`@deepseek-ai/cordis` = `4.0.4`、随包 Node `v24.9.0`） |
+| 包操作 | 你调 `dsh plugin …` | Desktop 启动时会做 profile maintenance：把非市场来源的插件迁成**不可变 generation**（`.generations/live/<...>`，一次 rename 上线），并写 `dsh.desktop.generationProjection` 与 `pnpm.overrides`；迁移失败会写 `profiles/web/.generations-deferred.json` 并**冻结**该迁移 |
+
+其余一律相同：数据目录仍是 `~/.ai-token-report`，**与命令行版共用**（身份 / appKey 填一次两边都生效，见上方「多套 DSH 并存」）；会话日志按本机全部 DSH 的**并集**统计。
 
 ### 装好之后
 
@@ -181,13 +201,16 @@ node $desktopDsh --profile web --dump-config | Select-String token-report
 
 - 首次使用、填服务端与 appKey、看「上报调试」，都与命令行版一致，见「第一次使用」与「开启团队上报」。
 
-### 三个坑
+### 四个坑
 
-1. 🚨 **版本窗口**：当前 `peerDependencies` 是 `>=0.1.7-rc.2 <0.3.0-0`，**放宽后的窗口从 `0.7.0` 起就在 npm 上**（`0.6.0` 及更早那一版钉的是精确 `0.1.7-rc.2`）。宿主启动时由 `dsh-app-boot` 的 `evaluatePluginCompatibility` 逐个 peer 做 `semver.satisfies(runtime, range, { includePrerelease: true })`，**任一不满足就跳过整个 bundle** —— 日志只有一行 `skipping profile bundle …`，表现是「面板不见了 + 一条也不上报」，**不是报错**。所以：
+1. 🚨 **包名必须是发布名**：界面与命令行都按包名找包，`dsh-plugin-token-report`（**不是**仓内历史名 `@ai-token-report/dsh-plugin`）。名字写错在界面里表现为「所有注册表都没有这个名字」，在命令行里是 `cannot resolve profile bundle …`。
+2. 🚨 **包必须带组合包 patch（`cordis.patch.yml`）**：官方插件管理器安装前会问清 spec 指向什么，**没有声明组合包的包当场被拒**，原话是「这个包没有声明组合包，无法作为插件安装」。本包自 `0.9.0` 起带这个文件，发布产物里那份的 `name` 是发布名。
+3. 🚨 **版本窗口**：当前 `peerDependencies` 是 `>=0.1.7-rc.2 <0.3.0-0`，**放宽后的窗口从 `0.7.0` 起就在 npm 上**（`0.6.0` 及更早那一版钉的是精确 `0.1.7-rc.2`）。宿主启动时由 `dsh-app-boot` 的 `evaluatePluginCompatibility` 逐个 peer 做 `semver.satisfies(runtime, range, { includePrerelease: true })`，**任一不满足就跳过整个 bundle** —— 日志只有一行 `skipping profile bundle …`，表现是「面板不见了 + 一条也不上报」，**不是报错**。所以：
    - Desktop 自带的 `0.1.7-rc.2`（以及 `0.2.x`）都在窗口内，**装 `@latest` 即可，不需要为了拿放宽窗口去手工打 tarball**（tarball 只在「装未发布版本」时才用得上）。
    - 反过来，Desktop 升到 `0.3.0` 及以后会被跳过。那时要么等插件放宽并复验，要么用宿主自己的 `allow-version … --accept-risk` 强制放行（**自担风险，不等于已验证**）。
-2. **不要把仓内源码目录装进 Desktop**：发布包是**构建产物**（`index.js` / `client.js`），而仓内目录要先 `bun run --filter dsh-plugin-token-report build`、且依赖写的是 `workspace:*`（指向两个从未发布的私有包）。宿主跑在 **Node** 上、也不会替你构建，所以桌面端只用发布包或 tarball。
-3. **升级 / 卸载走同一条路，不要只手改 `package.json`**：一旦 Desktop 的 generation 迁移成功，插件会被搬进不可变的 `.generations/live/<...>`，那时只有重新 `add` 才换得了版本（`plugin remove` 会走 Desktop 的 generation 下线流程）。
+4. 🚨 **升级 = 先卸载再装新版；不要只手改 `package.json`**：界面里没有版本选择器（也不提供自动更新），命令行 `add` 同 version 也换不了版本。另外**一旦 Desktop 的 generation 迁移成功**，插件会被搬进不可变的 `.generations/live/<...>`，那时只有重新 `add` 才换得了版本（`plugin remove` 会走 Desktop 的 generation 下线流程）。
+
+> **不要把仓内源码目录装进 Desktop**：发布包是**构建产物**（`index.js` / `client.js`），而仓内目录要先 `bun run --filter dsh-plugin-token-report build`、且依赖写的是 `workspace:*`（指向两个从未发布的私有包）。宿主跑在 **Node** 上、也不会替你构建，所以桌面端只用发布包或 tarball；界面里那个「本地绝对路径 / 压缩包」入口同样指的是**已构建好的发布产物**。
 
 ## 第一次使用
 
@@ -214,6 +237,8 @@ node $desktopDsh --profile web --dump-config | Select-String token-report
 ```
 <数据目录>/identity.json            ← 署名（token 就是 appKey）
 <数据目录>/plugin-connection.json   ← 面板里填的服务端地址 / appKey / 间隔 / 位置 / 会话日志根
+<数据目录>/project-aliases.txt      ← 项目名称别名（「自定义配置」；四种离线形态共用这一份，
+                                      刻意**不**塞进 plugin-connection.json）
 <数据目录>/usage.sqlite             ← 本地增量索引库（日志的派生物，可删可重建）
 <数据目录>/outbox/                  ← 磁盘 outbox（崩溃不丢数据）
 ```
@@ -242,6 +267,26 @@ Trae（国际版 `trae` / 国内版 `trae-cn`，两个发行版算两个来源�
 
 > 为什么不再做成「白名单」：少统计一个来源**没有任何下游信号** —— 面板数字看着完全正常，
 > 而它与「我在那台客户端上本来就没用量」长得一模一样。采集范围不是性能偏好，是一句会被读成结论的口径。
+
+### 按来源筛选（只看某一个客户端的用量）
+
+全部来源一起算时，一屏数字回答得了「本机用了多少」，回答不了「这些几乎全是 Codex 跑的」。
+工具栏上那个**「来源筛选」下拉**（就在「自定义」日期范围右边）就是干这个的：默认**「全部来源」**，选一个客户端之后整块面板只算它。
+
+- **默认 = 不过滤**：选「全部来源」时请求里**一个 `source` 参数都不发** —— 于是它与这个筛选存在之前**逐字节相同**，老宿主也照常服务。
+- **候选来自宿主的来源注册表**（本机认识哪些客户端），**不是**「库里有哪些用量」。所以选中一个从没跑过的客户端会得到**如实的 0**，而它旁边仍旧写着「全部来源 = 一起算」；候选缺失（老宿主）时**整个下拉不出现**，绝不给一个做不到的选择。
+- **它只收窄查询**：采集、历史补报、上报都**不受影响**（筛选是**视图状态** —— 和「周期 / 明细分组」同类，不写进 `plugin-connection.json`，重启后回到「全部来源」）。筛过的这一轮不会改变下一轮「全部来源」看到的东西。
+- **明细 / 趋势 / 项目 / 会话数 / 金额都跟着筛**，库与直扫两条取数路径**逐位一致**（库不可用时降级直扫，筛选不会静默失效）。
+- **写错来源名会明确报错**，绝不静默当成「没给」：`sources: ['Codex']`（大小写打错）在「取交集」的写法下交集为空，而空交集在 `openStats` 那边**等于不过滤** —— 于是它会安静地返回**全部来源**的数（数字变大、不报错）。所以未注册的 id 从参数层到查询层一路抛错，并列出本机已注册的清单。
+
+等价入口（同一语义，同一实现）：
+
+| 入口 | 写法 |
+|---|---|
+| 面板 | 工具栏「来源筛选」下拉（单选；「全部来源」= 不带参数） |
+| `token_usage` 工具 | `source` 参数，逗号分隔：`dsh` / `codex` / `claude-code` / `trae` / `trae-cn` / `workbuddy`；`all` 或缺省 = 全部来源 |
+| CLI | `ai-token-report --source codex --source dsh`（可重复，也可 `--source codex,dsh`；`all` = 全部；未注册的 id 当场报错） |
+| `ctx.tokenReport` 服务 | `queryUsage({ sources: ['codex'] })` —— `[]` 或全量 = 全部来源 |
 
 ### 调整面板位置
 
@@ -278,7 +323,7 @@ Trae（国际版 `trae` / 国内版 `trae-cn`，两个发行版算两个来源�
 
 ### 开启团队上报
 
-在详情面板右上角点击齿轮「配置」，**五个字段**：
+在详情面板右上角点击齿轮「配置」，**六个字段**：
 
 | 字段 | 说明 |
 |---|---|
@@ -287,6 +332,7 @@ Trae（国际版 `trae` / 国内版 `trae-cn`，两个发行版算两个来源�
 | 上报间隔 | 5 秒 / 10 秒（默认）/ 30 秒 / 1 分钟 / 5 分钟。这个数字直接决定部门服务端的请求密度，所以只给档位 |
 | 面板位置 | 见上一节；保存后**就地**换地方 |
 | 会话日志根 | 每行一个 DSH home；**留空 = 自动发现**。见上方「多套 DSH 并存」 |
+| 项目名称别名（「自定义配置」） | 每行一条 `项目名 = 路径或仓库名`；只改**本机**看到的名字，不影响上报数据与部门看板。见下方「自定义配置」 |
 
 点击「验证并保存」后，插件用这个 appKey 向对应服务端的 `/api/v1/identity/verify` 校验身份，
 **姓名与分组以服务端返回值为准**（面板不再询问姓名 —— 它由 appKey 在服务端绑定的人决定）。
@@ -380,7 +426,8 @@ DSH 升级会保留旧格式日志作为备份；同一会话存在多个规范�
 
 | 版本 | 使用者能感知的变动 |
 |---|---|
-| **0.9.0** | ★ **不再与官方 OTel 后端互斥**：插件不再注册 `sessionTelemetry` 服务（改订阅宿主会话事件流），装了它不必再停用 `session-telemetry-otel`；`cordis.patch.yml` 里那两行可以删掉。包名与发布名统一为 `dsh-plugin-token-report`（旧仓内名 `@ai-token-report/dsh-plugin` 仍会被修复工具清理）。peer 去掉 `@deepseek-ai/dsh-session-telemetry` |
+| **1.0.0** | ★ **新增「来源筛选」**：面板工具栏（「自定义」右边）多一个下拉，默认**「全部来源」**（请求与以前**逐字节相同**），选中一个客户端之后整块面板只算它；`token_usage` 工具多了 `source` 参数、`ctx.tokenReport` 的查询多了 `sources`（同一语义，见「按来源筛选」）。未注册 / 写错的来源名**当场报错并列出本机已注册清单**，绝不静默变回「全部来源」。★ 同时修掉一个**只在库不可用时才出现**的老问题：**直扫降级路径忽略了来源筛选**（筛了一个来源却拿到全部来源的数字，且不报错）。另外补上**桌面端界面安装**（侧栏「插件」→「添加插件」） |
+| 0.9.0 | ★ **不再与官方 OTel 后端互斥**：插件不再注册 `sessionTelemetry` 服务（改订阅宿主会话事件流），装了它不必再停用 `session-telemetry-otel`；`cordis.patch.yml` 里那两行可以删掉。包名与发布名统一为 `dsh-plugin-token-report`（旧仓内名 `@ai-token-report/dsh-plugin` 仍会被修复工具清理）。peer 去掉 `@deepseek-ai/dsh-session-telemetry` |
 | 0.8.0 | ★ **统计与上报范围都改成「本机全部已注册来源」**（Codex / Claude Code / Trae / WorkBuddy 缺省就一起算、也一起报）；面板里可改「会话日志根」（保存即生效）；README 补齐 DSH Desktop 的安装步骤。旧的 `extraSources` 配置项**已废弃**（写了会在启动日志里告警） |
 | 0.7.0 | `peerDependencies` 从精确 `0.1.7-rc.2` 放宽成兼容窗口 `>=0.1.7-rc.2 <0.3.0-0` —— 宿主小版本升级不必再等插件跟进 |
 | 0.6.0 | ★ **数据目录搬到 `~/.ai-token-report`**（升级要手动搬一次家，见下一节）；面板里可改面板位置；**保存即生效**，不必重启；面板开始展示费用（估算） |
@@ -450,7 +497,7 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
 | 启动报 `service "sessionTelemetry" has been registered at <…>` | 只可能出自 **0.8.x 及更早**的版本（它要独占那个服务名，与官方 OTel 互斥） | 升级到 0.9.0+ 即可共存；暂时不能升级时，在 profile 的 `cordis.patch.yml` 里写 `- id: session-telemetry-otel` + `disabled: true` |
 | 面板不见了，且一条也不上报（启动日志只有 `skipping profile bundle …`） | 宿主版本落在**兼容窗口**之外 —— 见上方「环境要求」。这一行不是报错，是整个 bundle 被跳过了 |
 | 没有用量入口 | 确认安装在 `web` profile、bundle 数组包含发布包名，并已重启；`features.ui` 不能关闭 |
-| 桌面端（DSH Desktop）装不上 / 界面里搜不到 | 桌面端的社区市场只收 awesome-dsh-plugin 精选列表内的来源，本插件不在其中 —— 按上方「在 DSH Desktop（桌面端）上安装」走命令行 |
+| 桌面端（DSH Desktop）装不上 | 界面里「插件」→「添加插件」→ 填 `dsh-plugin-token-report`（**包名必须是发布名**、且包要带组合包 patch）；装完点「立即启用」再重启。排障与 headless 走「在 DSH Desktop（桌面端）上安装」里的命令行步骤 |
 | 401 / 未通过宿主鉴权 | 使用本次 DSH 启动时打印的完整地址重新打开 |
 | 首次统计较慢 | 等待首次索引完成；如显示降级，检查 SQLite 权限与宿主 Node 版本 |
 | 团队看板没有数据 | 先看配置页「上报调试」页签：它会直接说「未上报及原因」并列出最近请求与回执；再用 `token_usage_diagnostics` 看补报进度 |
@@ -696,6 +743,7 @@ node "$env:USERPROFILE/.dsh/profiles/web/node_modules/dsh-plugin-token-report/re
                                           （通常是好几个根：`~/.dsh`、Desktop 的 harness……按并集统计）
 <dataDir>/identity.json                  ← 署名（token 就是 appKey）
 <dataDir>/plugin-connection.json         ← 面板里填的服务端地址 / appKey / 间隔 / 位置 / 会话日志根
+<dataDir>/project-aliases.txt            ← 项目名称别名（每行一条；面板 / 本地页 / CLI / token_usage 共用）
 <dataDir>/usage.sqlite                   ← 本地增量库（日志的派生物，可删可重建）
 <dataDir>/portal.sqlite                  ← 上报库（只有在这台机器跑部门服务端时才存在；**唯一副本，绝不删**）
 <dataDir>/state.json                     ← CLI 上报水位与 pending
@@ -1075,9 +1123,10 @@ DSH 的 web 服务器**不做任何鉴权**（`dsh-host-webserver` 的文档明�
 点击明细行展开四项 token 与会话数；明细每页展示 10 行，超过一页时显示翻页与总条数，切换分组或时间范围回到第一页。明细保留全部数据，短周期趋势保留最多 31 点，今年和自定义范围保留完整序列。
 切换时间时保留已有内容与范围标签，结果返回后整体更新；图表复用实例，弹框保持稳定高度。底部不再展示数据来源、耗时与读取时间，仅在查询失败或降级时提示原因。
 
-「配置」页有**五个字段**：服务端地址、appKey（管理员在平台「appKey 管理」页按人发放并复制）、
+「配置」页有**六个字段**：服务端地址、appKey（管理员在平台「appKey 管理」页按人发放并复制）、
 **上报间隔**（5 秒～5 分钟档位）、**面板位置**（输入框上方 / 标题栏右上角 / 两处都要）、
-**会话日志根**（每行一个 DSH home，见下）。
+**会话日志根**（每行一个 DSH home，见下），以及「自定义配置」里的
+**项目名称别名**（每行一条 `项目名 = 路径或仓库名`，见下）。
 保存时若填了 appKey，先向 `<服务端地址>/api/v1/identity/verify` 校验，姓名与分组只认服务端返回值；
 **appKey 留空且地址没变 = 只更新间隔 / 位置 / 会话日志根**（不重校验、不重写身份文件）——
 那串密钥往往已经不在用户手边，只改偏好不该逼他再粘一次。
@@ -1104,6 +1153,42 @@ DSH 的 web 服务器**不做任何鉴权**（`dsh-host-webserver` 的文档明�
 - ⚠️ 它改的是**日志来源**，不是**身份与库的位置**。面板刻意**没有** `dataDir`：
   那个字段会连身份文件、本地库、outbox 与补报水位一起换掉 ——
   「填完就变成另一个人」不该发生在一个设置页上（要分开身份请在部署配置 / 环境变量里给）。
+
+#### 「自定义配置」→ 项目名称别名
+
+同一个仓库常常有多个工作目录（仓库根、各子目录、不同盘符），
+`project` 维度默认取 **cwd 的最后一段**，于是 `my-project` 会被拆成 `my-project` / `core` / … 好几行。
+这一栏把它们折成你认得的一个名字：
+
+```text
+# 显示名 = 一个或多个匹配值（逗号分隔）
+presales-kb-parent = D:\Coding\presales-kb-parent, presales-kb-parent
+ai-token-report    = ai-token-report
+```
+
+- **等号左边是显示名，右边是匹配值**；一条规则可以写多个匹配值（逗号或全角逗号分隔）。
+  面板在那栏下面逐条列出**此刻真正生效**的规则（`显示名 ⇐ 匹配值（模式）`）——
+  等号写反了一眼就能看出来。
+- 匹配值有**两种模式**（按「含不含路径分隔符」自动判定，面板上标成「路径前缀」/「仓库名」）：
+  **路径前缀**（含 `\` 或 `/`）只在该位置生效，按分隔符边界匹配，最长者优先；
+  **仓库名**（不含分隔符）匹配 cwd 的**任一路径段逐字全等**，一条覆盖该仓库在任意磁盘 / 父目录下的所有子目录。
+  两类都有时**路径模式优先**；都没有命中就回落成 cwd 最后一段。段是**全等不是前缀**
+  （`skills-cli` 不吃 `skills-cli-old`），且**逐字区分大小写**。
+- **只改显示**：面板、`token_usage` 工具、本地页面与 CLI 看到的名字会变，
+  **上报数据里的 `cwd` 一个字节都不改**，部门看板的项目归一化规则（平台「项目归一化」页，
+  见 [线上项目归一化规则](../../.agents/skills/online-project-rules/SKILL.md)）是**另一套口径**，不受这里影响。
+- 规则落在**数据目录**下的 `project-aliases.txt`（缺省 `~/.ai-token-report/project-aliases.txt`），
+  **不写进 `plugin-connection.json`** —— 面板保存别名时绝不重写你那串连接配置。
+  这份文件是**四种离线形态共用**的（插件面板 / `token_usage` / 本地页面 / CLI），
+  所以同一台机器上不可能出现「面板折了、命令行没折」。
+- ★ **保存即生效**，不必重启：下一次取数就用新名字（历史数据也一起改名，因为这是**查询期**口径）。
+- **一行写坏 = 整份不生效**（不是跳过那一行），面板会写清第几行、为什么，
+  并如实说明「项目名仍按 cwd 最后一段显示」；CLI 也会在 stderr 上告警
+  （`--quiet` 也不闭嘴）。「整份拒绝」是刻意的：半份生效会让使用者
+  以为「只有坏掉的那条没生效」，而其它项目的名字已经被悄悄改掉了。
+  文本域**清空 = 没有别名**（删掉那份文件），回到默认口径。
+- 上限：200 条规则 / 64 KB 文本。坏行、重复匹配值、裸盘符（`D:`）与根目录（`/`）
+  一律拒绝 —— 一条 `D:` 会吃掉整个盘的项目名。
 
 **★ 保存后立即生效，不需要重启 DSH。** 宿主半的 `ReportRuntime` 会重新读一遍
 「已保存的连接 + 身份文件」并按需**换掉投递单元**（`runtime.ts`）：
@@ -1278,11 +1363,11 @@ bun run --filter 'dsh-plugin-token-report' build
 
 | 脚本 | 层次 | 断言数 | 验证什么 |
 |---|---|---|---|
-| `bun test packages/dsh-plugin` | 单元 | 446 | 折叠口径 / 配置优先级 / **面板位置与热切换** / outbox 崩溃不丢 / 热路径只入队 / **就地换连接（runtime）** / **上报实录的字节上限与截断** / **配置与调试路由与页面文案** / **会话日志根的落盘、清空与生效来源** / **界面：格式、取数状态机、挂载点、离屏渲染** / **捕获侧：宿主事件 → 账本记录、正文不外发、拿不到时间戳整条丢弃** |
-| `verify/verify-plugin.ts` | 端到端冒烟 | 79 | **真 HTTP 往返** + 真扫日志 + 崩溃恢复（假 ctx）+ **面板改会话日志根后同一进程就地生效** + **捕获侧不注册 `sessionTelemetry`**（与官方 OTel 共存的正面证据） |
+| `bun test packages/dsh-plugin` | 单元 | 472 | 折叠口径 / 配置优先级 / **面板位置与热切换** / outbox 崩溃不丢 / 热路径只入队 / **就地换连接（runtime）** / **上报实录的字节上限与截断** / **配置与调试路由与页面文案** / **会话日志根的落盘、清空与生效来源** / **项目名称别名的解析、整份拒绝与过线程** / **界面：格式、取数状态机、挂载点、离屏渲染** / **捕获侧：宿主事件 → 账本记录、正文不外发、拿不到时间戳整条丢弃** |
+| `verify/verify-plugin.ts` | 端到端冒烟 | 90 | **真 HTTP 往返** + 真扫日志 + 崩溃恢复（假 ctx）+ **面板改会话日志根后同一进程就地生效** + **项目名称别名保存后 `token_usage` 立刻改口、坏行整份拒绝** + **捕获侧不注册 `sessionTelemetry`**（与官方 OTel 共存的正面证据） |
 | `verify/verify-cordis-load.ts` | 真实框架装载 | 11 | 打包产物挂进**真 cordis Context**：**先让官方后端占住 `sessionTelemetry` 服务名**，断言照样装载、没把它顶掉、真事件总线上的计费事件被捕获并投递、卸载后监听器解除；含 `inject` 形状 |
 | `verify/verify-resolution.ts` | **宿主语义** | 7 | 用 **Node**（不是 Bun）解析并加载打包产物，逐个 peer 断言可解析 |
-| `verify/verify-client-bundle.ts` | **浏览器半产物** | 40 | 真跑 `lib/client.js`：信封形状 / **平台模块纯度** / 双半路由一致（含配置与调试两条新路由） / **会话日志根那一栏真的在产物里** / **三种位置各注册哪些 slot** / slot 注册 |
+| `verify/verify-client-bundle.ts` | **浏览器半产物** | 44 | 真跑 `lib/client.js`：信封形状 / **平台模块纯度** / 双半路由一致（含配置与调试两条新路由） / **会话日志根那一栏真的在产物里** / **「自定义配置」里的项目名称别名那一栏真的在产物里** / **三种位置各注册哪些 slot** / slot 注册 |
 | `verify/diagnose-boot.ts` | 排障工具 | — | profile 里哪个包 import 就炸，展开完整 cause 链 |
 | `verify/verify-profile-boot.ts <tgz>` | **发布产物** | — | 从 `bun pm pack` 出来的 tarball 装进临时 profile，**起完整 DSH Web 并打 HTTP**（不是「import 成功就算过」） |
 | `verify/verify-startup.ts` | 真宿主冷启动 | — | 真 `dsh web` + 面板三条查询的绝对条数（已关掉非 DSH 来源，见脚本内注释） |
@@ -1394,17 +1479,17 @@ bun run packages/dsh-plugin/verify/repro-boot-failure.ts    # 复现激活失败
 | `src/reporter.ts` | 内存队列 → 批量 → HTTP（热路径只入队）+ 上报间隔热更新 + 请求预览 |
 | `src/report-log.ts` | 上报实录（环形缓冲：请求体原文 + 回执，三层字节上限，UTF-8 边界截断） |
 | `src/runtime.ts` | ★ 运行时：状态判定（`evaluateStatus`）、就地换连接（换投递单元而不是换后端）、调试数据出口 |
-| `src/settings.ts` | 配置页的宿主半：GET/POST `/api/tokenReport.settings`（五个字段、校验、偏好更新、就地生效、生效日志根与来源） |
+| `src/settings.ts` | 配置页的宿主半：GET/POST `/api/tokenReport.settings`（六个字段、校验、偏好更新、就地生效、生效日志根与来源、项目名称别名的整份校验与 `project-aliases.txt` 落盘） |
 | `src/reports.ts` | 调试页的宿主半：GET/POST `/api/tokenReport.reports`（状态 + 计数 + 实录 + 立即上报 / 不发送预览） |
 | `src/stats.ts` | 统计查询与渲染（**不实现任何公式**） |
 | `src/stats-worker-client.ts` / `src/stats-worker.ts` | 有界线程调度、日志变化合并及周期性完整对账 |
 | `src/identity.ts` | 身份解析（复用 core 的存储，与本地页共用同一份文件） |
 | `src/ui-bridge.ts` | 宿主侧 UI 数据通道：`/api/tokenReport.stats` + `/api/tokenReport.config`（**每次现读**面板位置）+ TTL 缓存（**按取数范围指纹**，改日志根不残留旧范围）+ 并发合并 |
-| `src/client/protocol.ts` | ★ **双半唯一契约**：载荷类型、周期、**面板位置枚举与配置解析**、间隔档位、**会话日志根三件套**、响应解析（零依赖，两边都能 import） |
+| `src/client/protocol.ts` | ★ **双半唯一契约**：载荷类型、周期、**面板位置枚举与配置解析**、间隔档位、**会话日志根三件套**、**项目名称别名三件套（原文 / 生效规则 / 坏行说明）**、响应解析（零依赖，两边都能 import） |
 | `src/client/store.ts` | 浏览器侧取数状态机（`fetch`/时钟可注入，因此可单测） |
 | `src/client/format.ts` | 纯展示格式（不是口径公式，见文件头注释） |
 | `src/client/components.tsx` | 两个挂载点的 React 组件 |
-| `src/client/settings.tsx` | 配置页：五个字段 + 「连接配置 / 上报调试」两个页签（会话日志根是文本域，另有一行「当前生效的根」） |
+| `src/client/settings.tsx` | 配置页：六个字段 + 「连接配置 / 上报调试」两个页签（会话日志根是文本域，另有一行「当前生效的根」；「自定义配置」里的项目名称别名也是文本域，另有一行「此刻生效的规则」） |
 | `src/client/report-debug.tsx` | 上报调试页：状态、计数、最近请求体与回执、补报进度、立即上报 / 预览 |
 | `src/client/position.ts` | 面板落点的进程内信号总线（保存后**就地**重挂挂载点） |
 | `src/client/styles.ts` | `<style>` 注入（全部用 `--dsw-alias-*` 主题变量） |

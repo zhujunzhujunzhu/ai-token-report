@@ -104,6 +104,14 @@ export interface UsageStoreDeps {
 export interface UsageState {
   period: UiPeriod
   dateRange?: UiDateRange
+  /**
+   * ★ **来源筛选**（空数组 = 全部来源）。
+   *
+   * 与 `period` / `detail` 同级的**视图状态**：它只改变「这次查哪些来源」，
+   * 不写任何配置文件、不影响采集与上报 —— 重开面板回到「全部来源」。
+   * 宿主侧的收窄语义见 `ui-bridge.ts` 的 `?source=` 与 `stats.ts` 的 `UsageQuery.sources`。
+   */
+  sources: string[]
   /** 有详情订阅者时才查询趋势与当前维度的一页。 */
   detail?: { by: UiGroupBy; page: number }
   /** 首次加载（`data` 还没有值时）。 */
@@ -126,6 +134,13 @@ export interface UsageStore {
   /** 切换周期并立即取数。 */
   setPeriod(period: UiPeriod): void
   setCustomRange(range: UiDateRange): void
+  /**
+   * ★ 切换**来源筛选**（空数组 = 全部来源）并立即取数。
+   *
+   * 非法值（空串 / 重复项）在这里就地清掉：宿主只认「已注册来源的子集」，
+   * 把脏值送过去只会换来一条错误载荷。
+   */
+  setSources(sources: string[]): void
   /** 手动刷新（绕过宿主缓存）。 */
   refresh(): void
   /** 详情按打开的面板计数；同页多个入口共享一次取数。 */
@@ -169,7 +184,7 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
   const fullIntervalMs = deps.fullIntervalMs ?? DEFAULT_FULL_INTERVAL_MS
   const visibility = deps.visibility ?? browserVisibility()
 
-  let state: UsageState = { period: UI_DEFAULT_PERIOD, loading: true, refreshing: false }
+  let state: UsageState = { period: UI_DEFAULT_PERIOD, sources: [], loading: true, refreshing: false }
   const listeners = new Set<() => void>()
 
   let disposers = 0
@@ -184,6 +199,8 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
   let detailBy: UiGroupBy = 'provider-model'
   let detailPage = 1
   let snapshotKey: string | undefined
+  /** 上一次取数用的来源筛选（用来判断「换了筛选 = 换了视图」）。 */
+  let lastSourcesKey = ''
   const snapshots = new Map<string, { data: UiPayload; at: number; bytes: number }>()
   let snapshotBytes = 0
   let snapshotDay = ''
@@ -243,8 +260,14 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
     }, deps.requestTimeoutMs ?? 125_000)
 
     try {
+      // 来源筛选变了（或第一次取数）就当换了一个视图：明细回到第一页。
+      // 否则「筛到一个来源之后仍停在第 3 页」会先显示一页空表，再被宿主钳回末页。
+      const sourcesNow = state.sources.join(',')
       if (mode === 'full' && (period !== state.period || dateRange?.since !== state.dateRange?.since
-        || dateRange?.until !== state.dateRange?.until)) detailPage = 1
+        || dateRange?.until !== state.dateRange?.until || sourcesNow !== lastSourcesKey)) {
+        detailPage = 1
+        lastSourcesKey = sourcesNow
+      }
       const detail = detailSubscribers > 0 ? { by: detailBy, page: detailPage } : undefined
 
       const query = new URLSearchParams({ period })
@@ -254,6 +277,10 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
         query.set('page', String(detail.page))
         query.set('pageSize', String(UI_PAGE_SIZE))
       }
+      // ★ 来源筛选：一个参数一个来源（宿主也接受逗号分隔）。
+      //   全部来源时**一个参数都不发** —— 于是「默认状态」的请求与这个筛选
+      //   存在之前**逐字节相同**，老宿主也照常服务。
+      for (const source of state.sources) query.append('source', source)
       if (force) query.set('refresh', '1')
       if (period === 'custom' && dateRange) {
         query.set('since', dateRange.since)
@@ -465,6 +492,15 @@ export function createUsageStore(deps: UsageStoreDeps): UsageStore {
     setCustomRange(range) {
       if (!validDateRange(range)) return
       void load('custom', false, { ...range }, 'full', true)
+    },
+
+    setSources(sources) {
+      // 去重 + 丢掉空串：宿主只认「已注册来源的子集」，脏值会换来一条错误载荷。
+      const next = [...new Set(sources.map((id) => id.trim()).filter((id) => id !== ''))]
+      if (next.join(',') === state.sources.join(',')) return
+      // 先落状态再取数：`load()` 是照着 `state.sources` 拼查询参数的。
+      patch({ sources: next })
+      void load(state.period, false, state.dateRange, 'full', true)
     },
 
     refresh() {

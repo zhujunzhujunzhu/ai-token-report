@@ -164,6 +164,16 @@ check('★ 浏览器半产物里有「会话日志根」这一栏（改完 setti
 check('★ 浏览器半产物里有「当前生效」那一行（我存的 vs 真正在读的）', code.includes('当前生效'))
 check('宿主半导出了会话日志根的解析入口（面板保存要走它）', typeof host.parseDshHomes === 'function')
 
+// ★ 「自定义配置 → 项目名称别名」同理：源码在 `client/settings.tsx`，会不会出现在面板上
+//   完全取决于有没有重新 build。这里只验「那一栏真的进了产物」——**内容怎么解析由宿主半负责**
+//   （浏览器半一个 workspace 包都进不去，所以它连规则都不解析，只把文本原样传回宿主）。
+check('★ 浏览器半产物里有「自定义配置」这一节（别名那一栏的归属）', code.includes('自定义配置'))
+check('★ 浏览器半产物里有「项目名称别名」这一栏', code.includes('项目名称别名'))
+check('★ 浏览器半产物里有别名文本域的说明（每行一条：项目名 = 路径或仓库名）',
+  code.includes('每行一条'))
+check('★ 别名一栏写明「不改上报数据、不影响部门看板」（别名只是本机显示）',
+  code.includes('不影响部门看板') || code.includes('不改上报数据'))
+
 // ── ④ 真的执行一遍 ──────────────────────────────────────────────────────
 console.log('\n── 执行产物（假 loader + 严格 require）──')
 
@@ -386,6 +396,40 @@ check(
 )
 await mount('dock')
 check('重复装配不重复插样式（HMR 会重新执行工厂）', styles.length === 1, `实际 ${styles.length} 个`)
+
+// ── ⑥ 来源筛选（工具栏那个下拉）──────────────────────────────────────────
+//
+// 它必须**真的在产物里**：面板的下拉、`全部来源` 那一项、以及 CSS 规则。
+// 单测跑的是源码，产物少一个类名/文案时页面只是「少了一个控件」—— 不报错。
+console.log('\n── 来源筛选（浏览器半产物）──')
+check('★ 产物里有「全部来源」那一项（缺了它使用者就没有「不过滤」的入口）', code.includes('全部来源'))
+check('产物里带下拉的类名', code.includes('atr-source-filter') && code.includes('atr-select'))
+const selectRule = (styles[0]?.textContent ?? '').match(/\.atr-select\{[^}]*\}/)?.[0] ?? ''
+check(
+  '★ CSS 里有 .atr-select 规则（没有它下拉会撑成宿主默认宽、与其它按钮对不齐）',
+  selectRule.includes('min-width') && selectRule.includes('--dsw-alias-'),
+  selectRule === '' ? '（没找到 .atr-select 规则）' : selectRule,
+)
+
+/**
+ * ★ **两份来源展示名表必须逐字一致**。
+ *
+ * 看板用 `web-portal/src/types/portal.ts` 的 `SOURCE_LABELS`，浏览器半进不去
+ * workspace 包，只能在 `client/protocol.ts` 里再写一份。单边改动**不会报错**，
+ * 只会让同一个人在两个界面上看到两个名字（「Trae CN」/「Trae 国内版」）。
+ * 这里从看板那份真源里读出 id→名字，再逐个在**产物**里找。
+ */
+const portalTypes = readFileSync(join(import.meta.dir, '..', '..', 'web-portal', 'src', 'types', 'portal.ts'), 'utf8')
+const labelsBlock = /export const SOURCE_LABELS[^=]*=\s*\{([\s\S]*?)\n\}/.exec(portalTypes)?.[1] ?? ''
+const labelPairs = [...labelsBlock.matchAll(/^\s*(?:'([^']+)'|([A-Za-z][\w-]*)):\s*'([^']+)'/gm)]
+  .map((m) => ({ id: m[1] ?? m[2]!, label: m[3]! }))
+check('看板那份来源名表读到了（解析失败会让下面那条空转）', labelPairs.length >= 6, `读到 ${labelPairs.length} 条`)
+const missingLabels = labelPairs.filter((pair) => !code.includes(`'${pair.label}'`) && !code.includes(`"${pair.label}"`) && !code.includes(`>${pair.label}<`))
+check(
+  '★ 浏览器半的展示名与看板逐字一致（单边改动不会报错，只会两个页面两个名字）',
+  missingLabels.length === 0,
+  missingLabels.map((p) => `${p.id} → ${p.label}`).join(' | '),
+)
 
 console.log('\n' + '='.repeat(72))
 if (failures === 0) console.log(`✅ 全部通过：${checks} 项断言`)

@@ -148,6 +148,102 @@ describe('取数：成功路径', () => {
   })
 })
 
+/**
+ * ★ **来源筛选**（面板工具栏那个下拉）在浏览器半的接线。
+ *
+ * 三个「错了不会报错」的点：默认一个参数都不发、筛选变了要换一份快照、
+ * 明细页码要跟着回到第一页。
+ */
+describe('来源筛选：视图状态，不是配置', () => {
+  test('★ 默认「全部来源」：请求里**一个 source 参数都不发**', async () => {
+    const { impl, urls } = fakeFetch(() => ({ body: payloadBody() }))
+    const store = createUsageStore({ fetch: impl })
+    const unsubscribe = store.subscribe(() => {})
+    await settle()
+
+    expect(store.getSnapshot().sources).toEqual([])
+    expect(urls[0]).not.toContain('source=')
+    unsubscribe()
+    store.dispose()
+  })
+
+  test('选一个来源 → 取数带上 `source=`；换一个来源 → 是新的一份快照', async () => {
+    const { impl, urls } = fakeFetch(() => ({ body: payloadBody() }))
+    const store = createUsageStore({ fetch: impl })
+    const unsubscribe = store.subscribe(() => {})
+    await settle()
+
+    store.setSources(['codex'])
+    expect(store.getSnapshot().sources).toEqual(['codex'])
+    await settle()
+    expect(urls[urls.length - 1]).toContain('source=codex')
+
+    // 换一个来源：缓存键必须跟着变，否则会拿着上一份来源的快照画
+    store.setSources(['dsh'])
+    await settle()
+    expect(urls[urls.length - 1]).toContain('source=dsh')
+    expect(urls[urls.length - 1]).not.toContain('source=codex')
+
+    // 切回「全部来源」：状态立刻回退，且不带筛选的那份请求确实发出过（第一次取数）
+    store.setSources([])
+    expect(store.getSnapshot().sources).toEqual([])
+    await settle()
+    expect(urls[0]).not.toContain('source=')
+    expect(store.getSnapshot().error).toBeUndefined()
+    unsubscribe()
+    store.dispose()
+  })
+
+  test('★ 同一份来源重复设置是空操作（不重复取数、不重渲染）', async () => {
+    const { impl, urls } = fakeFetch(() => ({ body: payloadBody() }))
+    const store = createUsageStore({ fetch: impl })
+    const unsubscribe = store.subscribe(() => {})
+    await settle()
+
+    store.setSources(['codex', 'codex', ' '])
+    await settle()
+    expect(store.getSnapshot().sources).toEqual(['codex'])
+    const requests = urls.length
+    const renders = store.getSnapshot()
+
+    store.setSources(['codex'])
+    await settle()
+    expect(urls.length).toBe(requests)
+    // 快照引用都没换 ⇒ 也不会触发一次重渲染
+    expect(store.getSnapshot()).toBe(renders)
+    unsubscribe()
+    store.dispose()
+  })
+
+  test('筛选变化后明细回到第一页（否则会先画一页空表）', async () => {
+    const { impl, urls } = fakeFetch((url) => {
+      const page = Number(new URL(`http://127.0.0.1${url}`).searchParams.get('page') ?? '1')
+      return {
+        body: payloadBody({
+          view: 'detail',
+          pagination: { by: 'provider-model', page, pageSize: 10, totalRows: 100 },
+        }),
+      }
+    })
+    const store = createUsageStore({ fetch: impl })
+    const release = store.acquireDetails()
+    const unsubscribe = store.subscribe(() => {})
+    await settle()
+
+    store.setDetail('provider-model', 3)
+    await settle()
+    expect(urls[urls.length - 1]).toContain('page=3')
+
+    store.setSources(['codex'])
+    await settle()
+    expect(urls[urls.length - 1]).toContain('source=codex')
+    expect(urls[urls.length - 1]).toContain('page=1')
+    unsubscribe()
+    release()
+    store.dispose()
+  })
+})
+
 describe('★ 失败分诊：三条路各给一条能指着动作的提示', () => {
   test('404 —— 路由根本没装上（宿主不是 web profile / 没启用 UI 通道）', () => {
     const message = describeFetchFailure(404, undefined)
@@ -660,6 +756,25 @@ describe('readUiResponse：不可信输入的边界', () => {
         reasoning: 0,
         calls: 16_437,
       })
+    }
+  })
+
+  test('★ availableSources：只认非空字符串，去重且保留宿主给的顺序', () => {
+    const result = readUiResponse(payloadBody({ availableSources: ['codex', 'dsh', 'codex', '', 7, null] }))
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.payload.availableSources).toEqual(['codex', 'dsh'])
+  })
+
+  test('★ availableSources：缺字段 / 空数组 / 脏值 ⇒ 当没有（面板据此不画下拉）', () => {
+    // 「缺字段」= 老宿主 / 没有来源清单的宿主：画一个只有「全部来源」一项的下拉
+    // 等于给使用者一个做不到的选择，所以这一项必须是**缺席**而不是空数组。
+    for (const body of [payloadBody(), payloadBody({ availableSources: [] }),
+      payloadBody({ availableSources: [null, 3, ''] }), payloadBody({ availableSources: 'codex' })]) {
+      const result = readUiResponse(body)
+      expect(result.ok).toBe(true)
+      if (result.ok) {
+        expect('availableSources' in result.payload).toBe(false)
+      }
     }
   })
 })

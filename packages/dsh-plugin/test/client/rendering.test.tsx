@@ -143,6 +143,46 @@ describe('详情体', () => {
     expect(html).toContain('未命中缓存的输入 token')
   })
 
+  test('★ 来源下拉：候选来自宿主，默认「全部来源」，来源名用展示名', async () => {
+    const store = await readyStore({ ...defaultBody(), availableSources: ['dsh', 'codex', 'claude-code'] })
+    const html = renderToStaticMarkup(createElement(UsageDetail, { state: store.getSnapshot(), store }))
+    expect(html).toContain('class="atr-select atr-source-filter"')
+    expect(html).toContain('aria-label="来源筛选"')
+    expect(html).toContain('全部来源')
+    expect(html).toContain('>Codex<')
+    expect(html).toContain('>Claude Code<')
+  })
+
+  test('★ 没有候选（老宿主）时**整个下拉不出现**，也不显示「全部来源」', async () => {
+    const store = await readyStore()
+    const html = renderToStaticMarkup(createElement(UsageDetail, { state: store.getSnapshot(), store }))
+    expect(html).not.toContain('atr-source-filter')
+    expect(html).not.toContain('全部来源')
+  })
+
+  test('★ 选中一个来源时那一项就是选中项（不会静默显示成「全部来源」）', async () => {
+    const store = await readyStore({ ...defaultBody(), availableSources: ['dsh', 'codex'] })
+    const state = store.getSnapshot()
+    const html = renderToStaticMarkup(createElement(UsageDetail, {
+      state: { ...state, sources: ['codex'] },
+      store,
+    }))
+    expect(html).toContain('<option value="codex" selected="">Codex</option>')
+    // 「全部来源」那一项不是选中项（否则界面写着全部来源、查询其实还筛着）
+    expect(html).toContain('<option value="">全部来源</option>')
+    expect(html).not.toContain('<option value="" selected="">全部来源</option>')
+  })
+
+  test('★ 选中项已经不在候选里（宿主这一轮没报它）→ 如实标出来，不假装是全部来源', async () => {
+    const store = await readyStore({ ...defaultBody(), availableSources: ['dsh'] })
+    const state = store.getSnapshot()
+    const html = renderToStaticMarkup(createElement(UsageDetail, {
+      state: { ...state, sources: ['codex'] },
+      store,
+    }))
+    expect(html).toContain('Codex（已不可用）')
+  })
+
   test('提供趋势画布和精确值入口，折叠时不构造数据表', async () => {
     const store = await readyStore()
     const html = renderToStaticMarkup(createElement(UsageDetail, { state: store.getSnapshot(), store }))
@@ -177,7 +217,7 @@ describe('详情体', () => {
     const store = createUsageStore({ fetch: async () => ({ ok: true, status: 200, json: async () => ({}) }) })
     const html = renderToStaticMarkup(
       createElement(UsageDetail, {
-        state: { period: UI_DEFAULT_PERIOD, loading: true, refreshing: false },
+        state: { period: UI_DEFAULT_PERIOD, sources: [], loading: true, refreshing: false },
         store,
       }),
     )

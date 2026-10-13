@@ -1,6 +1,7 @@
 /**
- * 插件设置页 —— **五件事：服务端地址、appKey、上报间隔、面板位置、会话日志根**，
- * 外加一个「上报调试」页签（看刚刚发出去了什么，见 `report-debug.tsx`）。
+ * 插件设置页 —— **六件事：服务端地址、appKey、上报间隔、面板位置、会话日志根、
+ * 项目名称别名**（最后一项归在「自定义配置」区），外加一个「上报调试」页签
+ * （看刚刚发出去了什么，见 `report-debug.tsx`）。
  *
  * ## 为什么是这几个字段（外加一个调试页）
  *
@@ -13,52 +14,33 @@
  * | 上报地址 `/api/v1/token-usage` | `baseUrl` + 固定路径 |
  * | 校验地址 `/api/v1/identity/verify` | 同上 |
  * | 上报间隔 / 面板位置 / 会话日志根 | 纯本机偏好（与凭证无关） |
+ * | 项目名称别名 | 纯本机**显示口径**（`<数据目录>/project-aliases.txt`） |
  *
- * 旧版面板让用户分别填「姓名 / 身份 Key / 完整上报地址 / appKey」——
- * 四栏里有两栏是同一个意思（身份 Key 与 appKey 都只是凭证），
- * 还有一栏要求用户自己拼出完整接口路径。实测用户会把 API base URL 填进
- * 「姓名」，而真正该填的 appKey 栏空着。
+ * ## 「自定义配置」区：项目名称别名
  *
- * ## 会话日志根为什么值得占一栏
+ * 面板上的「项目」维度取的是会话的 `cwd` 最后一段（`core/src/aggregate.ts` 的
+ * `projectName()`）—— 同一个仓库从根目录与子目录分别开会得到两个名字
+ * （`my-project` 与 `core`），看起来像两个项目。
  *
- * 面板上的数字来自**本机会话日志**，缺省自动发现本机全部 DSH home，但有两种
- * 情况自动发现帮不上忙：① 某个客户端的目录名字不像 DSH（发现规则只提示、
- * 绝不自动采用），需要手填；② 想**只看其中几处**。
- *
- * ★ 因此这一栏必须把「我填的」与「现在真的在读的」**分开显示**：
- *   输入框回填的是保存过的那一份，下面那行是宿主**此刻实际生效**的根
- *   （含 `exists: false` 的逐项提示）。合成一个显示，用户就分不清
- *   「保存成功了」与「保存的东西真的起作用了」。
- *
- * ⚠️ 面板刻意**没有**「数据目录」（`dataDir`）：那个字段会连身份文件、本地库、
- *   outbox 与补报水位一起换掉，在面板里改等于「填完就变成另一个人」。
- *
- * ## ★ 保存后立刻生效
- *
- * 保存成功后宿主会**就地**换连接（不必重启 DSH），并把 `reporting`
- * （上报中 / 未上报及原因）回给页面。所以这里如实显示：
- * 「已保存并开始上报 → 地址」。位置由 `position.ts` 的总线就地切换，
- * 会话日志根由宿主的统计上下文就地改用新根（下一次取数即生效）。
- *
- * ## 凭证只提交、不回显
- *
- * GET 只回「填没填」（`hasAppKey`），appKey 绝不发回浏览器；
- * 保存成功后立刻清空输入框。浏览器存储（localStorage / cookie）里也不留一份。
- *
- * ## 「只改偏好」不必重新校验 appKey
- *
- * 已经配好的人改间隔/位置/日志根时不该被要求再粘一次密钥（那串东西往往
- * 已经不在手边）。**连一次都没配过凭证的人也能只保存偏好** ——
- * 那三项都是纯本机读/上报偏好，与「能不能上报」无关。
+ * ★ 这一栏把 `显示名 = 匹配值, 匹配值` 写成规则，**只改显示**：
+ *   ① `cwd` 原值与上报数据一个字节都不动（部门看板的项目口径由服务端的
+ *      「项目归一化」规则决定，与本栏无关，面板文案必须说清这一点）；
+ *   ② 同一份文件被**四种离线形态**共用（插件面板 / `token_usage` 工具 /
+ *      本地页 / CLI），所以四处的项目名不可能各说各话；
+ *   ③ 「输入框里的草稿」与「此刻真的生效的规则」分开显示：只给输入框，
+ *      用户分不清「保存成功了」与「保存的东西真的起作用了」（与会话日志根同一个道理）。
  */
+
 import { createElement as h, useEffect, useState, type ReactNode, type FormEvent } from 'react'
 import {
   UI_DEFAULT_FLUSH_INTERVAL_MILLIS,
   UI_FLUSH_INTERVALS,
   UI_SETTINGS_PATH,
+  readUiProjectAliasesView,
   readUiRootsView,
   readUiSettings,
   type UiPosition,
+  type UiProjectAliasesView,
   type UiReportingStatus,
   type UiRootsSource,
   type UiSettingsPayload,
@@ -80,6 +62,15 @@ const ROOTS_SOURCE_LABELS: Record<UiRootsSource, string> = {
   env: '环境变量指定的',
   auto: '自动发现',
 }
+
+/** 别名规则的两种匹配模式的可读说法（与宿主 `isProjectPathRule()` 的判定同源）。 */
+const ALIAS_MODE_LABELS: Record<'path' | 'repo', string> = {
+  path: '路径前缀',
+  repo: '仓库名',
+}
+
+/** 「此刻生效的规则」最多逐条列出几条（再多就换成一行计数）。 */
+const ALIAS_LINES_MAX = 12
 
 /** 间隔的可读说法（后端值 → 文案）。 */
 export function intervalLabel(millis: number): string {
@@ -116,6 +107,23 @@ export function rootsSummary(roots: { path: string; exists: boolean }[], source:
     : `${head}；其中 ${missing} 个根下没有 sessions 目录，那些位置现在读不到日志。`
 }
 
+/**
+ * 「此刻真的生效的别名规则」那一行。
+ *
+ * ★ 三种状态必须能分开（与会话日志根的 `rootsSummary` 同一个道理）：
+ * - `note` 非空（宿主说整份不生效）→ **原样转述原因**，绝不改写成「没有别名」：
+ *   使用者会以为「我没配过」，而真实情况是「配了但一行写错了」；
+ * - 一条规则都没有且没有 note → 没配过，如实说明「项目名 = cwd 最后一段」；
+ * - 有规则 → 逐条列出（`显示名 ⇐ 匹配值`），让人一眼核对「我写的被认了没有」。
+ */
+export function aliasesSummary(view: UiProjectAliasesView): string {
+  const note = view.projectAliasesNote
+  if (note !== undefined && note !== '') return note
+  const rules = view.effectiveProjectAliases
+  if (rules.length === 0) return '还没有别名规则：项目名就是会话目录名的最后一段（例如 my-project）。'
+  return `当前生效 ${rules.length} 条别名规则：`
+}
+
 type Tab = 'connection' | 'debug'
 
 export function SettingsPanel(props: { onClose(): void }): ReactNode {
@@ -132,6 +140,15 @@ export function SettingsPanel(props: { onClose(): void }): ReactNode {
    *   而下方「当前生效」那一行必须始终反映**宿主此刻的事实**。
    */
   const [dshHomesText, setDshHomesText] = useState('')
+  /**
+   * 「自定义配置 → 项目名称别名」的输入框（多行文本，逐字写盘）。
+   *
+   * ⚠️ 与 `loaded.projectAliases` 分开存，理由同 `dshHomesText`：输入框里的是
+   *   草稿，下面那行「当前生效」必须始终反映**宿主此刻的事实**。
+   *   🚨 也**不做** trim / 重排：磁盘上那份原文要能被逐字节回填，
+   *      否则用户改一处、保存后会看到自己没写过的空白变化。
+   */
+  const [projectAliasesText, setProjectAliasesText] = useState('')
   const [message, setMessage] = useState('')
   const [busy, setBusy] = useState(false)
   const [tab, setTab] = useState<Tab>('connection')
@@ -149,6 +166,7 @@ export function SettingsPanel(props: { onClose(): void }): ReactNode {
       setInterval(body.flushIntervalMillis > 0 ? body.flushIntervalMillis : UI_DEFAULT_FLUSH_INTERVAL_MILLIS)
       setPosition(body.position)
       setDshHomesText(body.dshHomes.join('\n'))
+      setProjectAliasesText(body.projectAliases)
       setLive(body.reporting)
     }).catch((err: Error) => { if (!controller.signal.aborted) setRefreshError(err.message) })
     return () => controller.abort()
@@ -179,6 +197,10 @@ export function SettingsPanel(props: { onClose(): void }): ReactNode {
           flushIntervalMillis: interval,
           position,
           dshHomes: parseDshHomesText(dshHomesText),
+          // ★ 原文直接提交，**不**在这里切行 / 去空行 / trim：解析与校验是宿主
+          //   （`parseProjectAliasText()`）的唯一职责，浏览器半再解析一遍就是
+          //   第二个实现 —— 而且注释行会被它悄悄吃掉（保存后原文不再相同）。
+          projectAliases: projectAliasesText,
         }),
       })
       if (!response.ok) throw new Error(`保存失败（HTTP ${response.status}）`)
@@ -191,8 +213,13 @@ export function SettingsPanel(props: { onClose(): void }): ReactNode {
       const reporting = result['reporting'] as UiReportingStatus | undefined
       // ★ 宿主的落盘结果才是权威：它会裁掉空行与重复项（我们照它回填输入框）。
       const roots = readUiRootsView(result)
+      // ★ 别名的「权威」是磁盘上那份原文（宿主写完后回读的）。
+      //   ⚠️ 只在宿主**真的带了这个字段**时才回填：老宿主不带它，
+      //      照 `''` 回填会把用户刚写的那段草稿悄悄清掉（看起来像保存成功但内容没了）。
+      const aliases = readUiProjectAliasesView(result)
       setAppKey('')
       setDshHomesText(roots.dshHomes.join('\n'))
+      if (typeof result['projectAliases'] === 'string') setProjectAliasesText(aliases.projectAliases)
       if (reporting) setLive(reporting)
       if (nextPosition) {
         setPosition(nextPosition)
@@ -209,6 +236,7 @@ export function SettingsPanel(props: { onClose(): void }): ReactNode {
         name: name || prev.name,
         restartRequired: result['restartRequired'] === true,
         ...roots,
+        ...aliases,
       })
       setMessage(describeSaved(name, reporting, result['restartRequired'] === true))
     } catch {
@@ -260,6 +288,9 @@ export function SettingsPanel(props: { onClose(): void }): ReactNode {
   const rootsPlaceholder = roots.length > 0
     ? roots.map((root) => root.path).join('\n')
     : '例如 ~/.dsh；留空 = 自动发现本机全部 DSH home'
+  // 「此刻真的生效的别名规则」——来自宿主，**不是**输入框里的草稿
+  const aliasLine = aliasesSummary(loaded)
+  const aliasRules = loaded.effectiveProjectAliases
 
   return h('section', { className: 'atr-settings' }, head, tabs,
     h('p', { role: 'status' }, message || describeCurrent(loaded, live)),
@@ -311,6 +342,37 @@ export function SettingsPanel(props: { onClose(): void }): ReactNode {
       h('p', { className: 'atr-note' },
         'appKey 保存在本机、不回显；姓名与分组以服务端校验结果为准。保存后立即生效，无需重启 DSH：' +
         '启用后自动补报本机全部历史用量，失败会重试。只上报用量统计，不采集对话内容。'),
+      // ── ★「自定义配置」区 ────────────────────────────────────────────
+      //
+      // 与上面五项（连接 + 本机偏好）分开成一块：这里放的是**本机显示口径**，
+      // 不涉及凭证、不改上报数据、也不影响部门看板 —— 标题必须让这条边界一眼可见，
+      // 否则使用者会以为「配了别名，部门看板上的项目名也会变」。
+      h('div', { className: 'atr-section' },
+        h('span', { className: 'atr-section-title' }, '自定义配置'),
+        h('span', { className: 'atr-section-note' },
+          '这里的东西只改变本机看到的名字，不改上报数据，也不影响部门看板。'),
+        h('label', { className: 'atr-field' }, '项目名称别名（每行一条：项目名 = 路径或仓库名）',
+          h('textarea', {
+            className: 'atr-textarea', rows: 4, spellCheck: false, disabled,
+            value: projectAliasesText,
+            placeholder: 'presales-kb-parent = D:\\Coding\\presales-kb-parent\nai-token-report = ai-token-report',
+            onChange: (event: { target: { value: string } }) => setProjectAliasesText(event.target.value),
+          }),
+          h('span', { className: 'atr-note' },
+            '等号左边是显示的项目名；右边写一个或多个「匹配值」，用逗号分开。' +
+            '含路径分隔符 = 只在那个位置的路径前缀生效（按分隔符边界，不吃邻居项目）；' +
+            '不含分隔符 = 该仓库名在任意位置都折进来。' +
+            '留空 = 不折叠，项目名仍取会话目录名的最后一段；`#` 开头的行是注释。')),
+        // ★「此刻真的生效的规则」必须单独显示：只给输入框，用户分不清
+        //   「保存成功了」与「保存的东西真的起作用了」。
+        h('div', { className: 'atr-roots' },
+          h('p', { className: 'atr-note' }, `${aliasLine}（保存后才更新）`),
+          ...aliasRules.slice(0, ALIAS_LINES_MAX).map((rule) =>
+            h('p', { key: `${rule.alias}\u0001${rule.prefix}`, className: 'atr-note atr-root' },
+              `${rule.alias} ⇐ ${rule.prefix}（${ALIAS_MODE_LABELS[rule.mode]}）`)),
+          aliasRules.length > ALIAS_LINES_MAX
+            ? h('p', { className: 'atr-note' }, `… 另有 ${aliasRules.length - ALIAS_LINES_MAX} 条`)
+            : null)),
       h('button', { className: 'atr-btn atr-primary', type: 'submit', disabled: !canSave },
         busy ? '处理中…' : '验证并保存'),
       // ★ 这句必须与**这一次会不会去校验**对上：没配过凭证的人只改偏好时，
@@ -318,8 +380,8 @@ export function SettingsPanel(props: { onClose(): void }): ReactNode {
       h('p', { className: 'atr-note' },
         appKey.trim() === '' && !addressChanged
           ? hasAppKey
-            ? '留空 appKey 时只更新间隔、位置与会话日志根，不会重新校验凭证。'
-            : '还没有凭证：保存只记下间隔、位置与会话日志根（仍不上报）。要开始上报，请填上 appKey。'
+            ? '留空 appKey 时只更新间隔、位置、会话日志根与项目名称别名，不会重新校验凭证。'
+            : '还没有凭证：保存只记下间隔、位置、会话日志根与项目名称别名（仍不上报）。要开始上报，请填上 appKey。'
           : '保存会向服务端校验 appKey 并取回署名。')),
   )
 }

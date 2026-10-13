@@ -14,13 +14,19 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  aliasesSummary,
   describeCurrent,
   describeSaved,
   intervalLabel,
   parseDshHomesText,
   rootsSummary,
 } from '../../src/client/settings.js'
-import { UI_DEFAULT_FLUSH_INTERVAL_MILLIS, type UiSettingsPayload } from '../../src/client/protocol.js'
+import {
+  UI_DEFAULT_FLUSH_INTERVAL_MILLIS,
+  readUiProjectAliasesView,
+  readUiSettings,
+  type UiSettingsPayload,
+} from '../../src/client/protocol.js'
 
 /** 一份「配好了、正在跑」的读取载荷，各用例只改自己关心的字段。 */
 function loaded(overrides: Partial<UiSettingsPayload> = {}): UiSettingsPayload {
@@ -38,6 +44,8 @@ function loaded(overrides: Partial<UiSettingsPayload> = {}): UiSettingsPayload {
     dshHomes: [],
     effectiveRoots: [{ path: '/home/u/.dsh', exists: true }],
     rootsSource: 'auto',
+    projectAliases: '',
+    effectiveProjectAliases: [],
     ...overrides,
   }
 }
@@ -155,5 +163,76 @@ describe('会话日志根：输入框与「现在真的在读哪几处」', () =
 
   test('★ 宿主没给这个信息（旧宿主）→ 空串，调用方整行不显示，而不是说「0 个根」', () => {
     expect(rootsSummary([], 'auto')).toBe('')
+  })
+})
+
+/**
+ * 「自定义配置 → 项目名称别名」在面板上的两件事：
+ * ① 那一行「此刻真的生效的规则」怎么说；② 载荷解析在缺字段 / 脏值下怎么退化。
+ *
+ * ⚠️ 最要紧的一条是**别把「配了但写错」说成「没配过」** —— 前者用户要去改那行配置，
+ *   后者他会以为整个功能没生效。两者的界面表现必须不同。
+ */
+describe('项目名称别名：生效规则那一行 + 载荷解析', () => {
+  test('没配过 → 说清「项目名取 cwd 最后一段」，不出现任何告警口吻', () => {
+    const text = aliasesSummary({ projectAliases: '', effectiveProjectAliases: [] })
+    expect(text).toContain('还没有别名规则')
+    expect(text).toContain('最后一段')
+    expect(text).not.toContain('⚠')
+  })
+
+  test('★ note 非空（配了但整份不生效）→ 原样转述原因，绝不改口成「没有别名」', () => {
+    const note = '项目名称别名配置有 1 处问题，整份未生效（第 2 行：缺少 =）；项目名仍按 cwd 最后一段显示'
+    const text = aliasesSummary({ projectAliases: 'x', effectiveProjectAliases: [], projectAliasesNote: note })
+    expect(text).toBe(note)
+    expect(text).not.toContain('还没有别名规则')
+  })
+
+  test('有规则 → 说条数（逐条由调用方列出，带匹配模式）', () => {
+    const text = aliasesSummary({
+      projectAliases: 'x',
+      effectiveProjectAliases: [
+        { prefix: 'D:\\Coding\\my-project', alias: 'presales', mode: 'path' },
+        { prefix: 'my-project', alias: 'presales', mode: 'repo' },
+      ],
+    })
+    expect(text).toContain('2 条')
+  })
+
+  test('★ 解析：缺字段（旧宿主）退回「空 + 没有生效规则」，绝不抛错', () => {
+    expect(readUiProjectAliasesView(undefined)).toEqual({ projectAliases: '', effectiveProjectAliases: [] })
+    expect(readUiProjectAliasesView({})).toEqual({ projectAliases: '', effectiveProjectAliases: [] })
+    // 脏条目丢掉，好的那条留下
+    expect(readUiProjectAliasesView({
+      projectAliases: 'raw\n',
+      effectiveProjectAliases: [
+        { prefix: 'p', alias: 'a', mode: 'path' },
+        { prefix: 5, alias: 'a' },
+        { prefix: 'q' },
+        'nope',
+      ],
+    })).toEqual({
+      projectAliases: 'raw\n',
+      effectiveProjectAliases: [{ prefix: 'p', alias: 'a', mode: 'path' }],
+    })
+    // 模式只认两个已知值：不认识的一律当「仓库名」
+    expect(readUiProjectAliasesView({ effectiveProjectAliases: [{ prefix: 'p', alias: 'a', mode: 'weird' }] })
+      .effectiveProjectAliases[0]!.mode).toBe('repo')
+  })
+
+  test('★ 原文逐字保留（含注释与换行）：面板回填的必须就是磁盘上那一份', () => {
+    const raw = '# 说明\npresales = D:\\Coding\\my-project, my-project\n'
+    expect(readUiProjectAliasesView({ projectAliases: raw }).projectAliases).toBe(raw)
+  })
+
+  test('readUiSettings 把三件套带上（面板读一次就有全部信息）', () => {
+    const payload = readUiSettings({
+      projectAliases: 'p = a\n',
+      effectiveProjectAliases: [{ prefix: 'a', alias: 'p', mode: 'repo' }],
+      projectAliasesNote: '有问题',
+    })
+    expect(payload.projectAliases).toBe('p = a\n')
+    expect(payload.effectiveProjectAliases).toEqual([{ prefix: 'a', alias: 'p', mode: 'repo' }])
+    expect(payload.projectAliasesNote).toBe('有问题')
   })
 })

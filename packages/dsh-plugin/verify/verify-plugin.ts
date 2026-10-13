@@ -491,6 +491,10 @@ console.log('\n── 6. 面板改会话日志根：同一进程就地生效（�
     const file = join(logged, 'sessions', 'project', 'sess-roots', 'session.v3.jsonl.zstd')
     mkdirSync(dirname(file), { recursive: true })
     writeFileSync(file, zstdCompressSync(Buffer.from(`${JSON.stringify({
+      type: 'session', version: 3, id: 'sess-roots', createdAt: Date.now(),
+      // ★ 会话头里的 cwd 决定 `project` 维度的分组键（下面第 ⑧ 段要验项目名称别名）
+      cwd: 'D:\\Coding\\ai-token-report',
+    })}\n${JSON.stringify({
       type: 'assistant/message', seq: 1, time: Date.now(),
       data: {
         turn: 1, step: 1,
@@ -605,6 +609,101 @@ console.log('\n── 6. 面板改会话日志根：同一进程就地生效（�
     check('老面板提交的 extraSources 被忽略，而不是落盘',
       legacyPost['ok'] === true && savedFile()['extraSources'] === undefined,
       JSON.stringify(savedFile()['extraSources']))
+
+    // ⑧ 「自定义配置 → 项目名称别名」：**独立一份文件**（`project-aliases.txt`），
+    //   与连接配置分开 —— 合进 `plugin-connection.json` 会让面板保存别名时
+    //   整份重写连接配置（单位 / 位置 / 凭证一起被覆盖），而那条路是静默的。
+    //   生效也必须是**活的**：保存后同一个进程里的 `token_usage` 立刻改口。
+    const aliasFile = join(dataDir, 'project-aliases.txt')
+    check('★ 别名没有自己的 JSON 字段（它不住在连接配置里）',
+      savedFile()['projectAliases'] === undefined && !('effectiveProjectAliases' in savedFile()),
+      JSON.stringify(Object.keys(savedFile())))
+    check('没配过别名时如实回空（面板文本域为空 + 没有生效规则）',
+      before['projectAliases'] === '' && JSON.stringify(before['effectiveProjectAliases']) === '[]'
+      && before['projectAliasesNote'] === null,
+      JSON.stringify({ text: before['projectAliases'], rules: before['effectiveProjectAliases'] }))
+
+    const aliased = await save({ projectAliases: 'presales-kb-parent = D:\\Coding\\ai-token-report\n' })
+    check('别名保存成功并回报生效规则（含匹配模式）',
+      aliased['ok'] === true
+      && JSON.stringify(aliased['effectiveProjectAliases'])
+        === JSON.stringify([{ prefix: 'D:\\Coding\\ai-token-report', alias: 'presales-kb-parent', mode: 'path' }]),
+      JSON.stringify(aliased['effectiveProjectAliases'] ?? aliased['reason']))
+    check('别名原文逐字落盘（注释与空行都保留）',
+      readFileSync(aliasFile, 'utf8') === 'presales-kb-parent = D:\\Coding\\ai-token-report\n',
+      readFileSync(aliasFile, 'utf8'))
+    check('别名不改写连接配置（两份文件互不相干）',
+      savedFile()['dshHomes'] === undefined, JSON.stringify(savedFile()['dshHomes']))
+
+    const aliasedText = await tools['token_usage']!.run({ period: 'today', by: 'project' })
+    check('★ 保存后同一个进程里 `token_usage` 立刻用新项目名（不必重启）',
+      aliasedText.split('\n').some((line) => line.trim().startsWith('presales-kb-parent')),
+      aliasedText.split('\n').filter((line) => line.includes('presales')).join(' | ').slice(0, 200))
+    check('GET 回显磁盘上那一份原文',
+      (await getSettings())['projectAliases'] === 'presales-kb-parent = D:\\Coding\\ai-token-report\n')
+
+    // 坏行 → **整份拒绝**（不是「跳过这一行」）：留下半份生效的别名，使用者会以为
+    // 只有坏掉的那条没生效，而其它项目的名字已经被悄悄改掉了。
+    const textBeforeBadAlias = readFileSync(aliasFile, 'utf8')
+    const badAlias = await save({ projectAliases: 'presales-kb-parent = D:\\x\n这一行忘了等号\n' })
+    check('★ 别名有坏行 → 整份拒绝并说清第几行',
+      badAlias['ok'] === false && String(badAlias['reason']).includes('第 2 行')
+      && String(badAlias['reason']).includes('未保存'),
+      String(badAlias['reason']))
+    check('被拒后盘上的别名文件一个字节没被改写', readFileSync(aliasFile, 'utf8') === textBeforeBadAlias)
+
+    // 清空文本域 = 删掉那份文件 = 回到 `projectName()`（cwd 最后一段）
+    const clearedAlias = await save({ projectAliases: '' })
+    check('清空别名 = 删掉文件并回落 cwd 最后一段',
+      clearedAlias['ok'] === true && JSON.stringify(clearedAlias['effectiveProjectAliases']) === '[]'
+      && !existsSync(aliasFile),
+      JSON.stringify(clearedAlias['effectiveProjectAliases']))
+    const plainText = await tools['token_usage']!.run({ period: 'today', by: 'project' })
+    check('★ 清空后项目名回到 cwd 最后一段（`ai-token-report`）',
+      plainText.split('\n').some((line) => line.trim().startsWith('ai-token-report')),
+      plainText.split('\n').filter((line) => line.includes('ai-token-report')).slice(0, 3).join(' | ').slice(0, 200))
+
+    // ── ⑥ 来源筛选（`?source=`）────────────────────────────────────────────
+    //
+    // 这一组要证明的是：**筛选只收窄查询**，缺省一位都不变。
+    // 本脚本把非 DSH 来源用环境开关关了（见文件头），所以「筛到 Codex」必须是
+    // **如实的 0** —— 一旦它变回 1,110，就说明非法/未启用的来源被静默当成了「全部来源」，
+    // 而那正是这个筛选最危险的失效形态（数字变大且不报错）。
+    const payloadOf = async (search: string): Promise<Record<string, unknown>> =>
+      await (await statsRoute!(new Request(`http://localhost${UI_STATS_PATH}?${search}`))).json() as Record<string, unknown>
+    const defaultPayload = await payloadOf('period=today&view=summary')
+    const candidates = defaultPayload['availableSources'] as string[] | undefined
+    check('★ 载荷带来源候选（面板据此画下拉，缺字段就不画）',
+      Array.isArray(candidates) && candidates[0] === 'dsh' && candidates.includes('codex'),
+      JSON.stringify(candidates))
+    check('候选只来自宿主注册表（不带上任何用量行里的来源名）',
+      candidates !== undefined && candidates.every((id) => ['dsh', 'codex', 'claude-code', 'trae', 'trae-cn', 'workbuddy'].includes(id)),
+      JSON.stringify(candidates))
+
+    const siftedDsh = await payloadOf('period=today&view=summary&source=dsh')
+    check('筛 DSH：照常出数（1,110 token，与缺省逐位相同）',
+      ((siftedDsh['totals'] as { total?: number } | undefined)?.total) === 1_110,
+      JSON.stringify(siftedDsh).slice(0, 300))
+    const siftedCodex = await payloadOf('period=today&view=summary&source=codex')
+    check('★ 筛 Codex（本机没启用）：如实的 0，绝不回落成全部来源的 1,110',
+      ((siftedCodex['totals'] as { total?: number } | undefined)?.total) === 0
+      && siftedCodex['error'] === undefined,
+      JSON.stringify(siftedCodex).slice(0, 300))
+    const unknown = await payloadOf('period=today&view=summary&source=not-a-client')
+    check('★ 未注册的来源当场报错（不静默当成没给）',
+      String(unknown['error']).includes('未知的来源：not-a-client')
+      && String(unknown['error']).includes('dsh'),
+      String(unknown['error']))
+
+    const siftedText = await tools['token_usage']!.run({ period: 'today', source: 'codex' })
+    const totalLine = siftedText.split('\n').find((line) => line.includes('计费总量')) ?? ''
+    check('★ 工具认 `source`：文本里显式写出筛选（否则「用量降了」无从分辨）',
+      siftedText.includes('来源筛选  codex') && /计费总量\s+0\s/.test(totalLine),
+      totalLine.trim().slice(0, 200))
+    const toolUnknown = await tools['token_usage']!.run({ period: 'today', source: 'bogus' })
+    check('工具的未注册来源也给提示（与 CLI `--source` 同一句话）',
+      toolUnknown.includes('未注册的来源：bogus') && toolUnknown.includes('用 all 表示全部'),
+      toolUnknown.slice(0, 200))
   } finally {
     rmSync(home, { recursive: true, force: true })
   }

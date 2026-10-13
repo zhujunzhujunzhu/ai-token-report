@@ -53,6 +53,9 @@
 
 import { installCapture, type CaptureHost } from './capture.js'
 import type { TelemetryRecord } from './fold.js'
+// ★ 项目名称别名的装载入口（`<数据目录>/project-aliases.txt`）：统计上下文里
+//   每次取数现读一份 —— 见 `buildStatsContext()` 的 `projectAliases` getter。
+import { loadLocalProjectAliases } from '@ai-token-report/core/db'
 
 import {
   canReport,
@@ -420,6 +423,11 @@ function buildStatsContext(read: () => EffectiveConfig): StatsContext {
     // 单价快照（`pricing.json`）就在数据目录里：金额是**本机**的估算，
     // 所以「按哪份价算的」这件事必须跟着数据目录一起传下去。
     get dataDir() { return paths().dataDir },
+    // ★ 项目名称别名（本机显示口径）：`<数据目录>/project-aliases.txt`。
+    //   活取值 —— 面板里改完别名，**下一次取数**就按新规则出项目名（不必重启）。
+    //   写成启动快照的话，保存成功、文件也写了，但面板上的项目名仍旧 —— 且不报错。
+    //   ⚠️ 这里只读**文件**、不写：真正的写入口只有设置页那一条（`settings.ts`）。
+    get projectAliases() { return loadLocalProjectAliases({ dataDir: paths().dataDir }).rules },
     // ★ 多客户端来源：**全部已注册来源**，没有白名单可配（见 `extra-sources.ts`）。
     //   活取值 —— 会话日志根一改，下一次取数就按新的一组根走。
     get sourceRoots() { return resolveStatsSourceRoots(paths().dshHomes).roots },
@@ -485,6 +493,7 @@ function registerTools(
           series: '趋势粒度：day | hour（不给则不出趋势）',
           provider: 'provider 子串过滤（如 dashscope）',
           model: 'model 子串过滤（如 deepseek-v4.1-flash）',
+          source: '来源筛选，逗号分隔：dsh | codex | claude-code | trae | trae-cn | workbuddy；all 或缺省 = 全部来源（本机装了什么就统计什么）',
         },
         async run(raw: Record<string, unknown>): Promise<string> {
           return runTool(statsContext, raw)
@@ -535,9 +544,25 @@ async function runTool(statsContext: StatsContext, raw: Record<string, unknown>)
   const model = typeof raw['model'] === 'string' ? raw['model'].trim() : ''
   if (model) query.model = model
 
+  // ★ 来源筛选：与 CLI `--source` **同一语义**（逗号分隔、`all` = 全部、未注册当场报错）。
+  //   刻意不在这里做别的解释：安静地统计出 0 条，看起来与「这台机器没用过那个客户端」
+  //   一模一样，而两者的处置完全不同（见 CLI 那段注释）。
+  const rawSource = typeof raw['source'] === 'string' ? raw['source'].trim() : ''
+  if (rawSource !== '') {
+    const parts = rawSource.split(',').map((part) => part.trim()).filter((part) => part !== '')
+    const known: readonly string[] = statsSourceIds()
+    const invalid = parts.filter((part) => part !== 'all' && !known.includes(part))
+    if (invalid.length > 0) {
+      return `未注册的来源：${invalid.join(', ')}（已支持：${known.join(' / ')}；用 all 表示全部）`
+    }
+    // `all` 与「恰好选中了全部」都退化成「不过滤」：两者与缺省完全等价。
+    const picked = [...new Set(parts.filter((part) => part !== 'all'))]
+    if (!parts.includes('all') && picked.length > 0 && picked.length < known.length) query.sources = picked
+  }
+
   try {
     const result = await queryUsage(statsContext, query)
-    return formatUsage(result)
+    return formatUsage(result, { sources: query.sources })
   } catch (err) {
     // 统计失败（周期写错 / 目录不在）不该把对话打断，返回可读文本即可
     return `统计失败：${err instanceof Error ? err.message : String(err)}`
@@ -728,6 +753,7 @@ export { queryUsage, formatUsage, TOOL_DIMENSIONS, type UsageQuery, type UsageRe
 export {
   installUiRoute,
   createUiStatsProvider,
+  statsScopeOf,
   makeStatsFetch,
   makeConfigFetch,
   seriesFor,

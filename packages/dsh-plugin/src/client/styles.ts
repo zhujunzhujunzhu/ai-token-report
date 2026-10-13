@@ -147,6 +147,12 @@ export const CSS = calendarCss.replaceAll('.rdp-', '.atr-rdp-') + `
 .atr-segmented{gap:2px;padding:4px;border-radius:10px;background:var(--dsw-specific-tip,var(--dsw-alias-bg-layer-1))}
 .atr-segmented .atr-btn[aria-pressed="true"]{border-color:transparent;background:var(--dsw-alias-bg-base);color:var(--atr-accent);box-shadow:0 1px 4px rgba(0,0,0,.08);font-weight:600}
 .atr-date-trigger{border:1px solid var(--dsw-alias-border-l2)}
+/* ★ 来源筛选（工具栏里的下拉）。与日期触发器同一档视觉：chip 尺寸，不抢
+   「周期」那组按钮的视觉重量。宽度按内容走（来源名长短差很多：
+   DSH ↔ Claude Code），但给一个下限，免得「全部来源」被压成省略号。 */
+.atr-select{box-sizing:border-box;min-width:104px;padding:10px 11px;border:1px solid var(--dsw-alias-border-l2);border-radius:9px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;cursor:pointer}
+.atr-select:disabled{cursor:not-allowed;opacity:.6}
+.atr-select:focus-visible{outline:2px solid var(--atr-accent);outline-offset:2px}
 .atr-filter-actions{display:flex;align-items:center;gap:6px;margin-left:auto;flex:none}
 .atr-dialog .atr-icon-btn{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;padding:0;border:1px solid transparent;border-radius:9px;color:var(--dsw-alias-label-secondary)}
 .atr-dialog .atr-icon-btn:hover:not(:disabled){background:var(--atr-soft);color:var(--atr-accent)}

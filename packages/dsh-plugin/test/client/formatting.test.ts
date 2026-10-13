@@ -18,6 +18,7 @@ import {
   shortBucket,
   sourceLabel,
 } from '../../src/client/format.js'
+import { UI_ALL_SOURCES, usageSourceLabel } from '../../src/client/protocol.js'
 
 describe('紧凑数字', () => {
   test('1e9 / 1e6 / 1e3 各自进位', () => {
@@ -91,6 +92,35 @@ describe('来源标签：降级必须看得出来', () => {
 
   test('未知来源原样透出，不吞掉', () => {
     expect(sourceLabel('something-new')).toBe('something-new')
+  })
+})
+
+/**
+ * ★ **用量来源**（哪个客户端产生的用量）的展示名。
+ *
+ * 🚨 与上面的 `sourceLabel` 是**两件事**：那个说的是数据通路（库 / 直扫），
+ *   这个说的是客户端（DSH / Codex / …）。
+ *
+ * 这份表与部门看板 `web-portal/src/types/portal.ts` 的 `SOURCE_LABELS` **逐字一致**
+ * （浏览器半进不去 workspace 包，所以只能在插件里再写一份）。这里断言的是
+ * 「写下来的那一份」，两处同时改才需要动它 —— 它挡的是**单边**改动。
+ */
+describe('用量来源标签（下拉里的文案）', () => {
+  test('六个已注册来源各有说法，且与看板用词一致', () => {
+    expect(usageSourceLabel('dsh')).toBe('DSH')
+    expect(usageSourceLabel('codex')).toBe('Codex')
+    expect(usageSourceLabel('claude-code')).toBe('Claude Code')
+    expect(usageSourceLabel('trae')).toBe('Trae')
+    expect(usageSourceLabel('trae-cn')).toBe('Trae CN')
+    expect(usageSourceLabel('workbuddy')).toBe('WorkBuddy')
+  })
+
+  test('未知来源原样显示 id（猜一个名字更容易误导）', () => {
+    expect(usageSourceLabel('new-client')).toBe('new-client')
+  })
+
+  test('「全部来源」那一项的 value 是空串：与「不发 source 参数」是同一个意思', () => {
+    expect(UI_ALL_SOURCES).toBe('')
   })
 })
 

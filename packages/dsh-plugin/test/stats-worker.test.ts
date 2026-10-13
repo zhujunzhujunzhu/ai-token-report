@@ -177,3 +177,51 @@ test('真实 Worker 支持摘要、精确分页、手动追加刷新及外部写
     rmSync(root, { recursive: true, force: true })
   }
 }, 20_000)
+
+/**
+ * ★ 项目名称别名必须**过得了线程边界**。
+ *
+ * `StatsContext` 是被 `postMessage` 克隆过去的（`stats-worker-client.ts`），
+ * 函数过不去 —— 所以规则只能是**纯数据**（`{ prefix, alias }` 数组）。
+ * 这条测试是那个约束的唯一防线：接线改成传函数、或漏了转发，
+ * 表现都是「面板（走线程）不折、`token_usage` 工具（不走线程）折了」，
+ * 两个入口不一致而**没有任何报错**。
+ */
+test('★ 项目名称别名过线程：规则是纯数据，折出来的项目名与主线程一致', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'atr-worker-alias-project-'))
+  const sessionsRoot = join(root, 'sessions')
+  const dbPath = join(root, 'usage.sqlite')
+  /** 会话头的 `cwd` 决定项目维度：仓库根与它的子目录应该折成同一个名字。 */
+  const writeSession = (dir: string, id: string, cwd: string): void => {
+    const target = join(sessionsRoot, dir, id)
+    mkdirSync(target, { recursive: true })
+    writeFileSync(join(target, 'session.v3.jsonl.zstd'), zstdCompressSync(Buffer.from([
+      JSON.stringify({ type: 'session', version: 3, id, createdAt: Date.now(), cwd }),
+      JSON.stringify({ type: 'assistant/message', seq: 1, time: Date.now(),
+        data: { usage: { inputTokens: 5 }, message: { source: { provider: 'p', model: 'm' } } } }),
+    ].join('\n') + '\n')))
+  }
+  writeSession('a', 's-root', 'D:\\Coding\\my-project')
+  writeSession('b', 's-sub', 'D:\\Coding\\my-project\\packages\\core')
+  const base: StatsContext = {
+    config: { localDb: true }, sessionsRoots: [sessionsRoot], dbPath,
+    dataDir: join(root, 'data'), backgroundQueries: true,
+  }
+  try {
+    // 不给规则：两个目录 ⇒ 两个项目名（证明下面的折叠不是「本来就只有一行」）
+    const plain = await queryUsage({ ...base, dbPath: join(root, 'plain.sqlite') }, { by: ['project'] })
+    expect(plain.groups[0]!.rows.map((row) => row.key).sort()).toEqual(['core', 'my-project'])
+    // 给了规则（纯数据过线程）⇒ 折成一个名字，且会话按折后去重
+    const folded = await queryUsage(
+      { ...base, projectAliases: [{ prefix: 'my-project', alias: 'presales-kb-parent' }] },
+      { by: ['project'] },
+    )
+    expect(folded.groups[0]!.rows.map((row) => row.key)).toEqual(['presales-kb-parent'])
+    expect(folded.groups[0]!.rows[0]!.sessions).toBe(2)
+    expect(folded.totals.calls).toBe(2)
+  } finally {
+    await closeStatsWorker(dbPath)
+    await closeStatsWorker(join(root, 'plain.sqlite'))
+    rmSync(root, { recursive: true, force: true })
+  }
+}, 20_000)

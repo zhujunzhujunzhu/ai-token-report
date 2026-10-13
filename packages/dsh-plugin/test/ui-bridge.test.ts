@@ -22,10 +22,11 @@ import {
   makeConfigFetch,
   makeStatsFetch,
   seriesFor,
+  statsScopeOf,
   toUiPayload,
   type UiHostContext,
 } from '../src/index.js'
-import type { UsageResult } from '../src/stats.js'
+import type { StatsContext, UsageQuery, UsageResult } from '../src/stats.js'
 
 /**
  * 造一份金额（估算）。
@@ -434,6 +435,52 @@ describe('★ TTL 缓存 + 在途合并（面板常驻，不能每个周期重�
   })
 })
 
+/**
+ * 取数范围指纹 —— `installUiRoute` 交给 TTL 缓存的**键**。
+ *
+ * ★ 漏进指纹的那一项，症状永远是「改了没生效」而不是报错：面板会老老实实回放
+ *   最长一个 TTL 内的旧快照。项目名称别名尤其隐蔽 —— 它住在 `dataDir` **里面**，
+ *   只按目录做指纹的话，`dataDir` 一个字节都没变。
+ */
+describe('取数范围指纹（30 秒 TTL 缓存的键）', () => {
+  const base: StatsContext = {
+    config: { localDb: true },
+    sessionsRoots: ['/home/u/.dsh/sessions'],
+    dbPath: '/home/u/usage.sqlite',
+    dataDir: '/home/u/token-report',
+    sourceRoots: [{ source: 'codex', path: '/home/u/.codex' } as never],
+    sources: ['dsh', 'codex'],
+  }
+
+  test('★ 别名规则进指纹：加一条 / 改一条 / 清空都必须算另一份范围', () => {
+    const none = statsScopeOf(base)
+    const one = statsScopeOf({ ...base, projectAliases: [{ prefix: 'my-project', alias: 'presales' }] })
+    expect(one).not.toBe(none)
+    // 改显示名 = 另一份范围（否则旧名字要等 30 秒）
+    expect(statsScopeOf({ ...base, projectAliases: [{ prefix: 'my-project', alias: '另一个名字' }] })).not.toBe(one)
+    // 改匹配值同样是另一份范围
+    expect(statsScopeOf({ ...base, projectAliases: [{ prefix: 'other', alias: 'presales' }] })).not.toBe(one)
+    // 清空（= 删掉那份文件）也要变
+    expect(statsScopeOf({ ...base, projectAliases: [] })).toBe(none)
+  })
+
+  test('内容相同 → 指纹相同（不能按对象引用或时间戳算）', () => {
+    const a = statsScopeOf({ ...base, projectAliases: [{ prefix: 'p', alias: 'a' }, { prefix: 'q', alias: 'b' }] })
+    const b = statsScopeOf({ ...base, projectAliases: [{ prefix: 'p', alias: 'a' }, { prefix: 'q', alias: 'b' }] })
+    expect(a).toBe(b)
+    // 顺序也是内容的一部分：两条规则换个次序，折叠结果可能不同
+    expect(statsScopeOf({ ...base, projectAliases: [{ prefix: 'q', alias: 'b' }, { prefix: 'p', alias: 'a' }] })).not.toBe(a)
+  })
+
+  test('别名以外的每一项也都在指纹里（换根 / 换库 / 换清单 ⇒ 另一份范围）', () => {
+    expect(statsScopeOf({ ...base, sessionsRoots: ['/other'] })).not.toBe(statsScopeOf(base))
+    expect(statsScopeOf({ ...base, dbPath: '/other.sqlite' })).not.toBe(statsScopeOf(base))
+    expect(statsScopeOf({ ...base, dataDir: '/other-data' })).not.toBe(statsScopeOf(base))
+    expect(statsScopeOf({ ...base, sources: ['dsh'] })).not.toBe(statsScopeOf(base))
+    expect(statsScopeOf({ ...base, sourceRoots: [{ source: 'dsh', path: '/home/u/.dsh' } as never] })).not.toBe(statsScopeOf(base))
+  })
+})
+
 describe('Fetch 处理器', () => {
   test('解析 period 与 refresh 查询参数', async () => {
     const seen: { period?: string; refresh: boolean }[] = []
@@ -444,6 +491,7 @@ describe('Fetch 处理器', () => {
       },
       // 代次恒为 0：本用例不带 `gen` 参数，必须**不能**被当成探针命中
       generation: () => 0,
+      availableSources: () => ['dsh'],
     })
 
     await fetchStats(new Request(`http://127.0.0.1${UI_STATS_PATH}?period=month&refresh=1`))
@@ -710,5 +758,142 @@ describe('★ 路由安装：拿不到 connection 必须安静跳过', () => {
   test('headless（没有 inject，也没有 connection）→ unavailable，且不抛错', () => {
     const hosts = fakeHost({ connection: undefined, canInject: false })
     expect(installUiRoute(hosts.ctx, stats)).toBe('unavailable')
+  })
+
+  test('★ 来源清单接在 `stats.sources` 上：候选与校验共用它（接错线不会报错）', async () => {
+    const registered: unknown[] = []
+    const hosts = fakeHost({ connection: fakeConnection(registered) })
+    // 只有 DSH 的上下文：`codex` 不属于它 —— 必须当场被拒
+    expect(installUiRoute(hosts.ctx, { ...stats, sources: ['dsh'] })).toBe('registered')
+    const route = (registered as { path: string; fetch: (r: Request) => Promise<Response> }[])
+      .find((r) => r.path === UI_STATS_PATH)!
+    const rejected = await route.fetch(
+      new Request(`http://127.0.0.1${UI_STATS_PATH}?view=summary&source=codex`)).then((r) => r.json()) as { error?: string }
+    expect(rejected.error).toContain('未知的来源：codex')
+    // 合法来源照常放行（这里的会话目录不存在，会被翻成 200 + error 体，不影响本断言）
+    const ok = await route.fetch(
+      new Request(`http://127.0.0.1${UI_STATS_PATH}?view=summary&source=dsh`)).then((r) => r.json()) as UiPayload
+    expect(ok.availableSources).toEqual(['dsh'])
+  })
+})
+
+/**
+ * ★ 来源筛选（`?source=`）—— 面板工具栏那个下拉的宿主侧。
+ *
+ * 这一组钉住三条「错了不会报错」的边界：
+ * 1. **缺省不发 `source`** ⇒ 查询里没有 `sources` 字段（与这个筛选存在之前逐位相同）；
+ * 2. **未注册的来源当场回错误载荷**（不是安静地查出 0 行，更不是静默变回全部来源）；
+ * 3. **不同来源各自一份 TTL 缓存**：否则切回上一次的来源会拿到另一份来源的快照。
+ */
+describe('来源筛选（?source=）', () => {
+  /** 造一个「注册了 dsh + codex」的取数器，并把每次查询原样记下来。 */
+  function sourceProvider(options: { sources?: () => readonly string[] } = {}): {
+    fetchStats: (request: Request) => Promise<Response>
+    queries: UsageQuery[]
+  } {
+    const queries: UsageQuery[] = []
+    const fetchStats = makeStatsFetch(createUiStatsProvider({
+      run: async (query) => {
+        queries.push(query)
+        return sampleResult()
+      },
+      generation: () => 0,
+      ...(options.sources !== undefined ? { sources: options.sources } : {}),
+    }))
+    return { fetchStats, queries }
+  }
+
+  const request = (fetchStats: (r: Request) => Promise<Response>, search: string) =>
+    fetchStats(new Request(`http://127.0.0.1${UI_STATS_PATH}?${search}`))
+  const payloadOf = async (response: Response): Promise<UiPayload & { error?: string }> =>
+    await response.json() as UiPayload & { error?: string }
+
+  test('★ 默认（不发 `source`）：查询里**没有** `sources` 字段，且载荷带候选清单', async () => {
+    const { fetchStats, queries } = sourceProvider({ sources: () => ['dsh', 'codex'] })
+    const body = await payloadOf(await request(fetchStats, 'view=summary'))
+    expect('sources' in queries[0]!).toBe(false)
+    expect(body.availableSources).toEqual(['dsh', 'codex'])
+  })
+
+  test('筛一个来源：查询带上它，且候选清单照旧（下拉不该因为筛选而塌缩）', async () => {
+    const { fetchStats, queries } = sourceProvider({ sources: () => ['dsh', 'codex'] })
+    const body = await payloadOf(await request(fetchStats, 'view=summary&source=codex'))
+    expect(queries[0]!.sources).toEqual(['codex'])
+    expect(body.availableSources).toEqual(['dsh', 'codex'])
+  })
+
+  test('重复参数与逗号分隔都认，且去重（同一份来源只查一次）', async () => {
+    const a = sourceProvider({ sources: () => ['dsh', 'codex'] })
+    expect((await payloadOf(await request(a.fetchStats, 'view=summary&source=codex&source=dsh'))).error).toBeUndefined()
+    // 两个来源就是全量 ⇒ 退化成「不过滤」，与缺省逐位相同
+    expect('sources' in a.queries[0]!).toBe(false)
+
+    const b = sourceProvider({ sources: () => ['dsh', 'codex'] })
+    await request(b.fetchStats, 'view=summary&source=codex, dsh')
+    expect('sources' in b.queries[0]!).toBe(false)
+  })
+
+  test('★ 未注册的来源 → 错误载荷，且**一次查询都不发**', async () => {
+    const { fetchStats, queries } = sourceProvider({ sources: () => ['dsh', 'codex'] })
+    const body = await payloadOf(await request(fetchStats, 'view=summary&source=Codex'))
+    expect(body.error).toContain('未知的来源：Codex')
+    // 已注册清单要一起给出来：只报「错」不报「有哪些」会让人无从下手
+    expect(body.error).toContain('dsh / codex')
+    expect(queries.length).toBe(0)
+  })
+
+  test('★ 没有 `view` 的旧形态 + `source` → 明确拒绝，不塞一个形状不对的载荷', async () => {
+    const { fetchStats, queries } = sourceProvider({ sources: () => ['dsh', 'codex'] })
+    const body = await payloadOf(await request(fetchStats, 'period=today&source=codex'))
+    expect(body.error).toContain('来源筛选必须配合 view 参数')
+    expect(queries.length).toBe(0)
+  })
+
+  test('★ 不同来源各自一份缓存：切回来不能被另一份来源的快照命中', async () => {
+    let clock = 0
+    const queries: UsageQuery[] = []
+    const fetchStats = makeStatsFetch(createUiStatsProvider({
+      run: async (query) => { queries.push(query); return sampleResult() },
+      generation: () => 0,
+      now: () => clock,
+      sources: () => ['dsh', 'codex'],
+    }))
+    await request(fetchStats, 'view=summary&source=codex')
+    await request(fetchStats, 'view=summary&source=dsh')
+    expect(queries.length).toBe(2)
+    // TTL 内再问同一个来源：命中缓存，不再查
+    await request(fetchStats, 'view=summary&source=codex')
+    expect(queries.length).toBe(2)
+    // TTL 到期后照常重查
+    clock += 31_000
+    await request(fetchStats, 'view=summary&source=codex')
+    expect(queries.length).toBe(3)
+    expect(queries[2]!.sources).toEqual(['codex'])
+  })
+
+  test('★ 探针（`gen` 命中）不受筛选影响：204 且零查询', async () => {
+    const queries: UsageQuery[] = []
+    const fetchStats = makeStatsFetch(createUiStatsProvider({
+      run: async (query) => { queries.push(query); return sampleResult() },
+      generation: () => 7,
+      sources: () => ['dsh', 'codex'],
+    }))
+    const response = await request(fetchStats, 'view=summary&source=codex&gen=7')
+    expect(response.status).toBe(204)
+    expect(queries.length).toBe(0)
+  })
+
+  test('★ 不提供来源清单的宿主：载荷里**没有** `availableSources`（面板据此不画下拉）', async () => {
+    const { fetchStats } = sourceProvider()
+    const body = await payloadOf(await request(fetchStats, 'view=summary'))
+    expect('availableSources' in body).toBe(false)
+  })
+
+  test('★ 宿主没有来源清单时，任何 `source` 都是未注册（不静默当成「全部来源」）', async () => {
+    const { fetchStats, queries } = sourceProvider()
+    const body = await payloadOf(await request(fetchStats, 'view=summary&source=dsh'))
+    expect(body.error).toContain('未知的来源：dsh')
+    expect(body.error).toContain('本机已注册：无')
+    expect(queries.length).toBe(0)
   })
 })

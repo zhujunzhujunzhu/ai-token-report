@@ -62,6 +62,11 @@ export function queryInStatsWorker(ctx: StatsContext, query: UsageQuery): Promis
           //   漏传的后果是线程里按「库里的全部来源」出数（与主线程不一致，且不报错）。
           ...(ctx.sources !== undefined ? { sources: ctx.sources } : {}),
           ...(ctx.missingRoots !== undefined ? { missingRoots: ctx.missingRoots } : {}),
+          // ★ 项目名称别名（本机口径）必须一起过线：面板走的就是这条线程，
+          //   漏传的后果是「线程里按 cwd 最后一段出数」，而主线程侧的
+          //   `token_usage` 工具却折了 —— 两个入口的项目名不一致，且不报错。
+          //   传的是**规则数组**（纯数据）：解析器在 `openStats()` 里装配。
+          ...(ctx.projectAliases !== undefined ? { projectAliases: ctx.projectAliases } : {}),
         },
       })
     } catch (error) { own.fail(error instanceof Error ? error : new Error(String(error))) }

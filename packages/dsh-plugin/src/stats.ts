@@ -70,6 +70,7 @@ import {
   priceResolver,
   unpricedTargetsOf,
   type CostTotalsWithTargets,
+  type LocalProjectAliasRule,
 } from '@ai-token-report/core/db'
 
 import type { EffectiveConfig } from './config.js'
@@ -112,6 +113,17 @@ export interface UsageQuery {
   provider?: string
   /** model 子串过滤。 */
   model?: string
+  /**
+   * ★ **来源筛选** —— 只算这几个来源的行（`dsh` / `codex` / `claude-code` / …）。
+   *
+   * 语义与 CLI `--source` **完全一致**：给的是「已注册来源」的子集，空 / 缺省 = 全部来源。
+   * 面板下拉、`token_usage` 工具与 CLI 共用这一处判定（`executeQuery` 里做交集）。
+   *
+   * 🚨 它**只收窄查询**，不碰采集与上报：`sourceRoots` 仍然照旧全量 ingest，
+   *   上报也仍然按本机全部来源发。筛选一旦漏进那两条路，表现是
+   *   「切了个下拉，别的客户端的用量就再也不上报了」——**而且不报错**。
+   */
+  sources?: string[]
 }
 
 /** 一个分组的输出行 —— 字段名刻意与 CLI 的 JSON 输出保持一致。 */
@@ -228,6 +240,17 @@ export interface StatsContext {
   sources?: readonly SessionSource[]
   /** 白名单里**配了但不存在**的根：页面/日志要能分辨「没装」与「路径写错」。 */
   missingRoots?: readonly string[]
+  /**
+   * ★ **项目名称别名规则**（本机口径）—— 来自数据目录下的 `project-aliases.txt`
+   *   （`loadLocalProjectAliases()`），由组合根的 getter **每次取数现读**。
+   *
+   * 🚨 传的是**纯数据**而不是解析函数：这个上下文会经 `postMessage` 过线到统计
+   *   线程（`stats-worker-client.ts`），函数过不去 —— 传函数会让「面板走线程」
+   *   这条路上的别名静默不生效（而单线程的 `token_usage` 工具却正常）。
+   *   解析器在 `openStats()` 里由 `projectResolverFromRules()` 装配一次，
+   *   金额分桶再用 `session.projectNameOf` 取**同一个**（否则费用列会凭空缺行）。
+   */
+  projectAliases?: readonly LocalProjectAliasRule[]
   /** DSH 宿主启用独立线程，直接调用方仍可使用当前线程。 */
   backgroundQueries?: boolean
   /** 查询等待上限（含排队）；默认两分钟，异常线程不能让宿主无限等待。 */
@@ -289,6 +312,24 @@ export async function executeQuery(ctx: StatsContext, query: UsageQuery, options
   const range = resolveRange({ period: query.period, since: query.since, until: query.until })
 
   // 驱动选择集中在 core/db/driver.ts，构建时内联 core，运行时才加载 SQLite。
+  //
+  // ★ 来源筛选在这里落成**已注册来源的子集**（空 / 全量 = 全部），与 CLI `--source` 同一语义。
+  //
+  //   🚨 未注册的来源必须**在这里就抛错**，不能只靠参数层拦（UI 路由 / 工具各拦一次，
+  //      但 `ctx.tokenReport` 服务与 Worker 通道会直接调到这里）。
+  //      因为「交集为空」在 `openStats` 那边**等于「不过滤」** —— 于是
+  //      `sources: ['codex']` 打错一个字（`['Codex']`）会安静地返回**全部来源**的数字：
+  //      数字变大、不报错、跟「筛了但本来就只有这些」也看不出区别。
+  //      参数层给的是带「已注册清单」的友好提示，这里是最后一道闸。
+  const registered = ctx.sources ?? (['dsh'] as SessionSource[])
+  const requested = query.sources ?? []
+  const unknown = requested.filter((id) => !registered.includes(id as SessionSource))
+  if (unknown.length > 0) {
+    throw new Error(`未注册的来源：${unknown.join('、')}（本机已注册：${registered.join(' / ')}）`)
+  }
+  const picked = requested.length > 0
+    ? registered.filter((id) => requested.includes(id))
+    : registered
   const session = await openStats({
     sessionsRoot: ctx.sessionsRoots,
     dbPath: ctx.dbPath,
@@ -297,7 +338,7 @@ export async function executeQuery(ctx: StatsContext, query: UsageQuery, options
     //   一个文件 —— 不传就等于让库里躺着的未知来源冒充面板自己的数字。
     //   给**全量**在本仓与不传等价（`db/stats.ts` 的 `narrowSources` 只在数量少于
     //   已注册来源数时才收窄），所以汇总表那条快路径也保住了。
-    sources: ctx.sources ?? ['dsh'],
+    sources: picked,
     // ★ 带来源的根 = 本机全部已注册来源（DSH 的根用生效配置里那一组）。
     //   给了它才把其它来源并进来，并把它解析出来但**不存在**的根一并报出去。
     ...(ctx.sourceRoots !== undefined && ctx.sourceRoots.length > 0
@@ -310,6 +351,11 @@ export async function executeQuery(ctx: StatsContext, query: UsageQuery, options
       : {}),
     forceScan: !ctx.config.localDb,
     rollup: query.summaryOnly ? 'summary' : true,
+    // ★ 项目名称别名只影响 `project` 维度的分组键（三条取数路径共用它）；
+    //   空数组 = 没配，`openStats` 里就是 `projectName()` 的旧口径。
+    ...(ctx.projectAliases !== undefined && ctx.projectAliases.length > 0
+      ? { projectAliases: ctx.projectAliases }
+      : {}),
     readOnly: options.readOnly,
     changedFiles: options.changedFiles,
     ...(range.sinceMs !== undefined ? { sinceMs: range.sinceMs } : {}),
@@ -353,7 +399,10 @@ export async function executeQuery(ctx: StatsContext, query: UsageQuery, options
       //   （`groupKey()`），所以同一个维度里的行可以直接 `get(row.key)`。
       //   不同维度必须各建一次 —— 拿 provider 维度的金额表去查 model 维度，
       //   键看起来都是字符串，只是永远命中不了。
-      const buckets = costByGroupOf(records, dim, resolve, pricing.provenance)
+      //   ★ `session.projectNameOf` 是**这个会话**装配的那个解析器（别名规则
+      //     已经装进去）：自己拿 ctx.projectAliases 再装一个不算错，但那就成了
+      //     第二处装配点 —— 一旦两边的规则不同步，token 行与金额行会对不上。
+      const buckets = costByGroupOf(records, dim, resolve, pricing.provenance, session.projectNameOf)
       return { by: dim, rowCount: rows.length, rows: toRows(rows.slice(offset, offset + top), buckets) }
     })
 
@@ -417,12 +466,17 @@ export function leverageOf(counts: Pick<TokenCounts, 'input' | 'cacheRead'>): nu
  * ★ 金额同样必须带着口径出现（估算 / 未计价比例 / 单价来源）：
  *   只给一个 `¥12.35` 会让人拿它去对财务账单，而两者本来就对不上。
  */
-export function formatUsage(result: UsageResult, options: { maskUser?: boolean } = {}): string {
+export function formatUsage(result: UsageResult, options: { maskUser?: boolean; sources?: readonly string[] } = {}): string {
   const n = (v: number): string => v.toLocaleString('en-US')
   const lines: string[] = []
 
   lines.push(`AI token 用量  |  ${result.rangeLabel}`)
   lines.push(`数据来源  ${sourceLabel(result.source)}${result.degradedReason ? `（${result.degradedReason}）` : ''}`)
+  // ★ 筛选**必须显式出现**：同一句「今天用了多少」在筛选前后的答案不同，
+  //   而结果文本里没有别的痕迹能区分它们（数字变小会被读成「用量降了」）。
+  if (options.sources !== undefined && options.sources.length > 0) {
+    lines.push(`来源筛选  ${options.sources.join('、')}（只统计这些来源；缺省 = 全部已注册来源）`)
+  }
   lines.push(`耗时      ${result.elapsedMs}ms`)
   lines.push('')
 

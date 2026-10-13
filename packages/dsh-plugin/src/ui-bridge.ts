@@ -228,6 +228,15 @@ export interface UiStatsProvider {
    *   - 代次省的是**根本没有新数据**时的整轮往返（含载荷序列化与页面重渲染）。
    */
   generation(): number
+  /**
+   * ★ **本机已注册的来源清单**（`dsh` / `codex` / …），供 `?source=` 参数校验与
+   * 载荷里的下拉候选用。
+   *
+   * 🚨 与 `generation()` 同级：只允许**纯内存读**（每次取数都会调用一次）。
+   *   在这里 `registeredSources()` 是可以的（读的是适配器表，不碰磁盘），
+   *   但绝不要为它去扫日志根 —— 那会把探针省下来的开销又加回去。
+   */
+  availableSources(): readonly string[]
 }
 
 /**
@@ -277,10 +286,24 @@ export function createUiStatsProvider(options: {
    *   组合根传的是「库路径 + 数据目录 + 全部会话日志根」拼出来的串。
    */
   scope?: () => string
+  /**
+   * ★ **本机已注册的来源清单**（缺省为空数组 = 老宿主，面板**不出现**来源下拉）。
+   *
+   * 它同时被两处用：
+   * - `availableSources()`（`makeStatsFetch` 拿它校验 `?source=` 的合法性）；
+   * - 载荷里的 `availableSources`（浏览器半拿它画下拉）。
+   *
+   * 🚨 缺省**空数组**而不是 `['dsh']`：老宿主 / 单测夹具不该凭空多出一个来源下拉，
+   *   而真宿主不传就等于「这台机器有哪些客户端」这件事无人回答 —— 面板只画
+   *   「全部来源」一项，也就不会出现「选了一个查不出数的来源」。
+   *   与 `generation` 同级，只允许**纯内存读**。
+   */
+  sources?: () => readonly string[]
 }): UiStatsProvider {
   const now = options.now ?? (() => Date.now())
   const ttlMs = options.ttlMs ?? DEFAULT_TTL_MS
   const generation = options.generation ?? (() => 0)
+  const availableSources = options.sources ?? (() => [])
   const maxCacheBytes = Math.max(0, options.maxCacheBytes ?? DEFAULT_CACHE_BYTES)
 
   /** 缓存项。⚠️ 刻意**不**用「代次相同」当命中条件 —— 见下面 `get()` 的注释。 */
@@ -309,6 +332,12 @@ export function createUiStatsProvider(options: {
       const query: UsageQuery = {
         ...(period === 'custom' ? dateRange : { period }),
         ...(force ? { refresh: true } : {}),
+        // ★ 来源筛选**收窄查询，不碰采集与上报**（`UsageQuery.sources` 的注释）。
+        //   空数组 = 全部来源，与不传等价 —— 所以「全部来源」发出去的请求
+        //   与这个筛选存在之前**逐字节相同**。
+        ...(selection?.sources !== undefined && selection.sources.length > 0
+          ? { sources: [...selection.sources] }
+          : {}),
         ...(selection?.view === 'summary' ? { summaryOnly: true } : {
           by: selection?.view === 'detail' ? [by] : [...UI_GROUP_BY],
           top: selection?.view === 'detail' ? pageSize : Number.MAX_SAFE_INTEGER,
@@ -316,6 +345,13 @@ export function createUiStatsProvider(options: {
           series: period === 'custom' && dateRange?.since === dateRange?.until ? 'hour' : seriesFor(period),
         }),
       }
+      // ★ 下拉候选由宿主如实给出「这台机器注册了哪些来源」。
+      //   **一个都没有时字段整个不出现**：面板据此不画下拉（`缺失` 与 `空` 同一个处置，
+      //   见 protocol.ts 的 `availableSources`），于是不提供来源清单的宿主
+      //   连载荷大小都与这个筛选存在之前逐字节相同。
+      const sourceOptions = [...availableSources()]
+      const withSources = <T extends object>(body: T): T & { availableSources?: string[] } =>
+        sourceOptions.length > 0 ? { ...body, availableSources: sourceOptions } : body
       let result = await options.run(query)
       if (selection?.view === 'detail') {
         const totalRows = result.groups[0]?.rowCount ?? result.groups[0]?.rows.length ?? 0
@@ -324,11 +360,11 @@ export function createUiStatsProvider(options: {
           page = lastPage
           result = await options.run({ ...query, offset: (page - 1) * pageSize, refresh: false })
         }
-        return { ...toUiPayload(result, period, genAtStart), view: 'detail',
-          pagination: { by, page, pageSize, totalRows } }
+        return withSources({ ...toUiPayload(result, period, genAtStart), view: 'detail',
+          pagination: { by, page, pageSize, totalRows } })
       }
-      return { ...toUiPayload(selection?.view === 'summary' ? { ...result, groups: [], series: undefined } : result,
-        period, genAtStart), ...(selection ? { view: selection.view } : {}) }
+      return withSources({ ...toUiPayload(selection?.view === 'summary' ? { ...result, groups: [], series: undefined } : result,
+        period, genAtStart), ...(selection ? { view: selection.view } : {}) })
     } catch (err) {
       // ★ 扫描失败不抛给浏览器：面板要能就地显示「为什么没数」
       const body: UiErrorPayload = {
@@ -350,7 +386,7 @@ export function createUiStatsProvider(options: {
       // ★ 范围指纹参与缓存键：面板里改完会话日志根之后，旧范围的缓存自然再也
       //   命中不了（不需要任何「失效通知」这种会漏掉的机制）。
       const prefix = `${options.scope?.() ?? ''}\u0000${rangeKey}:`
-      const key = `${prefix}${selection?.view ?? 'legacy'}:${selection?.by ?? 'provider-model'}:${selection?.page ?? 1}:${selection?.pageSize ?? UI_PAGE_SIZE}`
+      const key = `${prefix}${selection?.view ?? 'legacy'}:${selection?.by ?? 'provider-model'}:${selection?.page ?? 1}:${selection?.pageSize ?? UI_PAGE_SIZE}:${selection?.sources === undefined ? '' : [...selection.sources].sort().join(',')}`
       if (force) {
         // 手动刷新当前范围时，其它页与摘要也应在下次读取时换成新快照。
         for (const cachedKey of cache.keys()) if (cachedKey.startsWith(prefix)) removeCached(cachedKey)
@@ -397,6 +433,8 @@ export function createUiStatsProvider(options: {
       inflight.set(key, task)
       return task
     },
+
+    availableSources,
   }
 }
 
@@ -442,6 +480,10 @@ export function makeConfigFetch(read: () => UiPosition): (request: Request) => P
  *
  * 查询参数：
  * - `period` —— 具名周期，不合法回落到默认值。
+ * - `source` —— **来源筛选**，可重复也可逗号分隔（`?source=codex&source=dsh`）。
+ *   与 CLI `--source` 同一语义：**已注册来源**的子集；一个都不给 = 全部来源。
+ *   未注册的来源**当场报错**，绝不静默回落成「全部」—— 那会让「选错了来源」
+ *   看起来跟「这个客户端没有用量」一模一样，而两者的处置完全不同。
  * - `refresh=1` —— 绕过宿主缓存（面板上的「刷新」按钮）。
  * - `gen=N` —— **代次探针**：调用方说「我手上是第 N 代」。
  *   宿主发现当前还是第 N 代就回 `204`（一个字节都不回，不查库、不序列化）；
@@ -463,10 +505,28 @@ export function makeStatsFetch(provider: UiStatsProvider): (request: Request) =>
       return jsonResponse({ period, error: '请选择有效的开始和结束日期，开始日期不能晚于结束日期' })
     }
     const rawView = url.searchParams.get('view')
+    // ★ 来源筛选在**参数层**校验：非法值必须是「一条读得懂的原因」，
+    //   而不是一个查得出 0 行的合法查询（见上面查询参数那一段）。
+    const known = provider.availableSources()
+    const picked: string[] = []
+    for (const raw of url.searchParams.getAll('source')) {
+      for (const part of raw.split(',').map((piece) => piece.trim()).filter((piece) => piece !== '')) {
+        if (!known.includes(part)) {
+          return jsonResponse({
+            period,
+            error: `未知的来源：${part}（本机已注册：${known.length > 0 ? known.join(' / ') : '无'}）`,
+          })
+        }
+        if (!picked.includes(part)) picked.push(part)
+      }
+    }
+    // 「一个都没给」与「恰好选中了全部来源」都退化成「不过滤」：
+    // 两者发出去的查询完全一样（`UsageQuery.sources` 的空/全量语义）。
+    const sources = picked.length > 0 && picked.length < known.length ? picked : undefined
     let selection: UiSelection | undefined
     if (rawView !== null) {
       if (rawView !== 'summary' && rawView !== 'detail') return jsonResponse({ period, error: '未知的用量视图' })
-      selection = { view: rawView }
+      selection = { view: rawView, ...(sources !== undefined ? { sources } : {}) }
       if (rawView === 'detail') {
         const by = url.searchParams.get('by') ?? 'provider-model'
         const page = Number(url.searchParams.get('page') ?? '1')
@@ -476,8 +536,14 @@ export function makeStatsFetch(provider: UiStatsProvider): (request: Request) =>
           || !Number.isSafeInteger((page - 1) * pageSize)) {
           return jsonResponse({ period, error: '无效的明细分组或分页参数' })
         }
-        selection = { view: rawView, by: by as UiGroupBy, page, pageSize }
+        selection = { view: rawView, by: by as UiGroupBy, page, pageSize,
+          ...(sources !== undefined ? { sources } : {}) }
       }
+    } else if (sources !== undefined) {
+      // 没有 `view` 的旧形态载荷是「全量分组 + 趋势」，与带筛选的语义对不上；
+      // 与其塞一个形状不对的载荷回去，不如把这条组合当场说清楚
+      // （真实客户端要么不带筛选、要么带 view，见 protocol.ts）。
+      return jsonResponse({ period, error: '来源筛选必须配合 view 参数（summary / detail）' })
     }
 
     // ⚠️ 必须区分「没传 gen」与「gen=0」，也要拒绝空串：
@@ -536,6 +602,34 @@ export interface UiHostContext {
  *   而 headless profile 永远不会提供它 —— 写进去等于**上报功能在 headless 下
  *   直接不激活**。这里用「先试一次，不行再等」的可选注入。
  */
+/**
+ * 取数范围指纹 —— 30 秒 TTL 缓存的**键**。
+ *
+ * ★ 存在的理由：`StatsContext` 的每一项都是**活取值**，所以「同一份数据」这句话
+ *   在两次请求之间可能已经变了。指纹覆盖「会影响结果的那几项」，变了就当场重新取数，
+ *   而不是继续回 TTL 内的旧快照（那看起来正是「改了没生效」，而且**不报错**）。
+ *
+ * 覆盖项与各自的理由：
+ * - `dbPath` / `dataDir` —— 换库、换数据目录（单价快照在那儿）；
+ * - `sessionsRoots` —— 面板里改完会话日志根；
+ * - `sourceRoots` —— 本机多装 / 少装一个客户端、或某个来源被环境开关关掉；
+ * - `sources` —— 查询期的来源清单（「只算哪些来源」，与「哪些目录存在」不是一件事）；
+ * - ★ `projectAliases` —— 别名住在 `dataDir` **里面**，`dataDir` 本身不会变：
+ *   只按目录做指纹的话，保存完别名之后 30 秒内面板还会拿旧项目名回放。
+ *   用**规则内容**（而不是文件 mtime）做指纹，是因为 mtime 在「删掉配置」与
+ *   「内容不变地重存」上给出的答案不稳定（两个方向都会误判）。
+ */
+export function statsScopeOf(stats: StatsContext): string {
+  return [
+    stats.dbPath,
+    stats.dataDir,
+    ...stats.sessionsRoots,
+    ...(stats.sourceRoots ?? []).map((root) => `${root.source}:${root.path}`),
+    ...(stats.sources ?? []),
+    ...(stats.projectAliases ?? []).map((rule) => `${rule.alias}\u0001${rule.prefix}`),
+  ].join('\u0000')
+}
+
 export function installUiRoute(
   ctx: UiHostContext,
   stats: StatsContext,
@@ -575,17 +669,12 @@ export function installUiRoute(
     // ★ 缓存跟着**取数范围**走：`StatsContext` 的路径都是活取值，
     //   面板里改完会话日志根之后，下一次取数就该按新范围查，
     //   而不是继续回 TTL 内的旧结果（那看起来就像「改了没生效」）。
-    scope: () => [
-      stats.dbPath,
-      stats.dataDir,
-      ...stats.sessionsRoots,
-      // 带来源的根进指纹：本机多装 / 少装一个客户端、或某个来源被环境开关关掉，
-      // 都必须是**另一份范围**，否则「新装的 Codex 要过 30 秒才出现」。
-      ...(stats.sourceRoots ?? []).map((root) => `${root.source}:${root.path}`),
-      // ★ 查询期的来源清单也要进指纹：根只反映「哪些来源的目录存在」，
-      //   而清单是「只算哪些来源」—— 两者可能不同，只按根做指纹会命中过期缓存。
-      ...(stats.sources ?? []),
-    ].join('\u0000'),
+    scope: () => statsScopeOf(stats),
+    // ★ 来源下拉的候选 = **本机已注册的来源**（与 `executeQuery` 里那份清单同源，
+    //   所以「下拉里能选的」与「查询真的会收窄的」永远是同一组）。
+    //   它同时被用来校验 `?source=` 的合法性 —— 让「选错了来源」当场报错，
+    //   而不是安静地查出 0 行（见 `makeStatsFetch`）。
+    sources: () => [...(stats.sources ?? ['dsh'] as const)],
     ...(options.ttlMs !== undefined ? { ttlMs: options.ttlMs } : {}),
     ...(options.generation !== undefined ? { generation: options.generation } : {}),
   })

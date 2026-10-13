@@ -8,10 +8,11 @@
  *    调 `host.apply()`，**不需要重启 DSH**；宿主没提供入口时才回退成重启。
  */
 import { test, expect, beforeEach, afterEach, describe } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { readIdentity, resolvePaths } from '@ai-token-report/core'
+import { projectAliasFileIn } from '@ai-token-report/core/db'
 import { resolveConfig, type EffectiveConfig } from '../src/config.js'
 import {
   baseUrlOf, createSettingsHandler, dshHomesSourceOf, endpointOf, MAX_DSH_HOMES, normalizeBaseUrl,
@@ -556,5 +557,107 @@ describe('会话日志根（面板里改统计范围）', () => {
     expect(parseDshHomes('x').ok).toBe(false)
     expect(parseDshHomes(['/a', 5]).ok).toBe(false)
     expect(parseDshHomes(['/a\0b']).ok).toBe(false)
+  })
+})
+
+/**
+ * 「自定义配置 → 项目名称别名」（`<数据目录>/project-aliases.txt`）。
+ *
+ * 这一栏与本机其它偏好有本质区别：它**不是** `plugin-connection.json` 里的字段，
+ * 而是一份独立文件，且被四种离线形态共用（插件面板 / `token_usage` / 本地页 / CLI）。
+ * 所以这里要钉住的边界比别处多一条：**面板里保存的必须就是那份文件本身**
+ * （逐字相同），不能是「面板自己的一份副本」—— 否则同一个 cwd 在两处会显示不同的名字。
+ */
+describe('项目名称别名（自定义配置）', () => {
+  const SIGNED = { ok: true, name: '张三' }
+  const aliasPath = (): string => projectAliasFileIn(dataDir)
+  const aliasText = (): string => 'presales-kb-parent = D:\\Coding\\my-project, presales-kb-parent\n'
+
+  test('没配过时：原文是空串、没有生效规则、也没有告警', async () => {
+    const get = await (await handler(SIGNED)(new Request('http://localhost/api/tokenReport.settings')))
+      .json() as Record<string, unknown>
+    expect(get).toMatchObject({ projectAliases: '', effectiveProjectAliases: [] })
+    // 没配过 ≠ 配置坏了：这一栏不许出现任何「不生效」的说法
+    expect(get['projectAliasesNote']).toBeNull()
+  })
+
+  test('★ 只改别名（不带 appKey）：逐字落盘，响应里带上此刻生效的规则', async () => {
+    const run = handler(SIGNED)
+    const body = await (await run(request({ projectAliases: aliasText() }))).json() as Record<string, unknown>
+    expect(body).toMatchObject({ ok: true })
+    // ★ 原文**逐字**相同（含注释与空行）：面板回填的就是磁盘上那一份
+    expect(readFileSync(aliasPath(), 'utf8')).toBe(aliasText())
+    expect(body['effectiveProjectAliases']).toEqual([
+      { prefix: 'D:\\Coding\\my-project', alias: 'presales-kb-parent', mode: 'path' },
+      { prefix: 'presales-kb-parent', alias: 'presales-kb-parent', mode: 'repo' },
+    ])
+    expect(body['projectAliasesNote']).toBeNull()
+
+    // 连接文件一个字节都没写：别名与本机连接是两件事
+    expect(readConnection({ dshHome: home, dataDir })).toEqual({})
+    // 同一个 handler 的 GET 立刻反映新规则
+    const get = await (await run(new Request('http://localhost/api/tokenReport.settings')))
+      .json() as Record<string, unknown>
+    expect(get['effectiveProjectAliases']).toEqual(body['effectiveProjectAliases'])
+  })
+
+  test('★ 有一行非法 ⇒ 整份拒绝，且**一个字节都不落盘**（其它偏好也不写）', async () => {
+    const body = await (await handler(SIGNED)(request({
+      projectAliases: 'presales = D:\\a\\proj\n这行忘了等号\n',
+      // 同一请求里还带了别的偏好：校验必须发生在**任何写之前**，
+      // 否则用户会看到「保存失败」却已经被写进去一半。
+      flushIntervalMillis: 5_000,
+      appKey: '',
+    }))).json() as Record<string, unknown>
+    expect(body).toMatchObject({ ok: false })
+    expect(String(body['reason'])).toContain('第 2 行')
+    expect(existsSync(aliasPath())).toBe(false)
+    expect(readConnection({ dshHome: home, dataDir })).toEqual({})
+  })
+
+  test('空文本 = 清掉别名（删文件，回落 cwd 最后一段）', async () => {
+    const run = handler(SIGNED)
+    await run(request({ projectAliases: aliasText() }))
+    expect(existsSync(aliasPath())).toBe(true)
+
+    const body = await (await run(request({ projectAliases: '\n  \n' }))).json() as Record<string, unknown>
+    expect(body).toMatchObject({ ok: true, projectAliases: '', effectiveProjectAliases: [] })
+    expect(existsSync(aliasPath())).toBe(false)
+    // 空文本与「没给这一项」是两回事：前者是明确的清空
+    expect(body['projectAliasesNote']).toBeNull()
+  })
+
+  test('没给这一项时不动盘上那份（部分客户端不会把它清空）', async () => {
+    await handler(SIGNED)(request({ projectAliases: aliasText() }))
+    await handler(SIGNED)(request({ appKey: '', position: 'both' }))
+    expect(readFileSync(aliasPath(), 'utf8')).toBe(aliasText())
+  })
+
+  test('★ 手改坏的那一份：整份不生效、原因原样带出去、原文照常回填（面板能就地修）', async () => {
+    mkdirSync(dataDir, { recursive: true })
+    const broken = 'good = D:\\a\\proj\nbad line\n'
+    writeFileSync(aliasPath(), broken)
+    const get = await (await handler(SIGNED)(new Request('http://localhost/api/tokenReport.settings')))
+      .json() as Record<string, unknown>
+    // 「配了但一行写错」绝不能显示成「没配过」：那会让人以为别名功能坏了
+    expect(get['projectAliases']).toBe(broken)
+    expect(get['effectiveProjectAliases']).toEqual([])
+    expect(String(get['projectAliasesNote'])).toContain('第 2 行')
+    expect(String(get['projectAliasesNote'])).toContain('整份未生效')
+  })
+
+  test('带 appKey 的那条路：校验没过 ⇒ 别名也不落盘（失败不覆盖）', async () => {
+    const body = await (await handler({ ok: false, reason: '服务器说不行' })(request({
+      baseUrl, appKey: 'report-secret', projectAliases: aliasText(),
+    }))).json() as Record<string, unknown>
+    expect(body).toMatchObject({ ok: false, reason: '服务器说不行' })
+    expect(existsSync(aliasPath())).toBe(false)
+  })
+
+  test('非字符串的别名配置直接报错（手搓请求，不是用户手滑）', async () => {
+    const body = await (await handler(SIGNED)(request({ projectAliases: ['a = b'] })))
+      .json() as Record<string, unknown>
+    expect(body).toMatchObject({ ok: false })
+    expect(existsSync(aliasPath())).toBe(false)
   })
 })

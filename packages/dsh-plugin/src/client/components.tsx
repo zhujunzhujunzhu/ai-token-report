@@ -46,7 +46,7 @@ import {
   fmtInt,
   fmtPct,
 } from './format.js'
-import { UI_PERIODS, UI_GROUP_BY, UI_PAGE_SIZE, type UiGroupBy, type UiGroupRow, type UiPeriod } from './protocol.js'
+import { UI_PERIODS, UI_GROUP_BY, UI_PAGE_SIZE, UI_ALL_SOURCES, usageSourceLabel, type UiGroupBy, type UiGroupRow, type UiPeriod } from './protocol.js'
 import type { UsageState, UsageStore } from './store.js'
 
 /**
@@ -84,6 +84,54 @@ function PeriodTabs(props: { period: UiPeriod; onPick: (p: UiPeriod) => void; di
         item.label,
       ),
     ),
+  )
+}
+
+/**
+ * ★ **来源筛选**下拉（工具栏里那个，默认「全部来源」）。
+ *
+ * 为什么要有它：自从面板把**全部已注册来源**并起来统计之后，一屏数字是
+ * DSH + Codex + Claude Code + … 的并集（见 `extra-sources.ts`）。这在「本机总用量」
+ * 这个问法下是对的，但回答不了「这些几乎全是 Codex 跑的」——
+ * 而这句话决定了接下来该优化哪个客户端。
+ *
+ * 三条不变量：
+ * 1. **默认「全部来源」**：不发 `source` 参数，与这个筛选存在之前的请求逐字节相同；
+ * 2. 候选**只来自宿主**（`availableSources`）——浏览器半不许自己拼一张客户端表，
+ *    那会产出一个本机不存在的来源，选中它只会得到如实的 0；
+ * 3. 老宿主（载荷里**没有** `availableSources` 字段）→ **整个下拉不出现**。
+ *    画一个只有「全部来源」一项的控件，等于给使用者一个做不到的选择。
+ */
+function SourceFilter(props: {
+  sources: string[]
+  /** 宿主的来源候选；**缺席**（老宿主 / 一个来源都没注册）= 整个下拉不出现。 */
+  options?: string[]
+  disabled: boolean
+  onPick: (sources: string[]) => void
+}): ReactNode {
+  const options = props.options ?? []
+  if (options.length === 0) return null
+  // 选中项可能是宿主**这一轮**没报出来的来源（例如刚被环境开关关掉）：
+  // 照原值留一个选项，否则 `value` 落不到任何 option 上，控件会静默显示成第一项
+  // （= 界面写着「全部来源」而查询其实还筛着 —— 两边不一致且不报错）。
+  const selected = props.sources[0] ?? UI_ALL_SOURCES
+  const known = options.includes(selected) || selected === UI_ALL_SOURCES
+  return createElement(
+    'select',
+    {
+      className: 'atr-select atr-source-filter',
+      'aria-label': '来源筛选',
+      title: '只统计选中的客户端来源。默认「全部来源」= DSH 与其它客户端一起算。',
+      disabled: props.disabled,
+      value: selected,
+      onChange: (event: { target: { value: string } }) => {
+        const value = event.target.value
+        props.onPick(value === UI_ALL_SOURCES ? [] : [value])
+      },
+    },
+    createElement('option', { key: UI_ALL_SOURCES, value: UI_ALL_SOURCES }, '全部来源'),
+    ...options.map((id) => createElement('option', { key: id, value: id }, usageSourceLabel(id))),
+    known ? null : createElement('option', { key: selected, value: selected }, `${usageSourceLabel(selected)}（已不可用）`),
   )
 }
 
@@ -170,6 +218,12 @@ export function UsageDetail(props: { state: UsageState; store: UsageStore; onClo
       period: state.period, onPick: store.setPeriod, disabled: blocked,
     }),
     createElement(DateRangePicker, { range: state.dateRange, active: state.period === 'custom', disabled: blocked, onApply: store.setCustomRange }),
+    createElement(SourceFilter, {
+      sources: state.sources,
+      options: data?.availableSources,
+      disabled: blocked,
+      onPick: store.setSources,
+    }),
     createElement('div', { className: 'atr-filter-actions' },
     createElement(
       'button',

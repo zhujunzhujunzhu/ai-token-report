@@ -173,6 +173,13 @@ export interface UiSelection {
   by?: UiGroupBy
   page?: number
   pageSize?: number
+  /**
+   * ★ **来源筛选**（`?source=`）：只算这几个来源。
+   *
+   * 缺省 / 空数组 = 全部来源（与这个筛选存在之前**逐字节相同**的查询）。
+   * 语义与 CLI `--source` 一致 —— 见宿主 `stats.ts` 的 `UsageQuery.sources`。
+   */
+  sources?: string[]
 }
 export interface UiPagination {
   by: UiGroupBy
@@ -216,6 +223,35 @@ export interface UiSeriesPoint {
   cacheHitRate: number
 }
 
+/**
+ * 用量**来源**（客户端）→ 展示名 —— 下拉里的文案。
+ *
+ * 🚨 别与上面的 `UiSource` 混了：那个是**数据通路**（`local-db` / `scan` / `none`），
+ *   这个是**哪个客户端产生的用量**（DSH / Codex / Claude Code / …，
+ *   权威定义是 core 的 `SessionSource`）。
+ *
+ * 文案与部门看板 `web-portal/src/types/portal.ts` 的 `SOURCE_LABELS` **逐字一致** ——
+ * 同一个来源在两个界面上叫两个名字，会让人以为是两个东西（浏览器半进不去 workspace 包，
+ * 所以这份表只能在这里再写一遍；改动时两边一起改）。
+ * 未知来源**原样显示 id**：猜一个名字比显示原值更容易误导。
+ */
+export const UI_USAGE_SOURCE_LABELS: Record<string, string> = {
+  dsh: 'DSH',
+  codex: 'Codex',
+  'claude-code': 'Claude Code',
+  trae: 'Trae',
+  'trae-cn': 'Trae CN',
+  workbuddy: 'WorkBuddy',
+}
+
+/** 下拉里「全部来源」这一项的 value（空串 = 不过滤，与不发 `source` 参数等价）。 */
+export const UI_ALL_SOURCES = ''
+
+/** 用量来源原值 → 展示名（未知值原样返回）。 */
+export function usageSourceLabel(value: string): string {
+  return UI_USAGE_SOURCE_LABELS[value] ?? value
+}
+
 /** 取数成功的载荷。 */
 export interface UiPayload {
   period: UiPeriod
@@ -245,6 +281,18 @@ export interface UiPayload {
   }
   groups: { by: string; rows: UiGroupRow[] }[]
   series?: UiSeriesPoint[]
+  /**
+   * ★ **本机已注册的来源**（宿主的 `stats.sources`），来源下拉的候选。
+   *
+   * 🚨 **字段只在真的有候选时出现**（不给 = 老宿主，或这台机器一个来源都没注册）：
+   *   两种情况下都是**不画那个下拉**。画一个只有「全部来源」一项的控件，
+   *   等于给使用者一个做不到的选择。
+   *
+   * ⚠️ 候选**只来自宿主**：浏览器半不许自己拼一张「我知道的客户端」表 ——
+   *   那会让下拉里出现一个本机根本不存在的来源，选中它只会得到如实的 0。
+   *   宿主侧同时用这份清单校验 `?source=`（未注册的来源当场报错，见 ui-bridge.ts）。
+   */
+  availableSources?: string[]
   sessions: number
   elapsedMs: number
   scannedAt: number
@@ -425,6 +473,13 @@ export function readUiResponse(value: unknown): { ok: true; payload: UiPayload }
   if (raw['view'] === 'detail' && pagination === undefined) {
     return { ok: false, error: '响应格式不认识（缺少有效分页信息）' }
   }
+  // ★ 来源候选：**只认非空字符串**，脏值当成「没有这个字段」（= 老宿主 →
+  //   面板不画来源下拉）。去重但保留宿主给的顺序（= 适配器注册顺序）。
+  //   过滤后一个都不剩也当成「没有这个字段」：空清单画不出可选的东西。
+  const rawSources = Array.isArray(raw['availableSources'])
+    ? [...new Set(raw['availableSources'].filter((item): item is string => typeof item === 'string' && item !== ''))]
+    : []
+  const availableSources = rawSources.length > 0 ? rawSources : undefined
 
   return {
     ok: true,
@@ -456,6 +511,10 @@ export function readUiResponse(value: unknown): { ok: true; payload: UiPayload }
       scannedAt: count(raw['scannedAt']),
       ...(cost !== undefined ? { cost } : {}),
       ...(typeof gen === 'number' && Number.isFinite(gen) ? { gen } : {}),
+      // ★ 来源候选只认**非空字符串**：脏值（数字 / null / 空串）一律当成
+      //   「没有这个字段」——面板据此决定画不画那个下拉，见 `UiPayload.availableSources`。
+      //   去重但**保留宿主给的顺序**：顺序就是适配器注册顺序，面板照原样排。
+      ...(availableSources !== undefined ? { availableSources } : {}),
     },
   }
 }
@@ -466,7 +525,7 @@ export function readUiResponse(value: unknown): { ok: true; payload: UiPayload }
  * ⚠️ 这里永远不含 appKey 本身，只有「填过没有」（`hasAppKey`）。
  *   GET 还回一次 appKey 就等于把凭证发进浏览器历史与缓存。
  */
-export interface UiSettingsPayload {
+export interface UiSettingsPayload extends UiProjectAliasesView {
   signed: boolean
   name: string
   /** 分组名（原 `dept`）—— 内部分组契约，宿主半与浏览器半同版本改。 */
@@ -506,8 +565,33 @@ export interface UiSettingsPayload {
 /** 生效日志根的来源。与宿主 `settings.ts` 的 `DshHomesSource` 同义。 */
 export type UiRootsSource = 'panel' | 'config' | 'env' | 'auto'
 
+/**
+ * 「项目名称别名」三件套 —— **读取载荷与保存响应共用同一份形状**。
+ *
+ * ★ 三者缺一不可（与会话日志根那三件套同一个道理）：
+ * - `projectAliases` —— 磁盘上那份**原文**（含注释）→ 回填文本框。面板里看到的
+ *   与文件里存的逐字节相同，所以「我改的是什么」没有第二种解释；
+ * - `effectiveProjectAliases` —— 此刻**真的在生效**的规则（含匹配模式）：
+ *   让用户看见「我写的那几行真的被认了」，以及每条是路径前缀还是仓库名；
+ * - `projectAliasesNote` —— 非空 = **一份都不生效**，以及为什么
+ *   （读不了 / 某一行非法 / 超上限）。静默不生效是本仓最反对的失败模式：
+ *   用户会以为「我配了别名」，而页面上只是项目名没变。
+ *
+ * ⚠️ 别名只影响**本机显示**（面板 / `token_usage` 工具 / 本地页 / CLI 的
+ *   `项目` 维度），`cwd` 原值与上报数据一个字节都不改 —— 部门看板的项目口径
+ *   由服务端的「项目归一化」规则决定，与本文件无关。
+ */
+export interface UiProjectAliasesView {
+  /** 磁盘上那份原文（空串 = 没配过 / 已清空）。 */
+  projectAliases: string
+  /** 此刻生效的规则（`mode`：含分隔符 = 路径前缀，不含 = 仓库名）。 */
+  effectiveProjectAliases: { prefix: string; alias: string; mode: 'path' | 'repo' }[]
+  /** 非空 = 一份都不生效，以及为什么。 */
+  projectAliasesNote?: string
+}
+
 /** 配置页的**保存**结果（`POST /api/tokenReport.settings`）。 */
-export interface UiSettingsSavePayload {
+export interface UiSettingsSavePayload extends Partial<UiProjectAliasesView> {
   ok: boolean
   reason?: string
   /** 服务端认下的姓名（只可能来自服务端，绝不是客户端提交的内容）。 */
@@ -671,6 +755,36 @@ export function readUiSettings(value: unknown): UiSettingsPayload {
     position: parseUiPosition(raw['position']) ?? UI_DEFAULT_POSITION,
     reporting: readUiReporting(raw['reporting']),
     ...readUiRootsView(raw),
+    ...readUiProjectAliasesView(raw),
+  }
+}
+
+/**
+ * 解析「项目名称别名」三件套。
+ *
+ * 与 `readUiRootsView` 同一套规矩：逐字段重建，脏值丢弃、缺字段回退，
+ * **绝不抛错** —— 旧宿主没有这三个字段时，面板应当退化成「这一栏是空的」，
+ * 而不是整页失败（老面板 + 新宿主、新面板 + 老宿主都会真实出现）。
+ */
+export function readUiProjectAliasesView(value: unknown): UiProjectAliasesView {
+  const raw = record(value) ?? {}
+  const effective: { prefix: string; alias: string; mode: 'path' | 'repo' }[] = []
+  for (const item of Array.isArray(raw['effectiveProjectAliases']) ? raw['effectiveProjectAliases'] : []) {
+    const entry = record(item)
+    if (entry === undefined) continue
+    const prefix = optionalText(entry['prefix'])
+    const alias = optionalText(entry['alias'])
+    if (prefix === undefined || alias === undefined) continue
+    // 模式只认两个已知值；不认识（含旧宿主）一律当「仓库名」，与宿主侧的
+    // `isProjectPathRule()` 判定方向一致：含分隔符才算路径前缀。
+    effective.push({ prefix, alias, mode: entry['mode'] === 'path' ? 'path' : 'repo' })
+  }
+  const note = optionalText(raw['projectAliasesNote'])
+  return {
+    // ★ 原文可以含换行与注释，**不做 trim**：面板要逐字节回填磁盘上那一份。
+    projectAliases: typeof raw['projectAliases'] === 'string' ? raw['projectAliases'] : '',
+    effectiveProjectAliases: effective,
+    ...(note ? { projectAliasesNote: note } : {}),
   }
 }
 

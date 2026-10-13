@@ -1,6 +1,6 @@
 /**
- * 插件配置页的宿主入口 —— 设置面有**五个字段**：
- * 服务端地址、appKey、上报间隔、面板位置、**会话日志根**。
+ * 插件配置页的宿主入口 —— 设置面有**六个字段**：
+ * 服务端地址、appKey、上报间隔、面板位置、会话日志根、**项目名称别名**。
  *
  * ## 为什么是这几项
  *
@@ -13,6 +13,7 @@
  * | `/api/v1/identity/verify` | `baseUrl` + 固定路径 |
  * | `/api/v1/token-usage` | `baseUrl` + 固定路径 |
  * | 上报间隔 / 面板位置 / 会话日志根 | 纯本机偏好，只写本地文件 |
+ * | 项目名称别名 | 纯本机**显示口径**（`<数据目录>/project-aliases.txt`），不改上报数据 |
  *
  * ## 会话日志根（`dshHomes`）为什么可以在这里改
  *
@@ -64,6 +65,13 @@ import {
   writeIdentity,
 } from '@ai-token-report/core'
 import { baseUrlOf, endpointOf, normalizeBaseUrl, INGEST_PATH, VERIFY_PATH } from '@ai-token-report/shared'
+import {
+  formatProjectAliasErrors,
+  isProjectPathRule,
+  loadLocalProjectAliases,
+  parseProjectAliasText,
+  writeLocalProjectAliases,
+} from '@ai-token-report/core/db'
 import {
   parseUiPosition,
   UI_POSITIONS,
@@ -418,6 +426,38 @@ export function createSettingsHandler(
     rootsSource: dshHomesSourceOf({ saved: state.saved, effective: state.config }),
   })
 
+  /**
+   * 面板要显示的「项目名称别名」三件套（与会话日志根那三件套同一个形状）。
+   *
+   * - `projectAliases` —— 磁盘上那份原文 → **回填文本框**（含注释，逐字节相同）；
+   * - `effectiveProjectAliases` —— **此刻真的在生效的规则**（含匹配模式），
+   *   让用户看见「我写的那几行真的被认了」；
+   * - `projectAliasesNote` —— 非空 = 一份都不生效，以及为什么（读不了 / 有一行非法）。
+   *
+   * ⚠️ 三者必须一起回，而且**不能**用「保存时那份」代替：别名的消费者是
+   *   本地页与 CLI（同一份文件），它随时可能被手改 —— 显示的是**现在**那一份。
+   *
+   * 🚨 绝不把 `note` 吞掉：静默不生效正是本仓最反对的失败模式 ——
+   *   使用者会以为「我配了别名」，而页面上只是项目名没变。
+   */
+  const aliasesView = (state: SettingsState): {
+    projectAliases: string
+    effectiveProjectAliases: { prefix: string; alias: string; mode: 'path' | 'repo' }[]
+    projectAliasesNote: string | null
+  } => {
+    const loaded = loadLocalProjectAliases({ dataDir: reportPaths(state.config).dataDir })
+    return {
+      projectAliases: loaded.text,
+      effectiveProjectAliases: loaded.rules.map((rule) => ({
+        prefix: rule.prefix,
+        alias: rule.alias,
+        // 两种写法的展示说法：含分隔符 = 限定位置的路径前缀，不含 = 任意位置的仓库名。
+        mode: isProjectPathRule(rule.prefix) ? 'path' : 'repo',
+      })),
+      projectAliasesNote: loaded.note,
+    }
+  }
+
   return async (request) => {
     const state = host.state()
     const paths = reportPaths(state.config)
@@ -440,6 +480,7 @@ export function createSettingsHandler(
         position: saved.position ?? state.config.ui.position,
         reporting: state.reporting,
         ...rootsView(state),
+        ...aliasesView(state),
       })
     }
     if (request.method !== 'POST') return json({ ok: false, reason: '不支持的请求方法' }, 405)
@@ -512,6 +553,26 @@ export function createSettingsHandler(
         if (!parsed.ok) return json({ ok: false, reason: parsed.reason })
         dshHomes = parsed.value
       }
+      // 项目名称别名：`undefined` = 这次不动它；空文本 = 清掉（删文件，回落 `projectName()`）。
+      //
+      // ★ 在这里（任何写之前）先整份校验一遍：`writeLocalProjectAliases()` 落盘前
+      //   也会校验，但那一步在「带 appKey」那条路上排在**身份与连接写完之后**，
+      //   那时再拒绝，用户的凭证已经换了 —— 一句「保存失败」会让他以为全没生效。
+      //   两次调用的是**同一个**纯函数，不是第二套校验。
+      let projectAliases: string | undefined
+      if (raw['projectAliases'] !== undefined) {
+        if (typeof raw['projectAliases'] !== 'string') {
+          return json({ ok: false, reason: '项目名称别名配置必须是一段文本' })
+        }
+        const parsed = parseProjectAliasText(raw['projectAliases'])
+        if (!parsed.ok) {
+          return json({
+            ok: false,
+            reason: `项目名称别名配置有 ${parsed.errors.length} 处问题，未保存：${formatProjectAliasErrors(parsed.errors)}`,
+          })
+        }
+        projectAliases = raw['projectAliases']
+      }
 
       const path = connectionPath(state.config)
       /** 这次要落盘的内容：**凭证来自本次输入，或原样沿用已保存的那一份**。 */
@@ -531,6 +592,18 @@ export function createSettingsHandler(
        *   所以这里不再重复写一次。
        */
       const commit = async (name: string, write = true): Promise<Response> => {
+        // ★ 项目名称别名是一份**独立文件**（`<数据目录>/project-aliases.txt`），
+        //   与连接 / 身份无关，所以先落它。失败时**必须说清「其它设置已保存」**：
+        //   只说「保存失败」会让用户以为凭证也没换，于是再存一次。
+        if (projectAliases !== undefined) {
+          const written = writeLocalProjectAliases({ dataDir: paths.dataDir, text: projectAliases })
+          if (!written.ok) {
+            return json({
+              ok: false,
+              reason: `项目名称别名配置未保存（${written.reason ?? '写入失败'}）；其它设置已保存`,
+            })
+          }
+        }
         if (write) atomicWrite(path, JSON.stringify(saved))
         const endpoint = saved.baseUrl !== undefined ? endpointOf(saved.baseUrl) : state.config.endpoint
         // ── ★ 就地生效：保存完就能开始上报，不必重启 DSH ──────────────
@@ -556,6 +629,9 @@ export function createSettingsHandler(
           position: saved.position ?? after.config.ui.position,
           flushIntervalMillis: saved.flushIntervalMillis ?? after.config.batch.flushIntervalMillis,
           ...rootsView(after),
+          // ★ 生效的别名规则同样在 `apply()` 之后现读：回给页面的必须是**这一刻**
+          //   磁盘上那份（保存成功但文件写失败时，这里不会假报生效）。
+          ...aliasesView(after),
           reporting,
           applied,
           restartRequired: !applied,
