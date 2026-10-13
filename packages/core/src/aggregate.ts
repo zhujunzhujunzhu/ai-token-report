@@ -45,8 +45,26 @@ export interface GroupRow {
   sub?: Map<string, TokenCounts>
 }
 
-/** 取分组键。 */
-export function groupKey(rec: UsageRecord, dim: GroupDimension): string {
+/**
+ * 「原始 cwd → 项目名」的解析器。
+ *
+ * ★ 默认实现是 {@link projectName}（取最后一段路径），而**带别名规则**时由
+ *   `db/project-alias.ts` 的 `projectResolverFromRules()` 给出 —— 规则的匹配语义
+ *   只在那一份实现里（仓库名 / 路径前缀双模、最长优先），这里只提供注入点。
+ *
+ * ⚠️ 为什么是**参数**而不是模块级状态：同一次查询里「token 分组」与「金额分桶」
+ *   必须用**同一个**解析器（`groupKey()` 是两条路径共用的键），而两条路径分别在
+ *   `aggregate.ts` 与 `db/cost.ts` 里调用它。任何一处漏传都会让同一行的 token
+ *   与金额对不上 —— 页面上两张表看起来都正常，只是对不齐。
+ */
+export type ProjectNameResolver = (cwd: string | null) => string
+
+/** 取分组键。`projectOf` 只影响 `project` 维度（其余维度与 cwd 无关）。 */
+export function groupKey(
+  rec: UsageRecord,
+  dim: GroupDimension,
+  projectOf: ProjectNameResolver = projectName,
+): string {
   switch (dim) {
     case 'source':
       return rec.source
@@ -61,7 +79,7 @@ export function groupKey(rec: UsageRecord, dim: GroupDimension): string {
     case 'source-provider-model':
       return `${rec.source}/${rec.provider}/${rec.model}`
     case 'project':
-      return projectName(rec.cwd)
+      return projectOf(rec.cwd)
     case 'session':
       return rec.sessionId
     case 'day':
@@ -120,16 +138,23 @@ export function dayKindOf(ms: number): 0 | 1 {
   return day === 0 || day === 6 ? 1 : 0
 }
 
-/** 按维度聚合。 */
+/**
+ * 按维度聚合。
+ *
+ * `projectOf` 只在 `project` 维度上有意义（见 {@link ProjectNameResolver}）：
+ * 它是**直扫路径**的项目名落点，SQL 路径（`db/query.ts` 的 `queryGroups`）与
+ * 汇总表路径（`db/local-rollup.ts`）吃的是同一个参数，三条路径必须一起改。
+ */
 export function aggregate(
   records: UsageRecord[],
   dim: GroupDimension,
+  projectOf: ProjectNameResolver = projectName,
 ): GroupRow[] {
   const map = new Map<string, GroupRow>()
   const sessionSets = new Map<string, Set<string>>()
 
   for (const rec of records) {
-    const key = groupKey(rec, dim)
+    const key = groupKey(rec, dim, projectOf)
     let row = map.get(key)
     if (!row) {
       row = {
@@ -172,6 +197,7 @@ export function crossTab(
   records: UsageRecord[],
   primary: GroupDimension,
   secondary: GroupDimension,
+  projectOf: ProjectNameResolver = projectName,
 ): { primaryKeys: string[]; secondaryKeys: string[]; cells: Map<string, TokenCounts> } {
   const cells = new Map<string, TokenCounts>()
   const primarySet = new Set<string>()
@@ -179,8 +205,8 @@ export function crossTab(
   const cellKey = (p: string, s: string): string => `${p}\u0000${s}`
 
   for (const rec of records) {
-    const p = groupKey(rec, primary)
-    const s = groupKey(rec, secondary)
+    const p = groupKey(rec, primary, projectOf)
+    const s = groupKey(rec, secondary, projectOf)
     primarySet.add(p)
     secondarySet.add(s)
     const k = cellKey(p, s)
@@ -207,8 +233,9 @@ export function crossTabRanked(
   records: UsageRecord[],
   primary: GroupDimension,
   secondary: GroupDimension,
+  projectOf: ProjectNameResolver = projectName,
 ): { primaryKeys: string[]; secondaryKeys: string[]; cells: Map<string, TokenCounts> } {
-  const base = crossTab(records, primary, secondary)
+  const base = crossTab(records, primary, secondary, projectOf)
 
   const sumFor = (fixed: string, keys: string[], axis: 'row' | 'col'): number => {
     let total = 0

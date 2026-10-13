@@ -32,7 +32,7 @@ import type { Database, SQLQueryBindings } from './driver.js'
 // ★ 时间键与项目名一律复用 aggregate.ts 的实现 ——
 //   这两条规则（toDayKey / toHourKey / projectName）必须只有一份实现，
 //   否则「SQL 路径」与「内存路径」会算出不同的桶键与项目名。
-import { projectName, toDayKey, toHourKey, type GroupDimension } from '../aggregate.js'
+import { projectName, toDayKey, toHourKey, type GroupDimension, type ProjectNameResolver } from '../aggregate.js'
 import { emptyCounts, type SessionSource, type TokenCounts } from '../types.js'
 import { EVENT_TABLE } from './schema.js'
 import { SQLITE_DIALECT, type PortalDialect } from './dialect.js'
@@ -1393,9 +1393,10 @@ export function queryGroups(
   filter: QueryFilter = {},
   dialect: PortalDialect = SQLITE_DIALECT,
   normalize?: ProviderNormalizer,
+  projectOf: ProjectNameResolver = projectName,
 ): QueryGroupRow[] {
   // project 维度走「取出 cwd 后内存分组」的特殊路径
-  if (dim === 'project') return queryGroupsByProject(db, filter)
+  if (dim === 'project') return queryGroupsByProject(db, filter, projectOf)
   // day / hour 同理：时间键必须在 JS 侧算
   if (dim === 'day' || dim === 'hour') return queryGroupsByTime(db, dim, filter)
 
@@ -1531,10 +1532,11 @@ export interface ProjectSessionPair {
  *
  * ★ 两种后端共用本函数（本地 `queryGroupsByProject` 与部门 `portal.ts`）。
  *
- * `projectOf` 是**部门路径专有**的项目名解析器（`project-alias.ts` 的
- * `ProjectNormalizer.resolve`）：命中 `project_alias` 规则时给出归一化名，
- * 否则回落 `projectName()`。本机库（`usage.sqlite`）没有那张表，
- * 调用方也就不传 —— 于是本地页面的项目维度与迁移前**逐字节相同**。
+ * `projectOf` 是项目名解析器：**部门路径**传 `project-alias.ts` 的
+ * `ProjectNormalizer.resolve`（命中 `project_alias` 表的规则），**本机路径**传
+ * `local-project-alias.ts` 的 `projectResolverFromRules()` 的结果（命中数据目录下
+ * `project-aliases.txt` 的规则）。两条路都不传时回落 `projectName()` ——
+ * 于是「没配规则」的行为与迁移前**逐字节相同**。
  *
  * ⚠️ 默认值必须是 `projectName` 本身，而不是「先算一个再判空」：
  *   两条路径的口径差异只允许来自「有没有规则」，不允许来自两条分支各写一遍。
@@ -1542,7 +1544,7 @@ export interface ProjectSessionPair {
 export function groupRowsFromProject(
   rows: readonly ProjectGroupRow[],
   sessionPairs: readonly ProjectSessionPair[],
-  projectOf: (cwd: string | null) => string = projectName,
+  projectOf: ProjectNameResolver = projectName,
 ): QueryGroupRow[] {
   const merged = new Map<string, QueryGroupRow>()
   // 各项目下的会话集合，用于合并后的去重计数（直接相加会把同一会话算两次）
@@ -1593,14 +1595,18 @@ export function groupRowsFromProject(
 }
 
 /** `project` 维度的分组（本地 SQLite 路径）。 */
-function queryGroupsByProject(db: Database, filter: QueryFilter): QueryGroupRow[] {
+function queryGroupsByProject(
+  db: Database,
+  filter: QueryFilter,
+  projectOf: ProjectNameResolver = projectName,
+): QueryGroupRow[] {
   const groups = projectGroupsQuery(filter)
   const pairs = projectSessionsQuery(filter)
   const rows = db.query<ProjectGroupRow, SQLQueryBindings>(groups.sql).all(groups.params)
   const sessionPairs = db
     .query<ProjectSessionPair, SQLQueryBindings>(pairs.sql)
     .all(pairs.params)
-  return groupRowsFromProject(rows, sessionPairs)
+  return groupRowsFromProject(rows, sessionPairs, projectOf)
 }
 
 /**

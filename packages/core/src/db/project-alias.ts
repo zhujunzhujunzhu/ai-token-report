@@ -57,12 +57,15 @@
  * 真实数据里仓库名的大小写变体只有盘符（`D:` / `d:`），而盘符在仓库名模式下
  * 本来就不参与匹配（只比段名），所以**这条约束在仓库名模式下几乎不产生代价**。
  *
- * ## 🚨 归一化只在**上报库**这条路径上生效
+ * ## 🚨 归一化只在**上报库**这条路径上生效（本机走同一套匹配、另一份规则）
  *
- * 本机库（`usage.sqlite`）没有 `project_alias` 表，也没有 `resolve` ——
- * 本地页面 / CLI / 插件面板的项目维度仍然是 `projectName()` 的旧口径。
- * 「本地页面看到的项目」与「看板上看到的项目」因此可能不同名，
- * 这是**刻意的**：项目别名规则是部门口径，不是本机口径（同 `provider-alias.ts`）。
+ * 本机库（`usage.sqlite`）没有 `project_alias` 表，本地页面 / CLI / 插件面板
+ * 的项目维度缺省仍是 `projectName()` 的旧口径。但**匹配语义是共用的**：
+ * 本机那份规则来自数据目录下的 `project-aliases.txt`（见 `local-project-alias.ts`），
+ * 装配走本文件的 {@link projectResolverFromRules} —— 于是「仓库名 / 路径前缀双模、
+ * 路径模式优先、最长优先、未命中回落」这套坑在本机与看板上**只实现一次**。
+ * 「本地页面看到的项目」与「看板上的项目名」仍可能不同，因为**规则不同源**
+ * （本机那份是个人偏好、看板那份是部门口径），这是刻意的。
  *
  * ## 为什么没有 SQL 片段
  *
@@ -74,7 +77,7 @@
  */
 
 import type { PortalStore } from './portal-connection.js'
-import { projectName } from '../aggregate.js'
+import { projectName, type ProjectNameResolver } from '../aggregate.js'
 // ★ 两个长度上限从**受控 DDL** 取，不在这里再写一遍字面量：
 //   表上的 CHECK 与这里的应用层校验必须是同一个数，各写一份的结果是
 //   「页面允许 300 字符、数据库拒收」，而错误信息只会是驱动原文。
@@ -291,6 +294,35 @@ export function projectNormalizer(map: ProjectAliasMap): ProjectNormalizer {
     //   绝不用空串或 other 兜底：那会把「漏配了一条规则」变成一个看起来正常的名字。
     resolve: (cwd: string | null) => apply(cwd) ?? projectName(cwd),
   }
+}
+
+/**
+ * 把一批「匹配值 → 项目名」直接装配成解析器（**本机口径**用）。
+ *
+ * ★ 与 {@link loadProjectAliases} + {@link projectNormalizer} 的关系：
+ *   后者是**上报库**那条路（规则在 `project_alias` 表里，还要按人员解析）；
+ *   这一条是**本机**那条路（规则在数据目录的文本文件里，只有一份、没有作用域）。
+ *   两条路共用 `projectNormalizer()` 的排序与匹配 —— 这就是「匹配语义只有一份」的落点。
+ *
+ * ## 为什么零条规则时直接返回 `projectName`
+ *
+ * 不返回 `projectNormalizer(new Map()).resolve` 也能得到同样结果，但那样每次取数
+ * 都要为「没有配置」这条最常见的路径造一个对象、跑一趟空循环。更重要的是**语义**：
+ * 「没配别名 ≡ 迁移前逐字节相同」这件事在这一行上写得出来。
+ *
+ * ## 重复匹配值
+ *
+ * 本机的文本文件在**写入前**就拒了重复（`local-project-alias.ts` 的解析器），
+ * 所以这里不会遇到;真遇到了（手工改坏文件）走 `Map.set` 的后者覆盖 ——
+ * 结果**确定**，不取决于调用顺序。
+ */
+export function projectResolverFromRules(
+  rules: readonly { prefix: string; alias: string }[],
+): ProjectNameResolver {
+  if (rules.length === 0) return projectName
+  const map = new Map<string, string>()
+  for (const rule of rules) map.set(normalizeProjectPrefix(rule.prefix), rule.alias)
+  return projectNormalizer(map).resolve
 }
 
 /**

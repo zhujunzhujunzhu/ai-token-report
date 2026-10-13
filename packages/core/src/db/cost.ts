@@ -37,7 +37,7 @@ import {
   type PricingProvenance,
   type PricingSnapshot,
 } from '@ai-token-report/shared'
-import { groupKey, type GroupDimension } from '../aggregate.js'
+import { groupKey, projectName, type GroupDimension, type ProjectNameResolver } from '../aggregate.js'
 import type { UsageRecord } from '../types.js'
 
 /**
@@ -163,16 +163,22 @@ export function emptyCostTotals(provenance: PricingProvenance): CostTotals {
  *   按**本地时区**分桶、会话 ID）只有一份实现。自己拼一遍的话，
  *   排行里的键与金额表里的键会在「项目」与「按天」这两维上悄悄错开，
  *   而两张表看起来都正常 —— 只是对不上。
+ *
+ * 🚨 `projectOf` 必须与喂给分组那次**是同一个**：`project` 维度的 token 行与
+ *   金额行靠 `groupKey()` 对上，两条路径各拿一个解析器会让「token 有行、
+ *   金额查不到」—— 页面上表现为费用列凭空缺几行。
+ *   调用方从 `StatsSession.projectNameOf` 取（同一个会话、同一个解析器）。
  */
 export function costByGroupOf(
   records: readonly UsageRecord[],
   dim: GroupDimension,
   resolve: PriceResolver,
   provenance: PricingProvenance,
+  projectOf: ProjectNameResolver = projectName,
 ): Map<string, CostTotals> {
   const buckets = new Map<string, CostPart[]>()
   for (const record of records) {
-    const key = groupKey(record, dim)
+    const key = groupKey(record, dim, projectOf)
     const part = costPartOf(record, resolve)
     const bucket = buckets.get(key)
     if (bucket) bucket.push(part)

@@ -143,11 +143,16 @@ export interface WriteConnectionResult {
 }
 
 /**
- * 原子写一份连接配置（0600）。
+ * 原子写一份文本文件（0600）。`label` 只用于错误信息。
  *
- * 传 `null` 表示**删除**（回滚用：本来就没有这份文件时，回滚等于删掉它）。
+ * ★ 抽成公共实现的原因：本机还有别的**配置型文本文件**需要同一套原子写
+ *   （项目名称别名 `project-aliases.txt`，见 `db/local-project-alias.ts`）。
+ *   各写一份的结果是「某个文件在某次断电后只剩半份」这类只在生产出现的现象，
+ *   而三个调用点里总有一个会漏掉 `rename` 或 `force` 清理。
+ *
+ * 传 `null` 表示**删除**（回滚 / 清空配置用）。
  */
-export function writeConnectionText(path: string, text: string | null): WriteConnectionResult {
+export function atomicWriteText(path: string, text: string | null, label: string): WriteConnectionResult {
   try {
     if (text === null) {
       rmSync(path, { force: true })
@@ -165,8 +170,17 @@ export function writeConnectionText(path: string, text: string | null): WriteCon
     }
     return { ok: true }
   } catch (err) {
-    return { ok: false, reason: `本机连接配置写入失败: ${messageOf(err)}` }
+    return { ok: false, reason: `${label}写入失败: ${messageOf(err)}` }
   }
+}
+
+/**
+ * 原子写一份连接配置（0600）。
+ *
+ * 传 `null` 表示**删除**（回滚用：本来就没有这份文件时，回滚等于删掉它）。
+ */
+export function writeConnectionText(path: string, text: string | null): WriteConnectionResult {
+  return atomicWriteText(path, text, '本机连接配置')
 }
 
 /**

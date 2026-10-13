@@ -51,7 +51,15 @@ import type { Database } from './driver.js'
 import { readLocalRollup, readLocalRollupSummary, rollupSupportsDimension, type LocalRollupSnapshot } from './local-rollup.js'
 import { existsSync, rmSync } from 'node:fs'
 
-import { aggregate, timeSeries, totalOf, type GroupDimension, type GroupRow } from '../aggregate.js'
+import {
+  aggregate,
+  projectName,
+  timeSeries,
+  totalOf,
+  type GroupDimension,
+  type GroupRow,
+  type ProjectNameResolver,
+} from '../aggregate.js'
 import { resolveRange } from '../range.js'
 import { scanAll, scanAllSources, sessionsRootList, type ScanOptions, type SessionsRootInput } from '../scanner.js'
 import { registeredSources } from '../sources/registry.js'
@@ -59,6 +67,8 @@ import type { SourceRoot } from '../sources/types.js'
 import { ingestPlainSources } from './ingest-plain.js'
 import type { ScanDiagnostics, TokenCounts, UsageRecord } from '../types.js'
 import { ingest, openDatabaseForIngest, readWatermarks } from './ingest.js'
+import { projectResolverFromRules } from './project-alias.js'
+import type { LocalProjectAliasRule } from './local-project-alias.js'
 import {
   queryGroups,
   queryRecords,
@@ -123,6 +133,18 @@ export interface OpenStatsOptions {
   rollup?: boolean | 'summary'
   /** 文件观察器提供的变化日志；缺省仍做完整对账。 */
   changedFiles?: string[]
+  /**
+   * ★ **本机项目名称别名**（`project` 维度的折叠规则）。
+   *
+   * 规则来自数据目录下的 `project-aliases.txt`（`loadLocalProjectAliases()`），
+   * 这里收的是**已经解析好的纯数据**而不是一个函数：`StatsContext` 会经
+   * `postMessage` 过线到统计线程（见 `dsh-plugin/src/stats-worker-client.ts`），
+   * 函数过不去 —— 传函数会让「面板走线程」这条路上的别名静默不生效。
+   *
+   * ⚠️ 它只影响**分组键**（`project` 维度），不影响 `totals` / `series` /
+   *   `records`：别名是显示口径，不是过滤条件。
+   */
+  projectAliases?: readonly LocalProjectAliasRule[]
 }
 
 /**
@@ -164,6 +186,15 @@ export class StatsSession {
   readonly #models: string[]
   /** 来源筛选（空 = 不过滤，即库里全部来源）。 */
   readonly #sources: string[]
+  /**
+   * ★ 项目名解析器 —— `project` 维度的**唯一**入口。
+   *
+   * 由 `openStats` 从 `projectAliases` 装配一次（`projectResolverFromRules`），
+   * 三条分组路径（SQL / 直扫 / 汇总表）共用它，并经 `projectNameOf` 暴露给
+   * 金额分桶的调用方 —— 同一个会话里 token 行与金额行必须用同一个解析器
+   * （见 `db/cost.ts` 的 `costByGroupOf`）。
+   */
+  readonly #projectOf: ProjectNameResolver
   /** sql 路径下的库连接。 */
   #db: Database | null = null
   /** scan 路径下的全量记录。 */
@@ -199,6 +230,8 @@ export class StatsSession {
     sessionsRoots?: string[]
     missingRoots?: string[]
     sourceRoots?: readonly SourceRoot[]
+    /** 项目名解析器（缺省 = `projectName()` 的旧口径）。 */
+    projectOf?: ProjectNameResolver
   }) {
     this.source = init.source
     this.scannedAt = init.scannedAt
@@ -213,6 +246,7 @@ export class StatsSession {
     this.#providers = init.providers
     this.#models = init.models
     this.#sources = init.sources === undefined ? [] : [...init.sources]
+    this.#projectOf = init.projectOf ?? projectName
     this.#db = init.db
     this.#records = init.records
     this.#sessions = init.sessions
@@ -252,6 +286,17 @@ export class StatsSession {
     return this.#diagnostics
   }
 
+  /**
+   * 项目名解析器（**与 `groups('project')` 用的是同一个**）。
+   *
+   * ★ 存在的理由是金额：`costByGroupOf()` 必须拿到同一个解析器，否则
+   *   `project` 维度的 token 行与金额行会对不上（页面上只表现为「费用列缺几行」）。
+   *   调用方**不要**自己按规则再装一个 —— 那就是第二个解析器。
+   */
+  get projectNameOf(): ProjectNameResolver {
+    return this.#projectOf
+  }
+
   /** 总计（四项独立 + calls）。派生指标请用 `derive()`。 */
   totals(): TokenCounts {
     if (this.#summaryCounts) return this.#summaryCounts
@@ -269,9 +314,11 @@ export class StatsSession {
   groups(dim: GroupDimension): GroupRow[] {
     // ⚠️ 来源维度刻意**不**走汇总表：汇总 cell 的键里没有来源，读它只会得到
     //   一段 undefined 的键（见 `rollupSupportsDimension` 的注释）。
+    //   ★ 项目维度**照常**走汇总表：解析器在 `readLocalRollup()` 时已经装进快照，
+    //     三条路径的项目名因此同源（见 `LocalRollupSnapshot.projectOf`）。
     if (this.#rollup && rollupSupportsDimension(dim)) return this.#rollup.groups(dim)
     if (this.#db) {
-      return queryGroups(this.#db, dim, this.#filter()).map((r) => ({
+      return queryGroups(this.#db, dim, this.#filter(), undefined, undefined, this.#projectOf).map((r) => ({
         key: r.key,
         counts: r.counts,
         // metrics 由调用方用 derive() 计算；这里先给零值占位，
@@ -282,7 +329,7 @@ export class StatsSession {
         sessions: r.sessions,
       }))
     }
-    return aggregate(this.#records ?? [], dim)
+    return aggregate(this.#records ?? [], dim, this.#projectOf)
   }
 
   /**
@@ -398,20 +445,49 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
   const providers = opts.providers ?? []
   const models = opts.models ?? []
 
+  // ★ 项目名称别名（本机口径）只在这里装配一次：规则 → 解析器的实现只有一份
+  //   （`project-alias.ts` 的 `projectResolverFromRules`），SQL / 直扫 / 汇总表
+  //   三条分组路径共用它。零条规则时它就是 `projectName` 本身 ⇒ 没配别名的行为
+  //   与迁移前逐字节相同。
+  const projectOf = projectResolverFromRules(opts.projectAliases ?? [])
+
   // 时间窗参数（两种路径共用同一份形状，避免某一支漏掉一边而另一支带上）
   const window = {
     ...(sinceMs !== undefined ? { sinceMs } : {}),
     ...(untilMs !== undefined ? { untilMs } : {}),
   }
 
+  // 来源筛选只在调用方**显式收窄**时加：全选与不加完全等价，
+  // 而生成一个 N 项的 `IN (...)` 只是白费。
+  //
+  // ⚠️ 必须在 `scanPath` **之前**算出来：直扫路径（显式 `forceScan`，或库不可用时的
+  //    降级目标）也要吃它 —— 见下方 `sourceAllowed`。
+  const allSources = registeredSources().length
+  const narrowSources: string[] | undefined = opts.sources !== undefined && opts.sources.length > 0 && opts.sources.length < allSources
+    ? [...opts.sources]
+    : undefined
+
   // ── 直扫路径（显式强制，或作为降级目标）──────────────────────────
   const scanPath = async (degradedReason?: string): Promise<StatsSession> => {
     const typedRoots = opts.sourceRoots
+    // 🚨 来源筛选在直扫路径上**同样必须生效**：收窄来源时只扫这些来源的根，
+    //   并且在候选记录上**再筛一次**。
+    //   漏掉这里的后果是「库不可用 → 自动降级为直扫」时筛选**静默失效**：
+    //   面板 / 工具筛了一个来源却拿到**全部来源**的数字，而它与「筛了但本来
+    //   就只有这些」在输出上完全一样（实测：`?source=codex` 回落成 DSH 的 1,110）。
+    //   记录级那一遍不是冗余：根与来源的对应关系来自**配置**，记录上的 `source`
+    //   才是**事实**，两者不一致时以事实为准（与 SQL 路径按 `source` 列筛同一口径）。
+    const allowedSources = narrowSources
+    const sourceAllowed = (source: string): boolean =>
+      allowedSources === undefined || allowedSources.includes(source)
+    const scannableRoots = typedRoots?.filter((root) => sourceAllowed(root.source))
     const scanKey = [
       'scan',
       typedRoots !== undefined
         ? typedRoots.map((root) => `${root.source}:${root.path}`).join('|')
         : presentRoots.join('|'),
+      // ★ 单飞的键必须覆盖「算哪些来源」，否则先来的全量直扫会被后来的筛选请求复用
+      allowedSources === undefined ? '*' : [...allowedSources].sort().join('|'),
       sinceMs ?? '*',
       untilMs ?? '*',
       providers.join('|'),
@@ -419,24 +495,27 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
     ].join('\u0000')
 
     const outcome = await singleFlight(scanFlights, scanKey, async (): Promise<ScanOutcome> => {
-      const scanned = typedRoots !== undefined
-        ? await scanAllSources(typedRoots, {
+      const scanned = scannableRoots !== undefined
+        ? await scanAllSources(scannableRoots, {
           providers,
           models,
           ...window,
           ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
         })
-        : await scanAll(presentRoots, {
+        : await scanAll(sourceAllowed('dsh') ? presentRoots : [], {
           providers,
           models,
           ...window,
           ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
         })
+      const records = allowedSources === undefined
+        ? scanned.records
+        : scanned.records.filter((record) => allowedSources.includes(record.source))
       return {
-        records: scanned.records,
+        records,
         // ★ 与 SQL 路径一致：按过滤后的记录去重，而不是用文件数。
         //   文件数会包含「有文件但这段时间没调用」的会话，让卡片虚高。
-        sessions: new Set(scanned.records.map((r) => r.sessionId)).size,
+        sessions: new Set(records.map((r) => r.sessionId)).size,
         diagnostics: scanned.diagnostics,
       }
     })
@@ -449,6 +528,7 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
       ...window,
       providers,
       models,
+      ...(allowedSources !== undefined ? { sources: allowedSources } : {}),
       db: null,
       records: outcome.records,
       sessions: outcome.sessions,
@@ -456,6 +536,7 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
       sessionsRoots: opts.sourceRoots?.map((root) => root.path) ?? presentRoots,
       ...(opts.sourceRoots !== undefined ? { sourceRoots: opts.sourceRoots } : {}),
       missingRoots,
+      projectOf,
     })
   }
 
@@ -499,13 +580,9 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
       }
     }
 
-    // 来源筛选只在调用方**显式收窄**时加：全选与不加完全等价，
+    // 来源筛选只在调用方**显式收窄**时加（`narrowSources` 已在 `scanPath` 之前算好，
+    // 直扫路径与库路径共用同一个判定）：全选与不加完全等价，
     // 而生成一个 N 项的 `IN (...)` 只是白费。
-    const allSources = registeredSources().length
-    const narrowSources: string[] | undefined = opts.sources !== undefined && opts.sources.length > 0 && opts.sources.length < allSources
-      ? [...opts.sources]
-      : undefined
-
     const filter = {
       ...window,
       ...(providers.length > 0 ? { providers } : {}),
@@ -518,7 +595,9 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
     //   所以收窄来源时一律绕过汇总表，走 `usage_event` 上的 SQL 聚合。
     const scoped = narrowSources !== undefined
     const summary = !scoped && opts.rollup === 'summary' ? readLocalRollupSummary(db, filter) : undefined
-    const rollup = !scoped && opts.rollup === true ? readLocalRollup(db, filter) : undefined
+    // ★ 汇总表路径也要吃解析器：本机面板走的正是它（`rollup: true`），
+    //   漏传会变成「SQL 路径折叠了、面板没折叠」—— 两条路径的数字都「看起来正常」。
+    const rollup = !scoped && opts.rollup === true ? readLocalRollup(db, filter, projectOf) : undefined
     return new StatsSession({
       source: 'sql',
       scannedAt: Date.now(),
@@ -544,6 +623,7 @@ export async function openStats(opts: OpenStatsOptions): Promise<StatsSession> {
       sessionsRoots: opts.sourceRoots?.map((root) => root.path) ?? presentRoots,
       ...(opts.sourceRoots !== undefined ? { sourceRoots: opts.sourceRoots } : {}),
       missingRoots,
+      projectOf,
     })
   } catch (err) {
     // 库不可用 ⇒ 降级直扫。原因必须带出去，否则用户无法判断

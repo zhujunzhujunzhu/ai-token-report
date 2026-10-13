@@ -7,7 +7,14 @@
  * 小时键仍由 aggregate.ts 生成；汇总只存原始列，比例交给 shared。
  */
 import { computeTotal } from '@ai-token-report/shared'
-import { groupKey, toHourKey, type GroupDimension, type GroupRow } from '../aggregate.js'
+import {
+  groupKey,
+  projectName,
+  toHourKey,
+  type GroupDimension,
+  type GroupRow,
+  type ProjectNameResolver,
+} from '../aggregate.js'
 import { derive, emptyCounts, mergeCounts, type TokenCounts, type UsageRecord } from '../types.js'
 import type { Database } from './driver.js'
 import { buildWhere, queryRecords, type QueryFilter } from './query.js'
@@ -159,7 +166,16 @@ export function rollupSupportsDimension(dim: GroupDimension): boolean {
 export class LocalRollupSnapshot {
   readonly counts = emptyCounts()
   readonly sessions: number
-  constructor(private readonly cells: Cell[]) {
+  /**
+   * 项目名解析器（`project` 维度用）。
+   *
+   * 🚨 必须由构造方（`readLocalRollup`）注入，不能在 `groups()` 里另取一份：
+   *   本机面板走的就是这条快路径，漏掉它会出现「配了别名、SQL 路径生效、
+   *   面板（rollup）没生效」—— 而两条路径的数字**看起来都正常**。
+   */
+  private readonly projectOf: ProjectNameResolver
+  constructor(private readonly cells: Cell[], projectOf: ProjectNameResolver = projectName) {
+    this.projectOf = projectOf
     const sessions = new Set<string>()
     for (const cell of cells) { mergeCounts(this.counts, cell.counts); sessions.add(cell.sessionId) }
     this.sessions = sessions.size
@@ -170,7 +186,7 @@ export class LocalRollupSnapshot {
     const sessions = new Map<string, Set<string>>()
     for (const cell of this.cells) {
       const first = dim === 'day' || dim === 'hour' ? cell.firstPositive ?? cell.lo : cell.lo
-      const key = groupKey({ time: cell.lo, provider: cell.provider, model: cell.model, cwd: cell.cwd, sessionId: cell.sessionId } as UsageRecord, dim)
+      const key = groupKey({ time: cell.lo, provider: cell.provider, model: cell.model, cwd: cell.cwd, sessionId: cell.sessionId } as UsageRecord, dim, this.projectOf)
       let row = groups.get(key)
       if (!row) {
         row = { key, counts: emptyCounts(), metrics: derive(emptyCounts()), firstTime: first, lastTime: cell.hi, sessions: 0 }
@@ -202,7 +218,11 @@ export class LocalRollupSnapshot {
 }
 
 /** 只在本地库使用；更新派生索引与生成快照共用事务，避免一半旧一半新的响应。 */
-export function readLocalRollup(db: Database, filter: QueryFilter = {}): LocalRollupSnapshot {
+export function readLocalRollup(
+  db: Database,
+  filter: QueryFilter = {},
+  projectOf: ProjectNameResolver = projectName,
+): LocalRollupSnapshot {
   if (filter.userIds?.length) throw new Error('本地派生索引不支持人员筛选，请使用上报库查询')
   return db.transaction(() => {
     sync(db)
@@ -234,7 +254,7 @@ export function readLocalRollup(db: Database, filter: QueryFilter = {}): LocalRo
       if (partial.has(key)) cells.push({ key, hour: toHourKey(r.time), sessionId: r.sessionId, provider: r.provider,
         model: r.model, cwd: r.cwd, lo: r.time, hi: r.time, firstPositive: r.time > 0 ? r.time : null, counts: r.usage })
     }
-    return new LocalRollupSnapshot(cells)
+    return new LocalRollupSnapshot(cells, projectOf)
   })
 }
 
