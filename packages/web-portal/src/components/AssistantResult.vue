@@ -8,7 +8,7 @@ import { SVGRenderer } from 'echarts/renderers'
 import { DataAnalysis, Grid, Download } from '@element-plus/icons-vue'
 import type { AssistantResult } from '@ai-token-report/shared'
 import { assistantChartData, buildAssistantEchartsOption } from '../utils/assistantEcharts.js'
-import { formatCount, formatPercent, formatFullDateTime } from '../utils/format.js'
+import { formatBucketFull, formatCount, formatPercent, formatFullDateTime } from '../utils/format.js'
 import { assistantTableCsv } from '../utils/assistantCsv.js'
 use([LineChart, BarChart, PieChart, ScatterChart, DatasetComponent, GridComponent, LegendComponent, TooltipComponent, AriaComponent, SVGRenderer])
 const props = defineProps<{ result: AssistantResult }>()
@@ -35,7 +35,10 @@ watch(() => [mode.value, metric.value, props.result], draw, { flush: 'post' })
 onBeforeUnmount(() => { resize?.disconnect(); chart?.dispose() })
 function display(value: string | number | null | undefined, format?: string): string {
   if (value === null || value === undefined) return '—'
-  if (typeof value !== 'number') return value
+  // ★ 分桶键（`2026-10-13T11`）在表格里也要读得出来 —— 图上已经格式化了，
+  //   表格里仍是机器格式的话，同一屏两种写法。非分桶文本原样返回。
+  //   ⚠️ CSV 导出**不**走这里（`assistantTableCsv` 直接读原值）：导出的是数据，不是排版。
+  if (typeof value !== 'number') return formatBucketFull(value)
   if (format === 'percent') return formatPercent(value)
   if (format === 'datetime') return formatFullDateTime(value)
   return formatCount(value)

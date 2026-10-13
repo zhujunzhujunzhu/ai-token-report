@@ -94,3 +94,48 @@ export function formatBucket(
   const [, month, day] = bucket.split('-')
   return month && day ? `${month}-${day}` : bucket
 }
+
+/**
+ * 服务端的两种分桶键，逐字对应 `aggregate.ts` 的 `toDayKey()` / `toHourKey()`。
+ *
+ * ★ 必须校验形状而不是「看着像日期就格式化」：展示层同时会碰到模型名、厂商名、
+ *   项目路径，把 `qwen-max` 这类文本当日期切一刀，图上会出现一年前的时间。
+ */
+const DAY_BUCKET = /^\d{4}-\d{2}-\d{2}$/
+const HOUR_BUCKET = /^\d{4}-\d{2}-\d{2}T\d{2}$/
+
+/**
+ * 从一列单元格值里认出时间分桶的粒度，认不出返回 `null`。
+ *
+ * 助手图表拿到的只有展示快照，**没有** `bucket=day|hour` 这个参数（它留在查询串里），
+ * 所以粒度只能从值本身认。认不出来时调用方一律原样显示。
+ *
+ * ⚠️ 混了两代键时以小时为准：日桶列里不可能出现小时键，反过来才会（窗口跨界）。
+ */
+export function bucketGranularityOf(
+  values: readonly unknown[],
+): 'day' | 'hour' | null {
+  let day = false
+  for (const value of values) {
+    if (typeof value !== 'string') continue
+    if (HOUR_BUCKET.test(value)) return 'hour'
+    if (DAY_BUCKET.test(value)) day = true
+  }
+  return day ? 'day' : null
+}
+
+/**
+ * 分桶键的**完整**写法：`2026-09-21T14` → `2026-09-21 14:00`。
+ *
+ * ★ 用在悬浮提示框的标题上（那里有位置写全）：`T14` 是机器格式，人读不出来。
+ *   日桶 `2026-09-21` 本来就完整，原样返回；其余文本（模型名 / 厂商名）一律不动。
+ *
+ * 🚨 不要改成 `new Date(bucket)` 再 `toLocaleString`：分桶键是**服务端本地时区**的
+ *   「哪一天的哪一小时」，浏览器时区不同（出差、客户在别的时区）时会整体位移，
+ *   而位移出来的图看起来完全正常，查起来极难。
+ */
+export function formatBucketFull(bucket: string): string {
+  return HOUR_BUCKET.test(bucket)
+    ? `${bucket.slice(0, 10)} ${bucket.slice(11)}:00`
+    : bucket
+}

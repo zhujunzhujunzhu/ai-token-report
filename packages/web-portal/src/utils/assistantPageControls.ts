@@ -98,12 +98,21 @@ function rowLabel(element: HTMLElement): string {
   if (!row) return ''
   const rows = Array.from(row.parentElement?.querySelectorAll('tr') ?? [])
   const index = rows.indexOf(row) + 1
-  const table = row.closest('.el-table,table')
+  // ⚠️ 展开内容那一行（`td.el-table__expanded-cell`）自己**没有任何列**，
+  //   名称只能从它上面那条数据行借 —— 否则展开区里的按钮全都只剩「第 N 行」，
+  //   助手分不清它属于哪个项目 / 哪个人。
+  //   ★ 行号仍取**展开行自己的位置**：同一个项目下多条规则的操作按钮必须靠行号
+  //   区分（路径是敏感值，不发给模型），换成父行号会让它们长得一模一样。
+  const named = row.querySelector('.el-table__expanded-cell') ? rows[index - 2] ?? row : row
+  const table = named.closest('.el-table,table')
   let name = ''
-  for (const cell of Array.from(row.querySelectorAll('td'))) {
+  for (const cell of Array.from(named.querySelectorAll('td'))) {
     const column = Array.from(cell.classList).find(item => /^el-table_\w+_column_\w+$/.test(item))
     const header = column ? clean(table?.querySelector(`th.${column}`)?.textContent) : ''
-    if (!/^(姓名|成员|人员|署名|分组名称|角色名称|模型|归一化后的项目|供应商)$/.test(header)) continue
+    // ⚠️ 表头文案是**展示层**的字符串，两页各有各的叫法（项目页「归一化后的项目」、
+    //   供应商页「归一化后的名字」），所以这里列的是白名单而不是一条模糊匹配 ——
+    //   多认一列等于把那一列的单元格内容（可能是路径 / 凭证）发给模型。
+    if (!/^(姓名|成员|人员|署名|分组名称|角色名称|模型|归一化后的项目|归一化后的名字|供应商)$/.test(header)) continue
     const candidate = clean(cell.querySelector('strong')?.textContent ?? cell.textContent, 48)
     if (safeMetadata(candidate) && !/[\\/]/.test(candidate) && !cell.querySelector('input,button,code')) { name = candidate; break }
   }
