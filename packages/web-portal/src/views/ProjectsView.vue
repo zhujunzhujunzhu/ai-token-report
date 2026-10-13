@@ -10,6 +10,13 @@
  * - 没有配规则的目录**回到旧口径**（目录最后一段，`D:\a\proj\packages\core` → `core`）
  *   —— 归一化不是「统一改名」，是「把散开的几行折回一个项目」。
  *
+ * ## ★ 列表的主体是「项目」，不是「规则」
+ *
+ * 同一个项目在线上通常是 3~6 条规则（换盘 / 换父目录 / 盘符大小写各一条），
+ * 平铺时那 6 行看起来像 6 份不同的配置。所以这一页**一个项目一行**：
+ * 行上给的是摘要（几条规则、几条路径、哪些人 / 全局），点开才逐条列规则与操作。
+ * 折叠的判断（计数、去重、组内顺序）都在 `projectsModel.ts` 里，由 `bun test` 钉住。
+ *
  * ## ⚠️ 与「供应商归一化」刻意不同的两点，页面必须说清
  *
  * | | 供应商归一化 | 项目归一化（本页） |
@@ -17,15 +24,18 @@
  * | 匹配 | 原始名**精确**（一字不差） | 原始 cwd 的**仓库名**（任一路径段）或**路径前缀** |
  * | 多条命中 | 同一原始名只有一条规则 | **路径前缀规则优先**；同类型内最具体者胜出 |
  *
- * 所以本页**不会**出现「一个目录一行」的提示：一条 `suit-g92-parent` 的规则本来就该
- * 覆盖它在任意磁盘下的所有子目录 —— 那正是这个功能的目的。
- *
  * ## 为什么这一页主推「填仓库名」而不是「填完整路径」
  *
  * 路径前缀模式下同一个仓库要**每种位置各配一条**：换盘、换父目录、换盘符大小写
  * （不同客户端写 `cwd` 的方式不同）。线上实测一个仓库要 3~6 条，漏掉一个变体就
  * **静默不命中**（页面上完全看不出来，只表现为「那个项目用量偏小」）。
  * 填仓库名把这三类差异一次消掉：一条规则管所有位置。
+ *
+ * ## 为什么项目名要能「带过来」再新增路径
+ *
+ * 项目名是**自由文本**，而分组键就是它的**逐字取值**（见 `projectsModel.ts`）：
+ * 手抄一遍差一个空格，看板上就多出一个项目，而页面上只表现为「怎么多了一行」。
+ * 所以每一行都提供「添加路径」，把这一行的项目名原样带进表单。
  *
  * ## 为什么匹配值要「选」而不是「填」
  *
@@ -52,6 +62,7 @@ import * as api from '../api/admin.js'
 import { fetchProjectCwds } from '../api/portal.js'
 import { useSessionStore } from '../stores/session.js'
 import { formatFullDateTime } from '../utils/format.js'
+import { groupProjectRules, projectGroupRowKey, type ProjectRuleGroup } from './projectsModel.js'
 
 const session = useSessionStore()
 const aliases = ref<PortalProjectAlias[]>([])
@@ -76,15 +87,38 @@ const form = ref<FormInstance>()
 const draft = reactive({ scope: 'global' as 'global' | 'member', member_id: '', prefix: '', alias: '' })
 
 const canManage = computed(() => session.can('projects:manage'))
-const rows = computed(() => aliases.value.filter((entry) =>
-  (!scopeFilter.value || entry.scope === scopeFilter.value) &&
-  (!search.value.trim() || `${entry.prefix} ${entry.alias} ${entry.member_name ?? ''}`.toLowerCase().includes(search.value.trim().toLowerCase())),
-))
+/** 列表主体：一行 = 一个归一化后的项目（折叠与筛选规则全在 `projectsModel.ts`）。 */
+const groups = computed(() => groupProjectRules(aliases.value, { search: search.value, scope: scopeFilter.value }))
+/**
+ * 列表上**真正显示**的规则条数。
+ *
+ * ⚠️ 刻意不复用「命中的条数」：关键字命中一条规则时整个项目都会展开（见
+ *   `groupProjectRules`），所以显示的条数会比命中的多 —— 计数若按命中算，
+ *   使用者会看到「3 条规则」却能数出 6 行，然后去查一个不存在的 bug。
+ *   筛选逻辑只此一处（一个 `filter` 谓词 + 一次分组），页面不再自己算一遍。
+ */
+const shownRules = computed(() => groups.value.reduce((total, group) => total + group.ruleCount, 0))
+/**
+ * 已展开的项目行。
+ *
+ * ★ 用受控的 `expand-row-keys` 而不是让表格自己记：这样「全部展开 / 全部收起」
+ *   与逐行点开共用同一份状态 —— 否则按钮只能靠重新挂载表格（`:key`）来强制展开，
+ *   点一下就把滚动位置和排序一起丢掉。
+ */
+const expandedKeys = ref<string[]>([])
+const allExpanded = computed(() => groups.value.length > 0 && expandedKeys.value.length >= groups.value.length)
+/** 汇总列最多列几个人名：成员多的项目会把这一列撑成一屏，其余折成「等 N 人」。 */
+const VISIBLE_MEMBERS = 4
+const visibleMembers = (group: ProjectRuleGroup) => group.members.slice(0, VISIBLE_MEMBERS)
+/**
+ * 行插槽给的 `row` 是 Element Plus 自己的 `DefaultRow`（`Record<PropertyKey, any>`），
+ * 不是本页的契约类型，而模板里做不了类型断言 —— 所以入口收 `unknown`、在这里收窄一次。
+ */
+const asGroup = (row: unknown): ProjectRuleGroup => row as ProjectRuleGroup
 const rules: FormRules = {
   prefix: [{ required: true, message: '请填写要归一化的目录前缀', trigger: 'blur' }],
   alias: [{ required: true, message: '请填写归一化后的项目名', trigger: 'blur' }],
 }
-const rowAlias = (row: unknown): PortalProjectAlias => row as PortalProjectAlias
 
 async function load(): Promise<void> {
   if (loading.value) return
@@ -108,6 +142,19 @@ async function load(): Promise<void> {
   loading.value = false
 }
 
+/** 展开 / 收起一行。 */
+function onExpandChange(_row: unknown, expanded: unknown): void {
+  // ⚠️ `type="expand"` 的列，`expand-change` 的第二参是**当前已展开的行数组**
+  //   （树形表格才是布尔值）—— 所以这里只认数组形态，两种写法都不必特判。
+  expandedKeys.value = Array.isArray(expanded)
+    ? expanded.map((item) => projectGroupRowKey(item as ProjectRuleGroup))
+    : []
+}
+
+function toggleExpandAll(): void {
+  expandedKeys.value = allExpanded.value ? [] : groups.value.map(projectGroupRowKey)
+}
+
 function open(entry: PortalProjectAlias | null = null): void {
   selected.value = entry
   draft.scope = entry?.scope ?? 'global'
@@ -116,6 +163,17 @@ function open(entry: PortalProjectAlias | null = null): void {
   draft.alias = entry?.alias ?? ''
   error.value = null
   showForm.value = true
+}
+
+/**
+ * 「给这个项目再加一条路径」：项目名原样带进表单。
+ *
+ * ★ 带过来的是**这一行显示的那个字符串**（不带 trim、不改大小写），因为分组键就是它 ——
+ *   使用者照着屏幕重打一遍，差一个字符就会变成另一个项目。
+ */
+function openForProject(group: ProjectRuleGroup): void {
+  open()
+  draft.alias = group.alias
 }
 
 async function save(): Promise<void> {
@@ -215,7 +273,13 @@ onMounted(() => { void load() })
       <template #header>
         <div class="panel-heading">
           <div>
-            <h2>规则列表</h2>
+            <h2>项目列表</h2>
+            <p>
+              一个项目一行：这一列是<strong>归一化后</strong>的名字，展开后能看到它关联了哪些路径、
+              以及每条规则是<strong>全局</strong>的还是配给了某几个人。
+              项目名<strong>逐字一致</strong>才会折进同一个项目 —— 差一个字符（多一个空格也算）
+              就是另一个项目，看板上也会分成两行，所以行上提供了「添加路径」把名字原样带过去。
+            </p>
             <p>
               全局规则对所有人生效，人员规则只对该人员生效。多条命中同一目录时<strong>路径前缀规则优先于仓库名规则</strong>，
               同类里<strong>前缀最长的胜出</strong>。前缀按<strong>路径分隔符边界</strong>判定、<strong>区分大小写</strong>，
@@ -230,31 +294,76 @@ onMounted(() => { void load() })
         <el-select v-model="scopeFilter" clearable placeholder="全部作用范围" aria-label="筛选作用范围">
           <el-option label="全局" value="global" /><el-option label="按人员" value="member" />
         </el-select>
-        <span class="muted">共 {{ rows.length }} 条规则</span>
+        <el-button :disabled="busy || !groups.length" @click="toggleExpandAll">{{ allExpanded ? '全部收起' : '全部展开' }}</el-button>
+        <span class="muted">共 {{ groups.length }} 个项目 · {{ shownRules }} 条规则</span>
       </div>
       <el-skeleton v-if="loading && !aliases.length" :rows="5" animated />
-      <el-table v-else :data="rows" row-key="alias_id" empty-text="还没有规则：现在所有目录都按「目录最后一段」显示">
-        <el-table-column prop="scope" label="作用范围" width="150" sortable>
+      <el-table
+        v-else
+        :data="groups"
+        :row-key="projectGroupRowKey"
+        :expand-row-keys="expandedKeys"
+        empty-text="还没有规则：现在所有目录都按「目录最后一段」显示"
+        @expand-change="onExpandChange"
+      >
+        <!--
+          展开区 = 这个项目的规则清单：一条规则一行，作用范围、路径、状态与三个操作都在这里。
+          项目行只放摘要，否则 30 条规则会把首屏铺满，又回到「一行一条规则、看不出哪些是一组」。
+        -->
+        <el-table-column type="expand" width="48">
           <template #default="{ row }">
-            <el-tag :type="row.scope === 'global' ? 'info' : 'success'">{{ row.scope === 'global' ? '全局' : '按人员' }}</el-tag>
-            <span v-if="row.member_name" class="muted"> {{ row.member_name }}</span>
+            <div class="rule-lines">
+              <div class="rule-lines-head">
+                <span>作用范围</span><span>仓库名 / 目录前缀</span><span>状态</span><span>更新时间</span><span v-if="canManage">操作</span>
+              </div>
+              <div v-for="entry in asGroup(row).rules" :key="entry.alias_id" class="rule-line">
+                <span class="rule-scope">
+                  <el-tag size="small" :type="entry.scope === 'global' ? 'info' : 'success'">{{ entry.scope === 'global' ? '全局' : '按人员' }}</el-tag>
+                  <span v-if="entry.member_name" class="muted">{{ entry.member_name }}</span>
+                </span>
+                <code class="rule-prefix">{{ entry.prefix }}</code>
+                <el-tag size="small" :type="entry.enabled ? 'success' : 'info'">{{ entry.enabled ? '启用' : '停用' }}</el-tag>
+                <span class="muted">{{ formatFullDateTime(entry.updated_at_ms) }}</span>
+                <span v-if="canManage" class="rule-ops">
+                  <el-button link type="primary" :disabled="busy" @click="open(entry)">编辑</el-button>
+                  <el-button link :type="entry.enabled ? 'warning' : 'success'" :disabled="busy" @click="changeStatus(entry)">{{ entry.enabled ? '停用' : '启用' }}</el-button>
+                  <el-button link type="danger" :disabled="busy" :icon="Delete" @click="remove(entry)">删除</el-button>
+                </span>
+              </div>
+            </div>
           </template>
         </el-table-column>
-        <el-table-column prop="prefix" label="仓库名 / 目录前缀" min-width="260" sortable>
-          <template #default="{ row }"><code>{{ row.prefix }}</code></template>
-        </el-table-column>
-        <el-table-column prop="alias" label="归一化后的项目" min-width="180" sortable>
-          <template #default="{ row }">{{ row.alias }}</template>
-        </el-table-column>
-        <el-table-column prop="enabled" label="状态" width="100" sortable>
-          <template #default="{ row }"><el-tag :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '启用' : '停用' }}</el-tag></template>
-        </el-table-column>
-        <el-table-column prop="updated_at_ms" label="更新时间" min-width="170" sortable><template #default="{ row }">{{ formatFullDateTime(row.updated_at_ms) }}</template></el-table-column>
-        <el-table-column v-if="canManage" label="操作" width="190" fixed="right">
+        <el-table-column prop="alias" label="归一化后的项目" min-width="200" sortable>
           <template #default="{ row }">
-            <el-button link type="primary" :disabled="busy" @click="open(rowAlias(row))">编辑</el-button>
-            <el-button link :type="row.enabled ? 'warning' : 'success'" :disabled="busy" @click="changeStatus(rowAlias(row))">{{ row.enabled ? '停用' : '启用' }}</el-button>
-            <el-button link type="danger" :disabled="busy" :icon="Delete" @click="remove(rowAlias(row))">删除</el-button>
+            <strong>{{ asGroup(row).alias }}</strong>
+            <span class="muted"> {{ asGroup(row).ruleCount }} 条规则</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="关联人员 / 作用范围" min-width="230">
+          <template #default="{ row }">
+            <el-tag v-if="asGroup(row).globalRules" size="small" type="info" class="member-chip">全局</el-tag>
+            <el-tag v-for="owner in visibleMembers(asGroup(row))" :key="owner.member_id" size="small" type="success" class="member-chip">
+              {{ owner.name }}<span v-if="owner.ruleCount > 1"> ×{{ owner.ruleCount }}</span>
+            </el-tag>
+            <span v-if="asGroup(row).members.length > VISIBLE_MEMBERS" class="muted">等 {{ asGroup(row).members.length }} 人</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="pathCount" label="关联路径" min-width="280" sortable>
+          <template #default="{ row }">
+            <code v-for="prefix in asGroup(row).prefixes.slice(0, 2)" :key="prefix" class="rule-prefix">{{ prefix }}</code>
+            <span v-if="asGroup(row).pathCount > 2" class="muted">共 {{ asGroup(row).pathCount }} 条路径，展开后逐条看</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="enabledRules" label="状态" width="140" sortable>
+          <template #default="{ row }">
+            <el-tag size="small" :type="asGroup(row).enabledRules ? 'success' : 'info'" class="member-chip">启用 {{ asGroup(row).enabledRules }}</el-tag>
+            <el-tag v-if="asGroup(row).disabledRules" size="small" type="warning" class="member-chip">停用 {{ asGroup(row).disabledRules }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="updatedAtMs" label="最近更新" min-width="170" sortable><template #default="{ row }">{{ formatFullDateTime(asGroup(row).updatedAtMs) }}</template></el-table-column>
+        <el-table-column v-if="canManage" label="操作" width="140" fixed="right">
+          <template #default="{ row }">
+            <el-button link type="primary" :disabled="busy" @click="openForProject(asGroup(row))">添加路径</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -305,7 +414,11 @@ onMounted(() => { void load() })
         </el-form-item>
         <el-form-item label="归一化后的项目名" prop="alias">
           <el-input v-model="draft.alias" maxlength="128" placeholder="例如 AI Token 用量平台" autocomplete="off" />
-          <p class="muted">这是看板「项目」维度里显示的名字，允许中文。</p>
+          <p class="muted">
+            这是看板「项目」维度里显示的名字，允许中文。
+            <strong>要并进已有项目请逐字一致</strong>（多一个空格就是另一个项目）——
+            从列表行上的「添加路径」进来时会自动带上那一行的名字。
+          </p>
         </el-form-item>
         <div class="dialog-actions">
           <el-button @click="showForm = false">取消</el-button>

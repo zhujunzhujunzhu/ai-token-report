@@ -769,6 +769,65 @@ code {
 .record-details {
   padding: 16px 32px;
 }
+/* ── 归一化页面（项目 / 供应商模型）：名字行 + 展开后的规则清单 ─────────
+   展开区是这个项目**关联的路径**、或这个展示名**关联的原始值**；表头与每一条规则
+   共用同一套网格，让「作用范围 / 原始值 / 状态 / 更新时间 / 操作」的对应关系一眼可见。
+   两页刻意共用同一套类名：行结构一模一样，各写一套只会慢慢漂移。 */
+.rule-lines {
+  padding: 2px 0 4px;
+}
+.rule-lines-head,
+.rule-line {
+  display: grid;
+  grid-template-columns: 140px minmax(160px, 1fr) 80px 150px auto;
+  align-items: center;
+  gap: 12px;
+}
+.rule-lines-head {
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--c-border);
+  color: #8a97a9;
+  font-size: 12px;
+}
+.rule-line {
+  padding: 7px 0;
+  border-bottom: 1px dashed #eef2f7;
+}
+.rule-line:last-child {
+  border-bottom: none;
+}
+.rule-scope {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+/* 路径或「限定供应商 · 模型」可能很长（`D:\Coding_agent\…`），一律单行省略：
+   撑开列宽会把这一行其余几列顶出去。 */
+.rule-prefix {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+/* 原始值那一格：上面一行原始值，下面一行「与原始名相同」的说明。
+   ⚠️ 外层必须 `overflow: hidden`（网格项的自动最小宽度因此归零），
+   否则单行省略失效：一个长路径会把整条轨道撑开、把其余几列一起顶出去。 */
+.rule-source {
+  overflow: hidden;
+}
+.rule-source .muted {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.rule-ops {
+  white-space: nowrap;
+}
+/* 汇总列里的「全局 / 人名 / 启用 n / 停用 m」标签挨着排，换行时留一点间距 */
+.member-chip {
+  margin: 0 4px 4px 0;
+}
 /* ── 采集诊断：指标卡 → 结论状态行 → 时间边界 → 口径说明 ───────────── */
 .diagnostic-cards {
   display: grid;

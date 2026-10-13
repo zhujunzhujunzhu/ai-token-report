@@ -45,6 +45,10 @@ import { fetchMembers } from '../api/admin.js'
 import * as api from '../api/admin.js'
 import { useSessionStore } from '../stores/session.js'
 import { formatFullDateTime } from '../utils/format.js'
+import {
+  groupProviderRules, providerGroupRowKey, providerRuleKeepsSourceName, providerRuleSourceOf, providerRuleTarget,
+  type ProviderRuleGroup, type ProviderRuleTarget,
+} from './providersModel.js'
 
 const session = useSessionStore()
 const aliases = ref<PortalProviderAlias[]>([])
@@ -71,27 +75,36 @@ const draft = reactive({
 })
 
 const canManage = computed(() => session.can('providers:manage'))
-/** 一条规则折叠哪个维度，由 `model` 是否有值决定（见 `PortalProviderAlias`）。 */
-const isModelRule = (entry: PortalProviderAlias): boolean => entry.model !== null
-/** 「作用对象」列的文字。 */
-const targetOf = (entry: PortalProviderAlias): string => (isModelRule(entry) ? '模型' : '供应商')
+/** 「作用对象」列 / 标签的文字。折叠哪个维度由 `model` 是否有值决定（见 `providersModel.ts`）。 */
+const targetLabel = (target: ProviderRuleTarget): string => (target === 'model' ? '模型' : '供应商')
+/** 列表主体：一行 = 一个归一化后的名字（折叠与筛选规则全在 `providersModel.ts`）。 */
+const groups = computed(() => groupProviderRules(aliases.value, { search: search.value, scope: scopeFilter.value, target: targetFilter.value }))
 /**
- * 规则匹配的**原始值**，拼成一行给列表看。
+ * 列表上**真正显示**的规则条数。
  *
- * ★ 模型规则要把「限定供应商」一并显示：只显示模型名的话，
- *   「`gpt-4o`（任意供应商）」与「`azure-openai` 下的 `gpt-4o`」在列表里长得一样，
- *   而这两条规则的射程完全不同。
+ * ⚠️ 刻意不复用「命中的条数」：关键字命中一条规则时整个名字都会展开（见
+ *   `groupProviderRules`），所以显示的条数会比命中的多 —— 计数若按命中算，
+ *   使用者会看到「2 条规则」却能数出 4 行，然后去查一个不存在的 bug。
+ *   筛选逻辑只此一处（一个 `filter` 谓词 + 一次分组），页面不再自己算一遍。
  */
-const sourceOf = (entry: PortalProviderAlias): string => {
-  if (entry.model === null) return entry.provider
-  const scope = entry.provider === ANY_PROVIDER ? '任意供应商' : entry.provider
-  return `${scope} · ${entry.model}`
-}
-const rows = computed(() => aliases.value.filter((entry) =>
-  (!scopeFilter.value || entry.scope === scopeFilter.value) &&
-  (!targetFilter.value || (targetFilter.value === 'model') === isModelRule(entry)) &&
-  (!search.value.trim() || `${entry.provider} ${entry.model ?? ''} ${entry.alias} ${entry.member_name ?? ''}`.toLowerCase().includes(search.value.trim().toLowerCase())),
-))
+const shownRules = computed(() => groups.value.reduce((total, group) => total + group.ruleCount, 0))
+/**
+ * 已展开的名字行。
+ *
+ * ★ 用受控的 `expand-row-keys` 而不是让表格自己记：这样「全部展开 / 全部收起」
+ *   与逐行点开共用同一份状态 —— 否则按钮只能靠重新挂载表格（`:key`）来强制展开，
+ *   点一下就把滚动位置和排序一起丢掉。
+ */
+const expandedKeys = ref<string[]>([])
+const allExpanded = computed(() => groups.value.length > 0 && expandedKeys.value.length >= groups.value.length)
+/** 汇总列最多列几个人名：成员多的展示名会把这一列撑成一屏，其余折成「等 N 人」。 */
+const VISIBLE_MEMBERS = 4
+const visibleMembers = (group: ProviderRuleGroup) => group.members.slice(0, VISIBLE_MEMBERS)
+/**
+ * 行插槽给的 `row` 是 Element Plus 自己的 `DefaultRow`（`Record<PropertyKey, any>`），
+ * 不是本页的契约类型，而模板里做不了类型断言 —— 所以入口收 `unknown`、在这里收窄一次。
+ */
+const asGroup = (row: unknown): ProviderRuleGroup => row as ProviderRuleGroup
 /**
  * 校验随「作用对象」变：供应商规则要原始供应商名，模型规则要原始模型名
  *   （「限定供应商」可以留空 = 任意供应商，所以它不是必填）。
@@ -105,7 +118,19 @@ const rules = computed<FormRules>(() => ({
     : [],
   alias: [{ required: true, message: '请填写归一化后的名字', trigger: 'blur' }],
 }))
-const rowAlias = (row: unknown): PortalProviderAlias => row as PortalProviderAlias
+
+/** 展开 / 收起一行。 */
+function onExpandChange(_row: unknown, expanded: unknown): void {
+  // ⚠️ `type="expand"` 的列，`expand-change` 的第二参是**当前已展开的行数组**
+  //   （树形表格才是布尔值）—— 所以这里只认数组形态，两种写法都不必特判。
+  expandedKeys.value = Array.isArray(expanded)
+    ? expanded.map((item) => providerGroupRowKey(item as ProviderRuleGroup))
+    : []
+}
+
+function toggleExpandAll(): void {
+  expandedKeys.value = allExpanded.value ? [] : groups.value.map(providerGroupRowKey)
+}
 
 async function load(): Promise<void> {
   if (loading.value) return
@@ -128,15 +153,29 @@ function open(entry: PortalProviderAlias | null = null): void {
   selected.value = entry
   draft.scope = entry?.scope ?? 'global'
   draft.member_id = entry?.member_id ?? ''
-  draft.target = entry && isModelRule(entry) ? 'model' : 'provider'
+  draft.target = entry ? providerRuleTarget(entry) : 'provider'
   // ★ 任意供应商在表单里显示成**空**（placeholder 写着「*（不限供应商）」）：
   //   让使用者看到一个字面量 `*` 会以为要自己记住这个魔法值，
   //   而它其实是「留空」这一件事的另一种写法。
-  draft.provider = entry ? (isModelRule(entry) && entry.provider === ANY_PROVIDER ? '' : entry.provider) : ''
+  draft.provider = entry ? (providerRuleTarget(entry) === 'model' && entry.provider === ANY_PROVIDER ? '' : entry.provider) : ''
   draft.model = entry?.model ?? ''
   draft.alias = entry?.alias ?? ''
   error.value = null
   showForm.value = true
+}
+
+/**
+ * 「给这个展示名再加一条规则」：名字与作用对象原样带进表单。
+ *
+ * ★ 带过来的是**这一行显示的那个字符串**（不带 trim、不改大小写），因为分组键就是它 ——
+ *   使用者照着屏幕重打一遍，差一个字符就会变成另一个展示名。
+ *   ⚠️ 只带名字与作用对象：这一组的「原始值」逐条不同（模型规则还要挑限定供应商），
+ *   带哪一条都是猜 —— 猜错会静默不命中，比留空更坏。
+ */
+function openForGroup(group: ProviderRuleGroup): void {
+  open()
+  draft.target = group.target
+  draft.alias = group.alias
 }
 
 async function save(): Promise<void> {
@@ -174,8 +213,8 @@ async function remove(entry: PortalProviderAlias): Promise<void> {
   if (busy.value) return
   try {
     await ElMessageBox.confirm(
-      `删除后 ${sourceOf(entry)} 会恢复成自己的原始名。历史用量不会被改动 —— 归一化只作用在查询上。`,
-      `删除规则 · ${sourceOf(entry)}`,
+      `删除后 ${providerRuleSourceOf(entry)} 会恢复成自己的原始名。历史用量不会被改动 —— 归一化只作用在查询上。`,
+      `删除规则 · ${providerRuleSourceOf(entry)}`,
       { type: 'warning', confirmButtonText: '删除规则', cancelButtonText: '取消' },
     )
   } catch { return }
@@ -235,7 +274,16 @@ onMounted(() => { void load() })
       <template #header>
         <div class="panel-heading">
           <div>
-            <h2>规则列表</h2>
+            <h2>归一化名字列表</h2>
+            <p>
+              一个名字一行：这一列是<strong>归一化后</strong>的名字，展开后能看到有哪些原始值折到了它、
+              以及每条规则是<strong>全局</strong>的还是配给了某几个人。
+              供应商与模型是<strong>两个维度</strong>（一条规则只折叠一个维度），
+              所以同一个名字在两个维度里各占一行。
+              名字<strong>逐字一致</strong>才会折进同一个名字 —— 差一个字符（多一个空格也算）
+              就是另一个名字，所以行上的「添加规则」会把这一行的名字与作用对象<strong>原样带过去</strong>，
+              不必照着屏幕重打。
+            </p>
             <p>全局规则对所有人生效；人员规则只对该人员生效，未提到的项仍回落全局。</p>
           </div>
           <el-button :icon="Refresh" :loading="loading" :disabled="busy" @click="load">刷新</el-button>
@@ -249,38 +297,80 @@ onMounted(() => { void load() })
         <el-select v-model="scopeFilter" clearable placeholder="全部作用范围" aria-label="筛选作用范围">
           <el-option label="全局" value="global" /><el-option label="按人员" value="member" />
         </el-select>
-        <span class="muted">共 {{ rows.length }} 条规则</span>
+        <el-button :disabled="busy || !groups.length" @click="toggleExpandAll">{{ allExpanded ? '全部收起' : '全部展开' }}</el-button>
+        <span class="muted">共 {{ groups.length }} 个名字 · {{ shownRules }} 条规则</span>
       </div>
       <el-skeleton v-if="loading && !aliases.length" :rows="5" animated />
-      <el-table v-else :data="rows" row-key="alias_id" empty-text="还没有规则：现在所有供应商与模型都按原始名展示">
-        <el-table-column prop="scope" label="作用范围" width="140" sortable>
+      <el-table
+        v-else
+        :data="groups"
+        :row-key="providerGroupRowKey"
+        :expand-row-keys="expandedKeys"
+        empty-text="还没有规则：现在所有供应商与模型都按原始名展示"
+        @expand-change="onExpandChange"
+      >
+        <!--
+          展开区 = 这个展示名的规则清单：一条规则一行，作用范围、原始值、状态与三个操作都在这里。
+          名字行只放摘要，否则几十条规则会把首屏铺满，又回到「一行一条规则、看不出哪些是一组的」。
+        -->
+        <el-table-column type="expand" width="48">
           <template #default="{ row }">
-            <el-tag :type="row.scope === 'global' ? 'info' : 'success'">{{ row.scope === 'global' ? '全局' : '按人员' }}</el-tag>
-            <span v-if="row.member_name" class="muted"> {{ row.member_name }}</span>
+            <div class="rule-lines">
+              <div class="rule-lines-head">
+                <span>作用范围</span><span>匹配的原始值</span><span>状态</span><span>更新时间</span><span v-if="canManage">操作</span>
+              </div>
+              <div v-for="entry in asGroup(row).rules" :key="entry.alias_id" class="rule-line">
+                <span class="rule-scope">
+                  <el-tag size="small" :type="entry.scope === 'global' ? 'info' : 'success'">{{ entry.scope === 'global' ? '全局' : '按人员' }}</el-tag>
+                  <span v-if="entry.member_name" class="muted">{{ entry.member_name }}</span>
+                </span>
+                <span class="rule-source">
+                  <code class="rule-prefix">{{ providerRuleSourceOf(entry) }}</code>
+                  <span v-if="providerRuleKeepsSourceName(entry)" class="muted">与原始名相同</span>
+                </span>
+                <el-tag size="small" :type="entry.enabled ? 'success' : 'info'">{{ entry.enabled ? '启用' : '停用' }}</el-tag>
+                <span class="muted">{{ formatFullDateTime(entry.updated_at_ms) }}</span>
+                <span v-if="canManage" class="rule-ops">
+                  <el-button link type="primary" :disabled="busy" @click="open(entry)">编辑</el-button>
+                  <el-button link :type="entry.enabled ? 'warning' : 'success'" :disabled="busy" @click="changeStatus(entry)">{{ entry.enabled ? '停用' : '启用' }}</el-button>
+                  <el-button link type="danger" :disabled="busy" :icon="Delete" @click="remove(entry)">删除</el-button>
+                </span>
+              </div>
+            </div>
           </template>
         </el-table-column>
-        <el-table-column prop="model" label="作用对象" width="100" sortable :sort-by="targetOf">
+        <el-table-column prop="alias" label="归一化后的名字" min-width="220" sortable>
           <template #default="{ row }">
-            <el-tag :type="isModelRule(rowAlias(row)) ? 'warning' : 'primary'" effect="plain">{{ targetOf(rowAlias(row)) }}</el-tag>
+            <strong>{{ asGroup(row).alias }}</strong>
+            <el-tag size="small" effect="plain" :type="asGroup(row).target === 'model' ? 'warning' : 'primary'" class="member-chip">{{ targetLabel(asGroup(row).target) }}</el-tag>
+            <span class="muted">{{ asGroup(row).ruleCount }} 条规则</span>
           </template>
         </el-table-column>
-        <el-table-column prop="provider" label="匹配的原始值" min-width="220" sortable :sort-by="sourceOf">
-          <template #default="{ row }"><code>{{ sourceOf(rowAlias(row)) }}</code></template>
-        </el-table-column>
-        <el-table-column prop="alias" label="归一化后" min-width="180" sortable>
+        <el-table-column label="关联人员 / 作用范围" min-width="230">
           <template #default="{ row }">
-            {{ row.alias }}<span v-if="row.alias === (isModelRule(rowAlias(row)) ? row.model : row.provider)" class="muted">（与原始名相同）</span>
+            <el-tag v-if="asGroup(row).globalRules" size="small" type="info" class="member-chip">全局</el-tag>
+            <el-tag v-for="owner in visibleMembers(asGroup(row))" :key="owner.member_id" size="small" type="success" class="member-chip">
+              {{ owner.name }}<span v-if="owner.ruleCount > 1"> ×{{ owner.ruleCount }}</span>
+            </el-tag>
+            <span v-if="asGroup(row).members.length > VISIBLE_MEMBERS" class="muted">等 {{ asGroup(row).members.length }} 人</span>
           </template>
         </el-table-column>
-        <el-table-column prop="enabled" label="状态" width="100" sortable>
-          <template #default="{ row }"><el-tag :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '启用' : '停用' }}</el-tag></template>
-        </el-table-column>
-        <el-table-column prop="updated_at_ms" label="更新时间" min-width="170" sortable><template #default="{ row }">{{ formatFullDateTime(row.updated_at_ms) }}</template></el-table-column>
-        <el-table-column v-if="canManage" label="操作" width="190" fixed="right">
+        <el-table-column prop="sourceCount" label="匹配的原始值" min-width="280" sortable>
           <template #default="{ row }">
-            <el-button link type="primary" :disabled="busy" @click="open(rowAlias(row))">编辑</el-button>
-            <el-button link :type="row.enabled ? 'warning' : 'success'" :disabled="busy" @click="changeStatus(rowAlias(row))">{{ row.enabled ? '停用' : '启用' }}</el-button>
-            <el-button link type="danger" :disabled="busy" :icon="Delete" @click="remove(rowAlias(row))">删除</el-button>
+            <code v-for="source in asGroup(row).sources.slice(0, 2)" :key="source" class="rule-prefix">{{ source }}</code>
+            <span v-if="asGroup(row).sourceCount > 2" class="muted">共 {{ asGroup(row).sourceCount }} 个原始值，展开后逐条看</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="enabledRules" label="状态" width="140" sortable>
+          <template #default="{ row }">
+            <el-tag size="small" :type="asGroup(row).enabledRules ? 'success' : 'info'" class="member-chip">启用 {{ asGroup(row).enabledRules }}</el-tag>
+            <el-tag v-if="asGroup(row).disabledRules" size="small" type="warning" class="member-chip">停用 {{ asGroup(row).disabledRules }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="updatedAtMs" label="最近更新" min-width="170" sortable><template #default="{ row }">{{ formatFullDateTime(asGroup(row).updatedAtMs) }}</template></el-table-column>
+        <el-table-column v-if="canManage" label="操作" width="140" fixed="right">
+          <template #default="{ row }">
+            <el-button link type="primary" :disabled="busy" @click="openForGroup(asGroup(row))">添加规则</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -326,6 +416,10 @@ onMounted(() => { void load() })
         </el-form-item>
         <el-form-item label="归一化后的名字" prop="alias">
           <el-input v-model="draft.alias" maxlength="128" placeholder="例如 阿里百炼 或 通义千问-Max" autocomplete="off" />
+          <p class="muted">
+            <strong>要并进已有名字请逐字一致</strong>（多一个空格就是另一个名字）——
+            从列表行上的「添加规则」进来时会自动带上那一行的名字与作用对象。
+          </p>
         </el-form-item>
         <div class="dialog-actions">
           <el-button @click="showForm = false">取消</el-button>
