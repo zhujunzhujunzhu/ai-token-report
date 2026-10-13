@@ -18,8 +18,8 @@ AI token 用量统计平台。四种形态：**CLI / 本地页面 / 部门看板
 
 ```bash
 bun install
-bun test                        # 不带 MySQL：1610 pass / 13 skip / 0 fail；
-                                # 带 ATR_V4_TEST_MYSQL_URL：**1626 pass / 0 skip / 0 fail**（那 13 条 MySQL 用例实跑）
+bun test                        # 不带 MySQL：2500 pass / 27 skip / 0 fail（2026-10-13 实测，161 个文件 157s）；
+                                # 带 ATR_V4_TEST_MYSQL_URL：那 27 条 MySQL 用例实跑
 bun run typecheck               # 7 个包全部 exit 0
 bun run build                   # web-local + web-portal 均构建成功
 bun run stats -- --period today # 终端统计（读本地库：**热态 ~0.2s**；首次冷建库含全部来源 ~13s，见 benchmark:sources）
@@ -216,10 +216,10 @@ bun test packages/server/test/online-project-rules-plan.test.ts    # 11 项：�
 
 # DSH 插件：构建 + 五层验证（从内到外逐层接近真实，改插件后全跑）
 bun run --filter '@ai-token-report/dsh-plugin' build
-bun run packages/dsh-plugin/verify/verify-plugin.ts         # 真 HTTP 往返 + 面板改会话日志根的就地生效（70 项）
-bun run packages/dsh-plugin/verify/verify-cordis-load.ts    # 真 cordis 装载（10 项）
-bun run packages/dsh-plugin/verify/verify-resolution.ts     # Node 语义解析（9 项）
-bun run packages/dsh-plugin/verify/verify-client-bundle.ts  # ★ 浏览器半产物（40 项，含金额只认字符串 / 不入账的未计价 / 会话日志根那一栏真的在产物里）
+bun run packages/dsh-plugin/verify/verify-plugin.ts         # 真 HTTP 往返 + 面板改会话日志根 / 项目名称别名 / 来源筛选的就地生效（97 项）
+bun run packages/dsh-plugin/verify/verify-cordis-load.ts    # 真 cordis 装载（11 项）
+bun run packages/dsh-plugin/verify/verify-resolution.ts     # Node 语义解析（7 项）
+bun run packages/dsh-plugin/verify/verify-client-bundle.ts  # ★ 浏览器半产物（49 项，含金额只认字符串 / 不入账的未计价 / 会话日志根与「自定义配置」别名那一栏 / 来源筛选下拉与来源展示名真的在产物里）
 bun run packages/dsh-plugin/verify/diagnose-boot.ts web     # 排障：哪个包 import 就炸
 
 # 部门看板（S7 + S8）：SSR 真执行组件树，断言门禁页 / 看板区块 / 统计页不出现金额 / 计价页的单价口径 / 金额三态（无字段 / 未计价 / 有金额）
@@ -230,7 +230,7 @@ bun test packages/shared/test/price.test.ts               # 口径与格式化�
 bun test packages/core/test/local-cost.test.ts            # 离线折叠：换价时刻 / 多币种 / 未计价 ≠ 0 / 快照四态
 bun test packages/server/test/local-api.test.ts           # 本地页三条接口的金额（SQL 与直扫逐位一致）
 bun run --filter '@ai-token-report/web-local' verify      # 本地页 SSR + 明细表费用列（模板层）
-bun test packages/cli                                     # --cost（默认关）+ pricing sync（44 项）
+bun test packages/cli                                     # --cost（默认关）+ pricing sync + 项目名称别名（52 项）
 bun run --filter '@ai-token-report/cli' verify:npm        # ★ 发布产物在 Node 与 Bun 上的金额路径
 bun test packages/server/test/reconcile-bill.test.ts      # 月度对账（61 项：窗口边界 / 表头 / 退出码）
 # 月度账单对账（账单数字**只**出现在这个脚本的输出里，绝不进页面 / 接口 / CLI 统计输出）
@@ -269,7 +269,7 @@ bun run reconcile:bill -- --portal-db <库路径|mysql://…> --bill <账单.csv
 | 身份署名 / 归属 | `.agents/skills/identity-attribution/SKILL.md` + `ARCHITECTURE.md` §4.5 |
 | **权限 / 人员管理 / token 发放** | `packages/server/src/identity/` + `docs/数据库重设计.md` + `ARCHITECTURE.md` §4.5.5~§4.5.8；`member-admin.ts` 仅历史兼容测试 |
 | **工程约定**（命令 / 测试位置 / 命名 / 中文注释 / 依赖） | `.agents/skills/repo-conventions/SKILL.md` + `docs/本仓工程约定.md` |
-| **AI 助手默认报表技能 / `/` 菜单 / 管理周报月报 / 多节导出** | `.agents/skills/management-reports/SKILL.md` + `docs/管理报表与默认技能.md`；默认目录在 `shared/src/assistant-skills.ts`，编排在 `server/src/assistant/reports.ts`，复用现有统计鉴权与口径 |
+| **AI 助手默认报表技能 / `/` 菜单 / 管理周报月报 / 多节导出 / 自定义技能** | `.agents/skills/management-reports/SKILL.md` + `docs/管理报表与默认技能.md`；默认目录在 `shared/src/assistant-skills.ts`，编排在 `server/src/assistant/reports.ts`，复用现有统计鉴权与口径。自定义技能（`/create-skill`）存储/可见范围在 `server/src/assistant/skill-store.ts`，**草稿不是授权**（`resolveAssistantSkill()` 的 `intent` 只取用户本轮正文）、**不改变数据范围**，目录在 `<dataDir>/assistant/.skills/` 不进上报库 |
 | 目录分工 / 数据通路 | `ARCHITECTURE.md` |
 | **多客户端来源适配器**（新增一个客户端 / 各来源的日志与四列映射） | `packages/core/src/sources/types.ts` 文件头（三步）+ `docs/Codex会话采集方案.md` + `docs/ClaudeCode会话采集方案.md` + `docs/Trae会话采集方案.md` + `docs/WorkBuddy会话采集方案.md` |
 | 插件方案（历史） | `docs/插件方案.md` |

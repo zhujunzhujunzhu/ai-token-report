@@ -2,6 +2,8 @@
 
 输入框输入 `/` 可引用内置管理报表、周报、月报、费用、使用分布、缓存和数据质量技能。选择只填入可编辑草稿，发送后由 `generate_management_report` 复用同窗授权统计，生成私有多节 HTML、Markdown、Word 或 Excel。时间与维度可覆盖默认条件，显式比较保留两期实际窗口。管理需求、默认命令与能力边界见 [管理报表与默认技能](管理报表与默认技能.md)。
 
+菜单里的「新建技能」与 `/create-skill` 打开同一张表单：把常用问法保存成一条 `/命令` + 一段指令草稿，并选择「仅自己可见」或「所有人可见」。这条命令由浏览器处理，不发给模型；公开技能进入全部门菜单，但**不改变任何人的数据范围**，调用时仍按调用者自己的身份与金额权限取数。别人的私有技能看不见，公开技能的草稿也不能替调用者授权写入或分享；创建者姓名只对本人与管理员可见。上限每人 50 条私有、全区 100 条公开，管理员可清理公开技能。技能存在 `<dataDir>/assistant/.skills/`，与对话同级、不进上报库。
+
 部门后台右下角提供全局悬浮小球。展开后是可拖动的聊天窗口，不遮断页面操作；切换页面、收起窗口不会终止对话。「我的对话」从窗口左侧展开，桌面端自动加宽，窄屏在窗口内展开侧栏。支持新建、续聊、停止、删除和查询来源展示。
 
 生成期间对话内容仍可自由滚动。向上翻阅会暂停自动跟随，后续文字、工具结果或文件不会把阅读位置强制拉回底部；手动滚回底部或点击圆形向下按钮后恢复跟随。对话视口底部持续显示当前生成阶段，结束、停止或失败后移除生成提示；离开最新位置时仍保留“回到最新内容”按钮。提示层不拦截滚轮和原生滚动条，小浮窗的底部留白随可用高度调整。
@@ -119,6 +121,9 @@ bun test packages/server/test/assistant-presentation.test.ts
 bun test packages/server/test/assistant-actions.test.ts packages/server/test/assistant-artifacts.test.ts packages/server/test/assistant-network.test.ts packages/server/test/assistant-navigation.test.ts
 bun test packages/server/test/assistant-shared-html.test.ts packages/server/test/assistant-intents.test.ts
 bun test packages/server/test/assistant-forms.test.ts
+bun test packages/server/test/assistant-skills.test.ts packages/server/test/assistant-skill-store.test.ts packages/server/test/assistant-skill-route.test.ts
+bun test packages/web-portal/test/assistant-skills.test.ts packages/web-portal/test/assistant-skill-form.test.ts
+bun run --filter '@ai-token-report/web-portal' verify
 bun run packages/server/verify/verify-assistant-capabilities.ts --mysql
 bun run packages/server/verify/verify-assistant-capabilities-live.ts
 bun --env-file=.env run packages/server/verify/verify-assistant-shared-html-live.ts

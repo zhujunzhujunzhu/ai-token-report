@@ -929,10 +929,22 @@ try {
     groupsHtml.includes('用量会按其所属的每个分组统计'))
   const providersHtml = await render('/src/views/ProvidersView.vue')
   // ⚠️ 文案一律按**当前源码**写（与上面管理页标题同一条纪律）：v12 起这一页同时管
-  //   供应商与模型，标题、搜索框与「未配置者保持原值」都改成了覆盖两个维度的说法。
+  //   供应商与模型，标题、搜索框与「未配置者保持原值」都改成了覆盖两个维度的说法；
+  //   2026-10 起列表主体又改成**归一化后的名字**（一个名字一行、展开看原始值与人员），
+  //   卡片标题随之从「规则列表」改成「归一化名字列表」。
   //   按旧文案断言会让「页面已经改对了」变成假失败 —— 而照抄当前文案仍然证明页面真的写出来了。
-  check('供应商模型归一化独立展示规则列表、搜索、作用范围与新增入口',
-    ['供应商模型归一化', '规则列表', '搜索原始名或归一化名', '全部作用范围', '添加规则'].every((label) => providersHtml.includes(label)))
+  check('供应商模型归一化独立展示名字列表、搜索、作用对象、作用范围与新增入口',
+    ['供应商模型归一化', '归一化名字列表', '搜索原始名或归一化名', '全部作用对象', '全部作用范围', '添加规则', '全部展开'].every((label) => providersHtml.includes(label)))
+  // ★ 折叠语义同样是这一页的**新**主体：SSR 下 `el-table` 的行与列根本不渲染，
+  //   所以「一个名字一行、展开才是原始值与人员」只能写在卡片说明里 ——
+  //   而它正是使用者需要读到的那句（否则他还会以为一屏几十行就是几十份配置）。
+  check('供应商模型归一化主推「一个名字一行」，并说明两个维度各占一行',
+    providersHtml.includes('一个名字一行') &&
+    providersHtml.includes('展开后能看到有哪些原始值折到了它') &&
+    providersHtml.includes('两个维度') &&
+    providersHtml.includes('各占一行'))
+  check('供应商模型归一化给出名字数与规则数的对照',
+    providersHtml.includes('个名字') && providersHtml.includes('条规则'))
   // ★ 这一页最容易配错的两件事必须写在页面上，而不是只写在代码注释里：
   //   ① 原始名是大小写敏感的精确匹配（写错就静默不命中）；
   //   ② 没配规则的项保持原始名（归一化不是「统一改名」）。
@@ -940,6 +952,12 @@ try {
     providersHtml.includes('一字不差') &&
     providersHtml.includes('没有配规则的项保持自己的原始名') &&
     providersHtml.includes('明细里始终同时显示原值'))
+  // ★ 展示名逐字一致才折进同一个名字：除了卡片说明，表单里也再写一遍
+  //   （照着屏幕重打一遍差一个空格就会变成另一个名字）。SSR 下 `el-dialog` 未打开时
+  //   不渲染内容，所以这里断言的是**卡片说明**里那两句。
+  check('供应商模型归一化写明展示名逐字一致与「添加规则」把名字原样带过去',
+    providersHtml.includes('逐字一致') &&
+    providersHtml.includes('原样带过去'))
   // ★ v12 扩到模型维度后的两条新语义也必须写在页面上（不看代码猜不到）：
   //   ① 一条规则只折叠一个维度（想两个都改就配两条）；② 模型规则的「限定供应商」留空 = 任意供应商。
   check('★ v12：写明「一条规则只折叠一个维度」与「限定供应商留空 = 任意供应商」',
@@ -947,10 +965,21 @@ try {
     providersHtml.includes('限定供应商') && providersHtml.includes('任意供应商'))
   check('供应商归一化不混排人员或分组列表', !providersHtml.includes('人员列表') && !providersHtml.includes('分组列表'))
   const projectsHtml = await render('/src/views/ProjectsView.vue')
-  check('项目归一化独立展示规则列表、搜索、作用范围与新增入口',
+  // ⚠️ 2026-10 起这一页的主体改成**项目**（一个项目一行、展开看它的路径与人员），
+  //   卡片标题随之从「规则列表」改成「项目列表」；断言按当前源码写。
+  check('项目归一化独立展示项目列表、搜索、作用范围与新增入口',
     // ⚠️ 占位符按**当前源码**写：这一页的搜索同时匹配仓库名 / 目录前缀与项目名，
     //   输入框占位语是「搜索仓库名或项目名」。
-    ['项目归一化', '规则列表', '搜索仓库名或项目名', '全部作用范围', '添加规则'].every((label) => projectsHtml.includes(label)))
+    ['项目归一化', '项目列表', '搜索仓库名或项目名', '全部作用范围', '添加规则', '全部展开'].every((label) => projectsHtml.includes(label)))
+  // ★ 折叠语义是这一页的**新**主体：SSR 下 `el-table` 的行与列根本不渲染，
+  //   所以「一个项目一行、展开才是路径与人员」只能写在卡片说明里 ——
+  //   而它正是使用者需要读到的那句（否则他还会以为一屏 30 行就是 30 份配置）。
+  check('项目归一化主推「一个项目一行」，并写明项目名逐字一致',
+    projectsHtml.includes('一个项目一行') &&
+    projectsHtml.includes('展开后能看到它关联了哪些路径') &&
+    projectsHtml.includes('逐字一致'))
+  check('项目归一化给出项目数与规则数的对照',
+    projectsHtml.includes('个项目') && projectsHtml.includes('条规则'))
   // ★ 与供应商那页**刻意不同**的三件事必须写在页面上，否则使用者会照搬供应商那套理解：
   //   ① 匹配的是**目录前缀**、而且按路径分隔符边界（`D:\a\proj` 不吃 `D:\a\proj-other`）；
   //   ② 多条命中时**最长前缀优先**；
@@ -1044,6 +1073,14 @@ try {
   const sessionEndHtml = await renderToString(createRenderApp({ render: () => h(SessionList, { ...sessionListProps, hasMore: false }) }))
   check('对话末页显示已加载全部', sessionEndHtml.includes('已加载全部对话') && !sessionEndHtml.includes('向下滚动加载更多'))
   check('助手输入框提供多选附件入口并保留输入法快捷键提示', assistantHtml.includes('添加附件') && assistantHtml.includes('type="file"') && assistantHtml.includes('multiple') && assistantHtml.includes('.docx') && assistantHtml.includes('.xlsx') && assistantHtml.includes('.pptx') && assistantHtml.includes('Alt + Enter'))
+  check('助手输入框提示包含自定义技能入口', assistantHtml.includes('选择技能（含自定义技能）'))
+  // 新建技能弹框的表单主体（el-dialog 的内容只在客户端渲染，故直接执行这个组件）。
+  const { default: SkillForm } = await server.ssrLoadModule('/src/components/AssistantSkillForm.vue')
+  const skillFormHtml = await renderToString(createRenderApp({ render: () => h(SkillForm, {
+    open: true,
+    skills: [{ skill_id: '11111111-1111-4111-8111-111111111111', command: '/weekly-cost', title: '上周费用', description: '按供应商看上周费用估算', prompt: '生成上周的费用分析报表', visibility: 'private', mine: true, can_delete: true, owner_name: '成员甲', created_at_ms: 1, updated_at_ms: 2 }],
+  }) }))
+  check('新建技能表单提供命令、草稿与可见范围，并声明公开技能不扩大数据权限', skillFormHtml.includes('不会新增数据范围') && skillFormHtml.includes('仅自己可见') && skillFormHtml.includes('所有人可见') && skillFormHtml.includes('只有你的斜杠菜单里有这条命令') && skillFormHtml.includes('/weekly-cost') && skillFormHtml.includes('删除技能 /weekly-cost') && skillFormHtml.includes('私有 1 / 50'))
   const attachmentHtml = await renderToString(createRenderApp({ render: () => h(AttachmentCard, { sessionId: '私有会话', attachment: { attachment_id: '上传甲', file_name: '<script>说明</script>.docx', media_type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', size_bytes: 2048, kind: 'document', extracted_chars: 1200, note: '内容已截断，仅包含前 60,000 字。' } }) }))
   check('上传历史显示文件名、容量、解析范围与下载入口，文件名被转义', attachmentHtml.includes('2.0 KB') && attachmentHtml.includes('已解析 1,200 字') && attachmentHtml.includes('前 60,000 字') && attachmentHtml.includes('下载附件') && attachmentHtml.includes('&lt;script&gt;说明&lt;/script&gt;') && !attachmentHtml.includes('<script>说明</script>'))
   const imageAttachmentHtml = await renderToString(createRenderApp({ render: () => h(AttachmentCard, { sessionId: '私有会话', attachment: { attachment_id: '图甲', file_name: '截图.png', media_type: 'image/png', size_bytes: 512, kind: 'image' } }) }))
