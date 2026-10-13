@@ -17,9 +17,11 @@ import type { ServerHandle } from '@ai-token-report/server'
 import {
   aggregate,
   crossTabRanked,
+  projectName,
   timeSeries,
   type GroupDimension,
   type GroupRow,
+  type ProjectNameResolver,
   type SeriesPoint,
 } from '@ai-token-report/core'
 import type { RunReportResult } from './report.js'
@@ -61,6 +63,7 @@ import {
   costByGroupOf,
   costTotalsOf,
   loadLocalPricing,
+  loadLocalProjectAliases,
   priceResolver,
   unpricedTargetsOf,
   type CostTotals,
@@ -1261,6 +1264,20 @@ async function main(): Promise<number> {
 
   const t0 = Date.now()
   let lastRender = 0
+  /**
+   * 本机项目名称别名（`<数据目录>/project-aliases.txt`）。
+   *
+   * ★ 与本地页 / 插件面板读的是**同一份文件**，所以三个离线形态的项目名
+   *   不可能各说各话（部门看板的口径由服务端的「项目归一化」规则决定，
+   *   与本文件无关）。只影响 `project` 维度的分组键。
+   *
+   * ⚠️ 配坏时**必须说一声**：整份不生效（见 `loadLocalProjectAliases`），
+   *   不说的话使用者会盯着没折叠的项目名以为「这个功能坏了」。
+   *   这行告警**不受 `--quiet` 影响** —— `--quiet` 省的是进度输出，
+   *   而「你的配置一行都没生效」不是进度，是结果的一部分。
+   */
+  const aliasLoad = loadLocalProjectAliases({ dataDir: paths.dataDir })
+  if (aliasLoad.note !== null) process.stderr.write(`警告: ${aliasLoad.note}\n`)
   // ★ 默认走本地 SQLite 增量库（`core/db`）：先 ingest 再查，量级从秒降到毫秒。
   //   `--no-db` 强制走直扫日志，用于与库结果做对照验证（两条路径必须给出同一个数）。
   const session = await openStats({
@@ -1286,6 +1303,10 @@ async function main(): Promise<number> {
     }),
     dbPath: paths.dbPath,
     rollup: true,
+    // ★ 项目名称别名（`<数据目录>/project-aliases.txt`）—— 与本地页、插件面板
+    //   读的是**同一份文件**，所以三个离线形态的项目名不可能各说各话。
+    //   只影响 `project` 维度的分组键；`cwd` 原值与上报数据一个字节都不改。
+    ...(aliasLoad.rules.length > 0 ? { projectAliases: aliasLoad.rules } : {}),
     ...(opts.period ? { period: opts.period } : {}),
     ...(range.sinceMs !== undefined ? { sinceMs: range.sinceMs } : {}),
     ...(range.untilMs !== undefined ? { untilMs: range.untilMs } : {}),
@@ -1324,9 +1345,19 @@ async function main(): Promise<number> {
   let series: SeriesPoint[] = []
   let total: ReturnType<typeof session.totals>
   let dbStats: ReturnType<typeof session.dbDiagnostics>
+  /**
+   * ★ 项目名解析器（`session.projectNameOf`）——**会话关掉之后仍然拿得到**，
+   *   而 `--cost` 的金额分桶要用它。
+   *
+   * 缺省是 `projectName`（没配别名时的旧口径）；真正的规则由 `openStats()` 从
+   * `<数据目录>/project-aliases.txt` 装配（见下面的 `projectAliases`），
+   * 所以这里**不**再读一次文件 —— 两处装配必然漂移，表现是费用列缺行。
+   */
+  let projectOf: ProjectNameResolver = projectName
   try {
     total = session.totals()
     dbStats = session.dbDiagnostics()
+    projectOf = session.projectNameOf
     const dims = opts.listProviders ? ['provider', 'provider-model'] as const : opts.by
     for (const dim of dims) grouped.set(dim, session.groups(dim).map(r => ({ ...r, metrics: derive(r.counts) })))
     if ((opts.cross && opts.format === 'table') || (opts.series && opts.format === 'json') || withCost) {
@@ -1348,7 +1379,7 @@ async function main(): Promise<number> {
 
   // ★ 只有 `--cost` 时才取价、才算金额。关着的时候一位金额都没有，也一次都不调用
   //   计价函数 —— 「算了再丢掉」在输出上看起来一样，但它让普通统计白白物化全部记录。
-  const costView = withCost ? buildCostView(paths, opts, records) : null
+  const costView = withCost ? buildCostView(paths, opts, records, projectOf) : null
 
   // --list-providers：只报告发现的口径边界
   if (opts.listProviders) {
@@ -1569,6 +1600,14 @@ function buildCostView(
   paths: ResolvedPaths,
   opts: CliOptions,
   records: readonly UsageRecord[],
+  /**
+   * ★ **项目名解析器**：必须与 token 分组用的是同一个（`session.projectNameOf`）。
+   *
+   * 缺省 `projectName` 只是为了让「没配过别名」与迁移前逐字节相同；
+   * 调用方在会话已经关掉的情况下**没有**别的来源 —— 所以这个参数默认值
+   * 刻意不是「按文件再装一个」（那是第二处装配点，规则不同步时金额列会缺行）。
+   */
+  projectOf: ProjectNameResolver = projectName,
 ): CostView {
   const pricing = loadLocalPricing({
     dataDir: paths.dataDir,
@@ -1577,7 +1616,9 @@ function buildCostView(
   const resolve = priceResolver(pricing.prices)
   const groups = new Map<GroupDimension, Map<string, CostTotals>>()
   for (const dim of opts.by) {
-    groups.set(dim, costByGroupOf(records, dim, resolve, pricing.provenance))
+    // 项目维度按别名折叠（与上面 `session.groups('project')` 同源），
+    // 其余维度用不到它 —— `groupKey()` 只在 `project` 上调用解析器。
+    groups.set(dim, costByGroupOf(records, dim, resolve, pricing.provenance, projectOf))
   }
   return {
     pricing,

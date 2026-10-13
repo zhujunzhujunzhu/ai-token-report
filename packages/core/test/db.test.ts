@@ -48,6 +48,7 @@ import {
   countEvents,
 } from '../src/db/index.js'
 import type { IngestRecord } from '../src/db/index.js'
+import { registeredSources } from '../src/sources/registry.js'
 import type { UsageRecord } from '../src/types.js'
 
 // ── 脚手架 ───────────────────────────────────────────────────────────────
@@ -167,7 +168,7 @@ function assertSameTotals(
 
 /** 取一份日志的「直扫基准」与「SQL 结果」，并断言两者相等。 */
 async function comparePaths(
-  opts: { period?: string; providers?: string[]; models?: string[] } = {},
+  opts: { period?: string; providers?: string[]; models?: string[]; sources?: string[] } = {},
 ): Promise<{ sql: Awaited<ReturnType<typeof openStats>>; scan: Awaited<ReturnType<typeof openStats>> }> {
   const scan = await openStats({
     sessionsRoot,
@@ -176,6 +177,7 @@ async function comparePaths(
     ...(opts.period ? { period: opts.period } : {}),
     ...(opts.providers ? { providers: opts.providers } : {}),
     ...(opts.models ? { models: opts.models } : {}),
+    ...(opts.sources ? { sources: opts.sources } : {}),
   })
   const sql = await openStats({
     sessionsRoot,
@@ -183,6 +185,7 @@ async function comparePaths(
     ...(opts.period ? { period: opts.period } : {}),
     ...(opts.providers ? { providers: opts.providers } : {}),
     ...(opts.models ? { models: opts.models } : {}),
+    ...(opts.sources ? { sources: opts.sources } : {}),
   })
   return { sql, scan }
 }
@@ -203,6 +206,44 @@ test('重复帧与跨文件重放：直扫和 SQLite 都按 event_id 首次出�
       expect(scan.records().map((r) => r.eventId).sort()).toEqual(sql.records().map((r) => r.eventId).sort())
     } finally { sql.close(); scan.close() }
   }
+})
+
+/**
+ * ★ **来源筛选在两条取数路径上必须一致**（`opts.sources`）。
+ *
+ * 直扫那条路曾经**完全忽略**它：库不可用 → 自动降级为直扫 → 筛了一个来源却拿到
+ * 全部来源的数字。这与「筛了、而本机本来就只有这些」在输出上完全一样，
+ * 只有把两条路径摆在一起比才看得见（实测出处：`verify-plugin.ts` 的
+ * `?source=codex` 回落成了 DSH 的 1,110）。所以这里跟着既有对账套路断言
+ * **逐位一致**，而不是只断一个数。
+ */
+test('来源筛选：直扫与 SQL 逐位一致（含「筛到本机没有的来源」⇒ 两边都是 0）', async () => {
+  makeSession('project', 'session-source', [
+    sessionLine('session-source', '/project'),
+    usageLine(1, { provider: 'p', input: 100, output: 10, cacheRead: 5, cacheWrite: 1 }),
+  ])
+
+  // ① 显式收窄到本机唯一的来源：照常出数
+  const kept = await comparePaths({ sources: ['dsh'] })
+  try {
+    assertSameTotals(kept.sql.totals(), kept.scan.totals(), '来源筛选=dsh')
+    expect(kept.scan.totals().total).toBe(116)
+  } finally { kept.sql.close(); kept.scan.close() }
+
+  // ② 收窄到一个**库里没有行**的来源：两边都必须是 0（不是「忽略筛选」）
+  const empty = await comparePaths({ sources: ['codex'] })
+  try {
+    assertSameTotals(empty.sql.totals(), empty.scan.totals(), '来源筛选=codex')
+    expect(empty.scan.totals()).toMatchObject({ total: 0, calls: 0 })
+    expect(empty.scan.records()).toEqual([])
+  } finally { empty.sql.close(); empty.scan.close() }
+
+  // ③ 全量 = 不过滤（逐位等于不给）
+  const all = await comparePaths({ sources: registeredSources().map((a) => a.id) })
+  try {
+    assertSameTotals(all.sql.totals(), all.scan.totals(), '来源筛选=全量')
+    expect(all.scan.totals().total).toBe(116)
+  } finally { all.sql.close(); all.scan.close() }
 })
 
 describe('db schema', () => {

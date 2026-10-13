@@ -60,9 +60,11 @@ import {
   costTotalsOf,
   emptyCostTotals,
   loadLocalPricing,
+  loadLocalProjectAliases,
   priceResolver,
   type CostTotals,
   type LocalPricing,
+  type LocalProjectAliasRule,
 } from '@ai-token-report/core/db'
 import { cacheHitRate, cacheLeverage } from '@ai-token-report/shared'
 import type {
@@ -111,11 +113,16 @@ export interface StatsProvider {
    * 打开一个统计会话。
    *
    * @param opts 时间窗与过滤条件（`period` 由本层解析成绝对时间后传入）
+   * @param opts.projectAliases - ★ 本机项目名称别名（`<数据目录>/project-aliases.txt`）。
+   *   本层**每次请求现读**再传进来：它只影响 `project` 维度的分组键，
+   *   与「用量从哪来」无关，但必须与**金额分桶**用同一个解析器
+   *   （由 `CoreStatsProvider` 传给 `openStats()`，金额侧再取 `session.projectNameOf`）。
    */
   open(opts: {
     period?: string
     providers: string[]
     models: string[]
+    projectAliases?: readonly LocalProjectAliasRule[]
   }): Promise<StatsSession>
 }
 
@@ -153,10 +160,16 @@ export class CoreStatsProvider implements StatsProvider {
     period?: string
     providers: string[]
     models: string[]
+    projectAliases?: readonly LocalProjectAliasRule[]
   }): Promise<StatsSession> {
     return openStats({
       sessionsRoot: this.#sessionsRoot,
       dbPath: this.#dbPath,
+      // ★ 项目名称别名只影响 `project` 维度的分组键（SQL / 汇总表 / 直扫三条路径共用）。
+      //   空数组 = 没配，`openStats()` 里就是 `projectName()` 的旧口径。
+      ...(opts.projectAliases !== undefined && opts.projectAliases.length > 0
+        ? { projectAliases: opts.projectAliases }
+        : {}),
       ...(this.#sourceRoots !== undefined && this.#sourceRoots.roots.length > 0
         ? {
           sourceRoots: this.#sourceRoots.roots,
@@ -282,7 +295,10 @@ export class LocalStatsRouter {
     return {
       pricing,
       totals: costTotalsOf(records, resolve, pricing.provenance),
-      byGroup: (dim) => costByGroupOf(records, dim, resolve, pricing.provenance),
+      // ★ 用 `session.projectNameOf`（= 会话装配的那个解析器）：自己按文件再装一个
+      //   不算错，但那就成了第二处装配点 —— 规则一旦不同步，`project` 维度的
+      //   token 行与金额行会对不上（页面上表现为费用列缺行，不报错）。
+      byGroup: (dim) => costByGroupOf(records, dim, resolve, pricing.provenance, session.projectNameOf),
     }
   }
 
@@ -540,6 +556,11 @@ export class LocalStatsRouter {
         ...(parsed.period ? { period: parsed.period } : {}),
         providers: parsed.providers,
         models: parsed.models,
+        // ★ 项目名称别名**每次请求现读**（活取值）：改完文件下一次刷新就生效，
+        //   不必重启本地页服务。读不到 / 内容坏了只是「这一条规则不生效」，
+        //   由 `loadLocalProjectAliases()` 折成 note（本接口不把它渲染出来 ——
+        //   本地页没有那一栏，出处在插件面板与 `project-aliases.txt`）。
+        projectAliases: loadLocalProjectAliases({ dataDir: this.#dataDir }).rules,
       })
       return { session }
     } catch (err) {
