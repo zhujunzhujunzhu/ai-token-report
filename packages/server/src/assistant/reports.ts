@@ -37,9 +37,19 @@ export const reportParameters = {
 } as const
 
 const fail = (message: string): never => { throw new IdentityError(400, message) }
+/**
+ * 报表窗口的写法：`2026-10-05 00:00:00 — 2026-10-11 23:59:59`（年月日时分秒）。
+ *
+ * ★ 与页面其它时刻（采集时间 / 冻结时刻）**同一形状**：窗口边界写成本地
+ *   `YYYY-MM-DD HH:mm:ss`，才看得出报表究竟覆盖到哪一秒；只写日期时
+ *   「23:59 是否含 23:59:59」要靠读者自己猜。
+ * ★ 用服务器本地时区（`sv-SE` 恰好给出这个形状），与 `stats-route.ts` 的
+ *   `describeAbs()` 同源 —— 两边时区不同会让同一窗口在页面上差几小时。
+ */
+const stamp = (ms: number): string => new Date(ms).toLocaleString('sv-SE')
 const rangeOf = (params: URLSearchParams) => {
   const from = Number(params.get('from')), to = Number(params.get('to'))
-  return { from, to, label: `${new Date(from).toLocaleDateString('sv-SE')} — ${new Date(to).toLocaleDateString('sv-SE')}`, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone }
+  return { from, to, label: `${stamp(from)} — ${stamp(to)}`, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone }
 }
 function validateRange(params: URLSearchParams): void {
   const { from, to } = rangeOf(params)

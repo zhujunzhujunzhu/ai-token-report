@@ -8,7 +8,7 @@
  *    那会让「从未上报」看起来像「刚刚上报过」。
  */
 import { describe, expect, test } from 'bun:test'
-import { bucketGranularityOf, formatBucket, formatBucketFull, formatTimeGap } from '../src/utils/format.js'
+import { bucketGranularityOf, formatBucket, formatBucketFull, formatFullDateTimeSeconds, formatTimeGap } from '../src/utils/format.js'
 
 const MINUTE = 60_000
 const HOUR = 60 * MINUTE
@@ -30,6 +30,23 @@ describe('数据新鲜度', () => {
     expect(formatTimeGap(null, now)).toBe('')
     expect(formatTimeGap(now, null)).toBe('')
     expect(formatTimeGap(0, now)).toBe('')
+  })
+})
+
+/**
+ * 精确到秒的时间写法：分享链接「到期时间」与操作卡「确认有效至」都用它。
+ *
+ * 钉住的是形状 `YYYY-MM-DD HH:mm:ss`。此前这两处模板里写的是
+ * `toLocaleString('zh-CN')`，会渲染成 `2026/10/15 09:49:43` ——
+ * 斜杠日期与平台上其它时间（报告页、明细表都是 `-` 分隔）写法不一致，
+ * 同一屏里出现两种时间格式，读者没法直接对照。
+ */
+describe('精确到秒的完整写法', () => {
+  test('年月日时分秒；缺值不伪装成某个时刻', () => {
+    const ms = new Date(2026, 9, 15, 9, 49, 43).getTime()
+    expect(formatFullDateTimeSeconds(ms)).toBe('2026-10-15 09:49:43')
+    expect(formatFullDateTimeSeconds(null)).toBe('—')
+    expect(formatFullDateTimeSeconds(0)).toBe('—')
   })
 })
 

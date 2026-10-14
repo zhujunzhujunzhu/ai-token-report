@@ -7,6 +7,7 @@ import { downloadAssistantArtifact, shareAssistantArtifact, revokeAssistantArtif
 import { withBase } from '../api/request.js'
 import { ASSISTANT_SHARE_HOURS, assistantShareActive, assistantShareUrl } from '../utils/assistantCapabilities.js'
 import { copyText } from '../utils/clipboard.js'
+import { formatFullDateTimeSeconds } from '../utils/format.js'
 const props = defineProps<{ artifact: AssistantArtifact; disabled?: boolean }>()
 const emit = defineEmits<{ updated: [artifact: AssistantArtifact] }>()
 const busy = ref(false), error = ref(''), notice = ref(''), hours = ref(24), now = ref(Date.now()), linkId = useId()
@@ -53,7 +54,7 @@ async function copy() {
       <small v-if="disabled">对话结束后即可创建或撤销分享。</small>
       <template v-if="activeShare && shareUrl">
         <a :id="linkId" :href="shareUrl" target="_blank" rel="noopener noreferrer" class="artifact-link">{{ shareUrl }}</a>
-        <small>到期时间：{{ new Date(artifact.share!.expires_at_ms).toLocaleString('zh-CN') }}</small>
+        <small>到期时间：{{ formatFullDateTimeSeconds(artifact.share!.expires_at_ms) }}</small>
         <div class="artifact-buttons"><el-button :disabled="busy" @click="copy">复制链接</el-button><el-button type="danger" plain :disabled="busy || disabled" @click="share(true)">撤销分享</el-button></div>
       </template>
       <template v-else>

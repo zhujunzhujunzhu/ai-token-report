@@ -1485,7 +1485,8 @@ function describeAbs(from: number | undefined, to: number | undefined): string {
   const fmt = (ms: number): string => {
     const d = new Date(ms)
     const p = (n: number): string => String(n).padStart(2, '0')
-    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+    // ★ 精确到秒：窗口末刻是 `23:59:59.999`，只写到分钟时看不出报表覆盖到哪一秒。
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
   }
   return `${from !== undefined ? fmt(from) : '最早'} ~ ${to !== undefined ? fmt(to) : '现在'}`
 }

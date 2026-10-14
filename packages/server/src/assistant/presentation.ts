@@ -53,7 +53,10 @@ export function presentAssistantResult(endpoint: string, query: string, value: u
   const body = object(value), params = new URLSearchParams(query)
   const periods: Record<string, string> = { today: '今天', yesterday: '昨天', week: '本周', lastweek: '上周', last7d: '最近 7 天', last30d: '最近 30 天', last90d: '最近 90 天', month: '本月', lastmonth: '上月', year: '今年' }
   const from = Number(params.get('from')), to = Number(params.get('to'))
-  const range = params.has('from') && params.has('to') ? `${new Date(from).toLocaleDateString('zh-CN')} — ${new Date(to).toLocaleDateString('zh-CN')}` : periods[params.get('period') ?? ''] ?? '当前查询范围'
+  // ★ 绝对窗口写成 `YYYY-MM-DD HH:mm:ss`（服务器本地时区，与 `range.label` 同源）：
+  //   此前用的 `zh-CN` 日期会输出 `2026/10/5`，既没有时刻、又与页面上其它时间的
+  //   写法不一致 —— 同一份报告里出现两种时间格式，读者无法直接对照。
+  const range = params.has('from') && params.has('to') ? `${new Date(from).toLocaleString('sv-SE')} — ${new Date(to).toLocaleString('sv-SE')}` : periods[params.get('period') ?? ''] ?? '当前查询范围'
   const result: AssistantResult = { result_id: randomUUID(), tool: `stats_${endpoint}`, query, captured_at_ms: Date.now(), title: titles[endpoint] ?? '查询结果', description: range }
   const rows = Array.isArray(body.rows) ? body.rows.map(object) : []
   if (endpoint === 'overview') {

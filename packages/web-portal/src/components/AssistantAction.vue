@@ -6,6 +6,7 @@ import type { AssistantPendingAction } from '@ai-token-report/shared'
 import { assistantDetail, confirmAssistantAction } from '../api/assistant.js'
 import { assistantActionStatus, canConfirmAssistantAction } from '../utils/assistantCapabilities.js'
 import { notifyAssistantManagementChanged } from '../utils/assistantPageSearch.js'
+import { formatFullDateTimeSeconds } from '../utils/format.js'
 const props = defineProps<{ action: AssistantPendingAction; disabled?: boolean }>()
 const emit = defineEmits<{ updated: [action: AssistantPendingAction] }>()
 const busy = ref(false), error = ref(''), now = ref(Date.now())
@@ -41,7 +42,7 @@ async function decide(decision: 'confirm' | 'cancel') {
     <p class="action-target">对象：{{ action.target_label }}</p>
     <p>{{ action.description }}</p>
     <p v-if="pending" class="action-warning">请核对对象和影响。只有点击下面的确认按钮才会执行；在对话中回复同意不会执行。</p>
-    <small v-if="pending">确认有效至 {{ new Date(action.expires_at_ms).toLocaleString('zh-CN') }}</small>
+    <small v-if="pending">确认有效至 {{ formatFullDateTimeSeconds(action.expires_at_ms) }}</small>
     <p v-if="pending && disabled" class="action-warning">对话结束后即可确认或取消。</p>
     <p v-if="error" class="action-error" role="alert">{{ error }}</p>
     <div v-if="pending" class="action-buttons"><el-button type="danger" :loading="busy" :disabled="busy || disabled" @click="decide('confirm')">{{ action.operation.includes('delete') ? '确认删除' : '确认停用' }}</el-button><el-button :disabled="busy || disabled" @click="decide('cancel')">取消操作</el-button></div>

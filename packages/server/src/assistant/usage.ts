@@ -43,9 +43,9 @@ export function usageRange(input: Record<string, unknown>, now = new Date()): UR
   return new URLSearchParams({ from: String(range.sinceMs), to: String(range.untilMs ?? now.getTime()) })
 }
 
-/** 模型不应自行将 epoch 毫秒换算成日期；给出与实际查询完全相同的本地日期。 */
+/** 模型不应自行将 epoch 毫秒换算成日期；给出与实际查询完全相同的本地日期（精确到秒）。 */
 function rangeLabel(params: URLSearchParams): string {
-  const date = (value: string | null) => new Date(Number(value)).toLocaleDateString('sv-SE')
+  const date = (value: string | null) => new Date(Number(value)).toLocaleString('sv-SE')
   return `${date(params.get('from'))} — ${date(params.get('to'))}`
 }
 

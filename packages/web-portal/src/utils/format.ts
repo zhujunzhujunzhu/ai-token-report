@@ -53,6 +53,22 @@ export function formatFullDateTime(ms: number | null): string {
 }
 
 /**
+ * `2026-09-21 14:05:30` —— **精确到秒**的完整写法。
+ *
+ * ★ 用在「时刻本身就是承诺」的地方：分享链接到期、操作确认有效期。
+ *   那里只写到分钟会让「还有 30 秒过期」显示成一个未来时刻；
+ *   也与报告页统一的时间写法（年月日时分秒）一致。
+ * ★ 刻意与 `formatFullDateTime` 并存而不是改它：其余页面（诊断、单价生效区间）
+ *   按分钟读更清爽，改公共函数等于顺手改掉那些页面的既有写法。
+ */
+export function formatFullDateTimeSeconds(ms: number | null): string {
+  if (ms === null || ms === 0) return '—'
+  const d = new Date(ms)
+  const p = (n: number): string => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
+/**
  * 两个时刻之间的相对间隔，用于展示「数据新鲜度」。
  *
  * ★ 基准刻意由调用方给（诊断页传**本次取数时刻**），不用 `Date.now()`：
