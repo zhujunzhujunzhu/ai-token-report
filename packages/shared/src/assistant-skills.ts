@@ -16,14 +16,23 @@ export type AssistantSkillId = AssistantSkill['id']
  * 斜杠菜单里的**动作**条目。
  *
  * ★ 与 `ASSISTANT_SKILLS` 刻意分成两份：默认报表技能的 `prompt` 是
- *   **服务端维护的默认请求**，只给命令时会用它去调用模型；而 `/create-skill`
- *   由浏览器直接打开「新建技能」表单，**从不进入对话**，也不该被
- *   `resolveAssistantSkill()` 当成一个可执行技能（它没有可信的默认请求）。
- *   合成一份的结果是：有人手动把 `/create-skill` 发出去，服务端会拿一段
- *   表单说明去问模型 —— 看起来「技能没生效」，实际是问错了对象。
+ *   **服务端维护的默认请求**，只给命令时会用它去调用模型；而这两条动作
+ *   由浏览器直接处理，**从不进入对话**，也不该被 `resolveAssistantSkill()`
+ *   当成可执行技能（它们没有可信的默认请求）。合成一份的结果是：有人手动把
+ *   `/create-skill` 发出去，服务端会拿一段模板去问模型 —— 看起来「技能没生效」，
+ *   实际是问错了对象。
+ * ★ `prompt` 有值 = 选中后把这段模板填进输入框（用户接着改名、写用途再发送）；
+ *   空串 = 由页面打开技能管理弹框。两种行为都在浏览器本地完成。
  */
 export const ASSISTANT_SKILL_ACTIONS = [
-  { command: '/create-skill', title: '新建技能', description: '把常用问法保存成 / 命令，选择仅自己或所有人可见' },
+  {
+    command: '/create-skill',
+    title: '新建技能',
+    description: '说清楚名称和用途，助手直接生成并保存；需要处理数据时可以带脚本',
+    prompt: '帮我新建一个技能。\n名称：\n用途：\n希望它输出什么：\n需要处理数据的方式（可选）：',
+    badge: '对话生成',
+  },
+  { command: '/skills', title: '管理技能', description: '查看已保存的命令与脚本，删除不用的技能', prompt: '', badge: '打开列表' },
 ] as const
 
 export type AssistantSkillAction = typeof ASSISTANT_SKILL_ACTIONS[number]
@@ -32,7 +41,7 @@ export type AssistantSkillAction = typeof ASSISTANT_SKILL_ACTIONS[number]
 export type AssistantCustomSkillVisibility = 'private' | 'public'
 
 /**
- * 自定义技能：成员保存的「命令 + 默认请求草稿」。
+ * 自定义技能：成员保存的「命令 + 默认请求草稿」，可额外带一段脚本。
  *
  * ★ 它**不携带任何权限**：调用时仍旧按当前身份重新鉴权、重新定数据范围，
  *   公开技能不会让任何人多看见一行数据。
@@ -44,6 +53,13 @@ export interface AssistantCustomSkill {
   title: string
   description: string
   prompt: string
+  /**
+   * 技能携带的脚本（可选）。
+   *
+   * ★ 可见技能就下发脚本本身：能运行它的人本来就应该能读到它 ——
+   *   部门共享的脚本隐藏代码、却允许任何人执行，才是更糟的形态。
+   */
+  script?: string
   visibility: AssistantCustomSkillVisibility
   /** 创建时刻的姓名快照；只有本人与管理员会收到，其他人看不到创建者是谁。 */
   owner_name?: string
@@ -62,12 +78,19 @@ export interface AssistantSkillCatalog {
   public_limit: number
 }
 
-/** 创建技能请求体；字段与页面表单一一对应，服务端仍逐项校验。 */
+/**
+ * 创建技能请求体。
+ *
+ * ★ 页面不再有「新建技能」表单：这份字段由助手在对话里生成，经 `create_skill`
+ *   工具落到服务端；服务端仍逐项校验（谁调用都一样，工具不是绕过校验的旁路）。
+ */
 export interface AssistantCustomSkillInput {
   command: string
   title: string
   description: string
   prompt: string
+  /** 可选的脚本源码：同步执行、用 `return` 返回结果、通过 `input` 读取数据。 */
+  script?: string
   visibility: AssistantCustomSkillVisibility
 }
 
@@ -82,8 +105,25 @@ export const ASSISTANT_CUSTOM_SKILL_LIMITS = {
   title_chars: 24,
   description_chars: 80,
   prompt_chars: 1000,
+  /** 技能脚本源码上限；脚本由创建者写、由沙箱执行，不是任意长度的程序仓库。 */
+  script_chars: 4000,
   private_per_member: 50,
   public_total: 100,
+} as const
+
+/**
+ * 技能脚本的沙箱限额：一次执行能吃多少数据、跑多久、吐多少结果。
+ *
+ * ★ 三份数字同时是**服务端强制**与**工具契约**：页面只需提示，不能自行放宽；
+ *   缺了任意一条，脚本就能把一次对话变成一次资源占用（或把结果撑爆模型上下文）。
+ */
+export const ASSISTANT_SKILL_SCRIPT_LIMITS = {
+  /** 交给脚本的输入（`input` 或数据集快照）序列化后的字符上限。 */
+  input_chars: 32_000,
+  /** 脚本返回值序列化后的字符上限。 */
+  output_chars: 64_000,
+  /** 同步执行上限：脚本必须是同步的，超时即中断本次调用。 */
+  timeout_ms: 1_500,
 } as const
 
 /**

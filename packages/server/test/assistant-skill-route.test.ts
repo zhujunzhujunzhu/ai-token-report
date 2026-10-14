@@ -17,10 +17,10 @@ const identity = await seedDatabaseIdentity({ sqlitePath: dbPath }, [
   { token: 'skill-b', name: '成员乙', role: 'member' },
 ])
 /** 夹具引擎只回答，不调用模型；它按运行时同一条解析规则还原「本轮请求」。 */
-let captured: { prompt: string; request: string; intent: string; custom?: string; skills: string[] } | undefined
+let captured: { prompt: string; request: string; intent: string; custom?: string; skills: string[]; hasScript?: boolean } | undefined
 const engine: AssistantEngine = { async run(input) {
   const resolved = resolveAssistantSkill(input.prompt, input.skills ?? [])
-  captured = { prompt: input.prompt, request: resolved.request, intent: resolved.intent, ...(resolved.custom ? { custom: resolved.custom.command } : {}), skills: (input.skills ?? []).map((skill: ResolvedCustomSkill) => skill.command) }
+  captured = { prompt: input.prompt, request: resolved.request, intent: resolved.intent, ...(resolved.custom ? { custom: resolved.custom.command, hasScript: !!resolved.custom.script } : {}), skills: (input.skills ?? []).map((skill: ResolvedCustomSkill) => skill.command) }
   input.emit({ type: 'text', text: '已收到' })
 } }
 const bundle = await createHandlerFor({ dshHome: root, dataDir: root, dbPath, assistantEngine: engine, requestLog: false })
@@ -122,11 +122,39 @@ test('发送自定义技能时按服务端目录解析：草稿进请求、技�
   expect(await sessionTotal('skill-a')).toBe(visibleBefore)
 })
 
-test('/create-skill 不进入对话：服务端只回一句请从菜单打开表单', async () => {
+test('带脚本的技能经 HTTP 往返：脚本落目录、下发给可见者、并进入本轮运行', async () => {
+  const script = 'return { total: input.rows.reduce((sum, row) => sum + row.tokens, 0) }'
+  const created = await create('skill-b', skillBody({ command: '/sum-tokens', title: '汇总', visibility: 'private', script }))
+  expect(created.status).toBe(200)
+  const catalogB = await catalog('skill-b')
+  expect(catalogB.skills.find(item => item.command === '/sum-tokens')).toMatchObject({ script })
+  // 私有技能不进别人的目录；公开技能才随目录发给全部门（能运行就能读到代码）。
+  expect((await catalog('skill-a')).skills.some(item => item.command === '/sum-tokens')).toBe(false)
+  const shared = await create('skill-b', skillBody({ command: '/team-sum', title: '部门汇总', prompt: '按供应商汇总输入数据', script }))
+  expect(shared.status).toBe(200)
+  expect((await catalog('skill-a')).skills.find(item => item.command === '/team-sum')).toMatchObject({ script })
+
+  // 坏脚本在写盘前就被拒绝：HTTP 上是 400，且目录里没有它。
+  const broken = await create('skill-b', skillBody({ command: '/broken', title: '坏脚本', script: 'return {' }))
+  expect(broken.status).toBe(400)
+  expect(await broken.json()).toMatchObject({ reason: expect.stringContaining('脚本语法错误') })
+  expect((await catalog('skill-b')).skills.some(item => item.command === '/broken')).toBe(false)
+
+  // 本轮调用带脚本的技能时，脚本按服务端身份随技能清单一起交给引擎（浏览器提交不了脚本）。
+  const response = await call('POST', 'chat', 'skill-b', { prompt: '/sum-tokens' })
+  expect(response.status).toBe(200)
+  await response.text()
+  expect(captured).toMatchObject({ custom: '/sum-tokens', hasScript: true })
+  const unsigned = await call('POST', 'chat', 'skill-b', { prompt: '/sum-tokens', skills: [{ command: '/sum-tokens', script: 'return 1' }] })
+  expect(unsigned.status).toBe(400)
+  expect(await unsigned.json()).toMatchObject({ reason: expect.stringContaining('仅支持 prompt') })
+})
+
+test('/create-skill 不进入对话：服务端只回一句请从技能菜单处理', async () => {
   const before = await sessionTotal('skill-a')
   const response = await call('POST', 'chat', 'skill-a', { prompt: '/create-skill' })
   expect(response.status).toBe(400)
-  expect(await response.json()).toMatchObject({ reason: expect.stringContaining('由技能菜单打开填写表单') })
+  expect(await response.json()).toMatchObject({ reason: expect.stringContaining('由技能菜单在浏览器里处理') })
   expect(await sessionTotal('skill-a')).toBe(before)
   expect(captured?.prompt).not.toBe('/create-skill')
 })

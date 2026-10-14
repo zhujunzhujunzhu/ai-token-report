@@ -23,7 +23,7 @@ import { renderAssistantMarkdown } from '../utils/assistantMarkdown.js'
 import { assistantNavigationActivity } from '../utils/assistantActivity.js'
 import { handleAssistantComposerKeydown } from '../utils/assistantComposer.js'
 import { createAssistantScrollState } from '../utils/assistantScroll.js'
-import { assistantSkillDraft, assistantSkillMove, assistantSkillMenuHeight, assistantSkillMenuOptions, assistantSkillOptions, assistantSkillQuery, assistantLocalCommand, assistantSkillBadge, handleAssistantSkillKeydown, type AssistantSkillMenuOption } from '../utils/assistantSkills.js'
+import { assistantSkillDraft, assistantSkillMove, assistantSkillMenuHeight, assistantSkillMenuOptions, assistantSkillOptions, assistantSkillQuery, assistantLocalCommand, assistantSkillBadge, assistantActionFor, assistantSkillTemplateCaret, handleAssistantSkillKeydown, type AssistantSkillMenuOption } from '../utils/assistantSkills.js'
 import { createAssistantConversations, type AssistantPendingFile } from '../utils/assistantConversations.js'
 import { assistantAttachmentAccept, assistantAttachmentError, assistantAttachmentKind, assistantAttachmentSize, assistantCanSend } from '../utils/assistantAttachments.js'
 import { assistantStatus, assistantSessions, assistantDetail, assistantSkills, chatAssistant, deleteAssistantSession, steerAssistant, reportAssistantPageAction } from '../api/assistant.js'
@@ -118,23 +118,37 @@ const suggestions = [
 ]
 function suggest(value: string) { prompt.value = value; composer.value?.focus() }
 function selectSkill(skill: AssistantSkillMenuOption) {
-  // ★ 动作条目（/create-skill）由浏览器直接打开表单，不填入草稿、从不发给模型。
-  if (skill.kind === 'action') { skillMenuDismissed.value = true; skillDialogOpen.value = true; return }
+  skillMenuDismissed.value = true
+  // ★ 动作条目（/create-skill 填模板、/skills 打开技能列表）由浏览器直接处理，从不发给模型。
+  if (skill.kind === 'action') { runSkillCommand(skill.command); return }
   // ★ 技能选择只填入可编辑草稿；确认时间、范围后仍由用户发送或排队。
   prompt.value = assistantSkillDraft(skill)
-  skillMenuDismissed.value = true
   void nextTick(() => { composer.value?.focus(); composer.value?.textarea?.setSelectionRange(prompt.value.length, prompt.value.length) })
+}
+/**
+ * 两条浏览器本地技能命令。
+ *
+ * ★ `/create-skill` 只把模板填进输入框、**不发送**：技能在对话里生成（助手调用
+ *   `create_skill` 保存），用户补完名称和用途后按 Enter。
+ * ★ `/skills` 打开已有的技能列表（查看脚本与删除）；页面不再提供手填表单。
+ */
+function runSkillCommand(command: string) {
+  const action = assistantActionFor(command)
+  if (!action) return
+  skillMenuDismissed.value = true
+  if (!action.prompt) { skillDialogOpen.value = true; return }
+  prompt.value = action.prompt
+  void nextTick(() => {
+    composer.value?.focus()
+    const caret = assistantSkillTemplateCaret(prompt.value)
+    composer.value?.textarea?.setSelectionRange(caret, caret)
+  })
 }
 /** 目录失败只影响自定义技能，内置技能照旧可用；错误在弹框里如实显示。 */
 async function loadSkills() {
   const result = await assistantSkills()
   if (result.ok) { customSkills.value = result.data.skills; skillCatalogError.value = '' }
   else skillCatalogError.value = `自定义技能暂时读取失败：${result.error}。内置技能不受影响，可稍后重新打开本弹框。`
-}
-function skillCreated(skill: AssistantCustomSkill) {
-  // 保存成功后把新命令填进输入框：用户接着补时间、人员等条件即可，不必再翻菜单。
-  prompt.value = `${skill.command} `
-  void nextTick(() => composer.value?.focus())
 }
 function moveSkill(direction: -1 | 1) {
   skillSelection.value = assistantSkillMove(skillSelection.value, direction, skills.value.length)
@@ -209,10 +223,12 @@ function composerKeydown(event: Event | KeyboardEvent) {
     },
   })
 }
-const toolNames: Record<string, string> = { generate_management_report: '生成管理报表', query_usage: '查询与展示', stats_overview: '用量总览', stats_series: '用量趋势', stats_breakdown: '用量分布', stats_records: '调用明细', stats_diagnostics: '采集诊断', stats_pricing: '模型单价', stats_providers: '厂商目录', stats_sources: '来源目录', portal_navigate: '页面导航与搜索', portal_page_state: '读取当前页面', portal_page_action: '操作页面控件', render_table: '表格展示', render_echarts: 'ECharts 图表', render_cards: '指标卡片', list_datasets: '会话数据集', list_shared_html: '查询有效 HTML 分享', portal_manage_query: '查看管理配置', portal_manage_mutate: '编辑与操作确认', portal_manage_save: '直接保存管理配置', portal_open_form: '打开填写表单', web_search: '公开网络搜索', web_read: '读取公开网页', create_file: '生成导出文件', share_html: '创建 HTML 分享' }
+const toolNames: Record<string, string> = { generate_management_report: '生成管理报表', query_usage: '查询与展示', stats_overview: '用量总览', stats_series: '用量趋势', stats_breakdown: '用量分布', stats_records: '调用明细', stats_diagnostics: '采集诊断', stats_pricing: '模型单价', stats_providers: '厂商目录', stats_sources: '来源目录', portal_navigate: '页面导航与搜索', portal_page_state: '读取当前页面', portal_page_action: '操作页面控件', render_table: '表格展示', render_echarts: 'ECharts 图表', render_cards: '指标卡片', list_datasets: '会话数据集', list_shared_html: '查询有效 HTML 分享', portal_manage_query: '查看管理配置', portal_manage_mutate: '编辑与操作确认', portal_manage_save: '直接保存管理配置', portal_open_form: '打开填写表单', web_search: '公开网络搜索', web_read: '读取公开网页', create_file: '生成导出文件', share_html: '创建 HTML 分享', create_skill: '新建技能', run_skill_script: '执行技能脚本' }
 function sourceDescription(source: AssistantToolEvent) {
   if (source.tool === 'portal_page_state') return '读取当前页面可以操作的控件'
   if (source.tool === 'portal_page_action') return '操作当前页面并核对浏览器返回的结果'
+  if (source.tool === 'create_skill') return '保存成本账号可复用的 / 命令，权限与数据范围不变'
+  if (source.tool === 'run_skill_script') return '在受限沙箱里执行这条技能自带的脚本；结果不是平台统计口径'
   if (source.tool.startsWith('portal_manage_')) return '沿用当前身份的管理权限'
   if (source.tool.startsWith('web_')) return '公开网络信息与来源'
   if (source.tool === 'create_file') return '文件保存在当前私有对话'
@@ -246,8 +262,9 @@ async function remove(id: string) {
 }
 async function send() {
   if (!canSend.value) return
-  // ★ `/create-skill` 是浏览器本地命令：整段草稿就是它时打开表单，绝不发给模型。
-  if (assistantLocalCommand(prompt.value)) { skillDialogOpen.value = true; return }
+  // ★ 两条技能动作命令由浏览器本地处理：整段草稿就是它时填模板或打开技能列表，绝不发给模型。
+  const local = assistantLocalCommand(prompt.value)
+  if (local) { runSkillCommand(local); return }
   const state = current.value, owner = state.key
   let pendingController: ReturnType<typeof createAssistantPageController> | undefined
   try {
@@ -328,6 +345,9 @@ onMounted(async () => {
 onBeforeUnmount(() => { skillMenuResize?.disconnect(); transcriptResize?.disconnect(); if (transcriptFrame) cancelAnimationFrame(transcriptFrame); conversations.dispose() })
 watch(skillMenuOpen, async open => { if (open) { await nextTick(); fitSkillMenu() } })
 watch(showSessions, value => emit('sessions-toggle', value), { immediate: true })
+// ★ 技能可以在对话里被创建（create_skill）：一轮结束后重读目录，菜单与技能列表跟着更新。
+//   只在从「有会话在跑」变成「都跑完」时读一次，不轮询。
+watch(anyRunning, (running, before) => { if (before && !running) void loadSkills() })
 watch(prompt, () => { skillSelection.value = 0; skillMenuDismissed.value = false })
 watch(() => current.value.key, () => {
   dragging.value = false; skillSelection.value = 0; skillMenuDismissed.value = false; navigate = createAssistantNavigator(); if (fileInput.value) fileInput.value.value = ''
@@ -406,8 +426,8 @@ watch(() => [messages.value.length, messages.value.at(-1)?.text, messages.value.
           <div v-if="skillMenuOpen" class="assistant-skills">
             <div ref="skillMenuHeading" class="assistant-skills-heading"><strong>技能</strong><span>↑ ↓ 选择 · Enter / Tab 填入 · Esc 关闭</span></div>
             <div :id="skillMenuId" ref="skillMenu" class="assistant-skills-options" :style="{ maxHeight: `${skillMenuHeight}px` }" role="listbox" aria-label="助手技能">
-              <button v-for="(skill, index) in skills" :id="`${skillMenuId}-${skill.id}`" :key="skill.id" type="button" role="option" :aria-selected="index === skillSelection" tabindex="-1" @mousedown.prevent @click="selectSkill(skill)" @mousemove="skillSelection = index"><span class="assistant-skill-command">{{ skill.command }}</span><span class="assistant-skill-description"><strong>{{ skill.title }}<em v-if="assistantSkillBadge(skill)" class="assistant-skill-badge">{{ assistantSkillBadge(skill) }}</em></strong><small>{{ skill.description }}</small></span></button>
-              <p v-if="!skills.length" class="assistant-skills-empty">没有匹配的技能，试试 /report，或输入 /create-skill 新建一条。</p>
+              <button v-for="(skill, index) in skills" :id="`${skillMenuId}-${skill.id}`" :key="skill.id" type="button" role="option" :aria-selected="index === skillSelection" tabindex="-1" @mousedown.prevent @click="selectSkill(skill)" @mousemove="skillSelection = index"><span class="assistant-skill-command">{{ skill.command }}</span><span class="assistant-skill-description"><strong>{{ skill.title }}<em v-if="assistantSkillBadge(skill)" class="assistant-skill-badge">{{ assistantSkillBadge(skill) }}</em><em v-if="skill.hasScript" class="assistant-skill-badge">含脚本</em></strong><small>{{ skill.description }}</small></span></button>
+              <p v-if="!skills.length" class="assistant-skills-empty">没有匹配的技能，试试 /report，或输入 /create-skill 用对话新建一条。</p>
             </div>
           </div>
         <form class="assistant-composer" :class="{ dragging }" @submit.prevent="send" @dragover="dragOver" @dragleave="dragLeave" @drop="dropFiles">
@@ -435,7 +455,7 @@ watch(() => [messages.value.length, messages.value.at(-1)?.text, messages.value.
       </section>
     </div>
     <!-- ★ 新建/管理自定义技能：/create-skill 与菜单「新建技能」都打开这个表单，不经过模型。 -->
-    <AssistantSkillDialog v-model="skillDialogOpen" :skills="customSkills" :load-error="skillCatalogError" @changed="loadSkills" @created="skillCreated" />
+    <AssistantSkillDialog v-model="skillDialogOpen" :skills="customSkills" :load-error="skillCatalogError" @changed="loadSkills" />
   </div>
 </template>
 

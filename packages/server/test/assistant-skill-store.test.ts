@@ -80,6 +80,7 @@ test('命令格式、保留命令、字段长度与可见范围逐项拒绝', as
     [{ command: '/Weekly_Cost' }, '命令需要形如'],
     [{ command: '/report' }, '已被平台内置技能占用'],
     [{ command: '/create-skill' }, '已被平台内置技能占用'],
+    [{ command: '/skills' }, '已被平台内置技能占用'],
     [{ title: '' }, '技能标题'],
     [{ title: 'x'.repeat(25) }, '技能标题'],
     [{ description: 'x'.repeat(81) }, '技能说明'],
@@ -88,6 +89,40 @@ test('命令格式、保留命令、字段长度与可见范围逐项拒绝', as
     [{ visibility: 'everyone' }, '可见范围只能是仅自己或所有人'],
     [{ extra: 1 }, '需要提供命令、标题、说明、指令与可见范围'],
   ] as const) await expect(skills.create(alice, input(bad as Record<string, unknown>))).rejects.toThrow(reason)
+})
+
+test('脚本随技能落盘并在目录里下发；没有脚本的技能与从前完全一样', async () => {
+  const { skills, root: directory } = store()
+  const plain = await skills.create(alice, input({ command: '/plain' }))
+  expect(plain.script).toBeUndefined()
+  const script = 'return { total: input.rows.reduce((sum, row) => sum + row.tokens, 0) }'
+  const withScript = await skills.create(alice, input({ command: '/sum-tokens', script }))
+  expect(withScript.script).toBe(script)
+  // 能运行这条脚本的人就应该能读到它（可见范围决定谁看得到技能）。
+  expect((await skills.list(bob)).skills).toEqual([])
+  const shared = await skills.create(alice, input({ command: '/team-sum', visibility: 'public', script: 'return input.rows.length' }))
+  expect((await skills.list(bob)).skills[0]!.script).toBe('return input.rows.length')
+  expect(shared.visibility).toBe('public')
+  // 磁盘上也不多写字段：没有脚本的记录里没有 script 键。
+  const path = join(directory, '.skills', 'members', `${createHash('sha256').update(memberA).digest('hex')}.json`)
+  const stored = JSON.parse(await readFile(path, 'utf8')) as { skills: Array<Record<string, unknown>> }
+  expect(stored.skills.filter(skill => skill.command === '/plain')[0]).not.toHaveProperty('script')
+  expect(stored.skills.filter(skill => skill.command === '/sum-tokens')[0]).toMatchObject({ script })
+  expect((await new AssistantSkillStore(directory).list(alice)).skills.find(skill => skill.command === '/sum-tokens')?.script).toBe(script)
+})
+
+test('脚本的写入前校验：长度、空脚本、控制字符与语法错误都在落盘前拒绝', async () => {
+  const { skills } = store()
+  for (const [bad, reason] of [
+    [{ script: 'x'.repeat(4001) }, '技能脚本需要为 1～4000 个字符'],
+    [{ script: '   ' }, '技能脚本需要为 1～4000 个字符'],
+    [{ script: "return '\u0000x'" }, '技能脚本需要为 1～4000 个字符'],
+    [{ script: 'return {' }, '脚本语法错误'],
+    [{ script: 42 }, '技能脚本需要是文本'],
+  ] as const) await expect(skills.create(alice, input(bad as Record<string, unknown>))).rejects.toThrow(reason)
+  // 语法错误不会留下半条记录：命令仍然可以再建，且目录里没有它。
+  expect((await skills.list(alice)).skills).toEqual([])
+  expect((await skills.create(alice, input({ command: '/weekly-cost', script: 'return 1' }))).command).toBe('/weekly-cost')
 })
 
 test('命令统一小写入库，重复命令（含内置与公开）在写入前被拒绝', async () => {

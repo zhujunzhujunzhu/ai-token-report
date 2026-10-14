@@ -21,9 +21,11 @@ Token 规模不能评价人员绩效、质量或 ROI；缺预算、应采名单�
 
 ## 自定义技能
 
-成员可用 `/create-skill`（或菜单里的「新建技能」）把常用问法保存成一条 `/命令` + 一段草稿，并选「仅自己可见」或「所有人可见」。这条命令由浏览器直接打开表单，**不进对话**：服务端收到它只回一句「请从技能菜单打开表单」。新增或修改这条能力时，契约在 `packages/shared/src/assistant-skills.ts`（`ASSISTANT_SKILL_ACTIONS` + `AssistantCustomSkill` + 校验/上限），存储在 `packages/server/src/assistant/skill-store.ts`，解析在 `assistant/skills.ts`，HTTP 在 `assistant-route.ts`，表单在 `web-portal/src/components/AssistantSkillForm.vue`。
+技能**由对话生成，没有手填表单**。`/create-skill`（或菜单里的「新建技能」）由浏览器直接处理、**不进对话**：它只把一段模板（名称 / 用途 / 输出 / 数据处理方式）填进输入框，用户补完按 Enter，助手调用 `create_skill` 生成并保存 `/命令` + 标题 + 说明 + 草稿（可选脚本）。`/skills`（菜单里的「管理技能」）打开技能列表，只做查看与删除。可见范围**默认仅自己**：只有用户本轮自己说出「所有人可见 / 部门共享」，`create_skill` 才允许保存公开技能（`assistantPublicSkillIntent()`），否则回 403 —— 模型不能替用户公开。契约在 `packages/shared/src/assistant-skills.ts`（`ASSISTANT_SKILL_ACTIONS` + `AssistantCustomSkill` + 校验/上限 + `ASSISTANT_SKILL_SCRIPT_LIMITS`），存储在 `packages/server/src/assistant/skill-store.ts`，解析与指引在 `assistant/skills.ts`，授权意图在 `assistant/intents.ts`，两个工具在 `assistant/runtime.ts`，脚本沙箱在 `assistant/skill-script.ts`，HTTP 在 `assistant-route.ts`，技能列表在 `web-portal/src/components/AssistantSkillForm.vue`。
 
-两条不可退让的边界：①**技能草稿不是授权** —— `resolveAssistantSkill()` 的 `intent` 只取用户本轮自己敲的正文，公开技能保存「删除项目规则」也不能替调用者挂载写入或分享工具；②**技能不改变数据范围** —— 每次调用重新鉴权、重新定金额与人员范围，公开技能不会让任何人多看见一行数据。创建者姓名只给本人与管理员；私有技能对他人不可见、管理员也不能删。上限每人 50 条私有、全区 100 条公开；命令统一小写、与内置命令同名即拒绝。技能目录在 `<dataDir>/assistant/.skills/`，**不进上报库**，只备份数据库不包含它。
+三条不可退让的边界：①**技能草稿不是授权** —— `resolveAssistantSkill()` 的 `intent` 只取用户本轮自己敲的正文，公开技能保存「删除项目规则」也不能替调用者挂载写入或分享工具；②**技能不改变数据范围** —— 每次调用重新鉴权、重新定金额与人员范围，公开技能不会让任何人多看见一行数据；③**模型不能注入代码** —— `run_skill_script` 只执行「用户本轮明确调用的那条技能」保存时经语法校验的脚本（`skillRequest.custom?.script`），对话里新写的代码进不来。创建者姓名只给本人与管理员；私有技能对他人不可见、管理员也不能删。上限每人 50 条私有、全区 100 条公开；命令统一小写、与内置命令同名即拒绝。技能目录在 `<dataDir>/assistant/.skills/`，**不进上报库**，只备份数据库不包含它。
+
+脚本是**同步函数体**（`return` 可序列化结果，数据从 `input` 读），在 `node:vm` + `Object.create(null)` 上下文里执行：数据以 JSON 字面量注入、结果以 JSON 取回，没有宿主对象跨界，没有网络 / 文件 / 进程 / 定时器 / `require`，`eval` 与 `Function` 关闭，超时 1,500 毫秒、输入 32,000 字符、输出 64,000 字符、脚本 4,000 字符。⚠️ `vm` 不是安全沙箱 —— 目标是「纯数据变换」，脚本来源是用户自己或部门内可见的技能，因此**脚本对能运行它的人可见**（目录会把 `script` 一起下发）。结果带 `computed_by_skill_script: true` 与说明，引用时必须写明**「脚本计算，非平台口径」**，不得当作平台用量、金额或绩效结论，也不得替换查询接口的真实数值。
 
 ## 维护能力
 
@@ -31,4 +33,4 @@ Token 规模不能评价人员绩效、质量或 ROI；缺预算、应采名单�
 
 复用统计路由的实时鉴权、数据范围、归一化和金额计算，不绕过路由直接查业务库。日期由后端解析，一份报表共享冻结时间边界，但各节仍是独立读取快照。保留完整返回行与模型预览的区别、分页、截断、来源与失败语义；任何一节失败时不创建部分完整报表。
 
-根据改动运行 server 的 assistant-skills/reports/artifacts/usage/presentation 相关测试与真实 DSH 回环装载验证；自定义技能另跑 `bun test packages/server/test/assistant-skill-store.test.ts packages/server/test/assistant-skill-route.test.ts` 与 `bun test packages/web-portal/test/assistant-skills.test.ts packages/web-portal/test/assistant-skill-form.test.ts`；前端菜单运行 web-portal 的 assistant-skills/composer/conversations 测试和 SSR 验证（弹框主体拆成 `AssistantSkillForm.vue` 才能被 SSR 执行）。完成全仓类型检查与两个 Web 构建。模型理解的真实验收按 `docs/AI助手用例与验收.md` 的隔离流程进行，不把回环夹具宣称为真实模型验证。
+根据改动运行 server 的 assistant-skills/reports/artifacts/usage/presentation 相关测试与真实 DSH 回环装载验证；自定义技能另跑 `bun test packages/server/test/assistant-skill-store.test.ts packages/server/test/assistant-skill-route.test.ts packages/server/test/assistant-skill-script.test.ts`、`bun test packages/web-portal/test/assistant-skills.test.ts`，以及真 DSH 内核的 `bun run packages/server/verify/verify-assistant-runtime.ts <协议> --skills`（三种协议各跑一次：建技能、公开护栏、脚本沙箱执行、提问轮不挂载写入面）。前端菜单运行 web-portal 的 assistant-skills/composer/conversations 测试和 SSR 验证（弹框主体拆成 `AssistantSkillForm.vue` 才能被 SSR 执行）。完成全仓类型检查与两个 Web 构建。模型理解的真实验收按 `docs/AI助手用例与验收.md` 的隔离流程进行，不把回环夹具宣称为真实模型验证。

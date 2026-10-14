@@ -13,11 +13,12 @@ import { validateAssistantConfig, type DshAssistantConfig } from './config.js'
 import { assistantPiProfile } from './request-profile.js'
 import { AssistantRuntimeError } from './runtime-error.js'
 import { queryUsage, usageParameters } from './usage.js'
-import { assistantReportGuidance, resolveAssistantSkill, type ResolvedCustomSkill } from './skills.js'
+import { assistantReportGuidance, assistantSkillAuthoringGuidance, resolveAssistantSkill, type ResolvedCustomSkill } from './skills.js'
 import { generateManagementReport, reportParameters } from './reports.js'
 import { AssistantNetwork } from './network.js'
 import { assistantNavigation } from './navigation.js'
-import { assistantWriteIntent, assistantShareIntent } from './intents.js'
+import { assistantWriteIntent, assistantShareIntent, assistantSkillCreateIntent, assistantPublicSkillIntent } from './intents.js'
+import { runSkillScript } from './skill-script.js'
 import { replaceAssistantFile } from './atomic-file.js'
 import type { AssistantActions } from './actions.js'
 import type { AssistantSkillStore } from './skill-store.js'
@@ -59,6 +60,10 @@ export class DshAssistantEngine implements AssistantEngine {
   get supportsSteering(): boolean { return true }
   async run(input: AssistantRun): Promise<void> {
     const skillRequest = resolveAssistantSkill(input.prompt, input.skills)
+    // ★ 两个新工具都只在「本轮确实该有它」时挂载，系统提示里的指引也按同一批开关拼接：
+    //   建技能只看用户本轮原话；跑脚本只看**用户本轮自己调用的那条技能自带的脚本**。
+    const canCreateSkill = !!this.services.skills && assistantSkillCreateIntent(skillRequest.intent)
+    const selectedScript = skillRequest.custom?.script
     const formContext = validateAssistantFormContext(input.formContext, input.page, input.principal)
     let pageContext = validateAssistantPageContext(input.pageContext, input.page, input.principal)
     if (!this.supportsImages && input.attachments?.some(attachment => attachment.image)) throw new IdentityError(415, '当前助手模型未启用图片理解，请启用视觉模型后再上传图片')
@@ -133,7 +138,7 @@ export class DshAssistantEngine implements AssistantEngine {
       await scope.plugin(projections.default)
       await scope.plugin(prompts.default, {
         includeHarnessIdentity: false, includeRuntimeContext: false,
-        personaPrefix: assistantReportGuidance(input.prompt, input.skills) + `你是 AI Token 平台的数据与操作助手。当前北京时间 ${new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' })}，时区 Asia/Shanghai。当前页面 ${input.page ?? '/overview'}；当前用户 ${input.principal.name}，数据范围 ${input.principal.roleCodes.includes('admin') ? '可查部门授权数据' : '仅本人'}。
+        personaPrefix: assistantReportGuidance(input.prompt, input.skills) + (canCreateSkill ? assistantSkillAuthoringGuidance() : '') + `你是 AI Token 平台的数据与操作助手。当前北京时间 ${new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' })}，时区 Asia/Shanghai。当前页面 ${input.page ?? '/overview'}；当前用户 ${input.principal.name}，数据范围 ${input.principal.roleCodes.includes('admin') ? '可查部门授权数据' : '仅本人'}。
 用最少工具准确回答。常规统计优先 query_usage：一次完成姓名解析、时间范围、查询与可选展示。用户提到姓名就传完整 member_name；今年=year，本月=month，上月=lastmonth，本周=week，昨天=yesterday。明确的时间永远优先于默认最近七天。不要先查最近七天推测人员或当前日期，不猜 member_id。模型标识保留用户给出的完整名称，包含“模型”等字时也不能删掉；模型筛选按平台包含匹配的语义，不把关键词匹配声称为精确唯一模型。默认未指定人员时按当前授权范围；“我”传 member_name="我"。续聊的“他/她/刚才那个人”沿用已经确定的人员；没有确定时先问清楚。同名、未找到或无权限，直接说明并停止，不能换个范围查出数字充当答案。
 总量问题用 view=overview、display=cards；排行/按模型等分布用 view=breakdown、by 对应维度，默认 display=table；趋势用 view=series、display=line。这是意图选择原则，不是接口固定图形：用户指定图形就用 display 对应类型，也可以省略 display 只回答；overview 不适合饼图，单个总量没有份额。两期比较用 overview 与 compare_period，display=table 或 bar。查询已 rendered 就不要再调用渲染工具；同一答案一般只需要一次 query_usage，获得结果后直接结束。改图时优先复用对话里的 dataset_id；只有无法确认时再 list_datasets，不重复取数。
 回答使用简洁 Markdown，先给具体数字和结论（常规回答1至3句，约100字），再注明人员、时间范围和来源。时间直接引用 range.label，不自行换算毫秒或推算日期；metrics_display 是已格式化的真实指标，直接引用，不重新计算缓存比率。趋势可引用 series_summary 的真实首尾和峰值。不要只说“我先查一下”，不要复述工具步骤，不要在简单问题上连续探索。表格已展示时不重复写Markdown表格或逐行复述，明细只说明展示条数和分页状态，不额外计算行合计；不要每次结尾都询问是否继续分析。只描述数据支持的事实，没有比较基准不评价用量“很低/很高”或成本效率。完整数值以工具返回为准，不用笼统的“约几千”替代精确值。无数据明确说明当前范围内已入库用量为0，不推断没有使用过。部分行/分页/截断必须说明，不把子集当整体。未计价表示金额未知，既不能断言零元，也不能断言“非零”或“有费用”；不要把“不等于零”解释成已知大于零。不同币种不能相加；已计价的费用也只是估算。
@@ -266,6 +271,40 @@ create_file 可以生成 docx/xlsx/html/md/csv/txt 基础文件；统计文件�
             { type: 'object', properties: { resource: { type: 'string', enum: resources }, operation: { type: 'string', enum: ['create', 'update', 'delete', 'disable', 'enable'] }, target_id: { type: 'string' }, values: { type: 'object', additionalProperties: true } }, required: ['resource', 'operation'], additionalProperties: false },
             async (args, principal) => await this.services.actions!.mutate(principal, input.sessionId, args as import('./actions.js').AssistantAdminMutation, input.emit))
         }
+      }
+      if (canCreateSkill) {
+        register('create_skill', '直接新建并保存一条自定义技能（/命令 + 默认请求草稿，可选脚本）。command 形如 /weekly-cost；title≤24字；description 一句话≤80字；prompt 是这条命令的默认请求草稿≤1000字，写清时间、维度与输出。script 可选：同步函数体，用 return 返回可序列化结果，通过 input 读取调用方数据，没有网络、文件与系统接口，禁止 eval/Function。visibility 默认 private，只有用户本轮明确说「所有人可见/部门共享」才可 public。成功返回 created:true；命令被占用或校验失败时按原因换名重试，不能改口说已保存。',
+          { type: 'object', properties: { command: { type: 'string', maxLength: 32 }, title: { type: 'string', maxLength: 24 }, description: { type: 'string', maxLength: 80 }, prompt: { type: 'string', maxLength: 1000 }, script: { type: 'string', maxLength: 4000, description: '可选脚本：同步函数体，用 return 返回可序列化结果，通过 input 读取数据' }, visibility: { type: 'string', enum: ['private', 'public'] } }, required: ['command', 'title', 'description', 'prompt'], additionalProperties: false },
+          async (args, principal) => {
+            const raw = (args ?? {}) as Record<string, unknown>
+            const visibility = raw.visibility === 'public' ? 'public' : 'private'
+            // ★ 公开是另一个量级的决定：只有用户本轮自己说了才算，模型不能替用户公开给全部门。
+            if (visibility === 'public' && !assistantPublicSkillIntent(skillRequest.intent)) throw new IdentityError(403, '只有你本轮明确说了「所有人可见 / 部门共享」才能保存公开技能，请先按仅自己可见保存')
+            const skill = await this.services.skills!.create(principal, {
+              command: raw.command, title: raw.title, description: raw.description, prompt: raw.prompt,
+              ...(raw.script === undefined ? {} : { script: raw.script }), visibility,
+            })
+            return { created: true, skill_id: skill.skill_id, command: skill.command, title: skill.title, description: skill.description, visibility: skill.visibility, has_script: !!skill.script, note: `技能已保存，用户下次输入 ${skill.command} 即可调用。` }
+          })
+      }
+      if (selectedScript) {
+        // ★ 只跑「用户本轮明确调用的那条技能」自带的脚本：模型给不了脚本源码，因此这里不是
+        //   「让模型执行任意代码」的入口 —— 代码是保存时经语法校验、存在技能目录里的那一份。
+        register('run_skill_script', `执行本轮用户明确调用的技能 ${skillRequest.custom!.command} 自带的脚本，用于按这条技能约定的方式处理数据。只传纯数据：传本轮已授权的 dataset_id（脚本收到 {query,title,total_rows,columns,rows}），或直接用 input 传数据。脚本在无网络、无文件、无系统接口的受限沙箱里同步执行，输入输出与耗时都有上限，失败原因会原样返回。★ 返回结果由成员脚本计算，不是平台统计口径：引用时必须说明来源，不能当作平台用量、金额或绩效结论，也不能用它替换查询接口的真实数值。`,
+          { type: 'object', properties: { dataset_id: { type: 'string', maxLength: 64, description: '本轮 query_usage 返回的 dataset_id' }, input: { type: 'object', additionalProperties: true, description: '直接交给脚本的数据；与 dataset_id 二选一' } }, additionalProperties: false },
+          async (args, principal) => {
+            const raw = (args ?? {}) as Record<string, unknown>
+            if ((raw.dataset_id === undefined) === (raw.input === undefined)) throw new IdentityError(400, '需要且只需要提供一个 dataset_id 或 input')
+            let payload: unknown
+            if (raw.dataset_id !== undefined) {
+              if (typeof raw.dataset_id !== 'string') throw new IdentityError(400, 'dataset_id 需要是字符串')
+              // 数据集按当前身份复验；脚本只拿到这次查询已经授权过的那份数据。
+              const snapshot = datasets.render('table', { dataset_id: raw.dataset_id }, principal)
+              payload = { query: snapshot.query, title: snapshot.title, total_rows: snapshot.table!.total_rows, columns: snapshot.table!.columns, rows: snapshot.table!.rows }
+            } else payload = raw.input
+            const { value, duration_ms } = runSkillScript(selectedScript, payload)
+            return { computed_by_skill_script: true, skill: skillRequest.custom!.command, result: value, duration_ms, note: '这段结果由技能脚本计算，不是平台统计口径；引用时请说明来源。' }
+          })
       }
       if (this.services.artifacts) {
         register('list_shared_html', '只读查询当前账号所有历史会话中目前对外开放的HTML报告/分享链接。返回标题、真实URL、北京时间到期时间、总数及分页；自动排除到期、撤销、会话删除或权限变化的文件。仅查询不创建分享，不需要本轮授权发布；不支持查询其他账号。默认limit=50，最多100，next_offset可继续查询。',

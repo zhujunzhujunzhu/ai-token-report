@@ -16,6 +16,7 @@ import type { AssistantActions } from '../src/assistant/actions.js'
 import type { AssistantArtifacts } from '../src/assistant/artifacts.js'
 import { AssistantArtifacts as ReportArtifacts } from '../src/assistant/artifacts.js'
 import { AssistantStore } from '../src/assistant/store.js'
+import { AssistantSkillStore } from '../src/assistant/skill-store.js'
 
 const protocol = (process.argv[2] ?? 'deepseek-messages') as AssistantProtocol
 const liveHTTP = process.argv.includes('--live-http')
@@ -24,8 +25,10 @@ const steeringHTTP = process.argv.includes('--steering')
 const reportsHTTP = process.argv.includes('--reports')
 const formContextHTTP = process.argv.includes('--form-context')
 const pageActionsHTTP = process.argv.includes('--page-actions')
+const skillsHTTP = process.argv.includes('--skills')
 const directory = mkdtempSync(join(tmpdir(), 'atr-dsh-runtime-'))
 const requests: any[] = []
+const SKILL_SCRIPT = 'return { total: input.rows.reduce((sum, row) => sum + row.tokens, 0) }'
 let textStreamOpen = false, sawLiveText = false
 function datasetOf(value: any): string | undefined {
   if (typeof value === 'string') { try { return datasetOf(JSON.parse(value)) } catch { return undefined } }
@@ -48,7 +51,13 @@ const fixture = createServer(async (req, res) => {
     6: ['portal_navigate', { path: '/analysis' }],
     8: ['render_echarts', { dataset_id, chart: { kind: 'pie', x_key: 'dimension', y_keys: ['total_tokens'] } }],
   }
-  if (attachmentsHTTP || steeringHTTP || reportsHTTP || formContextHTTP || pageActionsHTTP) for (const key of Object.keys(scheduled)) delete scheduled[Number(key)]
+  if (attachmentsHTTP || steeringHTTP || reportsHTTP || formContextHTTP || pageActionsHTTP || skillsHTTP) for (const key of Object.keys(scheduled)) delete scheduled[Number(key)]
+  if (skillsHTTP) {
+    // 第 1 轮：建技能 →（被测的公开护栏）→ 收尾文字；第 2 轮：跑脚本；第 3 轮：只问用法。
+    scheduled[1] = ['create_skill', { command: '/sum-by-model', title: '按模型汇总', description: '把行按模型汇总', prompt: '汇总输入数据里的行', script: SKILL_SCRIPT }]
+    scheduled[2] = ['create_skill', { command: '/too-public', title: '公开技能', description: '不该被建', prompt: '汇总输入数据里的行', visibility: 'public' }]
+    scheduled[4] = ['run_skill_script', { input: { rows: [{ model: 'a', tokens: 2 }, { model: 'b', tokens: 3 }] } }]
+  }
   if (pageActionsHTTP) {
     scheduled[1] = ['portal_page_state', {}]
     scheduled[2] = ['portal_page_action', { control_id: 'fresh-filter', operation: 'fill', value: 'fixture' }]
@@ -180,6 +189,48 @@ try {
     assert.equal(generated[0]!.artifact.share, undefined)
     assert(events.some(event => event.type === 'tool' && event.tool === 'generate_management_report' && event.state === 'completed'))
     console.log('DSH_REPORTS_OK: ' + protocol + '，默认技能、真实工具执行、多节文件及私有权限')
+  } else if (skillsHTTP) {
+    const principal = { memberId: randomUUID(), name: '技能夹具成员', permissions: ['stats:read'], roleCodes: ['member'], groupIds: [], groupNames: [], auth: { kind: 'token', tokenId: randomUUID() } } as Principal
+    const skills = new AssistantSkillStore(join(directory, 'assistant'))
+    const skillsEngine = new DshAssistantEngine(stats, { model: 'fixture-model', protocol, baseUrl: 'http://127.0.0.1:' + port + (protocol === 'deepseek-messages' ? '' : '/v1'), apiKeyEnv: 'ATR_ASSISTANT_TEST_KEY' }, { skills })
+    const input = { sessionId: randomUUID(), directory, principal, signal: AbortSignal.timeout(30_000), emit: (event: AssistantEvent) => events.push(event) }
+
+    // 第 1 轮：用户明确要求建技能 → 挂载 create_skill；公开护栏在真实运行时里生效。
+    await skillsEngine.run({ ...input, prompt: '帮我建一个技能：名称「按模型汇总」，用途是把查询到的行按模型汇总' })
+    assert.equal(requests.length, 3, '建技能应产生两次工具调用与一次收尾回答')
+    const createNames = requests[0].tools.map((tool: any) => tool.name ?? tool.function?.name)
+    assert(createNames.includes('create_skill'), '用户明确要求建技能时没有挂载 create_skill')
+    assert(!createNames.includes('run_skill_script') && !createNames.includes('portal_manage_save'), '建技能不该顺带挂载跑脚本或后台写入')
+    assert(JSON.stringify(requests[2]).includes('只有你本轮明确说了'), '没有用户授权的公开技能必须被拒绝并如实回报')
+    const catalog = await skills.list(principal)
+    assert.deepEqual(catalog.skills.map(skill => skill.command), ['/sum-by-model'], '公开护栏失效：未经用户同意的技能被保存了')
+    assert.equal(catalog.skills[0]!.script, SKILL_SCRIPT)
+    assert.equal(catalog.skills[0]!.visibility, 'private')
+    assert(events.some(event => event.type === 'tool' && event.tool === 'create_skill' && event.state === 'completed'))
+    assert(events.some(event => event.type === 'tool' && event.tool === 'create_skill' && event.status === 403 && event.state === 'failed'))
+
+    // 第 2 轮：用户本轮调用带脚本的技能 → 只挂载 run_skill_script，并在真沙箱里算出结果。
+    await skillsEngine.run({ ...input, sessionId: randomUUID(), prompt: '/sum-by-model 汇总这些数据', skills: [{ command: '/sum-by-model', title: '按模型汇总', prompt: '汇总输入数据里的行', visibility: 'private', script: SKILL_SCRIPT }] })
+    assert.equal(requests.length, 5)
+    const runNames = requests[3].tools.map((tool: any) => tool.name ?? tool.function?.name)
+    assert(runNames.includes('run_skill_script'), '调用带脚本的技能时没有挂载 run_skill_script')
+    assert(!runNames.includes('create_skill'), '本轮没有建技能请求却挂载了 create_skill')
+    assert(JSON.stringify(requests[3]).includes('不是平台统计口径'), '工具说明必须声明脚本结果不是平台口径')
+    assert(JSON.stringify(requests[4]).includes('computed_by_skill_script'), '脚本结果没有回给模型')
+    assert(JSON.stringify(requests[4]).includes(':5'), '脚本计算结果不是真实执行得到的 5')
+    assert(events.some(event => event.type === 'tool' && event.tool === 'run_skill_script' && event.state === 'completed'))
+
+    // 第 3 轮：只是问这个技能怎么用 → 两个工具都不挂载（不能凭「技能」两个字挂写入面）。
+    // ⚠️ 断言只针对**本轮的系统提示**：同一个会话目录会重放历史，历史里当然留着上一轮的
+    //    create_skill 调用；拿整份请求去搜字符串会把「重放」误判成「本轮又挂上了写工具」。
+    const systemText = (request: any): string => JSON.stringify(request.system ?? request.instructions ?? (request.messages ?? []).find((message: any) => message.role === 'system') ?? (request.input ?? []).find((item: any) => item.role === 'system') ?? '')
+    assert(systemText(requests[0]).includes('create_skill'), '系统提示缺少建技能指引')
+    await skillsEngine.run({ ...input, sessionId: randomUUID(), prompt: '这个技能怎么用', skills: [{ command: '/sum-by-model', title: '按模型汇总', prompt: '汇总输入数据里的行', visibility: 'private', script: SKILL_SCRIPT }] })
+    assert.equal(requests.length, 6)
+    const idleNames = requests[5].tools.map((tool: any) => tool.name ?? tool.function?.name)
+    assert(!idleNames.includes('create_skill') && !idleNames.includes('run_skill_script'))
+    assert(!systemText(requests[5]).includes('create_skill'), '提问轮的系统提示不该出现建技能指引')
+    console.log('DSH_SKILLS_OK: ' + protocol + '，建技能、公开护栏、脚本沙箱执行与提问轮不挂载写入面')
   } else if (liveHTTP) {
     Object.assign(process.env, { ATR_ASSISTANT_MODEL: 'fixture-model', ATR_ASSISTANT_PROTOCOL: protocol, ATR_ASSISTANT_BASE_URL: 'http://127.0.0.1:' + port + (protocol === 'deepseek-messages' ? '' : '/v1'), ATR_ASSISTANT_API_KEY_ENV: 'ATR_ASSISTANT_TEST_KEY', ATR_ASSISTANT_VERIFICATION_SOURCE: 'loopback' })
     await import('./verify-assistant-live.js')

@@ -1074,13 +1074,31 @@ try {
   check('对话末页显示已加载全部', sessionEndHtml.includes('已加载全部对话') && !sessionEndHtml.includes('向下滚动加载更多'))
   check('助手输入框提供多选附件入口并保留输入法快捷键提示', assistantHtml.includes('添加附件') && assistantHtml.includes('type="file"') && assistantHtml.includes('multiple') && assistantHtml.includes('.docx') && assistantHtml.includes('.xlsx') && assistantHtml.includes('.pptx') && assistantHtml.includes('Alt + Enter'))
   check('助手输入框提示包含自定义技能入口', assistantHtml.includes('选择技能（含自定义技能）'))
-  // 新建技能弹框的表单主体（el-dialog 的内容只在客户端渲染，故直接执行这个组件）。
+  // 技能管理弹框的主体（el-dialog 的内容只在客户端渲染，故直接执行这个组件）。
   const { default: SkillForm } = await server.ssrLoadModule('/src/components/AssistantSkillForm.vue')
   const skillFormHtml = await renderToString(createRenderApp({ render: () => h(SkillForm, {
     open: true,
-    skills: [{ skill_id: '11111111-1111-4111-8111-111111111111', command: '/weekly-cost', title: '上周费用', description: '按供应商看上周费用估算', prompt: '生成上周的费用分析报表', visibility: 'private', mine: true, can_delete: true, owner_name: '成员甲', created_at_ms: 1, updated_at_ms: 2 }],
+    skills: [
+      { skill_id: '11111111-1111-4111-8111-111111111111', command: '/weekly-cost', title: '上周费用', description: '按供应商看上周费用估算', prompt: '生成上周的费用分析报表', visibility: 'private', mine: true, can_delete: true, owner_name: '成员甲', created_at_ms: 1, updated_at_ms: 2 },
+      { skill_id: '22222222-2222-4222-8222-222222222222', command: '/sum-tokens', title: '汇总用量', description: '把输入行按模型汇总', prompt: '汇总这些行', visibility: 'private', mine: true, can_delete: true, created_at_ms: 1, updated_at_ms: 3, script: 'return input.rows.length' },
+    ],
   }) }))
-  check('新建技能表单提供命令、草稿与可见范围，并声明公开技能不扩大数据权限', skillFormHtml.includes('不会新增数据范围') && skillFormHtml.includes('仅自己可见') && skillFormHtml.includes('所有人可见') && skillFormHtml.includes('只有你的斜杠菜单里有这条命令') && skillFormHtml.includes('/weekly-cost') && skillFormHtml.includes('删除技能 /weekly-cost') && skillFormHtml.includes('私有 1 / 50'))
+  // ★ 断言的是「技能由对话生成 + 脚本原文只展示、执行在服务端沙箱」这两件事：
+  //   页面里既不该有建技能表单，也不该有可见范围选择器或任何执行脚本的入口。
+  check('技能管理弹框说明技能由对话生成、脚本只在服务端沙箱执行且不是平台口径',
+    skillFormHtml.includes('技能由对话生成') && skillFormHtml.includes('/create-skill') && skillFormHtml.includes('不会新增数据范围')
+    && skillFormHtml.includes('服务端受限沙箱') && skillFormHtml.includes('不是平台统计口径')
+    && skillFormHtml.includes('/weekly-cost') && skillFormHtml.includes('删除技能 /weekly-cost')
+    && skillFormHtml.includes('含脚本') && skillFormHtml.includes('查看脚本')
+    && skillFormHtml.includes('私有 2 / 50') && !skillFormHtml.includes('所有人可见'))
+  const sharedSkillFormHtml = await renderToString(createRenderApp({ render: () => h(SkillForm, {
+    open: true,
+    skills: [{ skill_id: '22222222-2222-4222-8222-222222222222', command: '/sum-tokens', title: '汇总用量', description: '把输入行按模型汇总', prompt: '汇总这些行', visibility: 'public', mine: false, can_delete: false, owner_name: '成员甲', created_at_ms: 1, updated_at_ms: 3, script: 'return input.rows.length' }],
+  }) }))
+  check('技能管理弹框原样展示脚本原文、标出部门共享，别人的技能只读',
+    sharedSkillFormHtml.includes('return input.rows.length') && sharedSkillFormHtml.includes('<pre class="skill-script"')
+    && sharedSkillFormHtml.includes('部门共享') && sharedSkillFormHtml.includes('由 成员甲 创建')
+    && sharedSkillFormHtml.includes('不可删除') && sharedSkillFormHtml.includes('公开 1 / 100'))
   const attachmentHtml = await renderToString(createRenderApp({ render: () => h(AttachmentCard, { sessionId: '私有会话', attachment: { attachment_id: '上传甲', file_name: '<script>说明</script>.docx', media_type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', size_bytes: 2048, kind: 'document', extracted_chars: 1200, note: '内容已截断，仅包含前 60,000 字。' } }) }))
   check('上传历史显示文件名、容量、解析范围与下载入口，文件名被转义', attachmentHtml.includes('2.0 KB') && attachmentHtml.includes('已解析 1,200 字') && attachmentHtml.includes('前 60,000 字') && attachmentHtml.includes('下载附件') && attachmentHtml.includes('&lt;script&gt;说明&lt;/script&gt;') && !attachmentHtml.includes('<script>说明</script>'))
   const imageAttachmentHtml = await renderToString(createRenderApp({ render: () => h(AttachmentCard, { sessionId: '私有会话', attachment: { attachment_id: '图甲', file_name: '截图.png', media_type: 'image/png', size_bytes: 512, kind: 'image' } }) }))

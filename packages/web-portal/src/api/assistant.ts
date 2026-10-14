@@ -1,12 +1,16 @@
 /** 助手的 POST SSE 客户端，沿用 Cookie、自定义同源请求头与部署前缀。 */
 import { ASSISTANT_SESSION_PAGE_SIZE } from '@ai-token-report/shared'
-import type { AssistantArtifact, AssistantAttachment, AssistantCustomSkill, AssistantCustomSkillInput, AssistantFormContext, AssistantPageContext, AssistantPageActionResult, AssistantPendingAction, AssistantDetail, AssistantEvent, AssistantSessionPage, AssistantSkillCatalog, AssistantStatus } from '@ai-token-report/shared'
+import type { AssistantArtifact, AssistantAttachment, AssistantFormContext, AssistantPageContext, AssistantPageActionResult, AssistantPendingAction, AssistantDetail, AssistantEvent, AssistantSessionPage, AssistantSkillCatalog, AssistantStatus } from '@ai-token-report/shared'
 import { post, request, withBase } from './request.js'
 
 export const assistantStatus = () => request<AssistantStatus>('/api/v1/assistant/status')
-/** 技能目录由服务端按当前身份过滤（自己的私有技能 + 全部公开技能）。 */
+/**
+ * 技能目录由服务端按当前身份过滤（自己的私有技能 + 全部公开技能）。
+ *
+ * ★ 这里**没有**「创建技能」的调用：技能由对话里的 `create_skill` 工具写入，
+ *   页面不再提交技能表单（HTTP 端点仍在，供工具与契约测试使用）。
+ */
 export const assistantSkills = () => request<AssistantSkillCatalog>('/api/v1/assistant/skills')
-export const createAssistantSkill = (input: AssistantCustomSkillInput) => post<{ skill: AssistantCustomSkill }>('/api/v1/assistant/skills', input)
 export async function deleteAssistantSkill(id: string): Promise<void> {
   await checked(await fetch(withBase(`/api/v1/assistant/skills/${encodeURIComponent(id)}`), {
     method: 'DELETE', headers: { 'X-Portal-Request': '1' }, credentials: 'same-origin', signal: AbortSignal.timeout(20_000),

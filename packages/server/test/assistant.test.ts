@@ -219,10 +219,13 @@ test('真实 DSH agent 在 Bun 与 Node 中均能调用工具并持久化续聊'
   if (!built.success) throw new Error(built.logs.join('\n'))
   const node = resolveNodeBin()
   expect(node).not.toBeNull()
-  for (const [binary, script] of [[process.execPath, entry], [node!, join(root, 'runtime-node', 'verify-assistant-runtime.mjs')]]) for (const protocol of ['deepseek-messages', 'openai-completions', 'openai-responses', 'live-http', 'reports-deepseek-messages', 'reports-openai-completions', 'reports-openai-responses']) {
-    const args = protocol === 'live-http' ? ['openai-completions', '--live-http'] : protocol.startsWith('reports-') ? [protocol.slice(8), '--reports'] : [protocol]
+  for (const [binary, script] of [[process.execPath, entry], [node!, join(root, 'runtime-node', 'verify-assistant-runtime.mjs')]]) for (const protocol of ['deepseek-messages', 'openai-completions', 'openai-responses', 'live-http', 'reports-deepseek-messages', 'reports-openai-completions', 'reports-openai-responses', 'skills-deepseek-messages', 'skills-openai-completions', 'skills-openai-responses']) {
+    // ★ 技能沙箱必须**在 Node 上也实跑**：线上跑 Node，而 Bun 的 vm.runInContext 对 Script 对象的行为不同。
+    const mode = protocol.startsWith('reports-') ? '--reports' : protocol.startsWith('skills-') ? '--skills' : undefined
+    const name = protocol.startsWith('reports-') ? protocol.slice(8) : protocol.startsWith('skills-') ? protocol.slice(7) : protocol
+    const args = protocol === 'live-http' ? ['openai-completions', '--live-http'] : mode ? [name, mode] : [protocol]
     const child = spawnSync(binary!, [script!, ...args], { env: cleanChildEnv(), encoding: 'utf8', windowsHide: true, timeout: 60_000 })
     if (child.status !== 0) throw new Error(child.error?.message ?? child.stdout + child.stderr)
-    expect(child.stdout).toContain(protocol === 'live-http' ? 'LOOPBACK_TEST_OK' : protocol.startsWith('reports-') ? 'DSH_REPORTS_OK' : 'DSH_RUNTIME_OK')
+    expect(child.stdout).toContain(protocol === 'live-http' ? 'LOOPBACK_TEST_OK' : protocol.startsWith('reports-') ? 'DSH_REPORTS_OK' : protocol.startsWith('skills-') ? 'DSH_SKILLS_OK' : 'DSH_RUNTIME_OK')
   }
 }, 240_000)

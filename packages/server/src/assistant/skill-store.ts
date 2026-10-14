@@ -1,5 +1,5 @@
 /**
- * 自定义技能目录：成员保存的「命令 + 默认请求草稿」。
+ * 自定义技能目录：成员保存的「命令 + 默认请求草稿」，可额外带一段脚本。
  *
  * ★ 存储与对话同级（`<数据目录>/assistant/.skills/`）：私有技能一人一份 JSON，
  *   公开技能全区一份。它**不进上报库** —— 这里没有用量事实，也不是身份或权限，
@@ -10,6 +10,8 @@
  *   后者会覆盖前者。多实例部署前必须先解决这一点。
  * ★ 归属只认服务端身份（`owner_member_id`），浏览器提交不了创建者。
  * ★ 技能不携带任何权限：调用时仍按当前身份重新鉴权、重新决定数据范围。
+ * ★ 脚本**只在这里存与校验**（含保存时语法检查），执行在 `skill-script.ts` 的沙箱里，
+ *   而且只有「用户本轮明确调用了这条技能」时才执行 —— 目录层不跑任何成员代码。
  */
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
@@ -21,6 +23,7 @@ import {
 import type { Principal } from '../identity/types.js'
 import { IdentityError } from '../identity/types.js'
 import { replaceAssistantFile } from './atomic-file.js'
+import { assertSkillScriptSyntax } from './skill-script.js'
 
 /** 磁盘上的记录：比对外契约多一个权威归属，永远不整个发给浏览器。 */
 export interface StoredCustomSkill {
@@ -29,6 +32,8 @@ export interface StoredCustomSkill {
   title: string
   description: string
   prompt: string
+  /** 可选脚本源码；没有脚本的技能与从前完全一样。 */
+  script?: string
   visibility: AssistantCustomSkillVisibility
   owner_member_id: string
   owner_name: string
@@ -103,6 +108,8 @@ export class AssistantSkillStore {
       title: text('title', ASSISTANT_CUSTOM_SKILL_LIMITS.title_chars), description: text('description', ASSISTANT_CUSTOM_SKILL_LIMITS.description_chars),
       prompt: text('prompt', ASSISTANT_CUSTOM_SKILL_LIMITS.prompt_chars), owner_member_id: text('owner_member_id', 64), owner_name: text('owner_name', 64),
       visibility: value.visibility as AssistantCustomSkillVisibility, created_at_ms: Number(value.created_at_ms), updated_at_ms: Number(value.updated_at_ms),
+      // ★ 没有脚本的技能与从前完全一样：旧目录文件不需要迁移，脚本也不会被补成空串。
+      ...(value.script === undefined ? {} : { script: text('script', ASSISTANT_CUSTOM_SKILL_LIMITS.script_chars) }),
     }
     if (!uuid.test(stored.skill_id) || !assistantSkillCommandValid(stored.command) || !visibilityValues.includes(stored.visibility)
       || !Number.isSafeInteger(stored.created_at_ms) || !Number.isSafeInteger(stored.updated_at_ms)) throw fail()
@@ -145,6 +152,8 @@ export class AssistantSkillStore {
     const mine = skill.owner_member_id === memberId
     return {
       skill_id: skill.skill_id, command: skill.command, title: skill.title, description: skill.description, prompt: skill.prompt,
+      // ★ 能运行这条脚本的人就应该能读到它：公开技能隐藏代码、却允许任何人执行，才是更糟的形态。
+      ...(skill.script ? { script: skill.script } : {}),
       visibility: skill.visibility, mine,
       can_delete: mine || (admin && skill.visibility === 'public'),
       // ★ 创建者姓名只给本人与管理员：公开技能已经发给全体，但「谁建的」不是全体都要知道的名字。
@@ -154,7 +163,7 @@ export class AssistantSkillStore {
   }
 
   async create(principal: Principal, input: unknown): Promise<AssistantCustomSkill> {
-    const { command, title, description, prompt, visibility } = this.validate(input)
+    const { command, title, description, prompt, script, visibility } = this.validate(input)
     return await this.withWriteLock(async () => {
       const [mine, shared] = await Promise.all([this.read(this.memberPath(principal.memberId)), this.read(this.publicPath())])
       const myPrivate = mine.filter(skill => skill.visibility === 'private')
@@ -168,6 +177,7 @@ export class AssistantSkillStore {
       const timestamp = this.now()
       const record: StoredCustomSkill = {
         skill_id: randomUUID(), command, title, description, prompt, visibility,
+        ...(script ? { script } : {}),
         owner_member_id: principal.memberId, owner_name: principal.name, created_at_ms: timestamp, updated_at_ms: timestamp,
       }
       if (visibility === 'public') await this.write(this.publicPath(), [...publicSkills, record])
@@ -198,7 +208,7 @@ export class AssistantSkillStore {
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw new IdentityError(400, '创建技能需要提供命令、标题、说明、指令与可见范围')
     const value = input as Record<string, unknown>
     const keys = ['command', 'title', 'description', 'prompt', 'visibility']
-    if (Object.keys(value).some(key => !keys.includes(key)) || keys.some(key => value[key] === undefined)) throw new IdentityError(400, '创建技能需要提供命令、标题、说明、指令与可见范围')
+    if (Object.keys(value).some(key => !keys.includes(key) && key !== 'script') || keys.some(key => value[key] === undefined)) throw new IdentityError(400, '创建技能需要提供命令、标题、说明、指令与可见范围')
     const text = (key: string, limit: number, label: string, multiline = false): string => {
       const item = value[key]
       if (typeof item !== 'string') throw new IdentityError(400, `${label}需要是文本`)
@@ -213,8 +223,16 @@ export class AssistantSkillStore {
     const title = text('title', ASSISTANT_CUSTOM_SKILL_LIMITS.title_chars, '技能标题')
     const description = text('description', ASSISTANT_CUSTOM_SKILL_LIMITS.description_chars, '技能说明')
     const prompt = text('prompt', ASSISTANT_CUSTOM_SKILL_LIMITS.prompt_chars, '指令草稿', true)
+    // ★ 脚本在**写入之前**做语法检查：存一条永远跑不起来的脚本，用户要到调用时才发现。
+    const script = value.script === undefined ? undefined : (() => {
+      if (typeof value.script !== 'string') throw new IdentityError(400, '技能脚本需要是文本')
+      const trimmed = value.script.trim()
+      if (!trimmed || trimmed.length > ASSISTANT_CUSTOM_SKILL_LIMITS.script_chars || trimmed.includes('\u0000')) throw new IdentityError(400, `技能脚本需要为 1～${ASSISTANT_CUSTOM_SKILL_LIMITS.script_chars} 个字符`)
+      assertSkillScriptSyntax(trimmed)
+      return trimmed
+    })()
     const visibility = value.visibility as AssistantCustomSkillVisibility
     if (!visibilityValues.includes(visibility)) throw new IdentityError(400, '可见范围只能是仅自己或所有人')
-    return { command, title, description, prompt, visibility }
+    return { command, title, description, prompt, ...(script ? { script } : {}), visibility }
   }
 }
