@@ -158,13 +158,123 @@ function markdownBody(content: string): string {
   flush(); if (code) result.push(`<pre><code>${xml(code.join('\n'))}</code></pre>`)
   return result.join('')
 }
-function htmlTable(table?: Table): string {
-  return table ? `<div class="table"><table><thead><tr>${table.columns.map(column => `<th>${xml(column.label)}</th>`).join('')}</tr></thead><tbody>${table.rows.map(row => `<tr>${table.columns.map(column => `<td>${xml(row[column.key])}</td>`).join('')}</tr>`).join('')}</tbody></table></div>` : ''
+/**
+ * 页面上唯一的时刻写法：`2026-10-13 15:46:26`（年月日时分秒）。
+ *
+ * ★ 用**服务器本地时区**（`sv-SE` 的 `toLocaleString` 正好是 `YYYY-MM-DD HH:mm:ss`），
+ *   与 `stats-route.ts` 的 `describeAbs()`、助手 `range.label` 同一时区。
+ *   换成固定时区或 UTC 会让「查询范围」与「采集时间」在页面上差几小时，
+ *   而两边各自看起来都很正常。
+ * ★ 不用 `toISOString()`：`2026-10-13T15:46:26.835Z` 带 T／毫秒／Z，是机器格式；
+ *   分享页要给人读，毫秒与「Z」没有任何信息量。
+ */
+const stamp = (ms: number): string => new Date(ms).toLocaleString('sv-SE')
+const ISO_TIME = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/g
+/** 把说明文本里残留的 ISO 时刻就地换成 `YYYY-MM-DD HH:mm:ss`（一行可能有多个）。 */
+const humanTime = (value: string): string => value.replace(ISO_TIME, matched => stamp(Date.parse(matched)))
+
+/**
+ * 说明行里属于**事实元数据**的键。
+ *
+ * ★ 只认白名单：说明文本里还有模型写的句子与长清单（如「未计价目标：…」），
+ *   凭「有没有冒号」去猜会把它们错当成元数据塞进表格。
+ */
+const FACT_KEYS = new Set(['报表生成时间', '数据集数量', '数据来源', '采集时间', '查询范围', '查询条件', '导出行数', '授权范围', '冻结窗口'])
+const CARD_PREFIX = '指标卡：'
+interface Fact { key: string; value: string }
+interface NoteParts { facts: Fact[]; cards: Fact[]; rest: string[] }
+/**
+ * 把快照说明拆成「事实 / 指标卡 / 其余句子」。
+ *
+ * ★ `rest` 里的每一行都要有归宿：多节报表收进页脚的可折叠「口径与边界」，
+ *   没有分节时按 Markdown 正文渲染。**任何一行都不许丢** ——
+ *   说明里恰恰写着「未计价不等于零」「不能相加」这类边界。
+ */
+function noteParts(note: string): NoteParts {
+  const facts: Fact[] = [], cards: Fact[] = [], rest: string[] = []
+  for (const raw of note.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line) continue
+    if (line.startsWith(CARD_PREFIX)) {
+      const body = line.slice(CARD_PREFIX.length), at = body.indexOf('：')
+      if (at > 0) { cards.push({ key: body.slice(0, at), value: body.slice(at + 1) }); continue }
+      rest.push(line); continue
+    }
+    const at = line.indexOf('：'), key = at > 0 ? line.slice(0, at) : ''
+    if (key && FACT_KEYS.has(key)) { facts.push({ key, value: line.slice(at + 1) }); continue }
+    rest.push(line)
+  }
+  return { facts, cards, rest }
 }
+/**
+ * 元数据行：键值对**流式排布**（放不下就整体换行），查询条件走等宽字体。
+ *
+ * ★ 刻意不用等高网格列：值的长短差很多（「用量总览」vs 一整串查询条件），
+ *   固定列宽会把长值折成四五行的窄条，短值旁边留一大片空白。
+ */
+function factsHtml(facts: readonly Fact[], extra = ''): string {
+  return facts.length ? `<dl class="facts${extra}">${facts.map(fact => `<div><dt>${xml(fact.key)}</dt><dd${fact.key === '查询条件' ? ' class="mono"' : ''}>${xml(humanTime(fact.value))}</dd></div>`).join('')}</dl>` : ''
+}
+/** 指标卡：只排版快照已格式化的真值，不在前端重算任何比率。 */
+function cardsHtml(cards: readonly Fact[]): string {
+  return cards.length ? `<div class="chips">${cards.map(card => `<div class="chip"><span class="chip-k">${xml(card.key)}</span><span class="chip-v">${xml(card.value)}</span></div>`).join('')}</div>` : ''
+}
+const rightAligned = (format: string | undefined) => format === 'number' || format === 'percent'
+/**
+ * 单元格的**展示文本**（未转义）：只做格式化，绝不改动数值本身。
+ *
+ * ★ `percent` 列在快照里是 0~1 的原始比率（如 `0.9875514758`），直接打印会把
+ *   「缓存命中率」显示成一串看不出意思的小数；这与看板 `formatPercent()` 的
+ *   1 位小数一致。
+ * ★ `datetime` 列（明细的 `ts`、数据边界的 `latestEventTs`）在快照里是 epoch 毫秒，
+ *   统一按本页的时刻写法显示 —— 页面上不该出现原始毫秒数。
+ * ★ 导出给 `verify-assistant-reports-live.ts` 用：那条验收要逐格比对
+ *   「页面里的值 == 授权数据集里的值」，比对时必须用**同一个**展示转换，
+ *   否则校验脚本里会多出第二份「页面怎么显示数字」的实现。
+ */
+export function tableCellText(value: unknown, format: string | undefined): string {
+  if (format === 'datetime') {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) return stamp(value)
+    if (typeof value === 'string' && /^\d{10,}$/.test(value)) return stamp(Number(value))
+    if (typeof value === 'string') return humanTime(value)
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    if (format === 'percent') return `${(value * 100).toFixed(1)}%`
+    if (format === 'number') return value.toLocaleString('en-US')
+  }
+  return String(value ?? '')
+}
+function htmlTable(table?: Table): string {
+  if (!table) return ''
+  const head = table.columns.map(column => `<th${rightAligned(column.format) ? ' class="num"' : ''}>${xml(column.label)}</th>`).join('')
+  const body = table.rows.map(row => `<tr>${table.columns.map(column => `<td${rightAligned(column.format) ? ' class="num"' : ''}>${xml(tableCellText(row[column.key], column.format))}</td>`).join('')}</tr>`).join('')
+  return `<div class="table"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`
+}
+const PAGE_CSS = `*,*::before,*::after{box-sizing:border-box}body{margin:0;background:#f2f5fa;color:#16233a;font:15px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;-webkit-font-smoothing:antialiased}main{max-width:1060px;margin:0 auto;padding:28px 18px 60px}.hero{position:relative;overflow:hidden;border-radius:20px;padding:28px 30px;background:linear-gradient(120deg,#123a7a,#2f6fed 62%,#4f8bff);color:#fff;box-shadow:0 18px 40px -18px rgba(18,58,122,.55)}.hero::after{content:"";position:absolute;right:-70px;top:-80px;width:220px;height:220px;border-radius:50%;background:rgba(255,255,255,.12)}.eyebrow{position:relative;margin:0 0 8px;font-size:12px;letter-spacing:.16em;opacity:.8}.hero h1{position:relative;margin:0;font-size:26px;line-height:1.35;font-weight:650}.facts{margin:0;display:flex;flex-wrap:wrap;gap:6px 30px}.hero .facts{position:relative;margin-top:18px}.facts>div{display:flex;gap:8px;align-items:baseline;max-width:100%;min-width:0}.facts dt{flex:0 0 auto;color:#6b7c99;font-size:13px}.facts dd{margin:0;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.facts dd.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12.5px;color:#42536f}.hero .facts dt{color:rgba(255,255,255,.74)}.chips{position:relative;margin:18px 0 0;display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(152px,1fr))}.chip{background:#f7f9fd;border:1px solid #e4eaf4;border-radius:12px;padding:10px 14px}.hero .chip{background:rgba(255,255,255,.14);border-color:rgba(255,255,255,.26)}.chip-k{display:block;font-size:12px;color:#6b7c99;margin-bottom:2px}.hero .chip-k{color:rgba(255,255,255,.76)}.chip-v{display:block;font-size:18px;font-weight:600;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.card{background:#fff;border:1px solid #e6ebf4;border-radius:16px;padding:22px 24px;margin-top:18px;box-shadow:0 12px 26px -24px rgba(22,35,58,.6)}.card>h2{margin:0 0 14px;font-size:19px;font-weight:650;display:flex;align-items:center;gap:10px}.card>h2::before{content:"";width:4px;height:18px;border-radius:2px;background:linear-gradient(#2f6fed,#7fadff)}.table{margin-top:16px;overflow-x:auto;border:1px solid #e6ebf4;border-radius:12px}table{border-collapse:collapse;width:100%;min-width:max-content;font-size:13px;font-variant-numeric:tabular-nums}th,td{padding:8px 9px;text-align:left;border-bottom:1px solid #eef2f8}th{position:sticky;top:0;background:#f4f7fd;color:#42536f;font-weight:600;font-size:12.5px;white-space:normal}td{white-space:nowrap}td.num,th.num{text-align:right;white-space:nowrap}tbody tr:nth-child(even){background:#fafcff}tbody tr:hover{background:#f1f6ff}tbody tr:last-child td{border-bottom:0}p{margin:14px 0}pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:14px 0}code{background:#eef3fb;padding:2px 5px;border-radius:5px}.boundaries{margin-top:18px;border:1px dashed #d7e0ee;border-radius:14px;background:#fbfcff;padding:12px 18px;color:#5b6b84;font-size:13px}.boundaries summary{cursor:pointer;font-weight:600;color:#42536f}.boundaries ul{margin:10px 0 2px;padding-left:20px}.boundaries li{margin:4px 0}footer{margin-top:26px;text-align:center;color:#8a97ad;font-size:12px}@media(max-width:600px){main{padding:14px 10px 40px}.hero{padding:20px;border-radius:16px}.hero h1{font-size:20px}.card{padding:16px}}`
+/**
+ * 分享页 / 导出 HTML 的排版。
+ *
+ * ★ **只排版**：数值、指标、金额一律原样透传（快照里已经格式化过的字符串不重算），
+ *   这里做的只有「百分号 / 千分位 / 时刻写法」这类展示转换。
+ * ★ 说明文本按「事实键：值」拆成元数据行，其余句子收敛到页脚可折叠的
+ *   「口径与边界」—— 每个分节都把同一串限制重复一遍时，正文会被说明淹没；
+ *   但**一条也不会消失**，展开就能看到。
+ * ★ 模型内容只进入文本节点。分享页不加载外部资源，也不接受脚本、表单或客户端凭证。
+ */
 function html(title: string, content: string, table?: Table, sections?: ArtifactSection[]): string {
-  const cells = sections ? sections.map(section => `<section><h2>${xml(section.title)}</h2><pre>${xml(section.note)}</pre>${htmlTable(section.table)}</section>`).join('') : htmlTable(table)
-  // 🚨 模型内容只进入文本节点。分享页不加载外部资源，也不接受脚本、表单或客户端凭证。
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="${xml(CSP)}"><title>${xml(title)}</title><style>body{font:16px/1.7 system-ui,sans-serif;color:#172033;background:#f6f8fc;margin:0;padding:32px}main{max-width:1000px;margin:auto;background:white;padding:32px;border-radius:16px}h1{font-size:28px;line-height:1.3}pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere}code{background:#edf2fa;padding:2px 4px;border-radius:4px}.table{overflow:auto}table{border-collapse:collapse;width:100%;font-size:14px}th,td{border:1px solid #dae1ec;padding:10px;text-align:left}th{background:#edf2fa}footer{color:#637088;font-size:12px;margin-top:24px}@media(max-width:600px){body{padding:12px}main{padding:20px}}</style></head><body><main><h1>${xml(title)}</h1>${markdownBody(content)}${cells}<footer>AI Token 用量平台 · 助手生成文件</footer></main></body></html>`
+  const head = noteParts(content)
+  const boundaries = new Set<string>()
+  // 多节报表的正文是编排层写的事实说明，不是模型正文；只有不分节时才把剩余行当 Markdown。
+  if (sections) head.rest.forEach(line => boundaries.add(line))
+  const body = sections
+    ? sections.map(section => {
+      const parts = noteParts(section.note)
+      parts.rest.forEach(line => boundaries.add(line))
+      return `<section class="card"><h2>${xml(section.title)}</h2>${factsHtml(parts.facts)}${cardsHtml(parts.cards)}${htmlTable(section.table)}</section>`
+    }).join('')
+    : `<section class="card">${markdownBody(head.rest.join('\n'))}${htmlTable(table)}</section>`
+  const notes = [...boundaries]
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="${xml(CSP)}"><title>${xml(title)}</title><style>${PAGE_CSS}</style></head><body><main><header class="hero"><p class="eyebrow">AI Token 用量平台 · 管理报表</p><h1>${xml(title)}</h1>${factsHtml(head.facts, ' hero-facts')}${cardsHtml(head.cards)}</header>${body}${notes.length ? `<details class="boundaries"><summary>口径与边界（${notes.length} 条）</summary><ul>${notes.map(line => `<li>${xml(line)}</li>`).join('')}</ul></details>` : ''}<footer>AI Token 用量平台 · 助手生成文件</footer></main></body></html>`
 }
 
 function snapshotNote(snapshot: AssistantResult): string {

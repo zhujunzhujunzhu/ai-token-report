@@ -245,6 +245,8 @@ test('分页快照导出明确行数、采集时间、查询条件与说明；Ex
       expect(entries['xl/worksheets/sheet1.xml']).toContain('<row r="2">')
       expect(entries['xl/worksheets/sheet1.xml']).toContain('<v>11</v>')
     } else if (format === 'docx') expect(unzip(bytes)['word/document.xml']).toContain('导出行数：2 / 1000')
+    // HTML 页把说明拆成「事实键 / 值」两栏（键与值各自一个节点），其它文本格式保留整行写法。
+    else if (format === 'html') expect(bytes.toString()).toContain('<dt>导出行数</dt><dd>2 / 1000 行')
     else if (format !== 'csv') expect(bytes.toString()).toContain('导出行数：2 / 1000')
   }
 })
@@ -266,12 +268,13 @@ for (const format of ['docx', 'xlsx', 'html', 'md'] as const) test(`${format} �
   const response = await f.artifacts.download(owner.memberId, artifact.artifact_id, owner)
   const bytes = Buffer.from(await response.arrayBuffer())
   const text = ['docx', 'xlsx'].includes(format) ? Object.values(unzip(bytes)).join('\n') : bytes.toString()
-  expect(text).toContain('123456789')
+  // HTML 页按列做展示格式（计数加千分位），其它格式保留原始数值写法。
+  expect(text).toContain(format === 'html' ? '123,456,789' : '123456789')
   expect(text).toContain('11')
   expect(text).toContain('22')
   expect(text).toContain('模型用量分布')
   expect(text).toContain('调用明细')
-  expect(text).toContain('导出行数：2 / 1000')
+  expect(text).toContain(format === 'html' ? '<dt>导出行数</dt><dd>2 / 1000 行' : '导出行数：2 / 1000')
   expect(text).toContain('起始位置 4')
   expect(text).toContain('&lt;script&gt;')
   expect(text).not.toContain('<script>')
@@ -288,10 +291,34 @@ for (const format of ['docx', 'xlsx', 'html', 'md'] as const) test(`${format} �
     expect(entries['xl/worksheets/sheet3.xml']).toContain(`采集时间：${capturedAt}`)
     expect(text).not.toContain('<f>')
   } else if (format === 'docx') expect((text.match(/<w:tbl>/g) ?? []).length).toBe(2)
-  else if (format === 'html') expect((text.match(/<section>/g) ?? []).length).toBe(2)
+  else if (format === 'html') expect((text.match(/<section[\s>]/g) ?? []).length).toBe(2)
   else expect(text).toContain('## 调用明细')
 })
 
+/**
+ * 分享页的形状约定：时刻统一成「年月日时分秒」、说明拆成事实行 + 页脚「口径与边界」、
+ * 数值按列格式美化。三条都是**展示**约定 —— 任何一条失效，页面就退回
+ * 「一坨 ISO 时间 + 每节重复一遍的说明」这种没人愿意读的形态。
+ */
+test('HTML 页时刻写成 年月日时分秒、说明收敛成事实行与页脚边界、数值按列格式化', async () => {
+  const f = await fixture()
+  const second = f.datasets.capture('breakdown', 'by=model', { by: 'model', rows: [{ key: '模型乙', totalTokens: 22, calls: 1, cacheHitRate: 0.875 }] }, owner)
+  const artifact = await f.artifacts.create(owner.memberId, f.session, { format: 'html', title: '管理周报 · 2026-10-05 00:00:00 — 2026-10-11 23:59:59', dataset_ids: [f.datasetId, second.dataset_id] }, f.datasets, owner)
+  const html = await (await f.artifacts.download(owner.memberId, artifact.artifact_id, owner)).text()
+  const stamp = (ms: number) => new Date(ms).toLocaleString('sv-SE')
+  // 1. 页面上不出现 `2026-10-13T15:46:26.835Z` 这种机器写法。
+  expect(html).not.toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/)
+  expect(html).toContain(`<dt>报表生成时间</dt><dd>${stamp(f.now())}</dd>`)
+  expect(html).toMatch(/<dt>采集时间<\/dt><dd>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}<\/dd>/)
+  // 2. 说明拆成事实行；口径与边界收进一处可折叠块，不再以 <pre> 整段铺开。
+  expect(html).not.toContain('<pre>')
+  expect(html).toContain('<dt>导出行数</dt><dd>')
+  expect(html).toContain('<summary>口径与边界')
+  expect(html.match(/<summary>/g)).toHaveLength(1)
+  // 3. 数值按列格式：比率 → 百分数（与看板同为 1 位小数），计数 → 千分位。
+  expect(html).toContain('<td class="num">87.5%</td>')
+  expect(html).toContain('<td class="num">123,456,789</td>')
+})
 test('多节 Excel 同名与非法名称不会覆盖工作表；八个数据集分别保留且都有出处', async () => {
   const f = await fixture()
   const snapshots = Array.from({ length: 8 }, (_, index) => f.datasets.capture('breakdown', `by=model&period=last7d&offset=${index}`, { by: 'model', rows: [{ key: `模型${index}`, totalTokens: index + 100 }] }, owner))
@@ -376,7 +403,11 @@ for (const format of ['docx', 'xlsx', 'html', 'md'] as const) test(`${format} �
   const content = entries ? Object.values(entries).join('\n') : bytes.toString()
   for (const value of expected) {
     expect(artifact.note).toContain(value)
-    expect(content).toContain(value)
+    // HTML 页把指标卡拆成「名称 / 值」两个节点（卡片样式需要分栏），文本格式保留整行写法。
+    const card = value.slice('指标卡：'.length), at = card.indexOf('：')
+    expect(content).toContain(format === 'html'
+      ? `<span class="chip-k">${card.slice(0, at)}</span><span class="chip-v">${card.slice(at + 1)}</span>`
+      : value)
   }
   if (format === 'xlsx') for (const value of expected) expect(entries!['xl/worksheets/sheet3.xml']).toContain(value)
 })

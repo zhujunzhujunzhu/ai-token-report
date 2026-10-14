@@ -12,6 +12,7 @@ import { IdentityRepository } from '../src/identity/index.js'
 import { assistantConfigFromEnv, type DshAssistantConfig } from '../src/assistant/config.js'
 import { AssistantStore } from '../src/assistant/store.js'
 import { AssistantDatasets } from '../src/assistant/datasets.js'
+import { tableCellText } from '../src/assistant/artifacts.js'
 import { presentAssistantResult } from '../src/assistant/presentation.js'
 import { createServer, type ServerHandle } from '../src/index.js'
 
@@ -200,12 +201,15 @@ try {
         check(download.headers.get('content-type')?.includes('text/html'), 'html-download-mime')
         const html = bytes.toString()
         check(!html.includes('<script') && !html.includes('<form'), 'html-static-private-report')
-        const sections = [...html.matchAll(/<section><h2>([\s\S]*?)<\/h2><pre>[\s\S]*?<\/pre>[\s\S]*?<tbody>([\s\S]*?)<\/tbody>[\s\S]*?<\/section>/g)]
+        // ★ 逐格比对：页面只做**展示格式**（时刻 / 百分数 / 千分位），期望值必须走
+        //   渲染层同一个 `tableCellText()` —— 在这里重写一遍「页面怎么显示数字」
+        //   就是第二份实现，它会与页面一起漂移而不报错。
+        const sections = [...html.matchAll(/<section[^>]*><h2>([\s\S]*?)<\/h2>[\s\S]*?<tbody>([\s\S]*?)<\/tbody>[\s\S]*?<\/section>/g)]
         check(sections.length === snapshots.length, 'html-all-sections')
         for (const [index, snapshot] of snapshots.entries()) {
           check(decodeXml(sections[index]![1]!) === snapshot.title, 'html-section-title')
-          const exported = [...sections[index]![2]!.matchAll(/<tr>([\s\S]*?)<\/tr>/g)].map(row => [...row[1]!.matchAll(/<td>([\s\S]*?)<\/td>/g)].map(cell => decodeXml(cell[1]!)))
-          const expected = snapshot.table!.rows.map(row => snapshot.table!.columns.map(column => String(row[column.key] ?? '')))
+          const exported = [...sections[index]![2]!.matchAll(/<tr>([\s\S]*?)<\/tr>/g)].map(row => [...row[1]!.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/g)].map(cell => decodeXml(cell[1]!)))
+          const expected = snapshot.table!.rows.map(row => snapshot.table!.columns.map(column => tableCellText(row[column.key], column.format)))
           check(isDeepStrictEqual(exported, expected), 'html-every-cell-matches-sql-dataset')
         }
         check(decodeXml(html).includes(`from=${from}`) && decodeXml(html).includes(`to=${to}`), 'html-preserves-frozen-query-window')
