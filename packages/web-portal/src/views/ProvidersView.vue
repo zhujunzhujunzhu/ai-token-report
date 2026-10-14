@@ -256,16 +256,6 @@ onMounted(() => { void load() })
       <div>
         <div class="eyebrow">PROVIDER &amp; MODEL NORMALIZATION</div>
         <h1>供应商模型归一化</h1>
-        <p>
-          把上报里出现的多个<strong>供应商名</strong>或<strong>模型名</strong>折叠成同一个展示名，
-          这样按供应商 / 模型看用量时才不会一个东西散成好几行。
-          <strong>一条规则只折叠一个维度</strong>（两个都要改就配两条）；原始名是<strong>一字不差</strong>的精确匹配，
-          写错大小写或多一个空格都不会命中；模型规则的「限定供应商」<strong>留空 = 任意供应商</strong>。
-        </p>
-        <p class="muted">
-          <strong>没有配规则的项保持自己的原始名</strong>，明细里始终同时显示原值；
-          费用按原始供应商与模型计价，改名不影响金额。
-        </p>
       </div>
       <el-button v-if="canManage" type="primary" :icon="Plus" :disabled="busy" @click="open()">添加规则</el-button>
     </div>
@@ -275,16 +265,6 @@ onMounted(() => { void load() })
         <div class="panel-heading">
           <div>
             <h2>归一化名字列表</h2>
-            <p>
-              一个名字一行：这一列是<strong>归一化后</strong>的名字，展开后能看到有哪些原始值折到了它、
-              以及每条规则是<strong>全局</strong>的还是配给了某几个人。
-              供应商与模型是<strong>两个维度</strong>（一条规则只折叠一个维度），
-              所以同一个名字在两个维度里各占一行。
-              名字<strong>逐字一致</strong>才会折进同一个名字 —— 差一个字符（多一个空格也算）
-              就是另一个名字，所以行上的「添加规则」会把这一行的名字与作用对象<strong>原样带过去</strong>，
-              不必照着屏幕重打。
-            </p>
-            <p>全局规则对所有人生效；人员规则只对该人员生效，未提到的项仍回落全局。</p>
           </div>
           <el-button :icon="Refresh" :loading="loading" :disabled="busy" @click="load">刷新</el-button>
         </div>

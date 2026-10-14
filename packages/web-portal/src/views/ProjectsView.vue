@@ -334,11 +334,6 @@ onMounted(() => { void load() })
       <div>
         <div class="eyebrow">PROJECT NORMALIZATION</div>
         <h1>项目归一化</h1>
-        <p>
-          把上报里散开的多个工作目录折叠成同一个项目名：配一条<strong>仓库名</strong>规则，
-          仓库根与各子目录就一起记到同一个项目名下。
-          <strong>没有配规则的目录保持原样</strong>（仍按「目录最后一段」显示）。
-        </p>
       </div>
       <el-button v-if="canManage" type="primary" :icon="Plus" :disabled="busy" @click="open()">添加规则</el-button>
     </div>
@@ -348,17 +343,6 @@ onMounted(() => { void load() })
         <div class="panel-heading">
           <div>
             <h2>项目列表</h2>
-            <p>
-              一个项目一行：这一列是<strong>归一化后</strong>的名字，展开后能看到它关联了哪些路径、
-              以及每条规则是<strong>全局</strong>的还是配给了某几个人。
-              项目名<strong>逐字一致</strong>才会折进同一个项目 —— 差一个字符（多一个空格也算）
-              就是另一个项目，看板上也会分成两行，所以行上提供了「添加路径」把名字原样带过去。
-            </p>
-            <p>
-              全局规则对所有人生效，人员规则只对该人员生效。多条命中同一目录时<strong>路径前缀规则优先于仓库名规则</strong>，
-              同类里<strong>前缀最长的胜出</strong>。前缀按<strong>路径分隔符边界</strong>判定、<strong>区分大小写</strong>，
-              两端的尾部分隔符会被自动去掉；<strong>没有配规则的目录仍然按「目录最后一段」显示</strong>。
-            </p>
           </div>
           <el-button :icon="Refresh" :loading="loading" :disabled="busy" @click="load">刷新</el-button>
         </div>

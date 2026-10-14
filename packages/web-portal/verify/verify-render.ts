@@ -947,68 +947,42 @@ try {
     groupsHtml.includes('一名成员可同时属于多个分组') &&
     groupsHtml.includes('用量会按其所属的每个分组统计'))
   const providersHtml = await render('/src/views/ProvidersView.vue')
-  // ⚠️ 文案一律按**当前源码**写（与上面管理页标题同一条纪律）：v12 起这一页同时管
-  //   供应商与模型，标题、搜索框与「未配置者保持原值」都改成了覆盖两个维度的说法；
-  //   2026-10 起列表主体又改成**归一化后的名字**（一个名字一行、展开看原始值与人员），
-  //   卡片标题随之从「规则列表」改成「归一化名字列表」。
-  //   按旧文案断言会让「页面已经改对了」变成假失败 —— 而照抄当前文案仍然证明页面真的写出来了。
+  // ⚠️ 文案一律按**当前源码**写（与上面管理页标题同一条纪律）：2026-10 起这一页按
+  //   「生产系统」收敛 —— 页头与卡片里的长篇讲解（折叠语义 / 匹配规则 / 逐字一致……）
+  //   全部删除，只留标题、筛选、列表与入口。那些约束现在只写在**表单提示**里，
+  //   而 `el-dialog` 未打开时 SSR 不渲染内容 ⇒ 这里断言不到；照旧文案断言只会变成
+  //   「页面已经按新形态改对了」的假失败。
   check('供应商模型归一化独立展示名字列表、搜索、作用对象、作用范围与新增入口',
     ['供应商模型归一化', '归一化名字列表', '搜索原始名或归一化名', '全部作用对象', '全部作用范围', '添加规则', '全部展开'].every((label) => providersHtml.includes(label)))
-  // ★ 折叠语义同样是这一页的**新**主体：SSR 下 `el-table` 的行与列根本不渲染，
-  //   所以「一个名字一行、展开才是原始值与人员」只能写在卡片说明里 ——
-  //   而它正是使用者需要读到的那句（否则他还会以为一屏几十行就是几十份配置）。
-  check('供应商模型归一化主推「一个名字一行」，并说明两个维度各占一行',
-    providersHtml.includes('一个名字一行') &&
-    providersHtml.includes('展开后能看到有哪些原始值折到了它') &&
-    providersHtml.includes('两个维度') &&
-    providersHtml.includes('各占一行'))
   check('供应商模型归一化给出名字数与规则数的对照',
     providersHtml.includes('个名字') && providersHtml.includes('条规则'))
-  // ★ 这一页最容易配错的两件事必须写在页面上，而不是只写在代码注释里：
-  //   ① 原始名是大小写敏感的精确匹配（写错就静默不命中）；
-  //   ② 没配规则的项保持原始名（归一化不是「统一改名」）。
-  check('供应商模型归一化写明匹配规则与「未配置者保持原值」',
-    providersHtml.includes('一字不差') &&
-    providersHtml.includes('没有配规则的项保持自己的原始名') &&
-    providersHtml.includes('明细里始终同时显示原值'))
-  // ★ 展示名逐字一致才折进同一个名字：除了卡片说明，表单里也再写一遍
-  //   （照着屏幕重打一遍差一个空格就会变成另一个名字）。SSR 下 `el-dialog` 未打开时
-  //   不渲染内容，所以这里断言的是**卡片说明**里那两句。
-  check('供应商模型归一化写明展示名逐字一致与「添加规则」把名字原样带过去',
-    providersHtml.includes('逐字一致') &&
-    providersHtml.includes('原样带过去'))
-  // ★ v12 扩到模型维度后的两条新语义也必须写在页面上（不看代码猜不到）：
-  //   ① 一条规则只折叠一个维度（想两个都改就配两条）；② 模型规则的「限定供应商」留空 = 任意供应商。
-  check('★ v12：写明「一条规则只折叠一个维度」与「限定供应商留空 = 任意供应商」',
-    providersHtml.includes('一条规则只折叠一个维度') &&
-    providersHtml.includes('限定供应商') && providersHtml.includes('任意供应商'))
+  // ★ 未配规则的项回落**原始名**这条口径仍在页面上（空表说明那一句）——
+  //   删掉的只是围绕它的那段讲解，不是这条事实本身。
+  check('供应商模型归一化说明没有规则时仍按原始名展示',
+    providersHtml.includes('所有供应商与模型都按原始名展示'))
+  // ★ 回归闸门：删掉的整段讲解最容易被「顺手再加回来」。这里钉住它**不回来** ——
+  //   回来就亮红，而不是让人再对着截图肉眼比一遍。
+  check('★ 供应商模型归一化不再堆页头 / 卡片长说明',
+    !providersHtml.includes('一条规则只折叠一个维度') &&
+    !providersHtml.includes('没有配规则的项保持自己的原始名') &&
+    !providersHtml.includes('明细里始终同时显示原值'))
   check('供应商归一化不混排人员或分组列表', !providersHtml.includes('人员列表') && !providersHtml.includes('分组列表'))
   const projectsHtml = await render('/src/views/ProjectsView.vue')
-  // ⚠️ 2026-10 起这一页的主体改成**项目**（一个项目一行、展开看它的路径与人员），
-  //   卡片标题随之从「规则列表」改成「项目列表」；断言按当前源码写。
+  // ⚠️ 与供应商页同一条纪律：这一页也只留标题、筛选、列表与入口。
   check('项目归一化独立展示项目列表、搜索、作用范围与新增入口',
     // ⚠️ 占位符按**当前源码**写：这一页的搜索同时匹配仓库名 / 目录前缀与项目名，
     //   输入框占位语是「搜索仓库名或项目名」。
     ['项目归一化', '项目列表', '搜索仓库名或项目名', '全部作用范围', '添加规则', '全部展开'].every((label) => projectsHtml.includes(label)))
-  // ★ 折叠语义是这一页的**新**主体：SSR 下 `el-table` 的行与列根本不渲染，
-  //   所以「一个项目一行、展开才是路径与人员」只能写在卡片说明里 ——
-  //   而它正是使用者需要读到的那句（否则他还会以为一屏 30 行就是 30 份配置）。
-  check('项目归一化主推「一个项目一行」，并写明项目名逐字一致',
-    projectsHtml.includes('一个项目一行') &&
-    projectsHtml.includes('展开后能看到它关联了哪些路径') &&
-    projectsHtml.includes('逐字一致'))
   check('项目归一化给出项目数与规则数的对照',
     projectsHtml.includes('个项目') && projectsHtml.includes('条规则'))
-  // ★ 与供应商那页**刻意不同**的三件事必须写在页面上，否则使用者会照搬供应商那套理解：
-  //   ① 匹配的是**目录前缀**、而且按路径分隔符边界（`D:\a\proj` 不吃 `D:\a\proj-other`）；
-  //   ② 多条命中时**最长前缀优先**；
-  //   ③ 没配规则的目录回落「目录最后一段」的旧口径。
-  check('项目归一化写明前缀语义、最长优先与「未配置者回落旧口径」',
-    projectsHtml.includes('路径分隔符边界') &&
-    projectsHtml.includes('前缀最长的胜出') &&
-    projectsHtml.includes('没有配规则的目录仍然按「目录最后一段」显示'))
-  check('项目归一化写明大小写敏感与「尾部分隔符会被去掉」',
-    projectsHtml.includes('区分大小写') && projectsHtml.includes('会被自动去掉'))
+  // ★ 未命中回落「目录最后一段」的旧口径仍在页面上（空表说明那一句）；
+  //   前缀匹配的细节（分隔符边界 / 最长优先 / 尾部分隔符）改由**表单提示**承担。
+  check('项目归一化说明没有规则时仍按「目录最后一段」显示',
+    projectsHtml.includes('所有目录都按「目录最后一段」显示'))
+  check('★ 项目归一化不再堆页头 / 卡片长说明',
+    !projectsHtml.includes('路径分隔符边界') &&
+    !projectsHtml.includes('前缀最长的胜出') &&
+    !projectsHtml.includes('会被自动去掉'))
   check('项目归一化不混排人员或分组列表', !projectsHtml.includes('人员列表') && !projectsHtml.includes('分组列表'))
   const pricingHtml = await render('/src/views/PricingView.vue')
   check('模型单价独立展示计价目录与新增入口',
@@ -1017,32 +991,15 @@ try {
   //   它的旧形态是「一键把一屏没核对过的官方零售价写进库」，那正是被删掉的东西。
   check('★ 计价页不得再出现「内置种子价」入口',
     !pricingHtml.includes('内置种子价') && !pricingHtml.includes('种子'))
-  // ★ 这一页最容易误解的四件事必须写在页面上，而不是只写在代码注释里：
-  //   ① 粒度是「供应商 → 模型」，同一供应商下不同模型可以各配各的价；
-  //   ② 四类 token 各乘各自的价（合成一个价等于让 94% 的缓存读用量算错）；
-  //   ③ 只存单价、不存金额，所以改价不改写历史用量；
-  //   ④ 未配单价的用量是「未计价」，**不是 0 元**。
-  check('模型单价写明按「供应商 + 模型」粒度定价',
-    pricingHtml.includes('同一供应商下不同模型可以各不相同') &&
-    pricingHtml.includes('区间不得重叠'))
-  check('模型单价写明「只存单价不存金额」与「未计价不是 0 元」',
-    pricingHtml.includes('而历史用量一个字节都不会被动') &&
-    pricingHtml.includes('四类 token 各乘各自的价') &&
-    pricingHtml.includes('未计价') &&
-    pricingHtml.includes('多币种各自累加，绝不换算也绝不相加') &&
-    pricingHtml.includes('自建计价永远不会等于财务账单'))
+  // ★ 生产形态（2026-10）：单价口径不再用整段文字讲。删掉的是**讲解**，
+  //   不是口径本身 —— 「未计价 ≠ 0 元」这句仍以空表说明的形式留在页面上。
+  check('模型单价说明没有单价时用量是「未计价」而不是 0 元',
+    pricingHtml.includes('把全部用量标成「未计价」') && pricingHtml.includes('而不是 0 元'))
+  check('★ 模型单价不再堆页头 / 卡片长说明',
+    !pricingHtml.includes('整数微元') &&
+    !pricingHtml.includes('另一套四个数') &&
+    !pricingHtml.includes('自建计价永远不会等于财务账单'))
   check('模型单价不混排人员或分组列表', !pricingHtml.includes('人员列表') && !pricingHtml.includes('分组列表'))
-  // ★ v10 的两条新口径也必须写在页面上（它们是「不看代码就猜不到」的那类规则）：
-  //   ① 没有专属价时会落到**不限供应商的基础价**（保留值 `*` 绝不直接显示给人看）；
-  //   ② 闲时（低谷）价是**同一行的另一套四个数**，不是给高峰价乘一个折扣系数。
-  check('★ v10：模型单价写明「不限供应商的基础价」是兜底价',
-    pricingHtml.includes('没有为某个供应商单独配价时') &&
-    pricingHtml.includes('不限供应商的基础价') &&
-    pricingHtml.includes('兜底价'))
-  check('★ v10：模型单价写明闲时价是同一行的另一套四个数（不是乘折扣）',
-    pricingHtml.includes('闲时') &&
-    pricingHtml.includes('另一套四个数') &&
-    pricingHtml.includes('高峰 / 闲时'))
   const allHtml =
     loginHtml +
     dashboardHtml +
@@ -1064,13 +1021,11 @@ try {
   //   那与「页面要能让人核对单价」直接冲突 —— 于是它只会被删掉，而不是被满足。
   for (const term of ['消费金额', 'CNY', '¥', '充值余额', '80,642,909'])
     check(`统计页不包含金额或旧 mock：${term}`, !allHtml.includes(term))
-  // 反过来：计价页必须把「单价的单位」说清楚，否则人填进去的数字没有意义。
-  // ⚠️ 这里断言不到货币码（`CNY`）：币种只出现在**每条价的标签**与下拉候选里，
-  //   而 SSR 时列表为空、`el-dialog` 的内容进的是 teleport 载荷而非返回的 HTML。
-  //   想把「币种确实渲染出来了」也钉住，只能等有数据的那一层（真浏览器 / 组件测试）。
-  const pricingLabels = ['货币单位 / 百万 token', '整数微元', '每百万 token 2 元']
-  const pricingMissing = pricingLabels.filter((label) => !pricingHtml.includes(label))
-  check(`计价页写明单价的单位与微元口径${pricingMissing.length ? `（缺 ${pricingMissing.join('、')}）` : ''}`, pricingMissing.length === 0)
+  // ⚠️ 这里**不再**断言「单价的单位」出现在返回的 HTML 里：那句话原本挂在卡片的
+  //   长说明上，2026-10 按生产形态删掉后，单位只剩两处载体，而**两处 SSR 都取不到** ——
+  //   ① 每格单价的格式化结果（`¥5 / 百万 token`，要有数据才渲染表格）；
+  //   ② 表单标签（`el-dialog` 未打开时内容进 teleport，不进返回的 HTML）。
+  //   单位换算与格式化本身由 `test/unit-price.test.ts` 钉住。
   // 新能力须实际执行组件树，避免确认卡与文件按钮漏 import 或渲染旧授权。
   const { default: ActionCard } = await server.ssrLoadModule('/src/components/AssistantAction.vue')
   const { default: ArtifactCard } = await server.ssrLoadModule('/src/components/AssistantArtifact.vue')

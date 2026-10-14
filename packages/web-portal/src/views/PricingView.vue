@@ -373,18 +373,6 @@ onMounted(() => { void load() })
       <div>
         <div class="eyebrow">MODEL PRICING</div>
         <h1>模型单价</h1>
-        <p>
-          费用按「<strong>供应商 + 模型</strong>」精确匹配单价后现场计算：<strong>四类 token 各乘各自的价</strong>
-          （<code>输入 / 输出 / 缓存读 / 缓存写</code>），按<strong>事件发生时刻</strong>取当时生效的那条价，
-          分<strong>高峰 / 闲时</strong>两档（闲时价是同一行的另一套四个数，不是乘折扣系数）；
-          同一供应商下不同模型可以各不相同。
-        </p>
-        <p class="muted">
-          没有为某个供应商单独配价时会落到那条<strong>不限供应商的基础价</strong>（兜底价）。
-          库里只存单价、不存金额，改价即时生效而历史用量一个字节都不会被动；
-          没配单价的用量是「<strong>未计价</strong>」，不是 0 元。
-          多币种各自累加，绝不换算也绝不相加；自建计价永远不会等于财务账单（折扣、预付、赠送额度不在单价里）。
-        </p>
       </div>
       <div class="heading-actions">
         <el-button v-if="canManage" type="primary" :icon="Plus" :disabled="busy" @click="openForm()">新增单价</el-button>
@@ -396,11 +384,6 @@ onMounted(() => { void load() })
         <div class="panel-heading">
           <div>
             <h2>计价目录</h2>
-            <p>
-              单价按「<strong>货币单位 / 百万 token</strong>」录入，库里存<strong>整数微元</strong>（1 微 = 0.000001 货币单位）：
-              填 2 就是每百万 token 2 元。每个模型各有一条或多条<strong>生效区间</strong>，
-              区间不得重叠 —— 服务端会直接拒绝并说明撞上了哪一条。
-            </p>
           </div>
           <el-button :icon="Refresh" :loading="loading" :disabled="busy" @click="load">刷新</el-button>
         </div>
