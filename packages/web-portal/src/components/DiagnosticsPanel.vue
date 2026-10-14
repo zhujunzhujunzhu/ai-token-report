@@ -20,8 +20,8 @@
  * - **不给注册表补零**：某来源在本窗口没有数据就是「没出现」，
  *   补一排 0 会让它和「数据没进来」长得一样。
  */
-import { ElCard, ElIcon, ElTable, ElTableColumn, ElTag } from 'element-plus'
-import { computed, type Component } from 'vue'
+import { ElButton, ElCard, ElIcon, ElTable, ElTableColumn, ElTag } from 'element-plus'
+import { computed, ref, type Component } from 'vue'
 import {
   CircleCheck,
   Coin,
@@ -104,6 +104,14 @@ const reporterRows = computed(() =>
 const conclusion = computed(() =>
   conclusionOf(props.diagnostics?.unattributedEvents ?? 0, sourceRows.value, reporterRows.value),
 )
+/**
+ * 「查看是哪个来源」的展开状态。
+ *
+ * ⚠️ 默认收起：状态行只说「1 个采集来源」，点名是**下一步**才要的信息；
+ *   而展开态在数据刷新后**自动跟随**结论（名单来自 `conclusion.suspects`，
+ *   结论变成常态绿时它自然为空），所以不需要在这里再判一次。
+ */
+const showSuspects = ref(false)
 
 /** 时间边界；新鲜度以**本次取数时刻**为基准，避免浏览器时钟偏差。 */
 const boundaries = computed(() => {
@@ -151,6 +159,14 @@ const boundaries = computed(() => {
       结论状态行：把三件事（未归属 / 采集方掉线 / 署名者掉线）收成一句可执行的话。
       ⚠️ 只有全部正常时才显示「常态」那一句 —— 三种异常任一存在就说明白是哪一种，
       而不是笼统地说「有问题」。
+
+      ★ 告警态多一个入口：把「1 个采集来源」**点名到具体行**。
+        状态行说「有几个」，这里回答「是哪一个」—— 原本这一步只能靠使用者
+        自己去下方来源表里逐行看「新鲜度」列，而那张表按事件数排序，
+        掉线的来源往往因长期没数据而排在最后，正好最难被看见。
+        ⚠️ 明细**不重新判断**静默：名单、最近事件时刻与静默文案全部来自
+          `conclusion.suspects`（与表格标签同一次判定），这里只排版 ——
+          在模板里再比一次 24 小时就是第二份口径，两份一旦漂移不会报错。
     -->
     <div
       class="diagnostic-status"
@@ -161,13 +177,36 @@ const boundaries = computed(() => {
           ><Warning v-if="conclusion.tone === 'amber'" /><CircleCheck v-else /></el-icon
       ></span>
       <strong>{{ conclusion.text }}</strong>
-      <el-tag
-        v-if="conclusion.tone === 'amber'"
-        type="warning"
-        effect="light"
-        size="small"
-        >需核查</el-tag
-      >
+      <span class="diagnostic-status-actions">
+        <el-tag
+          v-if="conclusion.tone === 'amber'"
+          type="warning"
+          effect="light"
+          size="small"
+          >需核查</el-tag
+        >
+        <el-button
+          v-if="conclusion.suspects.length"
+          size="small"
+          type="warning"
+          plain
+          @click="showSuspects = !showSuspects"
+          >{{ showSuspects ? '收起' : conclusion.actionLabel }}</el-button
+        >
+      </span>
+    </div>
+    <div v-if="showSuspects && conclusion.suspects.length" class="diagnostic-suspects">
+      <p class="diagnostic-suspects-title">静默明细</p>
+      <ul>
+        <!-- ⚠️ key 用下标而不是 `suspect.label`：显示姓名允许重复（用户名才唯一），
+             拿姓名当 key 会在两个同名署名者身上生成重复键，Vue 只会静默复用 DOM。 -->
+        <li v-for="(suspect, index) in conclusion.suspects" :key="index">
+          <code>{{ suspect.label }}</code>
+          <span class="muted">最近事件</span>
+          <span class="tabular">{{ formatFullDateTime(suspect.latestEventTs) }}</span>
+          <el-tag type="warning" effect="light" size="small">{{ suspect.gapText }}</el-tag>
+        </li>
+      </ul>
     </div>
 
     <!--

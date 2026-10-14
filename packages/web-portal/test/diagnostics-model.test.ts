@@ -16,6 +16,7 @@ import {
   isEnriched,
   SILENT_WARN_MS,
   silenceOf,
+  type ReporterRowView,
   type SourceRowView,
 } from '../src/views/diagnosticsModel.js'
 
@@ -135,6 +136,104 @@ describe('结论收敛', () => {
   })
   test('没有任何一行（旧服务端没有来源表）也不会误判成有静默', () => {
     expect(conclusionOf(0, [], []).kind).toBe('healthy')
+  })
+})
+
+describe('结论点名到具体行（「查看是哪个来源」）', () => {
+  /**
+   * 一条来源行。
+   *
+   * ⚠️ 只有 `source` / `latestEventTs` / `silence` 参与点名，别的字段是占位 ——
+   *   在这里塞满假数据会让「名单里到底用的哪个字段」变得看不出来。
+   */
+  const srcRow = (
+    source: string,
+    silentForMs: number | null,
+    text: string,
+  ): SourceRowView =>
+    ({
+      source,
+      calls: 1,
+      totalTokens: 1,
+      sessions: 1,
+      earliestEventTs: 1_757_000_000_000,
+      latestEventTs: 1_757_500_000_000,
+      silentForMs,
+      silence: silenceOf(silentForMs, text),
+    }) as SourceRowView
+
+  const repRow = (
+    label: string,
+    silentForMs: number | null,
+    text: string,
+  ): ReporterRowView =>
+    ({
+      key: label,
+      label,
+      attributionStatus: 'legacy',
+      calls: 1,
+      totalTokens: 1,
+      groupNames: [],
+      latestEventTs: 1_757_400_000_000,
+      silentForMs,
+      silence: silenceOf(silentForMs, text),
+    }) as ReporterRowView
+
+  test('来源静默时名单就是那些来源，且与文案里的个数一致', () => {
+    const c = conclusionOf(
+      0,
+      [srcRow('dsh', 60_000, '刚刚'), srcRow('claude-code', 4 * 86_400_000, '4 天前')],
+      [],
+    )
+    expect(c.kind).toBe('silent-sources')
+    // 🚨 文案说「1 个」时名单必须正好一项：两者出自同一次判定，对不上就是两个口径。
+    expect(c.suspects).toEqual([
+      { label: 'claude-code', latestEventTs: 1_757_500_000_000, gapText: '4 天前' },
+    ])
+    expect(c.suspects.length).toBe(c.count)
+    expect(c.actionLabel).toBe('查看是哪个来源')
+  })
+  test('来源原值为空时名单里写「未标注」，不写成空串（不然看起来少一项）', () => {
+    const c = conclusionOf(0, [srcRow('', 3 * 86_400_000, '3 天前')], [])
+    expect(c.suspects.map((s) => s.label)).toEqual(['未标注'])
+  })
+  test('多个静默来源时入口改说复数，名单逐个列出', () => {
+    const c = conclusionOf(
+      0,
+      [srcRow('codex', 3 * 86_400_000, '3 天前'), srcRow('trae', 5 * 86_400_000, '5 天前')],
+      [],
+    )
+    expect(c.suspects.map((s) => s.label)).toEqual(['codex', 'trae'])
+    expect(c.actionLabel).toBe('查看是哪些来源')
+  })
+  test('署名者静默时改点署名者，入口文案跟着换', () => {
+    const c = conclusionOf(
+      0,
+      [srcRow('dsh', 1_000, '刚刚')],
+      [repRow('张三', 60_000, '刚刚'), repRow('历史人员：李四（待确认）', 3 * 86_400_000, '3 天前')],
+    )
+    expect(c.kind).toBe('stale-reporters')
+    expect(c.suspects.map((s) => s.label)).toEqual(['历史人员：李四（待确认）'])
+    expect(c.actionLabel).toBe('查看是哪位署名者')
+  })
+  // ⚠️ 未归属/常态绿时**没有**「是哪一个」可问：给一个点开只写着
+  //   「未归属」的按钮，等于把使用者引到一个没有答案的地方。
+  test('未归属与常态绿没有可点名的对象，入口整块不出现', () => {
+    const un = conclusionOf(9, [srcRow('codex', 3 * 86_400_000, '3 天前')], [])
+    expect(un.kind).toBe('unattributed')
+    expect(un.suspects).toEqual([])
+    expect(un.actionLabel).toBe('')
+    const ok = conclusionOf(0, [srcRow('dsh', 1_000, '刚刚')], [repRow('张三', 1_000, '刚刚')])
+    expect(ok.kind).toBe('healthy')
+    expect(ok.suspects).toEqual([])
+    expect(ok.actionLabel).toBe('')
+  })
+  test('静默文案直接复用该行的判定（面板不得自己再算一次间隔）', () => {
+    const row = srcRow('codex', 3 * 86_400_000, '3 天前')
+    expect(conclusionOf(0, [row], []).suspects[0]?.gapText).toBe(row.silence.text)
+  })
+  test('没有静默行时名单为空（旧服务端没有来源表也不会凭空造一项）', () => {
+    expect(conclusionOf(0, [], []).suspects).toEqual([])
   })
 })
 

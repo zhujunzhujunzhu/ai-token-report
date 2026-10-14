@@ -864,8 +864,50 @@ code {
   font-weight: 600;
   color: var(--c-text-primary);
 }
-.diagnostic-status .el-tag {
+/* 状态行右侧的动作区（告警标签 + 「查看是哪个来源」）。
+   ⚠️ `margin-left: auto` 必须落在**这一层**：分别给标签和按钮各加一份，
+   两者会被拆到状态行的两端，中间隔着一整行空白。 */
+.diagnostic-status-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
   margin-left: auto;
+}
+/* 点名明细：状态行只说「有几个」，这块回答「是哪一个」。
+   与下方来源表共用同一次静默判定，这里只负责排版。 */
+.diagnostic-suspects {
+  margin-top: 12px;
+  padding: 14px 20px;
+  border: 1px solid #f4e3c6;
+  border-radius: 11px;
+  background: #fffbf3;
+}
+.diagnostic-suspects-title {
+  margin: 0 0 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #c78b27;
+}
+.diagnostic-suspects ul {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.diagnostic-suspects li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--c-text-primary);
+}
+.diagnostic-suspects code {
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: #fdf0d9;
+  font-size: 12px;
 }
 .diagnostic-status.is-ok .diagnostic-status-icon {
   color: #21a68e;

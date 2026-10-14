@@ -578,6 +578,11 @@ try {
   check('诊断有未归属时状态行转为警告',
     diagnosticsHtml.includes('存在 1 条未归属记录') &&
     diagnosticsHtml.includes('is-warning') && diagnosticsHtml.includes('需核查'))
+  // ⚠️ 未归属优先时**没有**「查看是哪个来源」入口：状态行说的是未归属，
+  //   把静默来源的入口挂在这句话旁边，等于让使用者点开一个与上一句无关的名单。
+  check('未归属优先时状态行不出现来源点名入口',
+    diagnosticsHtml.includes('查看是哪个来源') === false &&
+    diagnosticsHtml.includes('查看是哪些来源') === false)
   const unattributedDiagnostics = dashboard.diagnostics
   dashboard.diagnostics = { ...unattributedDiagnostics, unattributedEvents: 0, unattributedRate: 0 }
   const cleanDiagnosticsHtml = await render('/src/views/DiagnosticsView.vue')
@@ -589,6 +594,14 @@ try {
   check('未归属清零后仍按静默来源给出可执行的结论',
     cleanDiagnosticsHtml.includes('is-warning') &&
     cleanDiagnosticsHtml.includes('采集来源已超过 24 小时没有新数据'))
+  // ★ 状态行只说「1 个采集来源」，使用者下一步问的恰恰是「哪一个」——
+  //   所以告警态必须给出一个点名的入口，而不是让人自己去来源表里翻。
+  //   ⚠️ 名单本身（哪个来源、静默多久）由 `test/diagnostics-model.test.ts` 钉住：
+  //     展开态默认是收起的，SSR 里不会有点名清单 —— 这是刻意的默认值。
+  check('静默来源状态行给出「查看是哪个来源」入口',
+    cleanDiagnosticsHtml.includes('查看是哪个来源'))
+  check('点名明细默认收起（要先点按钮才展开）',
+    cleanDiagnosticsHtml.includes('静默明细') === false)
   // ★ 只有未归属与静默都清掉时才是常态绿 —— 这一条钉住「红变绿」的全部条件。
   dashboard.diagnostics = {
     ...unattributedDiagnostics,
@@ -601,6 +614,12 @@ try {
   check('未归属与静默都清零时状态行恢复常态',
     healthyDiagnosticsHtml.includes('当前范围内未发现未归属记录，采集链路新鲜') &&
     healthyDiagnosticsHtml.includes('is-ok') && !healthyDiagnosticsHtml.includes('is-warning'))
+  // ⚠️ 常态绿时**入口整块消失**：没有可点名的对象，留一个按钮只会让人以为
+  //   「还有东西没看」。
+  check('全部新鲜时状态行不出现点名入口',
+    healthyDiagnosticsHtml.includes('查看是哪个来源') === false &&
+    healthyDiagnosticsHtml.includes('查看是哪些来源') === false &&
+    healthyDiagnosticsHtml.includes('静默明细') === false)
   dashboard.diagnostics = unattributedDiagnostics
   // ── v14：来源覆盖与署名覆盖 ──────────────────────────────────────
   // ⚠️ 分区标题用**分隔符精确匹配**，不能用 `includes('采集来源覆盖')`：

@@ -43,20 +43,59 @@ export type SourceRowView = DiagnosticsSourceRow & { silence: SilenceVerdict }
 export type ReporterRowView = DiagnosticsAttributionRow & { silence: SilenceVerdict }
 
 /**
- * 状态行要显示什么。
+ * 结论点名的**具体一行**：到底哪个采集来源 / 哪位署名者没数据了。
+ *
+ * ★ 抽出来是因为状态行原本只说「1 个采集来源」，而使用者下一步要问的
+ *   恰恰是「哪一个」。名单必须与状态行出自**同一次判定**（同一份
+ *   `silence`），否则页面上会出现「行数说 2 个、名单里只有 1 个」而**不报错**。
+ */
+export interface DiagnosticSuspect {
+  /** 点名用的标签：采集来源名（原值为空时给「未标注」）或署名者名。 */
+  label: string
+  /** 最近一条事件的时刻（原始毫秒）；格式化留给视图层。 */
+  latestEventTs: number | null
+  /** 已经算好的静默时长文案（「4 天前」）。视图层**不得**再算一次间隔。 */
+  gapText: string
+}
+
+/** 状态行要显示什么。 */
+export interface DiagnosticConclusion {
+  kind: 'unattributed' | 'silent-sources' | 'stale-reporters' | 'healthy'
+  count: number
+  tone: 'amber' | 'green'
+  text: string
+  /**
+   * 结论点到的具体行（来源静默时是来源行，署名者静默时是署名行）。
+   *
+   * ⚠️ 未归属与常态绿时**刻意为空**：那两种结论没有「是哪一个」可点，
+   *   给一个点开只写着「未归属」的按钮等于把使用者引到一个没有答案的地方。
+   */
+  suspects: readonly DiagnosticSuspect[]
+  /** 展开明细的入口文案；空串 = 这一条结论不出现入口。 */
+  actionLabel: string
+}
+
+/** 把「是哪一个」的条数写进入口文案，避免一条按钮对 1 个和 5 个用同一句措辞。 */
+function actionLabelOf(count: number, singular: string, plural: string): string {
+  return count > 1 ? plural : singular
+}
+
+/** 一行 → 一个可点名的对象（`gapText` 直接复用该行已判定的静默文案）。 */
+function suspectOf(
+  row: { latestEventTs: number | null; silence: SilenceVerdict },
+  label: string,
+): DiagnosticSuspect {
+  return { label, latestEventTs: row.latestEventTs, gapText: row.silence.text }
+}
+
+/**
+ * 收敛成一句可执行的结论。
  *
  * ⚠️ 顺序刻意固定：**未归属 > 来源静默 > 署名者静默**。
  *   未归属是「数据本身有问题」，永远比「某个客户端没在用」更该先说；
  *   而两个静默之间，来源维度更具体（能直接点名是哪个客户端）。
- */
-export type DiagnosticConclusion =
-  | { kind: 'unattributed'; count: number; tone: 'amber'; text: string }
-  | { kind: 'silent-sources'; count: number; tone: 'amber'; text: string }
-  | { kind: 'stale-reporters'; count: number; tone: 'amber'; text: string }
-  | { kind: 'healthy'; count: 0; tone: 'green'; text: string }
-
-/**
- * 收敛成一句可执行的结论。
+ *   ★ 由此得到的推论：有未归属时那一条静默**不会**出现在状态行上，
+ *     它的名单入口也就不出现（一次只说一件事，入口跟着那句话走）。
  *
  * 🚨 「全部正常」必须要求**三种异常都不存在**。只判未归属就发绿，
  *   会让「某人三天没上报」在页面上显示成一路绿灯 —— 而那正是这一页
@@ -73,6 +112,8 @@ export function conclusionOf(
       count: unattributedEvents,
       tone: 'amber',
       text: `存在 ${formatCount(unattributedEvents)} 条未归属记录`,
+      suspects: [],
+      actionLabel: '',
     }
   const silentSources = sourceRows.filter((row) => row.silence.tone === 'amber')
   if (silentSources.length)
@@ -81,6 +122,10 @@ export function conclusionOf(
       count: silentSources.length,
       tone: 'amber',
       text: `${silentSources.length} 个采集来源已超过 24 小时没有新数据`,
+      // ⚠️ `row.source` 为空是合法原值（服务端不归一化、也不补零），
+      //   按表格里同一个写法显示成「未标注」—— 这里写空串会让名单看起来少一项。
+      suspects: silentSources.map((row) => suspectOf(row, row.source || '未标注')),
+      actionLabel: actionLabelOf(silentSources.length, '查看是哪个来源', '查看是哪些来源'),
     }
   const staleReporters = reporterRows.filter((row) => row.silence.tone === 'amber')
   if (staleReporters.length)
@@ -89,12 +134,16 @@ export function conclusionOf(
       count: staleReporters.length,
       tone: 'amber',
       text: `${staleReporters.length} 位署名者已超过 24 小时没有新数据`,
+      suspects: staleReporters.map((row) => suspectOf(row, row.label)),
+      actionLabel: actionLabelOf(staleReporters.length, '查看是哪位署名者', '查看是哪些署名者'),
     }
   return {
     kind: 'healthy',
     count: 0,
     tone: 'green',
     text: '当前范围内未发现未归属记录，采集链路新鲜',
+    suspects: [],
+    actionLabel: '',
   }
 }
 
