@@ -1330,6 +1330,52 @@ describe('★ 趋势分层（按用户 / 按模型）', () => {
       .toEqual(items.map((item) => item.key).sort())
   })
 
+  /**
+   * 🚨 成员视图下「费用（估算）」列必须挂得上键。
+   *
+   * ## 实测事故（2026-10-13 线上管理周报）
+   *
+   * 成员分布表**整列**显示「未计价」，而同一行的「未计价 Token」是 0 ——
+   * 同一个页面上两处自相矛盾，且没有任何报错。
+   * 根因：分组键来自 `memberGroups()`（成员视图 = 稳定 `member_id` UUID），
+   * 金额取数却按 `COALESCE(user_id, 'unknown')`（= 姓名）分组；上报写入的是
+   * `userId = 姓名` + `memberId = UUID`，两套键**必然**对不上，
+   * 于是每一行都落进「这一行没有价」的空金额分支。
+   *
+   * 这一条钉在 HTTP 层（不是 core 层）：看板走的就是这条路径，
+   * 只有它同时覆盖鉴权、路由合并与响应契约。
+   */
+  test('★ 成员视图的费用列挂得上键：不再整列未计价，且与未计价 Token 自洽', async () => {
+    const { repository, admin, zhang, li, zhangKey, liKey, send } = await memberWorld()
+    await repository.setModelPrice(admin, {
+      provider: 'dashscope', model: 'deepseek-v4.1-flash', currency: 'CNY',
+      input_micro_per_ktok: 2_000, output_micro_per_ktok: 8_000,
+      cache_read_micro_per_ktok: 200, cache_write_micro_per_ktok: 2_000,
+      effective_from_ms: 1_000,
+    })
+    await send(zhangKey, [rec('z1', { input_tokens: 1000, output_tokens: 0, cache_read_tokens: 0 })])
+    await send(liKey, [rec('l1', { seq: 2, input_tokens: 3000, output_tokens: 0, cache_read_tokens: 0 })])
+
+    const route = memberRoute(repository)
+    const res = await route.handle(
+      'breakdown',
+      new URLSearchParams({ period: 'today', by: 'user', identity_view: 'member' }),
+      'Bearer tok-admin',
+    )
+    expect(res.status).toBe(200)
+    const rows = (res.body as BreakdownResponse).rows
+    // 键就是人员排行（`groups('user')`）那一套：稳定 UUID，不是姓名
+    expect(rows.map((row) => row.key).sort()).toEqual([zhang.member_id, li.member_id].sort())
+
+    const zhangRow = rows.find((row) => row.key === zhang.member_id)!
+    // 1000 token × 2000 微元 / 千 token = 2000 微元
+    expect(zhangRow.cost!.costs).toEqual([{ currency: 'CNY', amountMicro: 2_000, tokens: 1000 }])
+    // ★ 「有金额」与「未计价」必须自洽：挂在价上的用量不能再算作未计价
+    expect(zhangRow.cost!.unpricedTokens).toBe(0)
+    expect(zhangRow.cost!.unpricedRate).toBe(0)
+    expect(rows.find((row) => row.key === li.member_id)!.cost!.costs[0]!.amountMicro).toBe(6_000)
+  })
+
   test('★ stack=model 在成员视图下仍然用模型名（不能套用人员那套标签判定）', async () => {
     // 🚨 这一条是实测踩出来的：成员视图 + 按模型展开时，模型行既没有 `member_id`
     //   也没有 `user_id`，套用人员的标签判定会把**每一层都标成「未归属」** ——

@@ -317,24 +317,87 @@ describe('金额取数：分组维度', () => {
 
   test('★ 分组键与 groups(dim) 的 key 逐字相同（金额才能挂到行上）', async () => {
     await seed()
-    for (const dim of ['provider', 'model', 'provider-model', 'user', 'group', 'project', 'day'] as const) {
-      const keys = await withCost(async (s) => (await s.groups(dim)).map((row) => row.key))
-      const costs = await withCost((s) => s.costByGroup(dim))
+    // ★ 两种视图都要对：旧视图的键是 `user_id`，成员视图的键是稳定 `member_id`
+    //   （没有 ID 的历史行是 `legacy:…`）。生产上的部门看板走的是**成员视图**
+    //   那一条 —— 只钉旧视图等于没钉住「费用列整列未计价」这个 bug。
+    const views: QueryFilter[] = [{}, { identityView: 'member' }]
+    for (const filter of views) {
+      for (const dim of ['provider', 'model', 'provider-model', 'user', 'group', 'project', 'day'] as const) {
+        const keys = await withCost(async (s) => (await s.groups(dim)).map((row) => row.key), filter)
+        const costs = await withCost((s) => s.costByGroup(dim), filter)
 
-      if (dim === 'group') {
-        // 本数据集**没有造分组目录**（没有 `member_group_assignments`）——
-        // 于是「各分组之和 = 0、差额全是未分组人员」：两边都空是**正确**结果，
-        // 而不是金额漏算。未分组人员不进任何分组行是定义。
-        expect(keys).toEqual([])
-        expect(costs.size).toBe(0)
-        continue
+        if (dim === 'group') {
+          // 本数据集**没有造分组目录**（没有 `member_group_assignments`）——
+          // 于是「各分组之和 = 0、差额全是未分组人员」：两边都空是**正确**结果，
+          // 而不是金额漏算。未分组人员不进任何分组行是定义。
+          expect(keys).toEqual([])
+          expect(costs.size).toBe(0)
+          continue
+        }
+
+        expect(keys.length).toBeGreaterThan(0)
+        // 每一个有数据的行都必须能取到金额；金额里也不许出现多余的键。
+        for (const key of keys) expect(costs.has(key)).toBe(true)
+        expect([...costs.keys()].sort()).toEqual([...keys].sort())
       }
-
-      expect(keys.length).toBeGreaterThan(0)
-      // 每一个有数据的行都必须能取到金额；金额里也不许出现多余的键。
-      for (const key of keys) expect(costs.has(key)).toBe(true)
-      expect([...costs.keys()].sort()).toEqual([...keys].sort())
     }
+  })
+
+  /**
+   * ★ 回归：成员视图下「按 `user_id` 取金额」与「按 `member_id` 分组」是两套键。
+   *
+   * 生产形状就是本用例造的这样：`member_id` 是 UUID、`user_id` 是姓名快照
+   * （`ingest-route.ts` 写入 `userId: fresh.name` / `memberId: fresh.memberId`），
+   * 两者**必然不同值**。取金额若沿用 `COALESCE(user_id, 'unknown')`，
+   * 每一行都对不上键 ⇒ 费用列整列显示「未计价」，而同一行的「未计价 Token」
+   * 是 0（自相矛盾），且不会有任何报错。
+   */
+  test('★ 成员视图：UUID 行与 legacy:… 行都拿到金额，键与 groups("user") 逐字相同', async () => {
+    await seed()
+    const memberId = '7c000000-0000-4000-8000-0000000000c1'
+    const store = await openPortalStore({ sqlitePath: dbPath })
+    try {
+      // 稳定归属要求名册里有这个人（`usage_event.member_id` 是 RESTRICT 外键）。
+      await store.run(
+        'INSERT INTO members (member_id, display_name, created_at_ms, updated_at_ms) VALUES ($id, $name, 1, 1)',
+        { $id: memberId, $name: '王五' },
+      )
+      await insertAttributedRecords(
+        store,
+        [
+          // 两条都配了价：model-a 1000 / model-b 3000（微元 / 千 token）→ 2000 + 3000。
+          event('m1', { seq: 11, input_tokens: 2000 }),
+          event('m2', { seq: 12, model: 'model-b', input_tokens: 1000 }),
+        ],
+        { userId: '王五', userName: '王五', groupName: '研发一部', memberId },
+      )
+    } finally {
+      await store.close()
+    }
+
+    const { keys, costs } = await withCost(async (s) => ({
+      keys: (await s.groups('user')).map((row) => row.key),
+      costs: await s.costByGroup('user'),
+    }), { identityView: 'member' })
+
+    const legacyKey = `legacy:${Buffer.from('张三', 'utf8').toString('base64url')}`
+    // 数据集里只有两种归属：稳定 ID 那一行、以及 `seed()` 造的历史行。
+    expect([...keys].sort()).toEqual([memberId, legacyKey].sort())
+    // ① 键集合逐字相等 —— 这正是 bug 的判据（按 `user_id` 取金额时这里全不相等）。
+    expect([...costs.keys()].sort()).toEqual([...keys].sort())
+
+    // ② 稳定 ID 那一行必须拿到金额，且金额对得上（2000 + 3000 微）。
+    const member = costs.get(memberId)!
+    expect(member.costs).toEqual([{ currency: 'CNY', amountMicro: 5000, tokens: 3000 }])
+    expect(member.unpricedTokens).toBe(0)
+
+    // ③ 历史行（`member_id` 为空、只有 `user_id`）是另一个分支，同样必须拿到金额。
+    //    它也是「未归属的历史身份不许被并进某个稳定 ID」的那条口径。
+    const legacy = costs.get(legacyKey)!
+    expect(legacy.costs).toEqual([
+      { currency: 'CNY', amountMicro: 14200, tokens: 6100 },
+      { currency: 'USD', amountMicro: 500, tokens: 1000 },
+    ])
   })
 
   test('by=provider-model 与 by=user 也照同样口径算', async () => {

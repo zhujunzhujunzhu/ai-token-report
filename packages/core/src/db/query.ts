@@ -660,6 +660,13 @@ export interface CostQueryPrice extends ModelPrice { priceId: string }
  */
 export interface RawCostRow {
   grp_key?: string | null
+  /**
+   * **两列分组时的第二列**（成员视图人员维度 = `user_id` 原值）。
+   *
+   * ★ 只有成员视图的人员维度带这一列：它的身份键（`legacy:` 前缀里的
+   *   `base64url(user_id)`）算在 JS 侧，SQL 里取不到（SQLite 没有 base64 函数）。
+   */
+  grp_key_alt?: string | null
   /** 仅整体金额取数带这两列（用于回答「哪些模型没配价」）。 */
   provider?: string | null
   model?: string | null
@@ -728,6 +735,17 @@ function slotExpressionSql(dialect: PortalDialect, scheduleExpr: string, tsExpr:
 }
 
 /**
+ * 金额分组的键列名（SQL 别名，不是表列）。
+ *
+ * ★ 这里允许**两列**，唯一的原因是成员视图的人员维度：它的归属键有三种形态
+ *   （稳定 `member_id` / `legacy:<base64url(user_id)>` / `unknown`），
+ *   而 `base64url` 在 SQL 里不可移植（SQLite 没有 base64 函数）——
+ *   所以必须把 `member_id` 与 `user_id` 两列都取回来，键在 JS 侧拼。
+ *   第一列沿用 `grp_key`，第二列是 `grp_key_alt`。
+ */
+const COST_KEY_COLUMNS = ['grp_key', 'grp_key_alt'] as const
+
+/**
  * 金额取数的公共骨架。
  *
  * ## 为什么是 LEFT JOIN + 按 `price_id` 分组，而不是在 SQL 里写乘法
@@ -770,7 +788,12 @@ function slotExpressionSql(dialect: PortalDialect, scheduleExpr: string, tsExpr:
  *   分组键（`grp_key`）才用归一化表达式 —— 两者刻意不同名不同义。
  */
 function costQueryFor(
-  dimExpr: string | null,
+  /**
+   * 分组键表达式：`null` = 不分组（整体金额）；**一列** = 该表达式就是键；
+   * **两列** = 两列都取回来，键由调用方在 JS 侧拼（见 {@link COST_KEY_COLUMNS}）。
+   * 两列时行的形状仍然是一个 `grp_key` + 一个 `grp_key_alt`，顺序与数组一致。
+   */
+  dimExpr: string | readonly string[] | null,
   filter: QueryFilter,
   normalize: ProviderNormalizer | undefined,
   dimParams: Record<string, string | number>,
@@ -781,8 +804,14 @@ function costQueryFor(
   const { sql, params: whereParams } = buildWhere(filter, normalize)
   const targetCols = withTarget ? 'provider, model, ' : ''
   const targetGroup = withTarget ? 'provider, model, ' : ''
-  const select = dimExpr === null ? '' : `${dimExpr} AS grp_key,\n                 `
-  const group = dimExpr === null ? '' : 'grp_key, '
+  // ★ 分组键可以是一列，也可以是两列（见 `COST_KEY_COLUMNS`）。一列时的 SQL
+  //   文本与迁移前**逐字相同** —— 这条路径的每一条既有调用方都不受影响。
+  const dimCols = dimExpr === null ? [] : typeof dimExpr === 'string' ? [dimExpr] : dimExpr
+  const dimAliases = dimCols.map((_, i) => COST_KEY_COLUMNS[i]!)
+  const select = dimCols.length === 0
+    ? ''
+    : `${dimCols.map((expr, i) => `${expr} AS ${dimAliases[i]}`).join(',\n                 ')},\n                 `
+  const group = dimCols.length === 0 ? '' : `${dimAliases.join(', ')}, `
   const ts = `${EVENT_TABLE}.ts`
   // ★ 命中的价行只可能是「专属」或「基础」之一（见上面那段注释），COALESCE 只是取值。
   const priceId = 'COALESCE(mp_e.price_id, mp_b.price_id)'
@@ -825,7 +854,7 @@ function costQueryFor(
                      SUM(cache_read_tokens) AS cache_read_tokens, SUM(cache_write_tokens) AS cache_write_tokens
               FROM ${EVENT_TABLE}${sql}
               GROUP BY ${group}provider, model, cost_epoch${slotGroups.length ? ', ' + slotGroups.join(', ') : ''}) AS ${EVENT_TABLE}`
-    outerSelect = dimExpr === null ? '' : 'grp_key, '
+    outerSelect = dimCols.length === 0 ? '' : `${dimAliases.join(', ')}, `
     outerWhere = ''
   }
   const priceSource = prices === undefined ? priceSourceSql() : prices.length === 0
@@ -920,10 +949,47 @@ export function costByCwdQuery(
   return costQueryFor('cwd', filter, normalize, {}, dialect, false, prices)
 }
 
+/**
+ * **成员视图**下人员维度的金额：按 `member_id` 与 `user_id` 两列取数，键在 JS 侧拼。
+ *
+ * ## 🚨 为什么不能沿用 `COALESCE(user_id, 'unknown')`
+ *
+ * 成员视图的人员分组键是**稳定 `member_id`**（见 `portal.ts` 的 `memberGroups()`），
+ * 而旧视图的键才是 `user_id`。生产上这两个值必然不同（一个是 UUID、一个是姓名），
+ * 于是「按 `user_id` 取金额 + 按 `member_id` 分组」= **每一行都对不上键**：
+ * 分布表的费用列整列落到空金额（显示「未计价」），而同一行的「未计价 Token」
+ * 是 0 —— 两者自相矛盾，且没有任何报错。这正是本构建器存在的理由。
+ *
+ * ★ 键**只能在 JS 侧算**：`legacy:` 前缀里的 `base64url(user_id)` 在 SQL 里
+ *   不可移植（SQLite 没有 base64 函数），所以这里取回两列原值，
+ *   由调用方用**与 `memberGroups()` 同一个**函数（`memberIdentityKey()`）拼键。
+ *   把键写进 SQL 等于多出一份跑不起来的方言实现。
+ *
+ * ⚠️ 参数顺序与 {@link costByDimensionQuery} 对齐（`filter, dialect, normalize,
+ *   prices`）：它服务的维度与那个函数相同，只是视图不同。
+ */
+export function costByMemberQuery(
+  filter: QueryFilter = {},
+  dialect: PortalDialect = SQLITE_DIALECT,
+  normalize?: ProviderNormalizer,
+  prices?: readonly CostQueryPrice[],
+): SqlQuery {
+  return costQueryFor(['member_id', 'user_id'], filter, normalize, {}, dialect, false, prices)
+}
+
 /** 金额取数行 → 内核形状（`SUM` 的字符串归一化只此一处，理由同 `mapGroupRows`）。 */
 export interface CostRowCounts {
   /** 分组键；整体金额时为 `null`。 */
   key: string | null
+  /**
+   * 两列分组时的第二列原值（成员视图人员维度 = `user_id`）；只有一列时是 `null`。
+   *
+   * ★ 它必须一路带到调用方：成员视图的身份键是三分支（稳定 `member_id` /
+   *   `legacy:…` / `unknown`），后两种只有拿到 `user_id` 才算得出来。
+   *   在这里就拼好键是不行的 —— 「什么算同一个人」的口径只有一份，
+   *   在 `portal.ts` 的 `memberIdentityKey()`。
+   */
+  keyAlt: string | null
   /** 命中的单价行 ID；`null` = **未计价**（不是 0 元）。 */
   priceId: string | null
   /** 该单价行的币种；未计价时为 `null`。 */
@@ -945,6 +1011,7 @@ export function mapCostRows(rows: readonly RawCostRow[]): CostRowCounts[] {
   const text = (value: unknown): string | null => (value === null || value === undefined ? null : String(value))
   return rows.map((row) => ({
     key: text(row.grp_key),
+    keyAlt: text(row.grp_key_alt),
     priceId: text(row.price_id),
     currency: text(row.currency),
     // ⚠️ MySQL 的 CASE 结果可能以字符串回来（同 SUM(BIGINT)），所以按文本判 `'1'`。

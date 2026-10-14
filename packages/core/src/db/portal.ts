@@ -60,6 +60,7 @@ import {
   buildWhere,
   costByCwdQuery,
   costByDimensionQuery,
+  costByMemberQuery,
   costTotalsQuery,
   distinctUsersQuery,
   groupsQuery,
@@ -389,6 +390,41 @@ export interface PortalReporterCoverageRow {
 }
 
 /**
+ * 成员视图下的归属键 —— **唯一**一份三分支实现。
+ *
+ * ## 为什么必须只有一份
+ *
+ * 「什么算同一个人」在本仓有**四处**要用：`memberGroups()`（人员分组与排行）、
+ * `identityKeyOf()`（堆叠趋势的每一层）、`reporterCoverage()`（诊断表的署名键）、
+ * 以及成员视图的金额分支（`costByGroup('user')`）。各写一遍的后果不是编译错误，
+ * 而是**几份各自自洽的口径**：趋势图上的「张三」与排行里的「张三」成了两个层、
+ * 金额整列挂不上键 —— 每一处看起来都很正常，没有任何报错。
+ *
+ * ## 三种形态
+ *
+ * | 库里的行 | 键 |
+ * |---|---|
+ * | 有稳定 `member_id` | 该 UUID |
+ * | 没有 `member_id`、有 `user_id` | `legacy:<base64url(user_id)>`（待确认历史身份） |
+ * | 两者都没有 | `unknown`（{@link UNATTRIBUTED_USER}） |
+ *
+ * ⚠️ `legacy:` 里的 base64url **只能在 JS 侧算**：SQLite 没有 base64 函数，
+ *   把它写进 SQL 就是一份在 SQLite 上直接报错的方言实现。所以成员视图的
+ *   金额取数必须把 `member_id` 与 `user_id` **两列**都取回来（见
+ *   `query.ts` 的 `costByMemberQuery()`）。
+ *
+ * ⚠️ `legacyUserId` 只在 `memberId` 缺失时才被读：`memberGroups()` / `reporterCoverage()`
+ *   传的是 SQL 侧已经过 `CASE WHEN member_id IS NULL` 的 `legacy_id`，另两处
+ *   （堆叠趋势、成员视图的金额）传行上的原始 `user_id`。`memberId` 有值时两者同义
+ *   （都被忽略）。
+ */
+function memberIdentityKey(memberId: string | null | undefined, legacyUserId: string | null | undefined): string {
+  if (memberId !== null && memberId !== undefined) return memberId
+  if (typeof legacyUserId !== 'string') return UNATTRIBUTED_USER
+  return `legacy:${Buffer.from(legacyUserId, 'utf8').toString('base64url')}`
+}
+
+/**
  * 一个已就绪的上报库统计会话。
  *
  * ⚠️ 持有 `PortalStore`（**不是 `Database`**），**用完必须 `await close()`**：
@@ -667,8 +703,11 @@ export class PortalStatsSession {
    *   稳定人员 ID、按项目名合并、按本地时区分桶）只有一份实现，
    *   让路由层自己去对键，就会多出第二份「什么算同一组」的判断。
    *
-   * 三个分支对应 `dimensionExpression` 的三种归宿：
-   *   - SQL 侧可分组（provider / model / provider-model / user / group）→ 一次带 JOIN 的聚合；
+   * 四个分支对应分组键的四种归宿：
+   *   - SQL 侧可分组（provider / model / provider-model / source / session）→ 一次带 JOIN 的聚合；
+   *   - ★ **成员视图的人员** → 按 `member_id` 与 `user_id` 两列取数，键在 JS 侧拼
+   *     （`legacy:` 里的 base64url 在 SQL 里不可移植），与 `memberGroups()` 共用
+   *     `memberIdentityKey()`；
    *   - `project` → 先按 `cwd` 取金额，再按项目名合并（与分组路径同样的合并规则）；
    *   - `day` / `hour` → 取原始行、在 JS 侧分桶（**分桶必须在 JS 侧**，见 `query.ts`）。
    */
@@ -701,6 +740,22 @@ export class PortalStatsSession {
           //   另一条按 `projectName()` 的话，分布表与金额列会对不上号 ——
           //   表现是「某些项目的费用列是空的」，而两边的数字各自都是「对的」。
           this.#projectOf(row.key),
+          this.partOf(row.priceId, row.slot, row.usage, byId),
+        )
+      }
+    } else if (dim === 'user' && this.#filter.identityView === 'member') {
+      // 🚨 成员视图的分组键是稳定 `member_id`（见 `memberGroups()`），而
+      //   `dimensionExpression('user')` 产出的是 `COALESCE(user_id, 'unknown')`。
+      //   生产上这两个值必然不同（一个是 UUID、一个是姓名），于是按那个表达式
+      //   取金额**每一行都对不上键**：费用列整列落到空金额（页面显示「未计价」），
+      //   而同一行的「未计价 Token」是 0 —— 自相矛盾，且没有任何报错。
+      const q = costByMemberQuery(this.#filter, this.#dialect, this.#normalize, list)
+      for (const row of mapCostRows(await this.aggregate<RawCostRow>(q))) {
+        PortalStatsSession.push(
+          parts,
+          // ★ 键必须与 `groups('user')` **逐字相同**：用同一份三分支实现拼，
+          //   不在这里重写一遍 `member_id` / `legacy:` / `unknown` 的判定。
+          memberIdentityKey(row.key, row.keyAlt),
           this.partOf(row.priceId, row.slot, row.usage, byId),
         )
       }
@@ -1105,8 +1160,8 @@ export class PortalStatsSession {
    *   卡片上的「署名键组数」与这张表的行数必须是同一个数，
    *   否则同一个页面里两处数字对不上，而且谁都说不清哪个对。
    *
-   * ⚠️ 这里的 `legacy:` / `unknown` 键形**逐字复制** {@link memberGroups}：
-   *   人员排行里的「张三」与诊断表里的「张三」必须是同一个键。
+   * ⚠️ 这里的 `legacy:` / `unknown` 键形与 {@link memberGroups} **共用同一个**
+   *   `memberIdentityKey()`：人员排行里的「张三」与诊断表里的「张三」必须是同一个键。
    */
   async reporterCoverage(limit = 10): Promise<PortalReporterCoverageRow[]> {
     if (this.#filter.identityView !== 'member') {
@@ -1198,8 +1253,9 @@ export class PortalStatsSession {
       const cacheWrite = num(row.cache_write)
       const attributionStatus = row.member_id ? 'member' : row.legacy_id !== null ? 'legacy' : 'unattributed'
       return {
-        key: row.member_id
-          ?? (row.legacy_id !== null ? `legacy:${Buffer.from(row.legacy_id, 'utf8').toString('base64url')}` : UNATTRIBUTED_USER),
+        // ★ 键的口径只有一份（`memberIdentityKey`）：诊断表的「张三」与人员排行的
+        //   「张三」必须是同一个键，否则同一页面上两处行数对不上却各自都「合理」。
+        key: memberIdentityKey(row.member_id, row.legacy_id),
         label: row.member_id
           ? row.display_name ?? row.snapshot_name ?? '已停用人员'
           : row.legacy_id !== null ? `历史人员：${row.snapshot_name ?? row.legacy_id}（待确认）` : '未归属',
@@ -1298,7 +1354,9 @@ export class PortalStatsSession {
     const groups = await this.groupsOf(rows.map((row) => row.member_id))
     return sortGroupRows(rows.map((row) => {
       const attributionStatus = row.member_id ? 'member' : row.legacy_id !== null ? 'legacy' : 'unattributed'
-      const key = row.member_id ?? (row.legacy_id !== null ? `legacy:${Buffer.from(row.legacy_id, 'utf8').toString('base64url')}` : 'unknown')
+      // ★ 键的口径只有一份（`memberIdentityKey`）：成员视图的金额分支与堆叠趋势
+      //   都用它，否则费用列会整列挂不上这里产出的键。
+      const key = memberIdentityKey(row.member_id, row.legacy_id)
       const mapped = mapGroupRows([{ ...row, grp_key: key }])[0]!
       return { ...mapped, memberId: row.member_id,
         groupNames: (row.member_id ? groups.get(row.member_id) ?? [] : []).map((group) => group.name),
@@ -1542,13 +1600,12 @@ export class PortalStatsSession {
     return result
   }
 
-  /** 成员视图下的归属键；与 `memberGroups()` 的三分支**逐字相同**。 */
+  /** 成员视图下的归属键；与 `memberGroups()` 共用 `memberIdentityKey()` 的三分支。 */
   private identityKeyOf(row: StackRow, memberView: boolean): string {
     if (!memberView) return typeof row.user_id === 'string' ? row.user_id : UNATTRIBUTED_USER
-    const memberId = this.memberIdOf(row)
-    if (memberId) return memberId
+    // 驱动给的列值是 `unknown`：先收成 string | null，三分支的判定只留在共用实现里。
     const legacy = typeof row.user_id === 'string' ? row.user_id : null
-    return legacy === null ? UNATTRIBUTED_USER : `legacy:${Buffer.from(legacy, 'utf8').toString('base64url')}`
+    return memberIdentityKey(this.memberIdOf(row), legacy)
   }
 
   private memberIdOf(row: StackRow): string | null {
