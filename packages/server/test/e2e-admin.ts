@@ -382,6 +382,18 @@ try {
   const myCwds = (await request(a, 'stats/projects', keyA)).data.projects
   assert(myCwds.includes('D:\\proj\\packages\\core')); checks++
   equal(myCwds.includes('D:\\b-only'), false, '★ 非管理员拿不到别人名下的目录（路径会带出使用者信息）')
+  // ★ 这一条接口是全表 `DISTINCT cwd`（线上 50 万行 / 中位 774ms），服务端因此有
+  //   2 分钟短 TTL 缓存（`stats-route.ts` 的 `PROJECT_CATALOG_TTL_MS`）。缓存键必须
+  //   是**数据范围**：键错了的表现正是「乙拿到甲那一份」—— 而响应看起来完全正常。
+  //   所以这里紧接着用**另一个人的凭证**再要一次，断言他拿到的是自己名下的目录。
+  const theirCwds = (await request(a, 'stats/projects', keyB)).data.projects
+  assert(theirCwds.includes('D:\\b-only')); checks++
+  equal(theirCwds.includes('D:\\proj\\packages\\core'), true, '★ 换一个人就换一份候选（乙自己名下的目录在乙的候选里）')
+  // ★ 再要一次甲的：这一次走**缓存命中**那条路（不再开库、也不再有那条 SQL）。
+  //   上面三次都是「第一次」，命中路径只由这一条覆盖 —— 与中间那次乙的请求交错，
+  //   同时证明缓存不是一个「只记得最后一键」的槽位。
+  const againCwds = (await request(a, 'stats/projects', keyA)).data.projects
+  equal(JSON.stringify(againCwds), JSON.stringify(myCwds), '★ 同一范围的第二次请求走缓存命中，内容与第一次逐字相同')
   const allCwds = (await request(a, 'stats/projects', adminToken)).data.projects
   assert(allCwds.includes('D:\\b-only')); checks++
   equal((await request(a, 'stats/projects', null)).status, 401, '未认证不能读目录候选')

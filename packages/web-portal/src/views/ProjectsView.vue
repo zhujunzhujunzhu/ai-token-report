@@ -44,6 +44,16 @@
  * **可搜索的下拉**，候选项来自 `/api/v1/stats/projects`（库里真实出现过的 cwd）；
  * 也允许自己敲（那个接口需要 `stats:read`，拿不到就只剩手填，表单里会说明）。
  *
+ * ## ★ 为什么那份候选**不在打开页面时取**（2026-10-13 的卡顿修复）
+ *
+ * 它回的是 `usage_event.cwd` 的**全表去重清单**（`cwd` 是 `TEXT`、没有索引），
+ * 线上实测 **692ms / 51KB**（50.4 万行），而这一页真正要显示的规则列表只有
+ * **37ms / 25KB**。以前它和列表、名册一起 `Promise.all`，于是首帧和每次
+ * 「刷新 / 保存 / 删规则」后的重取都被一份「下拉里的可选值」拖住半秒以上。
+ *
+ * 现在它（以及同样只服务表单的人员名册）只在**打开表单**时才读，读过就留在
+ * 本次页面驻留期内复用；点「刷新」时才顺手重取一次。列表因此只剩一个请求。
+ *
  * 🚨 归一化按**查看者**生效：全局规则对所有人生效；人员规则只对那个人生效。
  *   同一条目录上前者被后者压住（跨作用范围时仍然是**更具体者**优先）。
  */
@@ -76,6 +86,16 @@ const people = ref<PortalMember[]>([])
  */
 const cwds = ref<string[]>([])
 const catalogLoaded = ref(false)
+/** 正在读候选（只影响表单里那句提示，不影响列表）。 */
+const catalogLoading = ref(false)
+/**
+ * 人员名册（表单里那个「成员」下拉）与它对应的两个状态。
+ *
+ * ⚠️ 与目录候选同样**只在打开表单时才读**：列表上的人名来自规则行自带的
+ *   `member_name`（服务端返回时已经带上），这一页不需要名册就能画完表格。
+ */
+const rosterLoaded = ref(false)
+const rosterLoading = ref(false)
 const loading = ref(false)
 const busy = ref(false)
 const error = ref<string | null>(null)
@@ -120,26 +140,76 @@ const rules: FormRules = {
   alias: [{ required: true, message: '请填写归一化后的项目名', trigger: 'blur' }],
 }
 
+/**
+ * 取列表（规则本身）。
+ *
+ * ## ★ 候选（目录 / 人员名册）**不在这里取** —— 这是这一页首帧的唯一大头
+ *
+ * `/api/v1/stats/projects` 回的是 `usage_event.cwd` 的**全表去重清单**，而 `cwd`
+ * 是 `TEXT` 且没有索引：线上实测（2026-10-13，50.4 万行）SQL 中位 **774ms**、
+ * 接口中位 **692ms / 51KB**，而同屏的规则列表只有 **37ms / 25KB**。
+ * 以前三者 `Promise.all` 一起等，于是**首帧、以及每次「刷新 / 保存 / 删规则」后的
+ * 重取**都被那一份「下拉里的候选」拖住半秒以上（服务端并发争抢时更长）。
+ *
+ * 候选只影响「填起来方不方便」，所以改成**打开表单时才读**（`ensureCatalog()` /
+ * `ensureRoster()`），列表不再等它。已经读过的那份留在本次页面驻留期内复用 ——
+ * 点「刷新」时才顺手重取一次（见下）。
+ */
 async function load(): Promise<void> {
   if (loading.value) return
   loading.value = true
   error.value = null
-  const [list, roster, catalog] = await Promise.all([
-    api.fetchProjectAliases(),
-    session.can('members:read') ? fetchMembers() : null,
-    // ⚠️ 候选项只影响「填起来方不方便」，所以它失败**不能让整页判定为不可用**：
-    //   与下面的人员名册同样处理，只是退回手填。
-    session.can('stats:read') ? fetchProjectCwds() : null,
-  ])
+  const list = await api.fetchProjectAliases()
   // ⚠️ 判空顺序是 `!ok` 在前：`ApiResult` 是**判别联合**，`status` / `error`
   //   只存在于失败那一支，先读字段是取不到的（`ProvidersView.vue` 里就是这么写错的）。
   if (!list.ok) {
     if (list.status === 401) { session.expire('登录已失效，请重新登录'); loading.value = false; return }
     error.value = list.error
   } else aliases.value = list.data.aliases
-  if (roster?.ok) people.value = roster.data.members
-  if (catalog?.ok) { cwds.value = catalog.data.projects; catalogLoaded.value = true }
   loading.value = false
+  // ★ 「刷新」是使用者明确要求的一份新数据，所以**已经读过**的候选也重取一遍；
+  //   没读过就不取（那正是上面要避免的那次全表扫）。两处都不阻塞列表：
+  //   候选迟到只表现为下拉里晚几百毫秒有值，而列表已经画完了。
+  if (catalogLoaded.value) void ensureCatalog(true)
+  if (rosterLoaded.value) void ensureRoster(true)
+}
+
+/**
+ * 目录候选（`GET /api/v1/stats/projects`）—— 用到时才读，读过就复用。
+ *
+ * ⚠️ 失败**不写 `catalogLoaded`**：它是空的两种含义完全不同（「没读到」与
+ *   「库里确实还没有目录」），表单里的文案据此分叉（见 `cwds` 上的说明）。
+ *   `force` 来自「刷新」按钮与返回值仍为 `catalogLoaded` 的后续调用。
+ */
+async function ensureCatalog(force = false): Promise<void> {
+  if (catalogLoading.value || (catalogLoaded.value && !force)) return
+  // 缺 `stats:read` 时**不打这个请求**：打过去只会拿到 403，而表单里那句
+  // 「读不到目录候选（需要 stats:read）」才是使用者要的答案。
+  if (!session.can('stats:read')) return
+  catalogLoading.value = true
+  const catalog = await fetchProjectCwds()
+  catalogLoading.value = false
+  if (!catalog.ok) {
+    if (catalog.status === 401) { session.expire('登录已失效，请重新登录'); return }
+    return
+  }
+  cwds.value = catalog.data.projects
+  catalogLoaded.value = true
+}
+
+/** 人员名册 —— 与目录候选同一形态：只在打开表单时读，读过就复用。 */
+async function ensureRoster(force = false): Promise<void> {
+  if (rosterLoading.value || (rosterLoaded.value && !force)) return
+  if (!session.can('members:read')) return
+  rosterLoading.value = true
+  const roster = await fetchMembers()
+  rosterLoading.value = false
+  if (!roster.ok) {
+    if (roster.status === 401) { session.expire('登录已失效，请重新登录'); return }
+    return
+  }
+  people.value = roster.data.members
+  rosterLoaded.value = true
 }
 
 /** 展开 / 收起一行。 */
@@ -163,6 +233,10 @@ function open(entry: PortalProjectAlias | null = null): void {
   draft.alias = entry?.alias ?? ''
   error.value = null
   showForm.value = true
+  // ★ 表单要用的两份候选在这里才去读（读过就复用，见 `load()` 上的说明）。
+  //   不 await：弹框立刻出现，下拉里的值晚到几百毫秒不影响已经能敲字。
+  void ensureRoster()
+  void ensureCatalog()
 }
 
 /**
@@ -382,7 +456,8 @@ onMounted(() => { void load() })
           <el-select v-model="draft.member_id" filterable placeholder="选择成员" aria-label="选择成员">
             <el-option v-for="person in people" :key="person.member_id" :label="person.name" :value="person.member_id" />
           </el-select>
-          <p v-if="!people.length" class="muted">读不到人员名单（需要 <code>members:read</code>），暂时只能配置全局规则。</p>
+          <p v-if="rosterLoading" class="muted">正在读取人员名单…</p>
+          <p v-else-if="!people.length" class="muted">读不到人员名单（需要 <code>members:read</code>），暂时只能配置全局规则。</p>
         </el-form-item>
         <el-form-item label="仓库名 / 目录前缀" prop="prefix">
           <!--
@@ -408,7 +483,13 @@ onMounted(() => { void load() })
             它会匹配该仓库在任意磁盘、任意父目录下的所有子目录。
             需要<strong>限定位置</strong>时才填完整路径，那种写法按路径前缀匹配。
             尾部的 <code>\</code> 或 <code>/</code> 会被自动去掉。
-            <template v-if="catalogLoaded">库里目前出现过 {{ cwds.length }} 个目录，可从上面选。</template>
+            <!--
+              ★ 候选是**打开表单时才取**的（`ensureCatalog()`），所以这里有三种状态：
+                正在读 / 读到了（报个数）/ 没读到（缺权限或失败）。把「正在读」说成
+                「读不到」会让使用者去查一个不存在的权限问题。
+            -->
+            <template v-if="catalogLoading">正在读取目录候选…</template>
+            <template v-else-if="catalogLoaded">库里目前出现过 {{ cwds.length }} 个目录，可从上面选。</template>
             <template v-else>读不到目录候选（需要 <code>stats:read</code>），请手动填写仓库名。</template>
           </p>
         </el-form-item>

@@ -209,6 +209,49 @@ function applyDataScope(
 }
 
 /**
+ * 目录候选（`GET /api/v1/stats/projects`）的**进程内短 TTL 缓存**。
+ *
+ * ## 为什么只有这一条候选需要缓存
+ *
+ * 它是**唯一一条要扫全表**的候选：回的是 `usage_event.cwd` 的去重清单，
+ * 而 `cwd` 是 `TEXT`、**没有索引**（前缀索引救不了 `DISTINCT`，见
+ * `docs/性能探索-线上-2026-10-04.md`）。线上实测（2026-10-13，50.4 万行）：
+ * `SELECT DISTINCT cwd … ORDER BY cwd` 中位 **774ms**（`type=ALL` +
+ * `Using temporary; Using filesort`），接口中位 **692ms / 51KB**。
+ * 分组 / 人员 / 供应商候选各只查几十行（实测 35~37ms），缓存它们只会
+ * 多出一份会过期的真相。
+ *
+ * ## 🚨 键是**数据范围**，不是性能参数
+ *
+ * 同一份目录对「部门视角」与「只看自己」是**两个答案**：后者只含本人名下的
+ * `cwd`（路径会带出使用者信息，见 `#projects()`）。所以键从
+ * `applyDataScope()` **已经算好的 filter** 派生 —— 那里是全仓唯一一份收窄
+ * 逻辑，这里绝不重写一遍。键错了＝把别人的目录名发给了只看自己的人，
+ * 而响应看起来完全正常；`e2e-admin.ts` 的「A 拿不到 `D:\b-only`、
+ * 管理员拿得到」那两条断言正好钉住这件事。
+ *
+ * ## TTL 与规模
+ *
+ * 2 分钟：这份清单只会因**新上报**变大，而它只是表单里的候选（也可以手填），
+ * 短暂陈旧没有后果；反过来，没有它时每来一个人、每点一次「添加规则」都要
+ * 再扫一遍全表 —— 在线上 2 核上那才是真问题。键的规模 = 1（部门）+ 每个
+ * 非管理员 1 个，线上最多几十个。
+ */
+const PROJECT_CATALOG_TTL_MS = 120_000
+
+/**
+ * 缓存键：把**已经算好的数据范围**逐字段排序后序列化。
+ *
+ * ⚠️ 排序的是字段名（不是值）：同一份范围必须给出同一个键，而对象字面量的
+ *   键序不该影响命中率。任何一个范围字段（成员 / 时间窗 / 视图）变化都会
+ *   换一个键 —— 这正是缓存安全的边界。
+ */
+function projectCatalogScopeKey(filter: QueryFilter): string {
+  const entries = Object.entries(filter).sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+  return JSON.stringify(entries)
+}
+
+/**
  * 某一行没查到金额时的兜底：一份**零用量**的金额。
  *
  * 正常情况不会走到（分组键与金额键由同一份实现产出），留着是为了让
@@ -321,6 +364,11 @@ export class StatsRoute {
   readonly #credentials: CredentialStore | undefined
   readonly #identityStore: IdentityRepository | undefined
   readonly #target: PortalTarget
+  /**
+   * `/stats/projects` 的短 TTL 缓存（键 = **数据范围**，见
+   * `projectCatalogScopeKey()` 上关于「键错了就是把别人的目录发给只看自己的人」的说明）。
+   */
+  readonly #projectCatalog = new Map<string, { at: number; values: string[] }>()
 
   constructor(options: StatsRouteOptions) {
     this.#credentials = options.credentials
@@ -913,6 +961,12 @@ export class StatsRoute {
     const scope = applyDataScope(viewer, new URLSearchParams(), { label: '全部时间', filter: {} })
     if ('result' in scope) return scope.result
 
+    // ★ 先看缓存：命中时**连库都不开**（这一条是全表扫，见 `PROJECT_CATALOG_TTL_MS`
+    //   上的实测）。返回的是副本，缓存里的那份只由 `#rememberProjectCatalog()` 写。
+    const cacheKey = projectCatalogScopeKey(scope.filter)
+    const cached = this.#rememberedProjectCatalog(cacheKey)
+    if (cached) return { status: 200, body: { projects: cached } satisfies StatsProjectsResponse }
+
     let store: PortalStore
     try {
       // ★ 与 `/stats/providers` / `/stats/sources` 同款：**开裸连接跑一条 SELECT**，
@@ -932,9 +986,11 @@ export class StatsRoute {
       // 取数 SQL 仍然只有一处实现（`distinctCwdsQuery`）—— 这里只负责执行它。
       const q = distinctCwdsQuery(scope.filter)
       const rows = await store.all<{ cwd: unknown }>(q.sql, q.params)
-      const body: StatsProjectsResponse = {
-        projects: rows.map(row => String(row.cwd)).filter(value => value.length > 0),
-      }
+      const projects = rows.map(row => String(row.cwd)).filter(value => value.length > 0)
+      // ⚠️ 只缓存**成功**的结果：把一次失败的查询结果（空清单）缓存下来，
+      //   会表现为「表单里一个目录都没有」持续 TTL 那么久 —— 那看起来像数据丢了。
+      this.#rememberProjectCatalog(cacheKey, projects)
+      const body: StatsProjectsResponse = { projects }
       return { status: 200, body }
     } catch (err) {
       if (this.#identityStore) return { status: 503, body: { ok: false, reason: '统计数据库暂时不可用，请稍后重试' } }
@@ -942,6 +998,28 @@ export class StatsRoute {
     } finally {
       await store.close()
     }
+  }
+
+  /**
+   * 读缓存：命中且未过期才返回，返回**副本**。
+   *
+   * ⚠️ 过期不删也能正确工作（判断按 `at`），但顺手删掉能让 `Map` 不留下
+   *   永远读不到的旧键 —— 线上这个进程会连续跑很多天。
+   */
+  #rememberedProjectCatalog(key: string): string[] | null {
+    const entry = this.#projectCatalog.get(key)
+    if (!entry) return null
+    if (Date.now() - entry.at >= PROJECT_CATALOG_TTL_MS) {
+      this.#projectCatalog.delete(key)
+      return null
+    }
+    return [...entry.values]
+  }
+
+  /** 写缓存；超过上限时整体清掉（线上键数 = 1 + 非管理员人数，正常情况下到不了上限）。 */
+  #rememberProjectCatalog(key: string, values: string[]): void {
+    if (this.#projectCatalog.size >= 64 && !this.#projectCatalog.has(key)) this.#projectCatalog.clear()
+    this.#projectCatalog.set(key, { at: Date.now(), values })
   }
 
   /**
