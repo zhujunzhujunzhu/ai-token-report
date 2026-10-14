@@ -177,6 +177,31 @@ export function planAgainstExisting(existing, candidates) {
   })
 }
 
+/**
+ * 删除规则的端点：**POST 子路径**，不是 `DELETE` 同一路径。
+ *
+ * 🚨 2026-10-13 实测踩过：`prune --yes` 逐条回 **405 方法不允许**。
+ *   `packages/server/src/app.ts` 的管理路由是**枚举注册**的
+ *   （`for (const path of [...]) app.post('/api/v1/admin/' + path, …)`），
+ *   项目规则那一组只有 `project-aliases` / `project-aliases/delete` /
+ *   `project-aliases/status` 三条 **POST**；`DELETE /api/v1/admin/project-aliases`
+ *   从来没被注册过（`http-contract.test.ts` 的 405 + Allow 断言正是钉这一点）。
+ *   所以「删旧规则」必须是 `POST <base>/api/v1/admin/project-aliases/delete`，
+ *   body 只带 `{ alias_id }`。
+ */
+export const PROJECT_ALIAS_DELETE_ENDPOINT = '/api/v1/admin/project-aliases/delete'
+
+/**
+ * 待删规则 → 远端脚本的逐行请求体。
+ *
+ * ⚠️ 刻意**不给 `method`**：远端脚本缺省 POST（`row.method || 'POST'`），
+ *   而删除端点是 POST 子路径 —— 给成 `DELETE` 会让每一条都 405。
+ * ⚠️ 句柄只能是 `alias_id`：业务主键是 `(scope, member_id, prefix)`，删不了。
+ */
+export function deletionRequests(rules) {
+  return rules.map((rule) => ({ label: `${rule.prefix} → ${rule.alias}`, body: { alias_id: rule.aliasId } }))
+}
+
 /** 计划 → 给人看的对齐文本（不做任何算术，只排版）。 */
 export function formatPlan(items) {
   const actionText = { create: '新建', update: '覆盖', same: '无变化' }

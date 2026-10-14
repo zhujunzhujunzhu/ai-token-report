@@ -379,7 +379,9 @@ if (CONFIG.mode === 'stats') {
 const endpoint = CONFIG.endpoint || '/api/v1/admin/pricing'
 const results = []
 for (const row of CONFIG.rows) {
-  // ★ method 由配置给（缺省 POST）：项目规则的「删掉旧规则」走 DELETE + {alias_id}。
+  // ★ method 由配置给（缺省 POST）：项目规则的「删掉旧规则」走
+  //   POST /api/v1/admin/project-aliases/delete + {alias_id}（**不是** DELETE 同一路径 ——
+  //   服务端的管理路由是枚举注册的 POST 子路径，写成 DELETE 会逐条 405，2026-10-13 实测）。
   //   写成同一个循环而不是两份，是为了让「逐行独立成败」这个性质只有一处实现。
   const response = await fetch(baseUrl + endpoint, {
     method: row.method || 'POST',

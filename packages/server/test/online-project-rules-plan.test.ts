@@ -13,12 +13,14 @@
  *    把个人规则也算进"已存在"会让一次全局改名被静默跳过。
  * 4. **空的规则目录必须报错**：算出一个"零条规则的成功计划"最危险 ——
  *    运维会以为已经生效，而看板一个字节都没变。
+ * 5. **删除打的是 POST 子路径**（`/project-aliases/delete`）：写成 `DELETE` 同一路径
+ *    会逐条 405（服务端的管理路由是枚举注册的 POST 子路径），而演练输出一切正常。
  */
 import { expect, test } from 'bun:test'
 
 import {
-  EXISTING_RULES_SQL, PROJECT_ALIAS_MAX_LENGTH, PROJECT_PREFIX_MAX_LENGTH,
-  decodeHex, formatPlan, isProjectPathRule, normalizeProjectPrefix, parseExistingRules,
+  EXISTING_RULES_SQL, PROJECT_ALIAS_DELETE_ENDPOINT, PROJECT_ALIAS_MAX_LENGTH, PROJECT_PREFIX_MAX_LENGTH,
+  decodeHex, deletionRequests, formatPlan, isProjectPathRule, normalizeProjectPrefix, parseExistingRules,
   planAgainstExisting, projectAliasNameError, projectPrefixError, readRules, ruleToApiBody,
 } from '../../../scripts/online-project-rules-plan.mjs'
 import { renderRemoteApplyScript } from '../../../scripts/online-pricing-plan.mjs'
@@ -153,7 +155,7 @@ test('🚨 读现有规则必须走 HEX（否则 Windows 前缀会被 --batch �
   expect(member[0]!.enabled).toBe(false)
 })
 
-test('🚨 远端脚本支持逐行的 method（项目规则删旧规则走 DELETE + {alias_id}）', () => {
+test('🚨 远端脚本支持逐行的 method（缺省 POST；项目规则的删除走 POST /delete）', () => {
   const rendered = renderRemoteApplyScript({
     endpoint: '/api/v1/admin/project-aliases',
     baseUrl: 'http://127.0.0.1:8787',
@@ -171,6 +173,19 @@ test('读现有规则的 SQL 必须带 alias_id（删除唯一可用的句柄）
   expect(EXISTING_RULES_SQL).toContain('alias_id')
   // 仍然走 HEX —— Windows 前缀会被 --batch 转义，不走 HEX 每条都判成新建
   expect(EXISTING_RULES_SQL).toContain('HEX(prefix)')
+})
+
+test('🚨 删旧规则必须打 POST 子路径 /project-aliases/delete（不是 DELETE 同一路径）', () => {
+  // 服务端 app.ts 的管理路由是**枚举注册的 POST 子路径**，
+  // `DELETE /api/v1/admin/project-aliases` 从来没被注册过 ⇒ 会逐条 405
+  //（2026-10-13 实测：prune --yes 成功 0 / 30，全部 405 方法不允许）。
+  expect(PROJECT_ALIAS_DELETE_ENDPOINT).toBe('/api/v1/admin/project-aliases/delete')
+  const rows = deletionRequests([
+    { prefix: 'D:\\a', alias: '甲', aliasId: 'rule-1' },
+  ])
+  // 逐行只给 body：远端脚本缺省 POST（给 method: 'DELETE' 就是那个 405 的成因）
+  expect(rows[0]!.body).toEqual({ alias_id: 'rule-1' })
+  expect(rows[0]!.method).toBeUndefined()
 })
 
 test('模式判定：含分隔符 ⇒ 路径模式；裸目录名 ⇒ 仓库名模式', () => {

@@ -170,12 +170,28 @@ bun run packages/server/verify/perf/online-probe.ts --file <按 cwd 分组的 SQ
 这是本工具**唯一会减少线上数据**的操作（其余是 upsert，重复跑无害），
 而目录文件写错一个字符就会把全部现有规则判成「不在目录里」。
 
-走 `DELETE /api/v1/admin/project-aliases`，body 是 `{ alias_id }`，逐行独立成败。
+🚨 走 **`POST /api/v1/admin/project-aliases/delete`**，body 是 `{ alias_id }`，逐行独立成败。
+
+**不是** `DELETE /api/v1/admin/project-aliases`（同一路径换方法）—— 服务端的管理路由是
+**枚举注册的 POST 子路径**（`app.ts` 里 `for (const path of [...]) app.post('/api/v1/admin/' + path, …)`，
+项目规则那一组只有 `project-aliases` / `project-aliases/delete` / `project-aliases/status`），
+`DELETE` 那条路径**从来没被注册过**。2026-10-13 实测：写成 DELETE 时 `prune --yes`
+逐条回 **405 方法不允许**（成功 0 / 30），而**演练输出一切正常** ——
+只看 dry-run 是发现不了的，必须先看一次 `--yes` 的真实返回码。
 
 ### 2.5 `verify` —— 证伪（不能省）
 
 读的是**看板自己的接口**（`/api/v1/stats/breakdown?by=project`，带 `stats:read` 的会话），
 打印每个项目的总 token 降序 + **行数**。
+
+⚠️ **`--from` 收的是 epoch 毫秒整数**（`--from 2026-10-07` 会被服务端回
+`400 from 需要是 epoch 毫秒整数`）。看板默认窗口「近 7 天」的起点 =
+`Date.parse('2026-10-07T00:00:00+08:00')` = `1791302400000`。
+
+🐞 **已知边界：`--from 0`（全时段）在回传链路上会被截断**，报
+`JSON Parse error: Expected '}'` —— 响应行数一多（600+ 行）就必现，与规则本身无关。
+全时段核对改成「按窗口分段 verify」或「只读 SQL 取规则表 + 用 `project-alias.ts`
+在本机重放同一份匹配实现」。
 
 > ★ 「规则写进去了」与「看板真的按它归好组了」是**两件事**：
 > 服务端读的是**上报库**的规则表（可能不是你以为的那个库）、规则 `enabled=0`、
@@ -232,7 +248,7 @@ bun run packages/server/verify/perf/online-probe.ts --file <按 cwd 分组的 SQ
 ## 4. 改完这个工具要跑什么
 
 ```bash
-bun test packages/server/test/online-project-rules-plan.test.ts   # 11 项：归一化 / 校验 / 计划 / HEX / DELETE
+bun test packages/server/test/online-project-rules-plan.test.ts   # 13 项：归一化 / 校验 / 计划 / HEX / 删除端点与句柄
 bun test packages/server/test/online-pricing-plan.test.ts         # 13 项：远端脚本渲染（别弄坏）
 bun test packages/core/test/project-alias.test.ts                 # 43 项：匹配语义（本工具的口径源头）
 bun run typecheck
@@ -340,3 +356,43 @@ bun run typecheck
 ⚠️ **第二轮未执行线上写入**：工作区里有**别人未提交的 pricing/cost 在途改动**
 （`repository.ts` 删了 `seedModelPrices`、`cli.ts` 处于语法错误状态），
 `bun run deploy` 会把它们一并推上线。切换步骤见 §1.3。
+
+### 6.3 第三轮：仓库名模式**真的写进线上** + 覆盖全部回落行（2026-10-13）
+
+起因：看板「项目」维度里大量行仍是 `cwd` 最后一段（用户截图那一页 10 行里 8 行如此）。
+先确认线上产物**已支持仓库名模式**（`/data/ai-token-report/packages/server/dist/main.mjs`
+里 `仓库名不能是盘符` 出现 2 次，来自 commit `7bbf6b9`，2026-10-04），所以**不需要先部署**。
+
+规则目录：`.artifacts/project-grouping/project-rules-repo-name-v2.json`（**105 条全局规则**），
+输入是线上 `usage_event.cwd` 的全量实测分布（**997 个目录 / 全站 73.0B token**）。
+
+| 口径 | 规则 | 全站未被任何规则命中的 token | 近 7 天（2026-10-07 起）|
+|---|---|---|---|
+| 改动前（30 条路径规则） | 30 | 74.56% | 93.64%，97 行 |
+| 改动后（105 条，其中 23 条是老项目的仓库名迁移） | 105 | **9.24%** | **10.26%**，88 行（看板实测）|
+
+- 老 10 个项目：**23 条仓库名规则**顶掉 30 条路径规则（`prune --yes` 30/30 成功），
+  一条规则同时覆盖多根 / 子目录 / 盘符大小写。
+- 新项目：别名**沿用目录名**（不发明业务口径），把同一仓库在多台机器 / 多个父目录下的
+  散行折成一行 —— 这张表里 82 条是「新项目」，业务中文名**留待人工拍板**（改 `alias` 一条即可）。
+- **两条候选被刻意丢弃**（否则会吃掉子仓库）：`back_vue_production`（20 字符 > `stec-promis-invest`
+  18 字符，会把 3.56B 的 invest 整个吞掉）与 `stec-promis-front`（同理吞掉 8 个 `stec-promis-page`）。
+  🚨 仓库名规则之间是按**名字长度**排序的（不是按路径深浅），所以「给父目录也配一条」
+  是这里最容易犯的错，配之前必须用真实 cwd 反查一遍（见 §1.6）。
+- 看板实测（`verify --from 1791302400000`，即近 7 天）：头几行 =
+  智慧车站代码 1.008B / 甬舟G92项目 989M / 建元资管项目 956M / CJTZ-v2 954M /
+  一体化项目 941M / AI Token 用量平台 913M，`suit-front-promis-module-yth`、
+  `stec-jyzg-parent` 等旧回落行已并入对应项目。
+- 工具侧修了一个真 bug：`prune` 原来打 `DELETE /api/v1/admin/project-aliases`，
+  线上逐条 **405**（服务端只枚举注册了 `POST …/project-aliases/delete`）——
+  改成 POST 子路径 + `deletionRequests()`，并加了单测钉住。
+
+**留待人工拍板（没配 / 需要口径决定）**：
+
+| 项 | 量 | 为什么没动 |
+|---|---|---|
+| 新项目的**业务中文名** | 82 条规则 | 名字是业务口径，不是技术问题；改 `alias` 一条立刻生效 |
+| `back_vue_production`（`D:\codes\fenghua\back_vue_production`） | 1.50B | 与 `stec-promis-invest`（同目录下的子仓库）看着是同一个项目，合并要拍板 |
+| `stec-promis-front` / `stec-promis-page` | 611M / 551M | 模块与宿主仓库，谁归谁要拍板 |
+| 通用名目录：`web` / `workspace` / `default-workspace` / `vue_code` / `doc` / `st`… | ~2.2B | 一段名会吃掉全站同名目录，宁可留着 |
+| 临时 / 会话目录：`2026-07-31-10-48-32` 这类 WorkBuddy 日期目录、`codex-threads-*`、uuid 目录 | ~1.4B | 收进一个「临时目录」就再也不容易发现「原来有东西跑在临时目录里」（见 §5.3）|

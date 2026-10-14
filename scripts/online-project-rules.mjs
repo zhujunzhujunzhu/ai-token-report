@@ -45,7 +45,8 @@ import {
   MYSQL, renderRemoteApplyScript, renderSqlProbe, wrapRemoteScript,
 } from './online-pricing-plan.mjs'
 import {
-  EXISTING_RULES_SQL, formatPlan, normalizeProjectPrefix, parseExistingRules, planAgainstExisting, readRules, ruleToApiBody,
+  EXISTING_RULES_SQL, PROJECT_ALIAS_DELETE_ENDPOINT, deletionRequests, formatPlan,
+  normalizeProjectPrefix, parseExistingRules, planAgainstExisting, readRules, ruleToApiBody,
 } from './online-project-rules-plan.mjs'
 
 // ── 入参 ────────────────────────────────────────────────────────────────────
@@ -221,10 +222,13 @@ function pruneRules(file, options) {
     console.log(`\n--dry-run（默认）：以上 ${doomed.length} 条**尚未删除**。确认无误后加 --yes 真删。`)
     return
   }
-  const rows = doomed.map((rule) => ({ label: `${rule.prefix} → ${rule.alias}`, body: { alias_id: rule.aliasId }, method: 'DELETE' }))
+  // 🚨 删除端点是 **POST 子路径**（不是 DELETE 同一路径）：服务端的管理路由是枚举注册的
+  //   POST `/api/v1/admin/project-aliases/delete`，`DELETE /api/v1/admin/project-aliases`
+  //   从来没有被注册过 ⇒ 写成 DELETE 会逐条 405（2026-10-13 实测）。
+  const rows = deletionRequests(doomed)
   const parsed = runRemoteScript({
     mode: 'apply',
-    endpoint: PROJECT_ALIASES_ENDPOINT,
+    endpoint: PROJECT_ALIAS_DELETE_ENDPOINT,
     baseUrl: options['base-url'] ?? null,
     username: options.username ?? null,
     password: options.password ?? null,
